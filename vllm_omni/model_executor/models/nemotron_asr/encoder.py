@@ -362,3 +362,153 @@ class FastConformerEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, pos_emb=pos_emb, masked=masked, pad_zero=pad_zero)
         return x, out_lens
+
+
+class StreamingCaches:
+    """Per-session encoder caches (the spec pages' in-module form).
+
+    ``channel``: per-layer normed attention inputs, ``(L, B, 56, d)``
+    (NeMo ``cache_last_channel``). ``time``: per-layer conv tails,
+    ``(L, B, d, kernel-1)`` (``cache_last_time``). ``valid``: filled
+    cache rows per batch element. The 56-slot capacity IS the attention
+    window (8 chunks x 7 frames at every published config), so the
+    streaming mask reduces to 'all valid cached rows + full intra-chunk'.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_layers: int,
+        batch: int,
+        d_model: int,
+        left_context: int,
+        conv_kernel: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.left_context = left_context
+        self.channel = torch.zeros(
+            n_layers, batch, left_context, d_model, device=device, dtype=dtype
+        )
+        self.time = torch.zeros(
+            n_layers, batch, d_model, conv_kernel - 1, device=device,
+            dtype=dtype,
+        )
+        self.valid = torch.zeros(batch, dtype=torch.long, device=device)
+
+
+def _stream_attention(
+    layer: ConformerLayer,
+    x: torch.Tensor,
+    *,
+    cache: torch.Tensor,
+    valid: torch.Tensor,
+    pos_emb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One layer's attention over [cache | new] keys (NeMo update_cache).
+
+    ``x`` is the normed attention input for the NEW frames (B, F, d);
+    ``cache`` holds the previous normed inputs (B, C, d). Returns the
+    attention output for the new frames and the advanced cache.
+    """
+    attn = layer.self_attn
+    batch, new_frames, _ = x.shape
+    capacity = cache.shape[1]
+    keys = torch.cat([cache, x], dim=1)  # (B, C+F, d)
+
+    b, t2 = batch, keys.shape[1]
+    q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
+    k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    p = attn.linear_pos(pos_emb).view(
+        pos_emb.size(0), -1, attn.h, attn.d_k
+    ).transpose(1, 2)
+    q_u = (q + attn.pos_bias_u).transpose(1, 2)
+    q_v = (q + attn.pos_bias_v).transpose(1, 2)
+    matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
+    matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+    scores = (
+        matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]
+    ) / attn.s_d_k
+    # Mask: cache rows beyond each element's valid count are dead; new
+    # frames all attend each other (intra-chunk lookahead).
+    row = torch.arange(capacity, device=x.device).unsqueeze(0)
+    dead = row < (capacity - valid.unsqueeze(1))  # (B, C) True = dead
+    mask = torch.zeros(
+        batch, 1, new_frames, t2, dtype=torch.bool, device=x.device
+    )
+    mask[:, :, :, :capacity] = dead.unsqueeze(1).unsqueeze(2)
+    scores = scores.masked_fill(mask, -_LOG_BASE)
+    weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+    out = torch.matmul(weights, v)
+    out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
+    # Advance cache: keep the last `capacity` of [cache | x].
+    new_cache = keys[:, -capacity:]
+    return attn.linear_out(out), new_cache
+
+
+def _stream_conv(
+    layer: ConformerLayer, x: torch.Tensor, cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Conv module over [time_cache | new] (CausalConv1D.update_cache)."""
+    conv = layer.conv
+    y = x.transpose(1, 2)
+    y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
+    padded = torch.cat([cache, y], dim=-1)
+    new_cache = padded[:, :, -cache.shape[-1] :]
+    y = conv.depthwise_conv(padded)
+    y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
+    y = torch.nn.functional.silu(y)
+    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
+
+
+def stream_step(
+    encoder: FastConformerEncoder,
+    chunk_mel: torch.Tensor,
+    caches: StreamingCaches,
+    *,
+    drop_extra: int,
+) -> torch.Tensor:
+    """One cached streaming encoder step (batch of sessions).
+
+    ``chunk_mel``: (B, feat, chunk-mel [+9-mel pre-encode context for
+    non-first chunks]). Returns the chunk's valid encoder frames
+    (B, F, d) and advances the caches in place — numerically the cached
+    form of the prefix computation the P3 probes proved golden-exact.
+    """
+    lengths = torch.full(
+        (chunk_mel.shape[0],), chunk_mel.shape[2], device=chunk_mel.device
+    )
+    x, _ = encoder.pre_encode(chunk_mel, lengths)
+    if drop_extra:
+        x = x[:, drop_extra:]
+    cache_len = caches.channel.shape[2]
+    pos_emb = encoder.pos_enc(
+        torch.zeros(
+            1, x.shape[1] + cache_len, x.shape[2], device=x.device
+        )
+    )
+    for idx, layer in enumerate(encoder.layers):
+        residual = x
+        y = layer.norm_feed_forward1(x)
+        residual = residual + 0.5 * layer.feed_forward1(y)
+        y = layer.norm_self_att(residual)
+        attn_out, caches.channel[idx] = _stream_attention(
+            layer, y,
+            cache=caches.channel[idx],
+            valid=caches.valid,
+            pos_emb=pos_emb,
+        )
+        residual = residual + attn_out
+        y = layer.norm_conv(residual)
+        conv_out, caches.time[idx] = _stream_conv(
+            layer, y, caches.time[idx]
+        )
+        residual = residual + conv_out
+        y = layer.norm_feed_forward2(residual)
+        residual = residual + 0.5 * layer.feed_forward2(y)
+        x = layer.norm_out(residual)
+    caches.valid = torch.clamp(
+        caches.valid + x.shape[1], max=caches.left_context
+    )
+    return x
