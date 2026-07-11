@@ -241,12 +241,16 @@ class ConformerConv(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Linear -> silu -> Linear (dropout is eval-noop, omitted)."""
+    """Linear -> silu -> Linear (dropout is eval-noop, omitted).
+
+    Bias-free: the checkpoint's encoder ``use_bias: False`` covers every
+    Linear/Conv in the layer (confirmed from the restored model config).
+    """
 
     def __init__(self, *, d_model: int, d_ff: int) -> None:
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear2(nn.functional.silu(self.linear1(x)))
