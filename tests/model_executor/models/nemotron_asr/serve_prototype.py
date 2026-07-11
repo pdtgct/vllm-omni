@@ -32,10 +32,17 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+    StreamingCaches,
+    stream_step,
+)
 from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
     load_core_from_dump,
     resolve_prompt_index,
 )
+
+PRE_ENCODE_CACHE_MEL = 9
+DROP_EXTRA = 2
 
 MEL_HOP = 160
 SUBSAMPLE = 8
@@ -53,9 +60,15 @@ class Session:
         )
         self.pcm = np.zeros(0, dtype=np.float32)
         self.emitted_mel = 0  # processed-mel boundary (NeMo-exact)
-        self.emitted_frames = 0
-        self.state = core.fresh_decode_state(
-            next(core.parameters()).device
+        device = next(core.parameters()).device
+        self.state = core.fresh_decode_state(device)
+        self.caches = StreamingCaches(
+            n_layers=len(core.encoder.layers),
+            batch=1,
+            d_model=1024,
+            left_context=56,
+            conv_kernel=9,
+            device=device,
         )
         self.labels: list[int] = []
         self.chunk_index = 0
@@ -109,40 +122,88 @@ class Batcher:
     def _process(self, batch) -> None:
         core = self.core
         with torch.inference_mode():
-            mels = []
-            for session, mel_end, _ in batch:
-                samples = torch.from_numpy(
-                    session.pcm[: mel_end * MEL_HOP + 240]
-                ).unsqueeze(0).to(self.device)
-                mel, _ = core.featurizer(
-                    samples,
-                    torch.tensor([samples.shape[1]], device=self.device),
+            # Cached streaming regime (golden-exact 5/5 cells incl. full
+            # cadence, p3_cached_probe): group same-shape chunk mels,
+            # stack session caches, one batched stream_step per group.
+            groups = {}
+            for entry in batch:
+                session, mel_end, _ = entry
+                first = session.emitted_mel == 0
+                start = (
+                    0 if first
+                    else session.emitted_mel - PRE_ENCODE_CACHE_MEL
                 )
-                mels.append(mel[0, :, :mel_end])
-            max_len = max(m.shape[1] for m in mels)
-            padded = torch.zeros(
-                len(mels), 128, max_len, device=self.device
-            )
-            lengths = torch.tensor(
-                [m.shape[1] for m in mels], device=self.device
-            )
-            for i, m in enumerate(mels):
-                padded[i, :, : m.shape[1]] = m
-            enc, enc_len = core.encoder(padded, lengths)
-            for i, (session, mel_end, _) in enumerate(batch):
-                valid = int(enc_len[i])
-                new = enc[i : i + 1, session.emitted_frames : valid]
-                if new.shape[1] > 0:
-                    cond = core.lid(
-                        new, prompt_index=session.prompt_index
+                width = mel_end - start if not first else mel_end
+                groups.setdefault((width, first), []).append(
+                    (entry, start)
+                )
+            for (width, first), members in groups.items():
+                mels = []
+                for (session, mel_end, _), start in members:
+                    samples = torch.from_numpy(
+                        session.pcm[: mel_end * MEL_HOP + 240]
+                    ).unsqueeze(0).to(self.device)
+                    mel, _ = core.featurizer(
+                        samples,
+                        torch.tensor(
+                            [samples.shape[1]], device=self.device
+                        ),
                     )
-                    labels, session.state = core.transcribe_chunk(
-                        cond[0], session.state
-                    )
-                    session.labels.extend(labels)
-                session.emitted_frames = valid
-                session.emitted_mel = mel_end
-                session.chunk_index += 1
+                    piece = mel[:, :, max(start, 0) : mel_end]
+                    if start < 0:
+                        piece = torch.cat(
+                            [
+                                torch.zeros(
+                                    1, 128, -start, device=self.device
+                                ),
+                                piece,
+                            ],
+                            dim=2,
+                        )
+                    mels.append(piece)
+                chunk_mel = torch.cat(mels, dim=0)
+                caches = StreamingCaches(
+                    n_layers=len(core.encoder.layers),
+                    batch=len(members),
+                    d_model=1024,
+                    left_context=56,
+                    conv_kernel=9,
+                    device=self.device,
+                )
+                caches.channel = torch.cat(
+                    [s.caches.channel for (s, _, _), _ in members], dim=1
+                )
+                caches.time = torch.cat(
+                    [s.caches.time for (s, _, _), _ in members], dim=1
+                )
+                caches.valid = torch.cat(
+                    [s.caches.valid for (s, _, _), _ in members]
+                )
+                frames = stream_step(
+                    core.encoder,
+                    chunk_mel,
+                    caches,
+                    drop_extra=0 if first else DROP_EXTRA,
+                )
+                for i, ((session, mel_end, _), _) in enumerate(members):
+                    session.caches.channel = caches.channel[
+                        :, i : i + 1
+                    ].clone()
+                    session.caches.time = caches.time[:, i : i + 1].clone()
+                    session.caches.valid = caches.valid[
+                        i : i + 1
+                    ].clone()
+                    new = frames[i : i + 1]
+                    if new.shape[1] > 0:
+                        cond = core.lid(
+                            new, prompt_index=session.prompt_index
+                        )
+                        labels, session.state = core.transcribe_chunk(
+                            cond[0], session.state
+                        )
+                        session.labels.extend(labels)
+                    session.emitted_mel = mel_end
+                    session.chunk_index += 1
 
 
 async def handle(ws, core, meta, batcher, sp) -> None:
