@@ -143,3 +143,62 @@ def greedy_decode_chunk(
     # Blank does not advance the predictor: state reflects the last
     # non-blank emission only.
     return emitted, DecodeState(h=h, c=c, last_label=last_label)
+
+
+def greedy_decode_batch(
+    enc_frames: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    state: DecodeState,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> tuple[list[list[int]], DecodeState]:
+    """Batched greedy label-looping decode over stacked sessions.
+
+    Semantically the reference loop (``greedy_decode_chunk``) run per
+    stream: each stream emits until its own blank or the per-frame cap,
+    committed state advances only on that stream's non-blank emissions,
+    and inactive streams are masked out of every update. Streams share
+    the frame count (callers batch same-shape chunk-steps).
+
+    Args:
+        enc_frames: ``(batch, time, enc_hidden)`` conditioned frames.
+        predictor: The prediction network.
+        joint: The joint network.
+        state: Stacked decode state — ``h``/``c`` ``(layers, batch,
+            hidden)``, ``last_label`` ``(batch,)``.
+        max_symbols: Per-frame emission cap (checkpoint value 10).
+
+    Returns:
+        Per-stream emitted label ids and the advanced stacked state.
+    """
+    batch = enc_frames.shape[0]
+    blank = predictor.blank_id
+    h, c = state.h, state.c
+    last_label = state.last_label
+    emitted: list[list[int]] = [[] for _ in range(batch)]
+    pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
+    for t in range(enc_frames.shape[1]):
+        frame = enc_frames[:, t]
+        active = torch.ones(
+            batch, dtype=torch.bool, device=enc_frames.device
+        )
+        for _ in range(max_symbols):
+            logits = joint.logits(frame, pred_out)
+            labels = logits.argmax(dim=-1)
+            emit = active & (labels != blank)
+            if not bool(emit.any()):
+                break
+            for i in emit.nonzero(as_tuple=True)[0].tolist():
+                emitted[i].append(int(labels[i]))
+            gate = emit.view(1, -1, 1)
+            last_label = torch.where(emit, labels, last_label)
+            # Commit the state that produced this pred_out, emitters only.
+            h = torch.where(gate, pred_h, h)
+            c = torch.where(gate, pred_c, c)
+            new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
+            pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
+            pred_h = torch.where(gate, new_h, pred_h)
+            pred_c = torch.where(gate, new_c, pred_c)
+            active = emit
+    return emitted, DecodeState(h=h, c=c, last_label=last_label)
