@@ -125,6 +125,16 @@ def main() -> None:
         )
     total_mel = int(mel_len[0])
     mel_per_chunk = frames_per_chunk * 8
+    # NeMo chunking (setup_streaming_params + buffer __iter__ tail rule
+    # @ de242add): first chunk is 8L+1 mel, shifts are 8L+8, and a tail
+    # shorter than one subsampled frame (8 mel) is DROPPED, never
+    # processed. Cumulative processed-mel boundaries per chunk:
+    boundaries = [8 * lookahead + 1]
+    while boundaries[-1] < total_mel:
+        boundaries.append(boundaries[-1] + mel_per_chunk)
+    boundaries = [min(b, total_mel) for b in boundaries]
+    if len(boundaries) >= 2 and total_mel - boundaries[-2] < 8:
+        boundaries.pop()  # dropped tail (< 8 mel)
 
     decode_state = DecodeState(
         h=torch.zeros(2, 1, 640, device=device),
@@ -136,18 +146,16 @@ def main() -> None:
     emitted_frames = 0
     with torch.inference_mode():
         for chunk in range(n_chunks):
-            mel_end = min((chunk + 1) * mel_per_chunk, total_mel)
+            mel_end = boundaries[min(chunk, len(boundaries) - 1)]
             prefix = mel[:, :, :mel_end]
             enc_out, enc_len = encoder(
                 prefix, torch.tensor([mel_end], device=device)
             )
+            # With NeMo-exact boundaries (first chunk 8L+1 mel), the
+            # cumulative valid frame count is enc_len(boundary) directly
+            # — the valid_out_len / drop_extra_pre_encoded interplay is
+            # embedded in the boundary arithmetic.
             valid = int(enc_len[0])
-            # NeMo's valid_out_len: the prefix-edge encoder frame has an
-            # incomplete receptive field and is NOT emitted for
-            # non-final chunks (keep_all_outputs only at the last step);
-            # the next chunk recomputes it with full context.
-            if chunk < n_chunks - 1:
-                valid -= 1
             new = enc_out[:, emitted_frames:valid]
             if new.shape[1] == 0 and chunk < n_chunks - 1:
                 partials.append(partials[-1] if partials else "")
