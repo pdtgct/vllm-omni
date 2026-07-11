@@ -37,6 +37,7 @@ def _fixture():
 def _featurizer(fixture) -> MelFeaturizer:
     return MelFeaturizer(
         filterbank=torch.from_numpy(fixture["filterbank"]),
+        window=torch.from_numpy(fixture["window"]),
         n_fft=int(fixture["n_fft"]),
         win_length=int(fixture["win_length"]),
         hop_length=int(fixture["hop_length"]),

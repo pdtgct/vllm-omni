@@ -29,6 +29,7 @@ class MelFeaturizer(nn.Module):
         self,
         *,
         filterbank: torch.Tensor,
+        window: torch.Tensor,
         n_fft: int = 512,
         win_length: int = 400,
         hop_length: int = 160,
@@ -41,15 +42,21 @@ class MelFeaturizer(nn.Module):
                 f"filterbank must be (n_mels, {n_fft // 2 + 1}), got "
                 f"{tuple(filterbank.shape)}"
             )
+        if window.shape != (win_length,):
+            raise ValueError(
+                f"window must be ({win_length},), got {tuple(window.shape)}"
+            )
         self.n_fft = n_fft
         self.win_length = win_length
         self.hop_length = hop_length
         self.preemph = preemph
         self.log_zero_guard = log_zero_guard
         self.register_buffer("fb", filterbank.to(torch.float32))
-        self.register_buffer(
-            "window", torch.hann_window(win_length, periodic=False)
-        )
+        # The checkpoint's persisted window, like the filterbank — a
+        # freshly built hann differs by one ulp (trained under a
+        # different torch rounding), which log() amplifies to ~1e-4 at
+        # quiet mel bins. Checkpoint buffers are inputs, not recomputed.
+        self.register_buffer("window", window.to(torch.float32))
 
     def output_lengths(self, sample_lengths: torch.Tensor) -> torch.Tensor:
         """Mel frame count per NeMo ``get_seq_len`` (center=True)."""
@@ -99,6 +106,11 @@ class MelFeaturizer(nn.Module):
             return_complex=True,
             pad_mode="constant",
         )
-        power = torch.view_as_real(spec).pow(2).sum(-1)
+        # NeMo computes magnitude (sqrt) then squares it back to power
+        # (features.py:443-453). Algebraically an identity, numerically
+        # an fp32 round-trip that log() then amplifies at low-energy
+        # bins — parity requires the same op order.
+        magnitude = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1))
+        power = magnitude.pow(2.0)
         mel = torch.matmul(self.fb, power)
         return torch.log(mel + self.log_zero_guard), mel_len

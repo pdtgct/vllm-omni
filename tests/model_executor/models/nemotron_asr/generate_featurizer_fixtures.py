@@ -54,6 +54,7 @@ def main() -> None:
         silence_waveform=silence.numpy(),
         silence_mel=s_mel.numpy(),
         filterbank=pre.fb[0].numpy(),
+        window=pre.window.numpy(),
         n_fft=np.int64(pre.n_fft),
         win_length=np.int64(pre.win_length),
         hop_length=np.int64(pre.hop_length),

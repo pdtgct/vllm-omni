@@ -97,6 +97,11 @@ def test_state_carries_across_chunks_without_sos_reinjection():
 
 
 def test_sos_is_blank_and_embeds_to_zeros():
-    predictor, _ = _nets()
+    # Fresh construction: padding_idx zeroes the blank row at init (the
+    # _nets fixture's blanket uniform re-init would overwrite it; real
+    # weights come from the checkpoint, whose blank row trained as pad).
+    predictor = Predictor(
+        vocab_size=_VOCAB, pred_hidden=_HID, pred_rnn_layers=2
+    )
     sos = torch.tensor([predictor.blank_id])
     assert torch.all(predictor.embed(sos) == 0.0)
