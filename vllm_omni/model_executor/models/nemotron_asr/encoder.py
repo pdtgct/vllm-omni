@@ -1,0 +1,360 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Cache-aware FastConformer encoder — P2 full-context regime.
+
+Op-for-op translation of the pinned NeMo modules for the shipped
+checkpoint's configuration (HF config.json, fetched 2026-07-11:
+d_model 1024, 8 heads, FF 4096, 24 layers, conv kernel 9, causal
+dw-striding 8x subsampling at 256 channels, attention/convolution bias
+FALSE, activation silu, scale_input FALSE):
+
+- dw-striding causal subsampling (subsampling.py:184-257,421-478)
+- Transformer-XL relative-position MHA with per-layer pos biases
+  (multi_head_attention.py:212-354; mask polarity True = masked)
+- causal depthwise conv module (conformer_modules.py:236-340,
+  causal_convs.py:73-151; left pad 8, right 0)
+- macaron conformer layer (conformer_modules.py:160-230)
+- centered rel-pos encoding (multi_head_attention.py:1056-1100)
+
+Streaming (per-chunk cache threading over spec pages) is the P3
+re-plumb; this regime runs one window over the whole utterance with
+cross-chunk state dormant (PORT-REGIME-001/002). All source refs
+@ NeMo de242add.
+"""
+
+import math
+
+import torch
+from torch import nn
+
+from vllm_omni.model_executor.models.nemotron_asr.masks import (
+    chunked_limited_mask,
+)
+
+_LOG_BASE = 10000.0
+
+
+def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
+    return (length + pad - kernel) // stride + 1
+
+
+class CausalConv2dSub(nn.Conv2d):
+    """CausalConv2D: (k-1, s-1) asymmetric zero pad on BOTH axes."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, padding=0, **kwargs)
+        k = self.kernel_size[0]
+        s = self.stride[0]
+        self._pad = (k - 1, s - 1, k - 1, s - 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(nn.functional.pad(x, self._pad))
+
+
+class SubsamplingDwStriding(nn.Module):
+    """Causal dw-striding ConvSubsampling, 8x (three stride-2 stages)."""
+
+    def __init__(
+        self,
+        *,
+        feat_in: int,
+        d_model: int,
+        conv_channels: int,
+        kernel: int = 3,
+        stride: int = 2,
+        stages: int = 3,
+    ) -> None:
+        super().__init__()
+        self.kernel = kernel
+        self.stride = stride
+        self.stages = stages
+        layers: list[nn.Module] = [
+            CausalConv2dSub(1, conv_channels, kernel, stride),
+            nn.ReLU(),
+        ]
+        for _ in range(stages - 1):
+            layers.append(
+                CausalConv2dSub(
+                    conv_channels,
+                    conv_channels,
+                    kernel,
+                    stride,
+                    groups=conv_channels,
+                )
+            )
+            layers.append(nn.Conv2d(conv_channels, conv_channels, 1))
+            layers.append(nn.ReLU())
+        self.conv = nn.Sequential(*layers)
+        freq = feat_in
+        pad = (kernel - 1) + (stride - 1)
+        for _ in range(stages):
+            freq = _conv_out_len(freq, pad=pad, kernel=kernel, stride=stride)
+        self.out = nn.Linear(conv_channels * freq, d_model)
+
+    def output_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        pad = (self.kernel - 1) + (self.stride - 1)
+        out = lengths
+        for _ in range(self.stages):
+            out = torch.div(
+                out + pad - self.kernel, self.stride, rounding_mode="floor"
+            ) + 1
+        return out.to(torch.int64)
+
+    def forward(
+        self, mel: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, feat_in, T)`` mel -> ``(B, T//8, d_model)``."""
+        x = mel.transpose(1, 2).unsqueeze(1)  # (B, 1, T, F)
+        x = self.conv(x)
+        b, c, t, f = x.size()
+        x = self.out(x.transpose(1, 2).reshape(b, t, c * f))
+        return x, self.output_lengths(lengths)
+
+
+class RelPositionalEncoding(nn.Module):
+    """Centered TXL relative positions L-1 .. -(L-1); no input scale."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.register_buffer("pe", torch.zeros(1, 0, d_model), persistent=False)
+
+    def _extend(self, length: int, ref: torch.Tensor) -> None:
+        if self.pe.size(1) >= 2 * length - 1:
+            return
+        positions = torch.arange(
+            length - 1, -length, -1, dtype=torch.float32, device=ref.device
+        ).unsqueeze(1)
+        pe = torch.zeros(positions.size(0), self.d_model, device=ref.device)
+        div_term = torch.exp(
+            torch.arange(
+                0, self.d_model, 2, dtype=torch.float32, device=ref.device
+            )
+            * -(math.log(_LOG_BASE) / self.d_model)
+        )
+        pe[:, 0::2] = torch.sin(positions * div_term)
+        pe[:, 1::2] = torch.cos(positions * div_term)
+        self.pe = pe.unsqueeze(0).to(ref.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return pos_emb ``(1, 2T-1, d)`` for input ``(B, T, d)``."""
+        self._extend(x.size(1), x)
+        length = x.size(1)
+        center = self.pe.size(1) // 2 + 1
+        return self.pe[:, center - length : center + length - 1]
+
+
+class RelPositionMHA(nn.Module):
+    """Transformer-XL rel-pos attention (per-layer pos biases)."""
+
+    def __init__(self, *, d_model: int, n_heads: int) -> None:
+        super().__init__()
+        self.h = n_heads
+        self.d_k = d_model // n_heads
+        self.s_d_k = math.sqrt(self.d_k)
+        self.linear_q = nn.Linear(d_model, d_model, bias=False)
+        self.linear_k = nn.Linear(d_model, d_model, bias=False)
+        self.linear_v = nn.Linear(d_model, d_model, bias=False)
+        self.linear_out = nn.Linear(d_model, d_model, bias=False)
+        self.linear_pos = nn.Linear(d_model, d_model, bias=False)
+        self.pos_bias_u = nn.Parameter(torch.zeros(n_heads, self.d_k))
+        self.pos_bias_v = nn.Parameter(torch.zeros(n_heads, self.d_k))
+
+    @staticmethod
+    def _rel_shift(x: torch.Tensor) -> torch.Tensor:
+        b, h, qlen, pos_len = x.size()
+        x = nn.functional.pad(x, pad=(1, 0))
+        x = x.view(b, h, -1, qlen)
+        return x[:, :, 1:].view(b, h, qlen, pos_len)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        pos_emb: torch.Tensor,
+        masked: torch.Tensor,
+    ) -> torch.Tensor:
+        """Self-attention; ``masked`` is (B, T, T) True = MAY NOT attend."""
+        b, t, _ = x.shape
+        q = self.linear_q(x).view(b, t, self.h, self.d_k)
+        k = self.linear_k(x).view(b, t, self.h, self.d_k).transpose(1, 2)
+        v = self.linear_v(x).view(b, t, self.h, self.d_k).transpose(1, 2)
+        p = self.linear_pos(pos_emb).view(
+            pos_emb.size(0), -1, self.h, self.d_k
+        ).transpose(1, 2)
+
+        q_u = (q + self.pos_bias_u).transpose(1, 2)
+        q_v = (q + self.pos_bias_v).transpose(1, 2)
+        matrix_bd = self._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
+        matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+        scores = (
+            matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]
+        ) / self.s_d_k
+        mask = masked.unsqueeze(1)
+        scores = scores.masked_fill(mask, -_LOG_BASE)
+        attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(b, t, self.h * self.d_k)
+        return self.linear_out(out)
+
+
+class ConformerConv(nn.Module):
+    """Pointwise->GLU->causal depthwise->norm->silu->pointwise."""
+
+    def __init__(
+        self, *, d_model: int, kernel: int, norm_type: str
+    ) -> None:
+        super().__init__()
+        self.norm_type = norm_type
+        self.left_pad = kernel - 1
+        self.pointwise_conv1 = nn.Conv1d(
+            d_model, d_model * 2, 1, bias=False
+        )
+        self.depthwise_conv = nn.Conv1d(
+            d_model, d_model, kernel, groups=d_model, bias=False
+        )
+        if norm_type == "layer_norm":
+            self.batch_norm: nn.Module = nn.LayerNorm(d_model)
+        elif norm_type == "batch_norm":
+            self.batch_norm = nn.BatchNorm1d(d_model)
+        else:
+            raise ValueError(f"unsupported conv norm: {norm_type}")
+        self.pointwise_conv2 = nn.Conv1d(d_model, d_model, 1, bias=False)
+
+    def forward(
+        self, x: torch.Tensor, pad_zero: torch.Tensor | None
+    ) -> torch.Tensor:
+        """``(B, T, d)`` -> ``(B, T, d)``; ``pad_zero`` True = padding."""
+        x = x.transpose(1, 2)
+        x = nn.functional.glu(self.pointwise_conv1(x), dim=1)
+        if pad_zero is not None:
+            x = x.masked_fill(pad_zero.unsqueeze(1), 0.0)
+        x = self.depthwise_conv(
+            nn.functional.pad(x, (self.left_pad, 0))
+        )
+        if self.norm_type == "layer_norm":
+            x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
+        else:
+            x = self.batch_norm(x)
+        x = nn.functional.silu(x)
+        return self.pointwise_conv2(x).transpose(1, 2)
+
+
+class FeedForward(nn.Module):
+    """Linear -> silu -> Linear (dropout is eval-noop, omitted)."""
+
+    def __init__(self, *, d_model: int, d_ff: int) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear2(nn.functional.silu(self.linear1(x)))
+
+
+class ConformerLayer(nn.Module):
+    """Macaron block: 0.5FF -> MHA -> conv -> 0.5FF -> norm_out."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_ff: int,
+        n_heads: int,
+        conv_kernel: int,
+        conv_norm_type: str,
+    ) -> None:
+        super().__init__()
+        self.norm_feed_forward1 = nn.LayerNorm(d_model)
+        self.feed_forward1 = FeedForward(d_model=d_model, d_ff=d_ff)
+        self.norm_self_att = nn.LayerNorm(d_model)
+        self.self_attn = RelPositionMHA(d_model=d_model, n_heads=n_heads)
+        self.norm_conv = nn.LayerNorm(d_model)
+        self.conv = ConformerConv(
+            d_model=d_model, kernel=conv_kernel, norm_type=conv_norm_type
+        )
+        self.norm_feed_forward2 = nn.LayerNorm(d_model)
+        self.feed_forward2 = FeedForward(d_model=d_model, d_ff=d_ff)
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        pos_emb: torch.Tensor,
+        masked: torch.Tensor,
+        pad_zero: torch.Tensor | None,
+    ) -> torch.Tensor:
+        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
+        x = x + self.self_attn(
+            self.norm_self_att(x), pos_emb=pos_emb, masked=masked
+        )
+        x = x + self.conv(self.norm_conv(x), pad_zero)
+        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
+        return self.norm_out(x)
+
+
+class FastConformerEncoder(nn.Module):
+    """Full-context regime encoder (PORT-REGIME-001/002).
+
+    One attention window over the whole utterance at the configured
+    ``att_context_size``; cross-chunk state pages dormant. The P3
+    streaming path re-plumbs the same layers over paged caches.
+    """
+
+    def __init__(
+        self,
+        *,
+        feat_in: int = 128,
+        d_model: int = 1024,
+        d_ff: int = 4096,
+        n_layers: int = 24,
+        n_heads: int = 8,
+        conv_kernel: int = 9,
+        conv_norm_type: str = "layer_norm",
+        subsampling_channels: int = 256,
+        att_context: tuple[int, int] = (56, 13),
+    ) -> None:
+        super().__init__()
+        self.att_context = att_context
+        self.pre_encode = SubsamplingDwStriding(
+            feat_in=feat_in,
+            d_model=d_model,
+            conv_channels=subsampling_channels,
+        )
+        self.pos_enc = RelPositionalEncoding(d_model)
+        self.layers = nn.ModuleList(
+            ConformerLayer(
+                d_model=d_model,
+                d_ff=d_ff,
+                n_heads=n_heads,
+                conv_kernel=conv_kernel,
+                conv_norm_type=conv_norm_type,
+            )
+            for _ in range(n_layers)
+        )
+
+    def forward(
+        self, mel: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, feat_in, T_mel)`` -> ``(B, T, d_model)`` encoder_raw.
+
+        Output is (B, T, D) — NeMo transposes to (B, D, T) at its
+        encoder boundary; the port keeps time-major throughout (layout,
+        not math; the capture-hook comparison transposes accordingly).
+        """
+        x, out_lens = self.pre_encode(mel, lengths)
+        pos_emb = self.pos_enc(x)
+        t = x.size(1)
+        may_attend = chunked_limited_mask(
+            t, self.att_context, device=x.device
+        )
+        valid = torch.arange(t, device=x.device).unsqueeze(
+            0
+        ) < out_lens.unsqueeze(1)
+        pair_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
+        masked = ~(may_attend.unsqueeze(0) & pair_valid)
+        pad_zero = ~valid
+        for layer in self.layers:
+            x = layer(x, pos_emb=pos_emb, masked=masked, pad_zero=pad_zero)
+        return x, out_lens
