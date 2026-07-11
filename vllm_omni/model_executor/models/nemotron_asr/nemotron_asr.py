@@ -149,8 +149,37 @@ class NemotronASRCore(nn.Module):
         )
 
 
+def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
+    """Cast compute modules to the policy's weight dtype (PORT-PREC-001).
+
+    Encoder, LID, predictor, and joint move to ``dtype_for("weights")``;
+    activations follow at the module entry seams, so this realization
+    requires the two classes to agree. The mel front-end stays fp32 —
+    it sits upstream of the activations seam and is the golden input
+    boundary. Recurrent/cache state dtypes are independent axes read at
+    their own construction sites (PORT-PREC-005), and the manual LSTM
+    cell up-casts its weights to the state dtype per step, keeping
+    ``(h, c)`` accumulation at fp32 under sub-fp32 weights.
+    """
+    weights = core.policy.dtype_for("weights")
+    activations = core.policy.dtype_for("activations")
+    if weights != activations:
+        raise ValueError(
+            "this realization derives activations from the weight "
+            f"dtype at the entry seams; policy {core.policy.identifier} "
+            f"declares weights={weights} activations={activations}"
+        )
+    for module in (core.encoder, core.lid, core.predictor, core.joint):
+        module.to(weights)
+    return core
+
+
 def load_core_from_dump(
-    dump_dir, *, device: torch.device, att_context=(56, 13)
+    dump_dir,
+    *,
+    device: torch.device,
+    att_context=(56, 13),
+    policy: PrecisionPolicy = FP32_BRINGUP,
 ) -> tuple[NemotronASRCore, dict]:
     """Assemble the core from the offline conversion dump.
 
@@ -178,6 +207,7 @@ def load_core_from_dump(
         att_context=att_context,
         filterbank=converted["featurizer.fb"][0],
         window=converted["featurizer.window"],
+        policy=policy,
     )
     # fb/window enter via the constructor (checkpoint-buffer rule);
     # exclude them here — NeMo's fb carries a leading batch dim.
@@ -197,12 +227,14 @@ def load_core_from_dump(
             f"core load mismatch: missing={real_missing} "
             f"unexpected={unexpected}"
         )
+    apply_policy_dtypes(core)
     core.to(device).eval()
     return core, meta
 
 
 __all__ = [
     "NemotronASRCore",
+    "apply_policy_dtypes",
     "load_core_from_dump",
     "resolve_prompt_index",
 ]

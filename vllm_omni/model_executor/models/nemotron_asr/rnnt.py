@@ -92,8 +92,16 @@ class Joint(nn.Module):
     def logits(
         self, enc_frame: torch.Tensor, pred_out: torch.Tensor
     ) -> torch.Tensor:
-        """Joint logits for one (frame, prediction) pair, ``(B, V+1)``."""
-        return self.joint_net(self.enc(enc_frame) + self.pred(pred_out))
+        """Joint logits for one (frame, prediction) pair, ``(B, V+1)``.
+
+        ``pred_out`` arrives in the recurrent-state dtype (fp32 by
+        PORT-PREC-005) while the joint computes in the policy's weight
+        dtype — both inputs cast to the weights here (PORT-PREC-001).
+        """
+        dtype = self.enc.weight.dtype
+        return self.joint_net(
+            self.enc(enc_frame.to(dtype)) + self.pred(pred_out.to(dtype))
+        )
 
 
 def greedy_decode_chunk(

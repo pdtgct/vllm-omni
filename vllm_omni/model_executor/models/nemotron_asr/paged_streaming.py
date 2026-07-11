@@ -58,7 +58,10 @@ def stream_step_paged(
     if drop_extra:
         x = x[:, drop_extra:]
     pos_emb = encoder.pos_enc(
-        torch.zeros(1, x.shape[1] + window, x.shape[2], device=x.device)
+        torch.zeros(
+            1, x.shape[1] + window, x.shape[2],
+            device=x.device, dtype=x.dtype,
+        )
     )
     for idx, layer in enumerate(encoder.layers):
         residual = x
@@ -102,7 +105,9 @@ def _paged_conv(
     y = x.transpose(1, 2)
     y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
     tail = pages[state_indices]
-    padded = torch.cat([tail, y], dim=-1)
+    # conv_state axis: read-cast to compute dtype; the scatter below
+    # casts back to the page dtype implicitly.
+    padded = torch.cat([tail.to(y.dtype), y], dim=-1)
     pages[state_indices] = padded[:, :, -tail.shape[-1] :]
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)

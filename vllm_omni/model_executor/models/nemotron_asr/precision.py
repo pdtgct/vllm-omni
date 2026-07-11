@@ -121,3 +121,19 @@ class PrecisionPolicy:
 
 FP32_BRINGUP: Final = PrecisionPolicy({"*": "fp32"})
 """The bring-up value: fp32 everywhere, matching the fp32-locked oracle."""
+
+BF16_COMPUTE: Final = PrecisionPolicy(
+    {
+        "weights": "bf16",
+        "activations": "bf16",
+        "attention_cache": "fp32",
+        "conv_state": "fp32",
+        "lstm_state": "fp32",
+        "queue_state": "fp32",
+    }
+)
+"""The first reviewed sub-fp32 policy (PORT-PREC-003): compute classes
+bf16, every state class fp32 — the vLLM mamba mixed-precision idiom
+(compute dtype below the recurrent/cache dtype, never the reverse).
+Transcript parity vs the fp32-locked oracle stays BLOCKING; tensor
+deltas are advisory under this identifier (EVAL-PAR-006)."""

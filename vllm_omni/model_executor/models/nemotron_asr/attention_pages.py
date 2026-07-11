@@ -122,8 +122,11 @@ def paged_stream_attention(
         new_frames=new_frames,
         window=window,
     )
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    # attention_cache is its own policy axis: pages may store a wider
+    # dtype than compute; read-cast to the activations dtype (writes
+    # cast implicitly on scatter).
+    k = k.to(x.dtype).transpose(1, 2)
+    v = v.to(x.dtype).transpose(1, 2)
     t2 = window + new_frames
 
     q = attn.linear_q(x).view(batch, new_frames, attn.h, attn.d_k)

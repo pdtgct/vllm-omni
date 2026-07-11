@@ -104,6 +104,9 @@ class SubsamplingDwStriding(nn.Module):
         self, mel: torch.Tensor, lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``(B, feat_in, T)`` mel -> ``(B, T//8, d_model)``."""
+        # Activations follow the policy-cast weights from this seam on;
+        # the fp32 mel front-end sits upstream of it (PORT-PREC-001).
+        mel = mel.to(next(self.parameters()).dtype)
         x = mel.transpose(1, 2).unsqueeze(1)  # (B, 1, T, F)
         x = self.conv(x)
         b, c, t, f = x.size()
@@ -414,7 +417,10 @@ def _stream_attention(
     attn = layer.self_attn
     batch, new_frames, _ = x.shape
     capacity = cache.shape[1]
-    keys = torch.cat([cache, x], dim=1)  # (B, C+F, d)
+    # The cache keeps its own policy axis (attention_cache); compute
+    # runs in the activations dtype, so read-cast here, write-cast on
+    # advance (PORT-PREC-001/005 — state dtype never follows compute).
+    keys = torch.cat([cache.to(x.dtype), x], dim=1)  # (B, C+F, d)
 
     b, t2 = batch, keys.shape[1]
     q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
@@ -443,7 +449,7 @@ def _stream_attention(
     out = torch.matmul(weights, v)
     out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
     # Advance cache: keep the last `capacity` of [cache | x].
-    new_cache = keys[:, -capacity:]
+    new_cache = keys[:, -capacity:].to(cache.dtype)
     return attn.linear_out(out), new_cache
 
 
@@ -454,8 +460,9 @@ def _stream_conv(
     conv = layer.conv
     y = x.transpose(1, 2)
     y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
-    padded = torch.cat([cache, y], dim=-1)
-    new_cache = padded[:, :, -cache.shape[-1] :]
+    # conv_state axis: read-cast to compute dtype, write-cast back.
+    padded = torch.cat([cache.to(y.dtype), y], dim=-1)
+    new_cache = padded[:, :, -cache.shape[-1] :].to(cache.dtype)
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
@@ -485,7 +492,8 @@ def stream_step(
     cache_len = caches.channel.shape[2]
     pos_emb = encoder.pos_enc(
         torch.zeros(
-            1, x.shape[1] + cache_len, x.shape[2], device=x.device
+            1, x.shape[1] + cache_len, x.shape[2],
+            device=x.device, dtype=x.dtype,
         )
     )
     for idx, layer in enumerate(encoder.layers):
