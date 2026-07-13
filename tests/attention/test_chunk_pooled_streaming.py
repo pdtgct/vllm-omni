@@ -67,7 +67,7 @@ def make_layer(bps: int) -> ChunkPooledStreamingAttention:
 
 def tiny_mha(h: int = 2, d_k: int = 4) -> RelPositionMHA:
     torch.manual_seed(0)
-    return RelPositionMHA(n_head=h, n_feat=h * d_k)
+    return RelPositionMHA(d_model=h * d_k, n_heads=h)
 
 
 # ---- contract greens: the decided formulas -----------------------------------
@@ -270,7 +270,10 @@ def test_backend_step_matches_paged_reference_ragged_batch():
     attn = tiny_mha(h, d_k)
     pos_emb = torch.randn(1, 2 * (window + frames) - 1, h * d_k)
     impl = ChunkPooledStreamingImpl(
-        num_heads=h, head_size=d_k, frames_per_chunk=frames
+        num_heads=h,
+        head_size=d_k,
+        frames_per_chunk=frames,
+        window_frames=window,
     )
     pages_ref, tables = pages_and_tables(
         batch=2, blocks=8, block_frames=frames, h=h, d_k=d_k
@@ -305,7 +308,10 @@ def test_first_chunk_is_ordinary():
     attn = tiny_mha(h, d_k)
     pos_emb = torch.randn(1, 2 * (window + frames) - 1, h * d_k)
     impl = ChunkPooledStreamingImpl(
-        num_heads=h, head_size=d_k, frames_per_chunk=frames
+        num_heads=h,
+        head_size=d_k,
+        frames_per_chunk=frames,
+        window_frames=window,
     )
     pages, tables = pages_and_tables(
         batch=1, blocks=4, block_frames=frames, h=h, d_k=d_k
@@ -338,7 +344,10 @@ def test_out_of_window_blocks_unreferenced():
     attn = tiny_mha(h, d_k)
     pos_emb = torch.randn(1, 2 * (window + frames) - 1, h * d_k)
     impl = ChunkPooledStreamingImpl(
-        num_heads=h, head_size=d_k, frames_per_chunk=frames
+        num_heads=h,
+        head_size=d_k,
+        frames_per_chunk=frames,
+        window_frames=window,
     )
     pages, tables = pages_and_tables(
         batch=1, blocks=8, block_frames=frames, h=h, d_k=d_k
@@ -376,12 +385,16 @@ def test_terminal_short_chunk_masks_dead_rows():
     h, d_k, frames, window = 2, 4, 4, 8
     live = 3  # terminal chunk carries 3 of 4 frames
     attn = tiny_mha(h, d_k)
-    pos_emb_full = torch.randn(1, 2 * (window + frames) - 1, h * d_k)
-    pos_emb_live = pos_emb_full[:, frames - live : , :][
-        :, : 2 * (window + live) - 1, :
-    ]
+    # pos_emb is sized for the LIVE computation (window + live): the
+    # serving layer computes pos_emb from actual sizes each step, and
+    # the impl contract requires the live-sized tensor when
+    # live_frames is set.
+    pos_emb_live = torch.randn(1, 2 * (window + live) - 1, h * d_k)
     impl = ChunkPooledStreamingImpl(
-        num_heads=h, head_size=d_k, frames_per_chunk=frames
+        num_heads=h,
+        head_size=d_k,
+        frames_per_chunk=frames,
+        window_frames=window,
     )
     pages, tables = pages_and_tables(
         batch=1, blocks=4, block_frames=frames, h=h, d_k=d_k
@@ -402,10 +415,11 @@ def test_terminal_short_chunk_masks_dead_rows():
         kv_pages=pages,
         block_tables=tables,
         seq_lens=torch.tensor([4]),
-        pos_emb=pos_emb_full,
+        pos_emb=pos_emb_live,
         live_frames=torch.tensor([live]),
     )
     torch.testing.assert_close(got[:, :live], want_live)
+    assert got[:, live:].abs().sum() == 0  # dead rows are zero
     assert not torch.isnan(got).any()
 
 

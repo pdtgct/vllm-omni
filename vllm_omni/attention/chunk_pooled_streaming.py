@@ -33,10 +33,14 @@ impl masks the dead query/KV rows — audio is never silence-padded, so
 the engine path stays bit-identical to the golden-proven math tier.
 """
 
+import copy
 from typing import Any
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.attention_pages import (
+    paged_stream_attention,
+)
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     PrecisionPolicy,
 )
@@ -81,7 +85,13 @@ def expected_alignment(
     attention page. Pins the arithmetic contract the registry-driven
     integration test proves end-to-end at the α4 rung.
     """
-    raise NotImplementedError
+    if frames_per_chunk < 1:
+        raise ValueError(
+            f"frames_per_chunk must be >= 1, got {frames_per_chunk}"
+        )
+    per_token = frames_per_chunk * per_token_frame_bytes
+    block_size = max(1, -(-reference_state_page_bytes // per_token))
+    return block_size, block_size * per_token
 
 
 def pool_common_metadata(common: Any, frames_per_chunk: int) -> Any:
@@ -96,7 +106,51 @@ def pool_common_metadata(common: Any, frames_per_chunk: int) -> Any:
     Q4). Malformed metadata raises ``ValueError`` — a loud guard,
     never a silent fallback (the new-model posture).
     """
-    raise NotImplementedError
+    if frames_per_chunk < 1:
+        raise ValueError(
+            f"frames_per_chunk must be >= 1, got {frames_per_chunk}"
+        )
+    required = (
+        "query_start_loc",
+        "seq_lens",
+        "num_actual_tokens",
+        "max_query_len",
+        "max_seq_len",
+        "slot_mapping",
+    )
+    missing = [name for name in required if not hasattr(common, name)]
+    if missing:
+        raise ValueError(
+            f"metadata is not streaming-shaped; missing {missing}"
+        )
+    pooled = copy.deepcopy(common)
+    bps = frames_per_chunk
+    pooled.query_start_loc = common.query_start_loc * bps
+    pooled.seq_lens = common.seq_lens * bps
+    pooled.num_actual_tokens = common.num_actual_tokens * bps
+    pooled.max_query_len = common.max_query_len * bps
+    pooled.max_seq_len = common.max_seq_len * bps
+    slots = common.slot_mapping
+    expanded = slots.unsqueeze(-1) * bps + torch.arange(
+        bps, device=slots.device, dtype=slots.dtype
+    )
+    # Padding slots (-1) stay -1, never a live-looking index.
+    pooled.slot_mapping = expanded.clamp(min=-1).reshape(-1)
+    return pooled
+
+
+class _PooledMetadataBuilder:
+    """The thin builder face over :func:`pool_common_metadata`."""
+
+    def __init__(self, frames_per_chunk: int) -> None:
+        if frames_per_chunk < 1:
+            raise ValueError(
+                f"frames_per_chunk must be >= 1, got {frames_per_chunk}"
+            )
+        self.frames_per_chunk = frames_per_chunk
+
+    def build(self, common: Any) -> Any:
+        return pool_common_metadata(common, self.frames_per_chunk)
 
 
 class ChunkPooledStreamingBackend:
@@ -119,7 +173,7 @@ class ChunkPooledStreamingBackend:
     @classmethod
     def get_builder_cls(cls) -> Any:
         """The metadata builder (wraps :func:`pool_common_metadata`)."""
-        raise NotImplementedError
+        return _PooledMetadataBuilder
 
 
 class ChunkPooledStreamingImpl:
@@ -141,7 +195,20 @@ class ChunkPooledStreamingImpl:
         frames_per_chunk: int,
         window_frames: int = CHECKPOINT_WINDOW_FRAMES,
     ) -> None:
-        raise NotImplementedError
+        if num_heads < 1 or head_size < 1:
+            raise ValueError("num_heads and head_size must be >= 1")
+        if frames_per_chunk < 1:
+            raise ValueError(
+                f"frames_per_chunk must be >= 1, got {frames_per_chunk}"
+            )
+        if window_frames < 1:
+            raise ValueError(
+                f"window_frames must be >= 1, got {window_frames}"
+            )
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.frames_per_chunk = frames_per_chunk
+        self.window_frames = window_frames
 
     def write_kv(
         self,
@@ -153,7 +220,26 @@ class ChunkPooledStreamingImpl:
         live_frames: torch.Tensor | None = None,
     ) -> None:
         """Projected-K/V scatter from pooled slots (mid-block safe)."""
-        raise NotImplementedError
+        batch, frames, _ = x.shape
+        h = attn.h
+        d_k = attn.d_k
+        k = attn.linear_k(x).view(batch, frames, h, d_k)
+        v = attn.linear_v(x).view(batch, frames, h, d_k)
+        block_frames = kv_pages.shape[2]
+        flat_k = k.reshape(batch * frames, h, d_k)
+        flat_v = v.reshape(batch * frames, h, d_k)
+        slots = slot_mapping.reshape(-1)
+        for i in range(slots.numel()):
+            slot = int(slots[i])
+            if slot < 0:
+                continue  # padding rows never write
+            if live_frames is not None and (
+                (i % frames) >= int(live_frames[i // frames])
+            ):
+                continue  # dead rows of a terminal short chunk
+            page, row = divmod(slot, block_frames)
+            kv_pages[0, page, row] = flat_k[i]
+            kv_pages[1, page, row] = flat_v[i]
 
     def forward(
         self,
@@ -168,11 +254,51 @@ class ChunkPooledStreamingImpl:
     ) -> torch.Tensor:
         """One streaming step ≡ ``paged_stream_attention`` (ragged OK).
 
-        ``live_frames`` marks a terminal short chunk's real rows; dead
-        rows are masked out of scores and produce zero output rows
-        that never contaminate live ones.
+        Without ``live_frames`` this IS the math tier — one call, no
+        re-implementation. With ``live_frames`` (a terminal short
+        chunk, OPEN-α1 (b)): the live rows compute exactly as a
+        truncated chunk would — never silence-padded — and the dead
+        output rows are zero; ``pos_emb`` must then be sized for
+        ``window + live`` (the serving layer computes pos_emb from
+        actual sizes each step). v1 masks uniformly per batch: a batch
+        mixing different live counts raises rather than guessing.
         """
-        raise NotImplementedError
+        if live_frames is None:
+            return paged_stream_attention(
+                attn,
+                x,
+                kv_pages=kv_pages,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                window=self.window_frames,
+                pos_emb=pos_emb,
+            )
+        live_values = {int(n) for n in live_frames}
+        if len(live_values) != 1:
+            raise ValueError(
+                "v1 terminal-short-chunk masking is uniform per batch; "
+                f"got live counts {sorted(live_values)}"
+            )
+        live = live_values.pop()
+        batch, frames, d_model = x.shape
+        if not 0 < live <= frames:
+            raise ValueError(
+                f"live_frames must be in (0, {frames}], got {live}"
+            )
+        out_live = paged_stream_attention(
+            attn,
+            x[:, :live],
+            kv_pages=kv_pages,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            window=self.window_frames,
+            pos_emb=pos_emb,
+        )
+        out = torch.zeros(
+            batch, frames, d_model, device=x.device, dtype=out_live.dtype
+        )
+        out[:, :live] = out_live
+        return out
 
 
 class ChunkPooledStreamingAttention:
@@ -195,8 +321,29 @@ class ChunkPooledStreamingAttention:
         policy: PrecisionPolicy,
         prefix: str,
     ) -> None:
-        raise NotImplementedError
+        if frames_per_chunk < 1:
+            raise ValueError(
+                f"frames_per_chunk must be >= 1, got {frames_per_chunk}"
+            )
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.frames_per_chunk = frames_per_chunk
+        self.window_frames = window_frames
+        self._policy = policy
+        self.prefix = prefix
 
     def get_kv_cache_spec(self, vllm_config: Any) -> Any:
         """``SlidingWindowSpec`` in pooled units (D-α1b)."""
-        raise NotImplementedError
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        return SlidingWindowSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=pooled_num_kv_heads(
+                self.num_heads, self.frames_per_chunk
+            ),
+            head_size=self.head_size,
+            dtype=self._policy.dtype_for("attention_cache"),
+            sliding_window=pooled_window(
+                self.window_frames, self.frames_per_chunk
+            ),
+        )
