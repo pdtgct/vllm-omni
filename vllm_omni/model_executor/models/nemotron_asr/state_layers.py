@@ -19,7 +19,8 @@ admission (PORT-STATE-003). Dtypes delegate to the ``PrecisionPolicy``
 reduced).
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import torch
 
@@ -134,3 +135,31 @@ class ReplayQueuePage(_StatePage):
             tensor_classes=("queue_state", "queue_state"),
             policy=policy,
         )
+
+
+def register_state_pages(
+    vllm_config: Any, pages: Iterable[_StatePage]
+) -> None:
+    """Register each page in the static forward context by prefix.
+
+    The engine's layer walk (``get_layers_from_vllm_config``) discovers
+    spec-emitting layers through
+    ``compilation_config.static_forward_context`` — registration is
+    what makes a page's ``get_kv_cache_spec`` reachable
+    (PORT-STATE-002). A duplicate prefix is a wiring error and raises
+    ``ValueError`` — never a silent overwrite.
+    """
+    raise NotImplementedError
+
+
+def zero_state_pages(
+    state_tensors: Sequence[torch.Tensor], block_ids: Sequence[int]
+) -> None:
+    """Zero the given page blocks in every state tensor, in place.
+
+    Recurrent state is read-before-write: a block freed by one session
+    and reallocated to another must be zeroed at admission or the new
+    session decodes from the old session's state (PORT-STATE-003).
+    Only the named blocks are touched.
+    """
+    raise NotImplementedError
