@@ -149,7 +149,14 @@ def register_state_pages(
     (PORT-STATE-002). A duplicate prefix is a wiring error and raises
     ``ValueError`` — never a silent overwrite.
     """
-    raise NotImplementedError
+    context = vllm_config.compilation_config.static_forward_context
+    for page in pages:
+        if page.prefix in context:
+            raise ValueError(
+                f"duplicate state-page prefix {page.prefix!r} in the "
+                "static forward context"
+            )
+        context[page.prefix] = page
 
 
 def zero_state_pages(
@@ -162,4 +169,69 @@ def zero_state_pages(
     session decodes from the old session's state (PORT-STATE-003).
     Only the named blocks are touched.
     """
-    raise NotImplementedError
+    ids = list(block_ids)
+    if not ids:
+        return
+    for tensor in state_tensors:
+        tensor[ids] = 0
+
+
+class HybridStateModelMixin:
+    """The ``IsHybrid`` conformance surface (consult D-α2a).
+
+    Core makes attention and state pages coexist by pre-equalization,
+    never unification: the ``is_hybrid`` flag routes the config
+    pre-pass (``HybridAttentionMambaModelConfig``), and the post-load
+    platform hook (``_align_hybrid_block_size``) picks the attention
+    block size and sets ``cache_config.mamba_page_size_padded`` from
+    the reference state bundle these hooks report — after which every
+    page's spec is born padded and grouping is uniform by
+    construction. The model computes NO page layout of its own
+    (PORT-STATE-001/002 as amended).
+
+    The reference bundle is the *largest per-layer page kind* — the
+    depthwise-conv tail — because the hook's semantics are "one
+    layer's state" and the attention page must dominate it; the
+    smaller LSTM/queue pages pad up to the same global value.
+    Geometry reads from the model config with the checkpoint's
+    defaults; the α4 registration wires the real config through.
+    """
+
+    is_hybrid: bool = True
+
+    _DEFAULT_D_MODEL = 1024
+    _DEFAULT_CONV_KERNEL = 9
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: Any
+    ) -> tuple[tuple[int, ...], ...]:
+        """The reference per-layer state bundle (the conv tail)."""
+        hf_config = getattr(
+            getattr(vllm_config, "model_config", None), "hf_config", None
+        )
+        d_model = getattr(hf_config, "d_model", cls._DEFAULT_D_MODEL)
+        kernel = getattr(
+            hf_config, "conv_kernel_size", cls._DEFAULT_CONV_KERNEL
+        )
+        return ((d_model, kernel - 1),)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls, vllm_config: Any
+    ) -> tuple[torch.dtype, ...]:
+        """Recurrent state defaults fp32 (PORT-PREC-001/005)."""
+        return (torch.float32,)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls, vllm_config: Any) -> Any:
+        """Align-mode prefix caching only; off for this model (v1).
+
+        Raises:
+            NotImplementedError: Always, until a session-caching slice
+                turns align-mode on — a loud seam, never a silent one.
+        """
+        raise NotImplementedError(
+            "prefix caching is off for the streaming ASR model; "
+            "mamba_cache_mode stays 'none'"
+        )

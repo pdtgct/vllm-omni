@@ -29,6 +29,7 @@ from vllm_omni.model_executor.models.nemotron_asr.precision import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
     ConvCachePage,
+    HybridStateModelMixin,
     LSTMStatePage,
     ReplayQueuePage,
     register_state_pages,
@@ -42,9 +43,17 @@ D_MODEL = 1024
 KERNEL = 9
 
 
+#: The attention page size for this suite's geometry (block 16 ×
+#: 8 kv-heads × 128 head × fp32 × K+V) — the value core's
+#: `_align_hybrid_block_size` hook computes and stamps into
+#: ``cache_config.mamba_page_size_padded`` for our numbers (consult
+#: D-α2a arithmetic: per-token 8192 B, block size stays 16).
+ATTN_PAGE_BYTES = 16 * 8 * 128 * 4 * 2
+
+
 def duck_vllm_config(
     *,
-    mamba_block_size: int = 512,
+    mamba_block_size: int = 4096,
     mamba_page_size_padded: int | None = None,
     mamba_cache_mode: str = "none",
 ) -> SimpleNamespace:
@@ -53,7 +62,12 @@ def duck_vllm_config(
     ``MambaBase.get_kv_cache_spec`` touches ``cache_config.mamba_*``
     and ``speculative_config``; ``get_kv_cache_groups`` touches
     ``scheduler_config.disable_hybrid_kv_cache_manager`` on our path.
-    Duck-typing keeps the suite off VllmConfig's model-loading ctor.
+    Duck-typing keeps the suite off VllmConfig's model-loading ctor
+    (``ModelRegistry`` resolution inside the platform hook needs the
+    α4 registration — the full two-stage integration test is a
+    bring-up rung). ``mamba_block_size`` defaults to a
+    max-model-len-like value: core sets it to ``max_model_len`` for
+    mode "none" — never a bespoke small block.
     """
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -130,19 +144,20 @@ def test_page_size_math_covers_every_state_tensor():
         assert spec.page_size_bytes >= payload
 
 
-# ---- mixed-group formation (the first conformance question) -----------------
+# ---- mixed-group formation (pre-equalized, the way core inits run) -----------
 
 
-def test_mixed_groups_form_with_attention_plus_three_page_kinds():
-    # The consult's α2 conformance question, unverified at the pin:
-    # does group formation accept a model whose spec dict mixes a
-    # sliding-window attention spec with three differently-shaped
-    # MambaSpec pages? Our path is the non-uniform one
-    # (unify_kv_cache_spec_page_size + uniform-page-size grouping).
-    cfg = duck_vllm_config()
+def preequalized_spec_dict(cfg) -> dict:
+    """The spec mix as core's init sequence actually produces it.
+
+    Core hybrids pre-equalize, never unify: the post-load platform
+    hook sets ``cache_config.mamba_page_size_padded`` to the attention
+    page size before any spec is built, so every ``MambaSpec`` is born
+    padded (consult D-α2a/c; ``_align_hybrid_block_size`` @ the pin).
+    """
     conv, lstm, queue = make_pages()
     attn = sliding_window_attn_spec()
-    spec_dict = {
+    return {
         "encoder.layers.0.attn": attn,
         "encoder.layers.1.attn": attn,
         "encoder.layers.0.conv": conv.get_kv_cache_spec(cfg),
@@ -155,6 +170,14 @@ def test_mixed_groups_form_with_attention_plus_three_page_kinds():
         "predictor.state": lstm.get_kv_cache_spec(cfg),
         "decode.replay": queue.get_kv_cache_spec(cfg),
     }
+
+
+def test_preequalized_mixed_groups_form():
+    # With the padding the platform hook stamps, grouping accepts the
+    # full mix: attention and page state never share a group, and
+    # every layer lands in exactly one group.
+    cfg = duck_vllm_config(mamba_page_size_padded=ATTN_PAGE_BYTES)
+    spec_dict = preequalized_spec_dict(cfg)
     groups = get_kv_cache_groups(cfg, spec_dict)
 
     grouped_layers = [
@@ -162,30 +185,64 @@ def test_mixed_groups_form_with_attention_plus_three_page_kinds():
     ]
     assert sorted(grouped_layers) == sorted(spec_dict)
     for group in groups:
-        kinds = {
-            type(
-                spec_dict[name]
-            )
-            for name in group.layer_names
-        }
-        # Attention and page state never share a group.
+        kinds = {type(spec_dict[name]) for name in group.layer_names}
         assert kinds in ({SlidingWindowSpec}, {MambaSpec})
 
 
-def test_mixed_group_page_sizes_unify():
-    # After grouping, every group's spec must agree on one page size —
-    # the allocator has exactly one block pool.
-    cfg = duck_vllm_config()
-    conv, lstm, queue = make_pages()
-    spec_dict = {
-        "encoder.layers.0.attn": sliding_window_attn_spec(),
-        "encoder.layers.0.conv": conv.get_kv_cache_spec(cfg),
-        "predictor.state": lstm.get_kv_cache_spec(cfg),
-        "decode.replay": queue.get_kv_cache_spec(cfg),
-    }
+def test_preequalized_pages_report_one_page_size_and_unify_is_identity():
+    # Every born-padded spec reports the attention page size, so
+    # unify_kv_cache_spec_page_size early-returns (identity) and the
+    # allocator sees exactly one pool page size.
+    from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
+
+    cfg = duck_vllm_config(mamba_page_size_padded=ATTN_PAGE_BYTES)
+    spec_dict = preequalized_spec_dict(cfg)
+    assert {
+        spec.page_size_bytes for spec in spec_dict.values()
+    } == {ATTN_PAGE_BYTES}
+    unified = unify_kv_cache_spec_page_size(dict(spec_dict))
+    assert unified == spec_dict
     groups = get_kv_cache_groups(cfg, spec_dict)
     page_sizes = {group.kv_cache_spec.page_size_bytes for group in groups}
-    assert len(page_sizes) == 1
+    assert page_sizes == {ATTN_PAGE_BYTES}
+
+
+def test_raw_unpadded_mix_still_dies_in_core_unification():
+    # Documents UPSTREAM behavior, not ours (consult D-α2c/d): feeding
+    # unpadded MambaSpecs into the non-uniform grouping path trips the
+    # divisible branch's post-condition (page size does not scale with
+    # block_size for constant-state specs) — a bare AssertionError at
+    # the pin. If core changes this branch, this test breaks loudly
+    # and the RFC observation gets revisited.
+    cfg = duck_vllm_config(mamba_page_size_padded=None)
+    spec_dict = preequalized_spec_dict(cfg)
+    with pytest.raises((AssertionError, NotImplementedError)):
+        get_kv_cache_groups(cfg, spec_dict)
+
+
+# ---- IsHybrid conformance surface (consult D-α2a) -----------------------------
+
+
+def test_hybrid_mixin_reports_the_conv_bundle_as_reference():
+    # The platform hook's semantics are "one layer's state"; the
+    # reference bundle is the largest per-layer kind (the conv tail),
+    # which the attention page must dominate — smaller pages pad up.
+    assert HybridStateModelMixin.is_hybrid is True
+    shapes = HybridStateModelMixin.get_mamba_state_shape_from_config(
+        duck_vllm_config()
+    )
+    assert shapes == ((D_MODEL, KERNEL - 1),)
+    dtypes = HybridStateModelMixin.get_mamba_state_dtype_from_config(
+        duck_vllm_config()
+    )
+    assert dtypes == (torch.float32,)
+
+
+def test_hybrid_mixin_copy_func_is_a_loud_seam():
+    # Align-mode prefix caching is off for v1; the hook must fail
+    # loudly if something turns it on, never silently no-op.
+    with pytest.raises(NotImplementedError):
+        HybridStateModelMixin.get_mamba_state_copy_func(duck_vllm_config())
 
 
 # ---- zero-at-admission under block reuse (PORT-STATE-003) -------------------
