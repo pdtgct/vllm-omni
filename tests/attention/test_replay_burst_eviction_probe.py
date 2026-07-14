@@ -68,13 +68,34 @@ def make_manager(spec: SlidingWindowSpec, num_blocks: int = 4096):
         SlidingWindowManager,
     )
 
-    pool = BlockPool(num_gpu_blocks=num_blocks, enable_caching=False)
+    # PIN v0.24.0 drift: BlockPool now requires ``hash_block_size``; it is
+    # inert here because caching is disabled (any positive int is fine).
     try:
-        manager = SlidingWindowManager(
-            kv_cache_spec=spec, block_pool=pool, kv_cache_group_id=0
+        pool = BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=False,
+            hash_block_size=spec.block_size,
         )
     except TypeError:
-        manager = SlidingWindowManager(spec, pool, 0)
+        pool = BlockPool(num_gpu_blocks=num_blocks, enable_caching=False)
+    # PIN v0.24.0 drift: SingleTypeKVCacheManager.__init__ now requires
+    # ``enable_caching`` and ``scheduler_block_size`` (LCM of group block
+    # sizes; a multiple of this manager's block_size — here block_size=1).
+    try:
+        manager = SlidingWindowManager(
+            kv_cache_spec=spec,
+            block_pool=pool,
+            enable_caching=False,
+            kv_cache_group_id=0,
+            scheduler_block_size=spec.block_size,
+        )
+    except TypeError:
+        try:
+            manager = SlidingWindowManager(
+                kv_cache_spec=spec, block_pool=pool, kv_cache_group_id=0
+            )
+        except TypeError:
+            manager = SlidingWindowManager(spec, pool, 0)
     return manager, pool
 
 
@@ -111,23 +132,39 @@ def run_geometry(bps: int) -> dict:
     }
 
     def fresh_request_and_blocks(total_tokens: int):
+        # PIN v0.24.0 drift: Request requires exactly one of sampling/
+        # pooling params set (ValueError if both unset), and no longer
+        # accepts ``eos_token_id``. This is a pooling (encoder) scenario.
+        # The Request is inert to the measurement — only its request_id
+        # is consumed; the manager is driven directly through
+        # ``req_to_blocks`` + ``remove_skipped_blocks``.
         try:
+            from vllm.pooling_params import PoolingParams
+
             req = Request(
                 request_id=f"probe-{bps}",
                 prompt_token_ids=list(range(total_tokens)),
                 sampling_params=None,
-                pooling_params=None,
-                eos_token_id=None,
-                arrival_time=0.0,
+                pooling_params=PoolingParams(),
             )
         except TypeError:
-            req = Request(
-                request_id=f"probe-{bps}",
-                prompt_token_ids=list(range(total_tokens)),
-                sampling_params=None,
-                eos_token_id=None,
-                arrival_time=0.0,
-            )
+            try:
+                req = Request(
+                    request_id=f"probe-{bps}",
+                    prompt_token_ids=list(range(total_tokens)),
+                    sampling_params=None,
+                    pooling_params=None,
+                    eos_token_id=None,
+                    arrival_time=0.0,
+                )
+            except TypeError:
+                req = Request(
+                    request_id=f"probe-{bps}",
+                    prompt_token_ids=list(range(total_tokens)),
+                    sampling_params=None,
+                    eos_token_id=None,
+                    arrival_time=0.0,
+                )
         blocks = pool.get_new_blocks(total_tokens)  # block_size=1
         return req, blocks
 
