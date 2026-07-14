@@ -307,17 +307,20 @@ class HybridStateModelMixin:
     """The ``IsHybrid`` conformance surface (consult D-α2a, as
     amended by the OPEN-α3-VEHICLE migration).
 
-    Core makes attention and state pages coexist by pre-equalization,
-    never unification: the ``is_hybrid`` flag routes the config
-    pre-pass (``HybridAttentionMambaModelConfig``), and the post-load
-    platform hook (``_align_hybrid_block_size``) sets
-    ``cache_config.mamba_page_size_padded`` from the reference state
-    bundle these hooks report. That machinery aligns state pages
-    *against an attention spec* — and post-migration this model has
-    none: the left-context window is itself a ``MambaSpec`` page (the
-    fourth kind), so ``is_hybrid`` is False and the hooks stay as
-    dormant documentation of the reference bundle. The model computes
-    NO page layout of its own (PORT-STATE-001/002 as amended).
+    ``is_hybrid`` is core's config-ROUTING channel, not an attention
+    claim (α4 correction): for an arch absent from ``MODELS_CONFIG_MAP``
+    it is the only path to ``MambaModelConfig``'s pre-pass, which sets
+    the ``mamba_block_size`` that ``MambaBase.get_kv_cache_spec``
+    hard-asserts — so the flag stays **True** even though this model
+    declares no attention spec (the left-context window is itself a
+    ``MambaSpec`` page, the fourth kind). The attention-align phase
+    still never runs: with every backend SSM, ``_find_non_ssm_backend``
+    returns None and the platform hook early-returns before the align,
+    so ``mamba_page_size_padded`` stays unset and the
+    ``get_mamba_state_*_from_config`` hooks are dormant documentation of
+    the reference bundle. The model computes NO page layout of its own
+    (PORT-STATE-001/002 as amended). Upstream end-state: a one-line
+    ``MODELS_CONFIG_MAP`` entry drops the flag (APPROVED core-PR item).
 
     The reference bundle is the *largest per-layer page kind* — now
     the window page (channel cache + valid-length slot). Geometry
