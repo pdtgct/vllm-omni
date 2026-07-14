@@ -472,22 +472,43 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 await hold_until_park()
             yield prompt(buffer)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Structural conformance seam (``is_vllm_model`` requires it).
+    def embed_multimodal(self, **kwargs: Any) -> Any:
+        """Stateless mel front-end → one carrier row per chunk (BU-c1).
 
-        The engine never routes token embedding through this model in
-        the D-b design — replay ids are consumed by the decode path
-        from the queue pages, not embedded as LM inputs — but vLLM's
-        ``is_text_generation_model`` gate checks the method's
-        presence at config time (α4 pod finding). Bring-up wires the
-        real no-op/predictor-embedding semantics; until then this is
-        a loud seam.
+        Runs the featurizer on each chunk's audio and packs the mel
+        into a single ``inputs_embeds`` row (``pack_audio_carrier``,
+        slot 0 = frame count). MUST be pure — the engine content-hash-
+        caches this output, so identical chunks must produce identical
+        carriers (PORT-INT-003).
         """
-        raise NotImplementedError("bring-up slice")
+        raise NotImplementedError("BU-c1 code phase")
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Canonical embed seam (``SupportsMultiModal``, D-BUc-2).
+
+        Zero-inits ``(num_tokens, hidden_size)`` — this model has no LM
+        table, so replay/flush rows stay zero and carry their id via
+        ``input_ids`` — and delegates to core
+        ``utils._merge_multimodal_embeddings`` to scatter the carrier
+        rows at the ``is_multimodal`` positions in place.
+        """
+        raise NotImplementedError("BU-c1 code phase")
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        """Chunk-ingest or replay step; hidden rows carry decisions."""
-        raise NotImplementedError("bring-up slice")
+        """Chunk-ingest or replay step; hidden rows carry decisions.
+
+        Thin wrapper: reads the bound page pools and per-row
+        ``state_indices`` from ``get_forward_context()`` and calls
+        ``run_forward_step`` (the pure pipeline). Verified on the pod
+        (BU-c2); the pure compute is loader-tested in BU-c1.
+        """
+        raise NotImplementedError("BU-c2 code phase")
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: Any = None

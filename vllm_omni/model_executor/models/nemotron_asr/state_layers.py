@@ -40,6 +40,14 @@ except ImportError:  # pragma: no cover - exercised only off-engine
 class _StatePage(MambaBase):  # type: ignore[misc]
     """One constant-size per-session state page."""
 
+    #: Lifecycle class (D-BUc-4): persistent recurrent state that
+    #: survives an idle park and is the offload/migration subject
+    #: (RFC Q5). The offload enumerator reads this; it is structurally
+    #: inert at bring-up — it must NOT touch grouping, get_kv_cache_spec,
+    #: get_state_shape, or fracture the uniform raw-page group. Migrates
+    #: onto the purpose-named spec upstream (decisions/state-spec-naming.md).
+    persist_across_session_park: bool = True
+
     def __init__(
         self,
         *,
@@ -155,6 +163,13 @@ class ReplayQueuePage(_StatePage):
     fp32), keeping the provenance-locked fp32-all policy identifier
     intact rather than introducing an integer dtype axis.
     """
+
+    #: Intra-burst scratch, not persistent state (D-BUc-4): the queue is
+    #: provably empty at park (a session parks only via the
+    #: drained-queue → park-token → resumable-stop path), so the offload
+    #: path skips it. A D-b decode artifact that vanishes if a
+    #: first-class emission seam (RFC Q2) lands.
+    persist_across_session_park: bool = False
 
     def __init__(
         self,
