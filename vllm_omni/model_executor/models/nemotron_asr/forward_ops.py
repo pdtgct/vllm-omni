@@ -37,7 +37,17 @@ def pack_audio_carrier(
     Raises:
         ValueError: If the mel does not fit in ``hidden_size - 1``.
     """
-    raise NotImplementedError("BU-b code phase")
+    feat, frames = mel.shape
+    payload = feat * frames
+    if 1 + payload > hidden_size:
+        raise ValueError(
+            f"mel ({feat}×{frames} = {payload}) + the frame-count slot "
+            f"exceeds hidden_size={hidden_size}"
+        )
+    row = torch.zeros(hidden_size, dtype=mel.dtype, device=mel.device)
+    row[0] = float(frames)
+    row[1 : 1 + payload] = mel.reshape(-1)
+    return row
 
 
 def unpack_audio_carrier(
@@ -48,7 +58,9 @@ def unpack_audio_carrier(
     Reads the frame count from slot 0; the inverse of
     ``pack_audio_carrier``.
     """
-    raise NotImplementedError("BU-b code phase")
+    frames = int(round(float(row[0])))
+    payload = feat * frames
+    return row[1 : 1 + payload].reshape(feat, frames)
 
 
 def merge_mm_embeddings(
@@ -70,7 +82,19 @@ def merge_mm_embeddings(
         ValueError: If ``is_multimodal.sum()`` does not equal
             ``len(mm_embeds)``.
     """
-    raise NotImplementedError("BU-b code phase")
+    n_mm = int(is_multimodal.sum())
+    if n_mm != mm_embeds.shape[0]:
+        raise ValueError(
+            f"{n_mm} multimodal rows but {mm_embeds.shape[0]} embeddings"
+        )
+    out = torch.zeros(
+        input_ids.shape[0],
+        hidden_size,
+        dtype=mm_embeds.dtype,
+        device=input_ids.device,
+    )
+    out[is_multimodal] = mm_embeds.to(out.dtype)
+    return out
 
 
 def classify_step_rows(
@@ -87,4 +111,15 @@ def classify_step_rows(
     emitted as park, never echo-guarded). ``queue_lengths`` is the
     remaining-labels count per row.
     """
-    raise NotImplementedError("BU-b code phase")
+    # Start FLUSH (non-placeholder, drained); non-empty queue → REPLAY;
+    # a placeholder id overrides to CHUNK regardless of queue.
+    roles = torch.full_like(input_ids, ROLE_FLUSH)
+    roles = torch.where(
+        queue_lengths > 0, torch.full_like(input_ids, ROLE_REPLAY), roles
+    )
+    roles = torch.where(
+        input_ids == placeholder_id,
+        torch.full_like(input_ids, ROLE_CHUNK),
+        roles,
+    )
+    return roles

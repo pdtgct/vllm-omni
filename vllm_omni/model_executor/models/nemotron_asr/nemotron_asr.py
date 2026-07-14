@@ -438,6 +438,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         """
         chunk_samples = getattr(model_config, "nemotron_chunk_samples", 8960)
         park_id = getattr(model_config, "park_token_id", None)
+        placeholder_id = getattr(model_config, "audio_chunk_token_id", 13089)
         # 8 mel frames * 160-sample hop: the shortest tail worth decoding.
         min_tail_samples = 1280
 
@@ -447,6 +448,15 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 if park_id is None or park_id in ids:
                     return
 
+        def prompt(chunk):
+            # TokensPrompt shape: one placeholder token per chunk
+            # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
+            # invalid on the real render path.
+            return {
+                "prompt_token_ids": [placeholder_id],
+                "multi_modal_data": {"audio": chunk},
+            }
+
         buffer = np.zeros(0, dtype=np.float32)
         yielded = False
         async for frame in audio_stream:
@@ -455,12 +465,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
                 if yielded:
                     await hold_until_park()
-                yield {"multi_modal_data": {"audio": chunk}}
+                yield prompt(chunk)
                 yielded = True
         if buffer.shape[0] >= min_tail_samples:
             if yielded:
                 await hold_until_park()
-            yield {"multi_modal_data": {"audio": buffer}}
+            yield prompt(buffer)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Structural conformance seam (``is_vllm_model`` requires it).
