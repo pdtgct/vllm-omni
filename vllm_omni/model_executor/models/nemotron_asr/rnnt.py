@@ -430,4 +430,10 @@ def verify_replay_echo(
             RuntimeError subclass, and the guard's negative test must
             never pass against an unimplemented stub.)
     """
-    raise NotImplementedError("α4 code phase")
+    mismatch = observed != forced
+    if bool(mismatch.any()):
+        row = int(mismatch.nonzero(as_tuple=True)[0][0])
+        raise ValueError(
+            f"replay echo mismatch at row {row}: observed="
+            f"{int(observed[row])} forced={int(forced[row])}"
+        )

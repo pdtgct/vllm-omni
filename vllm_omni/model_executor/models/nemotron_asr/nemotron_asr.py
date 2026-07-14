@@ -21,6 +21,7 @@ actively by the replay-echo guard (PORT-DEC-005/007).
 
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -259,6 +260,9 @@ class NemotronASRForRNNT(nn.Module):
     #: classvar is the core-route value (PORT-INT-002), worst case
     #: 14 frames × 10 symbols + park.
     realtime_max_tokens = 141
+    #: Engine logit width: tokenizer vocab + the park special token
+    #: (checkpoint default; __init__ re-reads it from the config).
+    num_logits = 13089
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
         super().__init__()
@@ -282,8 +286,31 @@ class NemotronASRForRNNT(nn.Module):
         partial tails as-is, sub-8-mel-frame remainders dropped,
         never zero-padded).
         """
-        raise NotImplementedError("α4 code phase")
-        yield  # pragma: no cover — makes the stub an async GENERATOR
+        chunk_samples = getattr(model_config, "nemotron_chunk_samples", 8960)
+        park_id = getattr(model_config, "park_token_id", None)
+        # 8 mel frames * 160-sample hop: the shortest tail worth decoding.
+        min_tail_samples = 1280
+
+        async def hold_until_park() -> None:
+            while True:
+                ids = await input_stream.get()
+                if park_id is None or park_id in ids:
+                    return
+
+        buffer = np.zeros(0, dtype=np.float32)
+        yielded = False
+        async for frame in audio_stream:
+            buffer = np.concatenate([buffer, frame])
+            while buffer.shape[0] >= chunk_samples:
+                chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
+                if yielded:
+                    await hold_until_park()
+                yield {"multi_modal_data": {"audio": chunk}}
+                yielded = True
+        if buffer.shape[0] >= min_tail_samples:
+            if yielded:
+                await hold_until_park()
+            yield {"multi_modal_data": {"audio": buffer}}
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Chunk-ingest or replay step; hidden rows carry decisions."""
@@ -299,4 +326,10 @@ class NemotronASRForRNNT(nn.Module):
         order (PORT-DEC-002) — ids are read by ROW POSITION, never by
         request id.
         """
-        raise NotImplementedError("α4 code phase")
+        from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+            forced_logits_rows,
+            read_decision_carrier,
+        )
+
+        ids = read_decision_carrier(hidden_states)
+        return forced_logits_rows(ids, num_logits=self.num_logits)
