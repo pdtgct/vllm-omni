@@ -3,7 +3,9 @@
 """Vehicle-migration tests-first: the window as the fourth state page.
 
 Specs: PORT-STATE-001/002 (as amended by the OPEN-α3-VEHICLE
-decision); the decision record is
+decision) and PORT-STATE-006 (the stream_step-literal window-page
+advance: bit-for-bit parity over page-backed views, replay from
+restored pools, session-to-pool-block binding); the decision record is
 docs/intent/port/decisions/attention-window-vehicle.md (notes repo).
 Two measured questions drive this slice:
 

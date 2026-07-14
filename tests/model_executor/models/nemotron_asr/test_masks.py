@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Chunked-limited attention mask: NeMo-exact under chunk pooling.
+"""Chunked-limited attention mask: NeMo-exact construction.
 
-Specs: PORT-POOL-002 (pooled mask reproduces NeMo's chunked-limited
-mask), PORT-POOL-003 (L1 CPU equivalence for all five chunk configs
-before any P3 streaming code merges).
+Specs: PORT-POOL-002 (mask construction reproduces NeMo's
+chunked-limited mask), PORT-POOL-003 (L1 CPU equivalence for all five
+chunk configs before any P3 streaming code merges).
 
 Two layers of assertion:
 - Property tests (self-contained): intra-chunk attention is full
