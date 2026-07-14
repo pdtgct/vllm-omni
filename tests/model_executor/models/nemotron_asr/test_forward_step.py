@@ -137,7 +137,7 @@ def _step(core, pools, input_ids, inputs_embeds, state_indices):
         core, input_ids, inputs_embeds,
         state_indices=state_indices,
         placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID, feat=FEAT,
-        drop_extra=0, prompt_index=0, **pools,
+        drop_extra=0, **pools,
     )
 
 

@@ -25,6 +25,9 @@ import numpy as np
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.nemotron_asr.convert import (
+    LID_REQUIRED_PATTERN,
+)
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     FastConformerEncoder,
 )
@@ -38,9 +41,6 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
-)
-from vllm_omni.model_executor.models.nemotron_asr.convert import (
-    LID_REQUIRED_PATTERN,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
@@ -324,6 +324,18 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             n_layers, hf_config, policy
         )
         register_state_pages(vllm_config, self._state_pages)
+        # Categorize the pages so forward can gather the bound pools by
+        # kind (window/conv/lstm/replay); the ordering matches
+        # state_page_prefixes.
+        kinds = [k for k, _ in state_page_prefixes(n_layers)]
+        paired = list(zip(kinds, self._state_pages, strict=True))
+        self._window_pages = [p for k, p in paired if k == "window"]
+        self._conv_pages = [p for k, p in paired if k == "conv"]
+        self._lstm_page = next(p for k, p in paired if k == "lstm")
+        self._replay_page = next(p for k, p in paired if k == "replay")
+        # The pre-encode overlap dropped from non-first chunks
+        # (drop_extra); session-first chunks use 0 (run_forward_step).
+        self._drop_extra = 2
 
     def _build_state_pages(
         self, n_layers: int, cfg: Any, policy: PrecisionPolicy
@@ -448,7 +460,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 if park_id is None or park_id in ids:
                     return
 
-        def prompt(chunk):
+        def prompt(chunk: np.ndarray) -> dict[str, Any]:
             # TokensPrompt shape: one placeholder token per chunk
             # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
             # invalid on the real render path.
@@ -479,9 +491,31 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         into a single ``inputs_embeds`` row (``pack_audio_carrier``,
         slot 0 = frame count). MUST be pure — the engine content-hash-
         caches this output, so identical chunks must produce identical
-        carriers (PORT-INT-003).
+        carriers (PORT-INT-003). The mm_kwargs key/shape is the
+        processor's contract (BU-c2), pod-verified/adapted.
         """
-        raise NotImplementedError("BU-c1 code phase")
+        from vllm_omni.model_executor.models.nemotron_asr.forward_ops import (
+            pack_audio_carrier,
+        )
+
+        audios = kwargs.get("audio")
+        if audios is None:
+            raise ValueError("embed_multimodal expects an 'audio' item")
+        rows = []
+        for chunk in audios:
+            wav = (
+                chunk
+                if isinstance(chunk, torch.Tensor)
+                else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
+            )
+            wav = wav.to(torch.float32).reshape(1, -1)
+            mel, _ = self.core.featurizer(
+                wav, torch.tensor([wav.shape[-1]], device=wav.device)
+            )
+            rows.append(
+                pack_audio_carrier(mel[0], hidden_size=self.config.hidden_size)
+            )
+        return torch.stack(rows)
 
     def embed_input_ids(
         self,
@@ -516,15 +550,59 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             hidden_size=hidden,
         )
 
-    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         """Chunk-ingest or replay step; hidden rows carry decisions.
 
-        Thin wrapper: reads the bound page pools and per-row
+        Thin wrapper (D-BUc-1): reads the bound page pools and per-row
         ``state_indices`` from ``get_forward_context()`` and calls
-        ``run_forward_step`` (the pure pipeline). Verified on the pod
-        (BU-c2); the pure compute is loader-tested in BU-c1.
+        ``run_forward_step`` (the pure pipeline, loader-tested in BU-c1).
+        Pod-verified/adapted (BU-c2): the exact metadata field access and
+        the ``_p``/``_d`` handling are confirmed against the real
+        ``ShortConvAttentionMetadata`` on the engine.
         """
-        raise NotImplementedError("BU-c2 code phase")
+        from vllm.forward_context import get_forward_context
+
+        from vllm_omni.model_executor.models.nemotron_asr.forward_step import (
+            run_forward_step,
+        )
+
+        assert inputs_embeds is not None and input_ids is not None
+        md = get_forward_context().attn_metadata
+        if md is None:
+            # V1 profiling: compute-shaped, no page IO (hazard 4).
+            return torch.zeros(
+                inputs_embeds.shape[0], inputs_embeds.shape[1],
+                dtype=inputs_embeds.dtype, device=inputs_embeds.device,
+            )
+        # All four page kinds share one uniform group → one metadata
+        # object; read the state indices once. Real serving is all-decode
+        # (one-token rows); _p is populated only by the profiling batch
+        # (which took the branch above).
+        meta = md[self._window_pages[0].prefix]
+        state_indices = meta.state_indices_tensor_d
+
+        return run_forward_step(
+            self.core, input_ids, inputs_embeds,
+            channel_pools=[pg.kv_cache[0] for pg in self._window_pages],
+            time_pools=[pg.kv_cache[0] for pg in self._conv_pages],
+            len_pools=[pg.kv_cache[1] for pg in self._window_pages],
+            h_pool=self._lstm_page.kv_cache[0],
+            c_pool=self._lstm_page.kv_cache[1],
+            queue_pool=self._replay_page.kv_cache[0],
+            book_pool=self._replay_page.kv_cache[1],
+            state_indices=state_indices,
+            placeholder_id=self.config.audio_chunk_token_id,
+            park_id=self.config.eos_token_id,
+            feat=_N_MELS,
+            drop_extra=self._drop_extra,
+        )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: Any = None

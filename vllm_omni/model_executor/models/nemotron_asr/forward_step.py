@@ -19,6 +19,8 @@ rows → the emitted id is written into every row's hidden output as the
 decision carrier (``compute_logits`` reads it back by row position).
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.encoder import stream_step
@@ -32,6 +34,7 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     QUEUE_HEAD,
     QUEUE_LAST_LABEL,
     QUEUE_LEN,
+    QUEUE_PROMPT,
     decode_chunk_paged,
     replay_step,
     verify_replay_echo,
@@ -41,9 +44,14 @@ from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
     PagedStreamingCaches,
 )
 
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRCore,
+    )
+
 
 def run_forward_step(
-    core: torch.nn.Module,
+    core: "NemotronASRCore",
     input_ids: torch.Tensor,
     inputs_embeds: torch.Tensor,
     *,
@@ -59,7 +67,6 @@ def run_forward_step(
     park_id: int,
     feat: int,
     drop_extra: int,
-    prompt_index: int,
 ) -> torch.Tensor:
     """One forward step over page-backed state; returns hidden carriers.
 
@@ -124,9 +131,13 @@ def run_forward_step(
                 inputs_embeds[row], feat=feat
             ).unsqueeze(0)
             enc = stream_step(
-                core.encoder, mel, caches,
+                # PagedStreamingCaches is StreamingCaches' structural twin
+                # (migration-proven bit-for-bit); stream_step reads only
+                # the shared .channel/.time/.valid surface.
+                core.encoder, mel, caches,  # type: ignore[arg-type]
                 drop_extra=0 if session_first else drop_extra,
             )
+            prompt_index = int(book_pool[block, QUEUE_PROMPT])
             conditioned = core.lid(enc, prompt_index=prompt_index)
             decode_chunk_paged(
                 conditioned, core.predictor, core.joint,
