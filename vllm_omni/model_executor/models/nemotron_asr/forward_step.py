@@ -21,9 +21,24 @@ decision carrier (``compute_logits`` reads it back by row position).
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.encoder import stream_step
 from vllm_omni.model_executor.models.nemotron_asr.forward_ops import (
     ROLE_CHUNK,
     ROLE_REPLAY,
+    classify_step_rows,
+    unpack_audio_carrier,
+)
+from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+    QUEUE_HEAD,
+    QUEUE_LAST_LABEL,
+    QUEUE_LEN,
+    decode_chunk_paged,
+    replay_step,
+    verify_replay_echo,
+    write_decision_carrier,
+)
+from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
+    PagedStreamingCaches,
 )
 
 
@@ -64,4 +79,67 @@ def run_forward_step(
         ValueError: On a replay-echo mismatch (a corrupted session),
             via ``verify_replay_echo``.
     """
-    raise NotImplementedError("BU-c1 code phase")
+    n_rows = int(input_ids.shape[0])
+    hidden = int(inputs_embeds.shape[1])
+    n_layers = len(channel_pools)
+    window = int(channel_pools[0].shape[1])
+    idx = state_indices.long()
+
+    heads = book_pool[idx, QUEUE_HEAD].long()
+    lens = book_pool[idx, QUEUE_LEN].long()
+    roles = classify_step_rows(
+        input_ids, placeholder_id=placeholder_id, queue_lengths=lens - heads
+    )
+
+    # Hazard 2: echo-guard replay rows against the PRE-advance head.
+    replay_mask = roles == ROLE_REPLAY
+    if bool(replay_mask.any()):
+        r_idx = idx[replay_mask]
+        r_head = heads[replay_mask]
+        forced = queue_pool[r_idx, r_head - 1].long()
+        verify_replay_echo(input_ids[replay_mask], forced)
+
+    # Chunk rows: session-first-zero (hazard 1), then stream_step → LID →
+    # decode fills the queue (hazard 3: before the drain below).
+    chunk_rows = (roles == ROLE_CHUNK).nonzero(as_tuple=True)[0].tolist()
+    with torch.no_grad():
+        for row in chunk_rows:
+            block = int(idx[row])
+            session_first = int(len_pools[0][block, 0]) == 0
+            if session_first:
+                for layer in range(n_layers):
+                    channel_pools[layer][block].zero_()
+                    time_pools[layer][block].zero_()
+                    len_pools[layer][block].zero_()
+                h_pool[block].zero_()
+                c_pool[block].zero_()
+                book_pool[block, QUEUE_LAST_LABEL] = float(core.blank_id)
+            caches = PagedStreamingCaches(
+                channel_views=[channel_pools[la][block] for la in range(n_layers)],
+                time_views=[time_pools[la][block] for la in range(n_layers)],
+                len_slots=[len_pools[la][block] for la in range(n_layers)],
+                left_context=window,
+            )
+            mel = unpack_audio_carrier(
+                inputs_embeds[row], feat=feat
+            ).unsqueeze(0)
+            enc = stream_step(
+                core.encoder, mel, caches,
+                drop_extra=0 if session_first else drop_extra,
+            )
+            conditioned = core.lid(enc, prompt_index=prompt_index)
+            decode_chunk_paged(
+                conditioned, core.predictor, core.joint,
+                h_pool=h_pool, c_pool=c_pool, queue_pool=queue_pool,
+                book_pool=book_pool, state_indices=torch.tensor([block]),
+            )
+
+    # One replay/drain over all rows; the emitted id is the decision.
+    emitted = replay_step(
+        queue_pool, book_pool, state_indices=idx, park_id=park_id
+    )
+    hidden_out = torch.zeros(
+        n_rows, hidden, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+    )
+    write_decision_carrier(hidden_out, emitted)
+    return hidden_out

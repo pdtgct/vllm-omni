@@ -38,7 +38,7 @@ class NemotronASRConfig(PretrainedConfig):
         *,
         vocab_size: int = 13090,
         num_asr_labels: int = 13087,
-        hidden_size: int = 15488,
+        hidden_size: int = 15617,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
         d_model: int = 1024,

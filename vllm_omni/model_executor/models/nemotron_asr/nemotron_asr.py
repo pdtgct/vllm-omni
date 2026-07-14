@@ -494,11 +494,27 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
 
         Zero-inits ``(num_tokens, hidden_size)`` — this model has no LM
         table, so replay/flush rows stay zero and carry their id via
-        ``input_ids`` — and delegates to core
-        ``utils._merge_multimodal_embeddings`` to scatter the carrier
-        rows at the ``is_multimodal`` positions in place.
+        ``input_ids`` — and scatters the carrier rows at the
+        ``is_multimodal`` positions. The upstream/core-PR form delegates
+        to core ``utils._merge_multimodal_embeddings`` over the zero
+        buffer; the port's ``merge_mm_embeddings`` is behaviourally
+        identical (native-ness audit) and keeps this loader-testable
+        off the engine.
         """
-        raise NotImplementedError("BU-c1 code phase")
+        from vllm_omni.model_executor.models.nemotron_asr.forward_ops import (
+            merge_mm_embeddings,
+        )
+
+        hidden = self.config.hidden_size
+        if multimodal_embeddings is None or is_multimodal is None:
+            return torch.zeros(
+                input_ids.shape[0], hidden,
+                dtype=torch.float32, device=input_ids.device,
+            )
+        return merge_mm_embeddings(
+            input_ids, multimodal_embeddings, is_multimodal,
+            hidden_size=hidden,
+        )
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Chunk-ingest or replay step; hidden rows carry decisions.
