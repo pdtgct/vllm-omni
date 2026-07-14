@@ -3,13 +3,16 @@
 """Per-session state pages via core vLLM's cache-spec system.
 
 The cache-aware streaming capability declares all cross-chunk model
-state through `kv_cache_interface` spec pages (PORT-STATE-001/002):
-left-context attention rides paged sliding-window KV (the block-pooled
-attention layer); the three non-attention states here ride
-``MambaSpec`` pages — the landed mechanism for constant-size
-per-session state (``ShortConv`` precedent), not a Mamba-specific hack
-(ledger §8 addendum: the capability is general; ``MambaSpec`` is
-today's vehicle).
+state through `kv_cache_interface` spec pages (PORT-STATE-001/002) —
+ALL FOUR kinds as constant-size ``MambaSpec`` pages: the encoder
+left-context window (the OPEN-α3-VEHICLE decision, measured
+2026-07-14 — paged sliding-window KV evicts live audio under RNN-T
+token cadence; see docs/intent/port/decisions/
+attention-window-vehicle.md in the notes repo), the depthwise-conv
+tails, the predictor LSTM, and the replay queue. ``MambaSpec`` is the
+landed mechanism for constant-size per-session state (``ShortConv``
+precedent), not a Mamba-specific hack (ledger §8 addendum: the
+capability is general; ``MambaSpec`` is today's vehicle).
 
 Each layer implements the ``MambaBase`` contract (get_state_shape /
 get_state_dtype / mamba_type), registers itself in the static forward
@@ -109,6 +112,39 @@ class LSTMStatePage(_StatePage):
         )
 
 
+class WindowCachePage(_StatePage):
+    """The encoder left-context window: the fourth state-page kind.
+
+    The OPEN-α3-VEHICLE decision (docs/intent/port/decisions/
+    attention-window-vehicle.md, measured 2026-07-14): the 56-frame
+    window lives as constant-size per-session state — NeMo's
+    ``cache_last_channel`` form, pre-projection, per layer — NOT as
+    paged sliding-window KV, whose positional eviction frees live
+    audio blocks under RNN-T token cadence (first evicting burst = 1,
+    all five geometries). Shapes: ``(window, d_model)`` plus a
+    per-page valid-length scalar (self-contained pages beat a global
+    length coupling for ``state_indices`` addressing; every layer's
+    stream advance writes the same value). The golden-proven
+    ``stream_step`` advances it — the engine path is the oracle path,
+    literally.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefix: str,
+        window: int,
+        d_model: int,
+        policy: PrecisionPolicy,
+    ) -> None:
+        super().__init__(
+            prefix=prefix,
+            shapes=((window, d_model), (1,)),
+            tensor_classes=("attention_cache", "queue_state"),
+            policy=policy,
+        )
+
+
 class ReplayQueuePage(_StatePage):
     """D-b replay queue + decode bookkeeping (PORT-DEC-002).
 
@@ -174,6 +210,26 @@ def zero_state_pages(
         return
     for tensor in state_tensors:
         tensor[ids] = 0
+
+
+def window_page_channel_view(
+    pool: torch.Tensor, *, block_id: int, d_model: int
+) -> torch.Tensor:
+    """A ``(window, d_model)`` VIEW into one window page block.
+
+    The engine hands the model flat page blocks; the encoder's
+    channel cache reads/writes this view in place — never a copy, so
+    the golden-proven ``stream_step`` advance IS the page write
+    (OPEN-α3-VEHICLE decision).
+    """
+    raise NotImplementedError
+
+
+def window_page_len_slot(
+    pool: torch.Tensor, *, block_id: int, d_model: int
+) -> torch.Tensor:
+    """The window page's trailing valid-length slot, as a view."""
+    raise NotImplementedError
 
 
 class HybridStateModelMixin:
