@@ -14,6 +14,7 @@ allocator halves live in test_omni_serving_binding.py (pod tier).
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -108,6 +109,33 @@ def test_next_chunk_holds_until_park_echo():
         assert first is not None
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(agen.__anext__(), timeout=0.2)
+
+    _run(scenario())
+
+
+# ---- the yield shape (PORT-INT-003 / D-BU-1) -----------------------------------
+
+
+def test_yield_carries_the_placeholder_token():
+    # The yield must be TokensPrompt-shaped — prompt_token_ids=[
+    # placeholder] + multi_modal_data audio — not a bare
+    # multi_modal_data dict (invalid on the real render path). One
+    # placeholder token per chunk makes PORT-POOL-001 true by
+    # construction; the id comes from the config.
+    import numpy as np
+
+    async def scenario():
+        async def audio_stream():
+            yield np.zeros(8960, dtype=np.float32)
+
+        input_stream: asyncio.Queue = asyncio.Queue()
+        model_config = SimpleNamespace(audio_chunk_token_id=13089)
+        agen = NemotronASRForRNNT.buffer_realtime_audio(
+            audio_stream(), input_stream, model_config
+        )
+        prompt = await agen.__anext__()
+        assert prompt["prompt_token_ids"] == [13089]
+        assert "audio" in prompt["multi_modal_data"]
 
     _run(scenario())
 
