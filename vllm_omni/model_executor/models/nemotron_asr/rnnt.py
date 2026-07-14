@@ -17,6 +17,7 @@ reference the fused/batched implementation is held to by tests).
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -210,3 +211,116 @@ def greedy_decode_batch(
             pred_c = torch.where(gate, new_c, pred_c)
             active = emit
     return emitted, DecodeState(h=h, c=c, last_label=last_label)
+
+
+# ---- engine-tier decode seams (α3 tests-first; PORT-DEC-002/003/007/008) -----
+
+#: Slot indices in the replay-queue page's 4-slot bookkeeping vector
+#: (ReplayQueuePage's second tensor): queue head, queue length, last
+#: emitted label, prompt index.
+QUEUE_HEAD, QUEUE_LEN, QUEUE_LAST_LABEL, QUEUE_PROMPT = 0, 1, 2, 3
+
+
+def park_token_id(hf_config: Any) -> int:
+    """The park token: the checkpoint's ``eos_token_id`` (PORT-DEC-003).
+
+    A config VALUE, never engine structure — published as an HF added
+    special token so default ``skip_special_tokens`` strips it.
+
+    Raises:
+        ValueError: If the config carries no ``eos_token_id`` — the
+            park path cannot exist without it, so fail at load.
+    """
+    raise NotImplementedError("α3 code phase")
+
+
+def realtime_token_budget(
+    *, frames_per_chunk: int, max_symbols: int = MAX_SYMBOLS_PER_STEP
+) -> int:
+    """Constant per-burst budget: queue capacity plus the park token.
+
+    ``realtime_max_tokens = frames_per_chunk × max_symbols + 1``
+    (PORT-INT-002; the output counter clears per update, so the budget
+    is per-burst, not per-session).
+    """
+    raise NotImplementedError("α3 code phase")
+
+
+def forced_logits_rows(
+    chosen: torch.Tensor, *, num_logits: int
+) -> torch.Tensor:
+    """Forced-emission logits: 0 at the chosen id, −inf elsewhere.
+
+    Never +inf (PORT-DEC-002): with the model-pinned greedy params the
+    engine argmaxes these rows, and the single finite entry is the
+    emission. One row per session; ``chosen`` is ``(B,)`` long.
+
+    Raises:
+        ValueError: If any chosen id falls outside ``num_logits``.
+    """
+    raise NotImplementedError("α3 code phase")
+
+
+def write_decision_carrier(
+    hidden: torch.Tensor, ids: torch.Tensor
+) -> None:
+    """Write each session's emitted/queued id into its own hidden row.
+
+    The forward's output row is the decision carrier (PORT-DEC-002):
+    the engine's ``logits_indices`` gather hands ``compute_logits``
+    exactly these rows, row-aligned by construction — no cross-call
+    stashing. Rides the ``queue_state`` dtype axis.
+
+    Raises:
+        ValueError: If ``hidden.dtype`` cannot represent every id
+            exactly (integer-exact range must cover the id space; a
+            bf16 carrier corrupts ids > 256).
+    """
+    raise NotImplementedError("α3 code phase")
+
+
+def read_decision_carrier(hidden: torch.Tensor) -> torch.Tensor:
+    """Recover the per-session ids ``write_decision_carrier`` wrote."""
+    raise NotImplementedError("α3 code phase")
+
+
+def decode_chunk_paged(
+    enc_frames: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    *,
+    h_pool: torch.Tensor,
+    c_pool: torch.Tensor,
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> None:
+    """Fixed-trip tensorized D-b chunk decode over page-backed state.
+
+    Exactly ``time × max_symbols`` masked, page-writing joint/predictor
+    trips — no data-dependent host branching (PORT-DEC-008); the
+    math-tier ``greedy_decode_batch`` is the differential oracle this
+    must match bit-for-bit (labels, predictor state, queue contents),
+    never the implementation. Reads/writes ``(h, c)`` at
+    ``h_pool[state_indices]``/``c_pool``, appends emissions to
+    ``queue_pool`` rows, and updates the 4-slot bookkeeping vector in
+    ``book_pool`` (QUEUE_* indices).
+    """
+    raise NotImplementedError("α3 code phase")
+
+
+def replay_step(
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    *,
+    state_indices: torch.Tensor,
+    park_id: int,
+) -> torch.Tensor:
+    """One replay step per session: next queued label, or park.
+
+    Returns ``(B,)`` long — the queued label at the head (advancing
+    it), or ``park_id`` for a drained/empty queue (PORT-DEC-002/003;
+    a blank-only chunk parks immediately, PORT-DEC-004).
+    """
+    raise NotImplementedError("α3 code phase")
