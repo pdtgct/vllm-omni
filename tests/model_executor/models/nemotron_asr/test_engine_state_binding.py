@@ -145,6 +145,13 @@ def test_page_size_math_covers_every_state_tensor():
 
 
 # ---- mixed-group formation (pre-equalized, the way core inits run) -----------
+#
+# Post-migration (OPEN-α3-VEHICLE) this model is attention-spec-free —
+# its own grouping topology is the pure-state dict exercised in
+# test_window_state_page.py. The mixed attention+state tests below are
+# KEPT as documentation of core's hybrid path at the pin (the
+# pre-equalization behavior α2 measured), so a core change to that
+# path still breaks loudly here.
 
 
 def preequalized_spec_dict(cfg) -> dict:
@@ -223,19 +230,21 @@ def test_raw_unpadded_mix_still_dies_in_core_unification():
 # ---- IsHybrid conformance surface (consult D-α2a) -----------------------------
 
 
-def test_hybrid_mixin_reports_the_conv_bundle_as_reference():
-    # The platform hook's semantics are "one layer's state"; the
-    # reference bundle is the largest per-layer kind (the conv tail),
-    # which the attention page must dominate — smaller pages pad up.
-    assert HybridStateModelMixin.is_hybrid is True
+def test_mixin_is_attention_free_and_reports_the_window_bundle():
+    # Post-migration (OPEN-α3-VEHICLE): every state kind is a MambaSpec
+    # page, so there is no attention spec to align against — is_hybrid
+    # is False and the reference bundle is the largest per-layer kind,
+    # now the window page.
+    assert HybridStateModelMixin.is_hybrid is False
     shapes = HybridStateModelMixin.get_mamba_state_shape_from_config(
         duck_vllm_config()
     )
-    assert shapes == ((D_MODEL, KERNEL - 1),)
+    assert shapes == ((56, D_MODEL), (1,))
     dtypes = HybridStateModelMixin.get_mamba_state_dtype_from_config(
         duck_vllm_config()
     )
-    assert dtypes == (torch.float32,)
+    # One dtype per bundle tensor (channel cache + valid slot), fp32.
+    assert dtypes == (torch.float32, torch.float32)
 
 
 def test_hybrid_mixin_copy_func_is_a_loud_seam():

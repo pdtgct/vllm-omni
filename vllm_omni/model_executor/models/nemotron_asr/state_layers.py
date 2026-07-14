@@ -304,51 +304,59 @@ class PagedStreamingCaches:
 
 
 class HybridStateModelMixin:
-    """The ``IsHybrid`` conformance surface (consult D-α2a).
+    """The ``IsHybrid`` conformance surface (consult D-α2a, as
+    amended by the OPEN-α3-VEHICLE migration).
 
     Core makes attention and state pages coexist by pre-equalization,
     never unification: the ``is_hybrid`` flag routes the config
     pre-pass (``HybridAttentionMambaModelConfig``), and the post-load
-    platform hook (``_align_hybrid_block_size``) picks the attention
-    block size and sets ``cache_config.mamba_page_size_padded`` from
-    the reference state bundle these hooks report — after which every
-    page's spec is born padded and grouping is uniform by
-    construction. The model computes NO page layout of its own
-    (PORT-STATE-001/002 as amended).
+    platform hook (``_align_hybrid_block_size``) sets
+    ``cache_config.mamba_page_size_padded`` from the reference state
+    bundle these hooks report. That machinery aligns state pages
+    *against an attention spec* — and post-migration this model has
+    none: the left-context window is itself a ``MambaSpec`` page (the
+    fourth kind), so ``is_hybrid`` is False and the hooks stay as
+    dormant documentation of the reference bundle. The model computes
+    NO page layout of its own (PORT-STATE-001/002 as amended).
 
-    The reference bundle is the *largest per-layer page kind* — the
-    depthwise-conv tail — because the hook's semantics are "one
-    layer's state" and the attention page must dominate it; the
-    smaller LSTM/queue pages pad up to the same global value.
-    Geometry reads from the model config with the checkpoint's
-    defaults; the α4 registration wires the real config through.
+    The reference bundle is the *largest per-layer page kind* — now
+    the window page (channel cache + valid-length slot). Geometry
+    reads from the model config with the checkpoint's defaults; the
+    α4 registration wires the real config through.
     """
 
-    is_hybrid: bool = True
+    #: Attention-spec-free: nothing to align. Grouping was measured
+    #: RAW_PURE_STATE_GROUPS_FORMED=True at the pin (heterogeneous
+    #: pure-state dicts form groups unpadded — padding-free first);
+    #: the padded fallback is one cache_config value away if the
+    #: allocator stage disagrees at the α4 rung.
+    is_hybrid: bool = False
 
     _DEFAULT_D_MODEL = 1024
-    _DEFAULT_CONV_KERNEL = 9
+    _DEFAULT_WINDOW = 56
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: Any
     ) -> tuple[tuple[int, ...], ...]:
-        """The reference per-layer state bundle (the conv tail)."""
+        """The reference per-layer state bundle (the window page)."""
         hf_config = getattr(
             getattr(vllm_config, "model_config", None), "hf_config", None
         )
         d_model = getattr(hf_config, "d_model", cls._DEFAULT_D_MODEL)
-        kernel = getattr(
-            hf_config, "conv_kernel_size", cls._DEFAULT_CONV_KERNEL
-        )
-        return ((d_model, kernel - 1),)
+        window = getattr(hf_config, "att_context_left", cls._DEFAULT_WINDOW)
+        return ((window, d_model), (1,))
 
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: Any
     ) -> tuple[torch.dtype, ...]:
-        """Recurrent state defaults fp32 (PORT-PREC-001/005)."""
-        return (torch.float32,)
+        """Recurrent state defaults fp32 (PORT-PREC-001/005).
+
+        One dtype per tensor in the reference bundle (window channel
+        cache + valid-length slot).
+        """
+        return (torch.float32, torch.float32)
 
     @classmethod
     def get_mamba_state_copy_func(cls, vllm_config: Any) -> Any:
