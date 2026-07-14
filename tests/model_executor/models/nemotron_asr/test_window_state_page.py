@@ -285,3 +285,136 @@ def test_stream_step_advances_page_backed_caches_bit_for_bit():
     fresh = window_page_channel_view(window_pool, block_id=0, d_model=d_model)
     torch.testing.assert_close(fresh, reference.channel[0, 0])
     assert window_pool[0, -1] == float(int(reference.valid[0]))
+
+
+# ---- the engine-tier properties, ported from the retired paged vehicle ---------
+#
+# The retired stream_step_paged suite proved two properties the engine
+# actually buys: state lives ONLY in the pools (park/evict/replay), and
+# sessions bind to pool blocks, never batch slots (cross-stream
+# isolation, CORNER-004 analog). Both must hold — and hold BITWISE, an
+# upgrade over the old vehicle's 2e-6 — on the state-page vehicle.
+
+
+def _paged_caches(window_pool, conv_pool, blocks, *, d_model, kernel, window):
+    from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
+        PagedStreamingCaches,
+        window_page_channel_view,
+        window_page_len_slot,
+    )
+
+    return PagedStreamingCaches(
+        channel_views=[
+            window_page_channel_view(window_pool, block_id=b, d_model=d_model)
+            for b in blocks
+        ],
+        time_views=[
+            conv_pool[b].view(d_model, kernel - 1) for b in blocks
+        ],
+        len_slots=[
+            window_page_len_slot(window_pool, block_id=b, d_model=d_model)
+            for b in blocks
+        ],
+        left_context=window,
+    )
+
+
+def test_state_lives_only_in_the_pools():
+    # Restoring the pools replays a step bit-for-bit — no hidden
+    # cross-chunk state survives outside them (the property that makes
+    # sessions parkable/evictable at the engine tier). The valid count
+    # rides in the pool too (the len slot), so the snapshot covers it.
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        stream_step,
+    )
+
+    enc = _tiny_encoder()
+    d_model, kernel, n_layers, window = 32, 5, 2, 8
+    window_pool = torch.zeros(n_layers, window * d_model + 1)
+    conv_pool = torch.zeros(n_layers, d_model * (kernel - 1))
+    paged = _paged_caches(
+        window_pool, conv_pool, range(n_layers),
+        d_model=d_model, kernel=kernel, window=window,
+    )
+    torch.manual_seed(11)
+    mels = [torch.randn(1, 16, 32) for _ in range(5)]
+    with torch.no_grad():
+        for step in range(4):
+            stream_step(
+                enc, mels[step], paged, drop_extra=0 if step == 0 else 2
+            )
+        window_snap = window_pool.clone()
+        conv_snap = conv_pool.clone()
+        first = stream_step(enc, mels[4], paged, drop_extra=2)
+        window_pool.copy_(window_snap)
+        conv_pool.copy_(conv_snap)
+        replay = stream_step(enc, mels[4], paged, drop_extra=2)
+    torch.testing.assert_close(replay, first, rtol=0.0, atol=0.0)
+
+
+def test_sessions_bind_to_pool_blocks_not_batch_slots():
+    # Two sessions interleaved on ONE shared pool, each on its own
+    # blocks, match their solo runs bit-for-bit — and a session's
+    # facade rebuilt fresh from its block ids mid-stream continues
+    # identically: the binding is session → pool blocks, never a live
+    # object or an arrival-order slot.
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        StreamingCaches,
+        stream_step,
+    )
+
+    enc = _tiny_encoder()
+    d_model, kernel, n_layers, window = 32, 5, 2, 8
+    torch.manual_seed(13)
+    steps = 6
+    mels = {
+        "a": [torch.randn(1, 16, 32) for _ in range(steps)],
+        "b": [torch.randn(1, 16, 32) for _ in range(steps)],
+    }
+
+    def solo(mel_stream):
+        caches = StreamingCaches(
+            n_layers=n_layers, batch=1, d_model=d_model,
+            left_context=window, conv_kernel=kernel,
+            device=torch.device("cpu"),
+        )
+        outs = []
+        with torch.no_grad():
+            for step, mel in enumerate(mel_stream):
+                outs.append(
+                    stream_step(
+                        enc, mel, caches, drop_extra=0 if step == 0 else 2
+                    )
+                )
+        return outs
+
+    want = {name: solo(stream) for name, stream in mels.items()}
+
+    # Shared pools; session a on blocks [0, 1], session b on [2, 3].
+    window_pool = torch.zeros(2 * n_layers, window * d_model + 1)
+    conv_pool = torch.zeros(2 * n_layers, d_model * (kernel - 1))
+    blocks = {"a": range(0, n_layers), "b": range(n_layers, 2 * n_layers)}
+    caches = {
+        name: _paged_caches(
+            window_pool, conv_pool, ids,
+            d_model=d_model, kernel=kernel, window=window,
+        )
+        for name, ids in blocks.items()
+    }
+    with torch.no_grad():
+        for step in range(steps):
+            if step == 3:
+                # Recomposition: rebuild b's facade from its block ids
+                # alone — the pool rows ARE the session.
+                caches["b"] = _paged_caches(
+                    window_pool, conv_pool, blocks["b"],
+                    d_model=d_model, kernel=kernel, window=window,
+                )
+            for name in ("a", "b") if step % 2 == 0 else ("b", "a"):
+                got = stream_step(
+                    enc, mels[name][step], caches[name],
+                    drop_extra=0 if step == 0 else 2,
+                )
+                torch.testing.assert_close(
+                    got, want[name][step], rtol=0.0, atol=0.0
+                )

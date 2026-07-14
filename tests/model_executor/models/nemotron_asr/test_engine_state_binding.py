@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """α2 engine binding: state pages against core's real KV-cache stack.
 
-Specs: PORT-STATE-001..004. The math tier (test_paged_streaming.py)
-proved the paged recursion against page-shaped pools; this suite binds
-the pages to the engine machinery itself — spec emission through the
+Specs: PORT-STATE-001..004. The math tier (test_window_state_page.py)
+proves ``stream_step`` over page-backed pools bit-for-bit; this suite
+binds the pages to the engine machinery itself — spec emission through the
 inherited ``MambaBase.get_kv_cache_spec`` seam, mixed-group formation
 (the consult's first conformance question: three ``MambaSpec`` page
 kinds coexisting with a sliding-window attention spec was unverified
