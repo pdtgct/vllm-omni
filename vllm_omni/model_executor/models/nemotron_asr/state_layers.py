@@ -222,14 +222,22 @@ def window_page_channel_view(
     the golden-proven ``stream_step`` advance IS the page write
     (OPEN-α3-VEHICLE decision).
     """
-    raise NotImplementedError
+    width = pool.shape[-1]
+    window, remainder = divmod(width - 1, d_model)
+    if remainder or window < 1:
+        raise ValueError(
+            f"page width {width} is not window*d_model+1 for "
+            f"d_model={d_model}"
+        )
+    return pool[block_id, : window * d_model].view(window, d_model)
 
 
 def window_page_len_slot(
     pool: torch.Tensor, *, block_id: int, d_model: int
 ) -> torch.Tensor:
     """The window page's trailing valid-length slot, as a view."""
-    raise NotImplementedError
+    del d_model  # the slot is positional: always the trailing element
+    return pool[block_id, -1:]
 
 
 class HybridStateModelMixin:
