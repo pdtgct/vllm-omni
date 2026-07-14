@@ -45,6 +45,9 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     Predictor,
     greedy_decode_chunk,
 )
+from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
+    HybridStateModelMixin,
+)
 
 
 class NemotronASRCore(nn.Module):
@@ -245,7 +248,7 @@ __all__ = [
 ]
 
 
-class NemotronASRForRNNT(nn.Module):
+class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     """The engine-facing model class (α4 tests-first skeleton).
 
     Single-stage LLM_AR omni model implementing ``SupportsRealtime``
@@ -312,9 +315,22 @@ class NemotronASRForRNNT(nn.Module):
                 await hold_until_park()
             yield {"multi_modal_data": {"audio": buffer}}
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Structural conformance seam (``is_vllm_model`` requires it).
+
+        The engine never routes token embedding through this model in
+        the D-b design — replay ids are consumed by the decode path
+        from the queue pages, not embedded as LM inputs — but vLLM's
+        ``is_text_generation_model`` gate checks the method's
+        presence at config time (α4 pod finding). Bring-up wires the
+        real no-op/predictor-embedding semantics; until then this is
+        a loud seam.
+        """
+        raise NotImplementedError("bring-up slice")
+
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Chunk-ingest or replay step; hidden rows carry decisions."""
-        raise NotImplementedError("α4 code phase")
+        raise NotImplementedError("bring-up slice")
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: Any = None

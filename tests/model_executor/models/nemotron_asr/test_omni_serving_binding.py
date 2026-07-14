@@ -38,9 +38,21 @@ WINDOW, D_MODEL, KERNEL = 56, 1024, 9
 
 
 def test_registry_resolves_the_model_class():
+    # Wheel-side signature (vllm 0.24.0, ee0da84ab9 @
+    # vllm/model_executor/models/registry.py _ModelRegistry
+    # .resolve_model_cls): takes a required `model_config: ModelConfig`
+    # second argument (duck-typed access only: `.model_impl` and
+    # `.convert_type` are read internally) — the bare
+    # `resolve_model_cls([ARCH])` this test used to call predates that
+    # signature.
+    from types import SimpleNamespace
+
     from vllm_omni.model_executor.models.registry import OmniModelRegistry
 
-    cls, resolved_arch = OmniModelRegistry.resolve_model_cls([ARCH])
+    duck_model_config = SimpleNamespace(model_impl="auto", convert_type="none")
+    cls, resolved_arch = OmniModelRegistry.resolve_model_cls(
+        [ARCH], duck_model_config
+    )
     assert resolved_arch == ARCH
     assert cls.__name__ == "NemotronASRForRNNT"
     assert cls.supports_realtime is True
@@ -80,24 +92,33 @@ def test_constraints_win_the_deploy_merge():
     # stage_config.merge: sampling.update(ps.sampling_constraints) —
     # the model's pipeline pin overrides deploy-YAML values on
     # collision. Drive the real merge with a hostile deploy default.
+    #
+    # Wheel-side shape (vllm_omni.config.stage_config @ the α4 pod
+    # checkout): merge_pipeline_deploy takes a real `DeployConfig`
+    # dataclass, not a raw nested dict (`_apply_platform_overrides`
+    # reads `deploy.platforms`); per-stage overrides are
+    # `StageDeployConfig` dataclass instances keyed by `stage_id`. The
+    # merged result carries `default_sampling_params` inside
+    # `StageConfig.yaml_extras`, not as a direct attribute.
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-    from vllm_omni.config.stage_config import merge_pipeline_deploy
+    from vllm_omni.config.stage_config import (
+        DeployConfig,
+        StageDeployConfig,
+        merge_pipeline_deploy,
+    )
 
     pipeline = OMNI_PIPELINES["nemotron_asr"]
-    deploy = {
-        "stages": [
-            {
-                "stage_id": 0,
-                "stage_type": "llm",
-                "worker_type": "ar",
-                "engine_args": {"model_arch": ARCH},
-                "default_sampling_params": {"temperature": 0.9},
-            }
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                default_sampling_params={"temperature": 0.9},
+            )
         ]
-    }
+    )
     merged = merge_pipeline_deploy(pipeline, deploy)
     stage0 = merged[0]
-    assert stage0.default_sampling_params["temperature"] == 0.0
+    assert stage0.yaml_extras["default_sampling_params"]["temperature"] == 0.0
 
 
 # ---- D-α4c: the registry-driven two-stage config pass (PORT-STATE-002) --------
@@ -165,6 +186,12 @@ def raw_duck_config(max_model_len: int = 4096) -> SimpleNamespace:
             mamba_block_size=max_model_len,
             mamba_page_size_padded=None,
             mamba_cache_mode="none",
+            # Wheel-side read (vllm 0.24.0 @ ee0da84ab9,
+            # kv_cache_utils.py:945 may_override_num_blocks): real
+            # CacheConfig always carries this field; the duck config
+            # needs it too once get_kv_cache_config_from_groups is
+            # driven for real.
+            num_gpu_blocks_override=None,
         ),
         speculative_config=None,
         scheduler_config=SimpleNamespace(
@@ -203,9 +230,11 @@ def test_allocator_sizes_per_layer_tensors_from_available_memory():
     groups = get_kv_cache_groups(cfg, spec_dict)
     page_sum = sum(s.page_size_bytes for s in spec_dict.values())
     budget = 64 * page_sum  # room for exactly 64 sessions
-    kv_config = get_kv_cache_config_from_groups(
-        cfg, groups, spec_dict, budget
-    )
+    # Wheel-side signature (vllm 0.24.0 @ ee0da84ab9,
+    # vllm/v1/core/kv_cache_utils.py:1318): 3 positional args — the
+    # per-layer kv_cache_spec dict is no longer accepted; the group's
+    # embedded UniformTypeKVCacheSpecs already carries it.
+    kv_config = get_kv_cache_config_from_groups(cfg, groups, budget)
     assert kv_config.num_blocks == 64
     tensors = kv_config.kv_cache_tensors
     assert len(tensors) == len(spec_dict)
