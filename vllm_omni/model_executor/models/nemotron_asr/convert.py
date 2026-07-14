@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+    ARCHITECTURE,
+    MODEL_TYPE,
+)
+
 Transform = Callable[[torch.Tensor], torch.Tensor]
 
 TRANSFORMS: dict[str, Transform] = {
@@ -187,7 +192,24 @@ def derive_vocab_size(state_dict: Mapping[str, torch.Tensor]) -> int:
         ConversionError: If the two corroborating tensors imply
             different V, or either is absent.
     """
-    raise NotImplementedError("BU-a code phase")
+
+    def rows(name: str) -> int:
+        if name not in state_dict:
+            raise ConversionError(
+                f"cannot derive vocab size: {name!r} absent from the "
+                "converted state dict"
+            )
+        return int(state_dict[name].shape[0])
+
+    joint_rows = rows("joint.joint_net.1.weight")  # V + 1 (blank last)
+    embed_rows = rows("predictor.embed.weight")  # V + 1 (blank pad row)
+    if joint_rows != embed_rows:
+        raise ConversionError(
+            "vocab-size tensors disagree: joint final linear implies "
+            f"V={joint_rows - 1}, predictor embedding implies "
+            f"V={embed_rows - 1}"
+        )
+    return joint_rows - 1
 
 
 def author_config(
@@ -211,4 +233,37 @@ def author_config(
             cross-check, when supplied) disagrees with the derived V,
             or if the two minted special ids are not distinct new ids.
     """
-    raise NotImplementedError("BU-a code phase")
+    v = derive_vocab_size(state_dict)
+    if reference_vocab_size is not None and reference_vocab_size != v:
+        raise ConversionError(
+            f"reference vocab size {reference_vocab_size} disagrees with "
+            f"the derived V={v} (checkpoint tensors win — settle the "
+            "metadata, do not proceed)"
+        )
+    if eos_token_id == audio_chunk_token_id:
+        raise ConversionError(
+            "park and placeholder ids must be distinct; both are "
+            f"{eos_token_id}"
+        )
+    for label, sid in (
+        ("eos_token_id/park", eos_token_id),
+        ("audio_chunk_token_id/placeholder", audio_chunk_token_id),
+    ):
+        if sid < v:
+            raise ConversionError(
+                f"{label}={sid} shadows a real label; a minted special "
+                f"must be a new id (>= V={v})"
+            )
+    # vocab_size is the logit width: it must cover every id, specials
+    # included (contiguous V, V+1 gives V+2).
+    vocab_size = max(v, eos_token_id + 1, audio_chunk_token_id + 1)
+    return {
+        "architectures": [ARCHITECTURE],
+        "model_type": MODEL_TYPE,
+        "vocab_size": vocab_size,
+        "num_labels": v,
+        "hidden_size": hidden_size,
+        "eos_token_id": eos_token_id,
+        "audio_chunk_token_id": audio_chunk_token_id,
+        "torch_dtype": "float32",
+    }

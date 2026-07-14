@@ -37,6 +37,7 @@ class NemotronASRConfig(PretrainedConfig):
         self,
         *,
         vocab_size: int = 13089,
+        num_labels: int = 13087,
         hidden_size: int = 15488,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
@@ -53,6 +54,10 @@ class NemotronASRConfig(PretrainedConfig):
         **kwargs: object,
     ) -> None:
         self.vocab_size = vocab_size
+        #: The decoded label-set size V (blank = V, joint emits V+1);
+        #: distinct from ``vocab_size``, the engine logit width that
+        #: also covers the minted park/placeholder specials.
+        self.num_labels = num_labels
         self.hidden_size = hidden_size
         self.audio_chunk_token_id = audio_chunk_token_id
         self.d_model = d_model

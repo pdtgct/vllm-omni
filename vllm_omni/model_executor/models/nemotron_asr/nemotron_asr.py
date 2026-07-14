@@ -39,15 +39,34 @@ from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
 )
+from vllm_omni.model_executor.models.nemotron_asr.convert import (
+    LID_REQUIRED_PATTERN,
+)
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+    MAX_SYMBOLS_PER_STEP,
     DecodeState,
     Joint,
     Predictor,
     greedy_decode_chunk,
 )
 from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
+    ConvCachePage,
     HybridStateModelMixin,
+    LSTMStatePage,
+    ReplayQueuePage,
+    WindowCachePage,
+    register_state_pages,
+    state_page_prefixes,
 )
+
+#: The largest published chunk (1120 ms) emits 14 encoder frames — the
+#: replay queue page's per-chunk worst case.
+_MAX_FRAMES_PER_CHUNK = 14
+#: The checkpoint's mel-bin count; the featurizer's filterbank is built
+#: as a placeholder at this width and overwritten by load_weights.
+_N_MELS = 128
+_STFT_FREQ_BINS = 512 // 2 + 1
+_WIN_LENGTH = 400
 
 
 class NemotronASRCore(nn.Module):
@@ -278,19 +297,126 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         ``load_weights``; page pools bind at forward (BU-b).
         """
         super().__init__()
-        raise NotImplementedError("BU-a code phase")
+        hf_config = vllm_config.model_config.hf_config
+        self.config = hf_config
+        # The engine samples over the full logit width (labels + minted
+        # park/placeholder specials); the core decodes over V labels.
+        self.num_logits = hf_config.vocab_size
+        policy = FP32_BRINGUP
+        self.core = NemotronASRCore(
+            vocab_size=hf_config.num_labels,
+            att_context=(
+                hf_config.att_context_left,
+                hf_config.att_context_right,
+            ),
+            enc_hidden=hf_config.d_model,
+            pred_hidden=hf_config.pred_hidden,
+            pred_rnn_layers=hf_config.pred_rnn_layers,
+            joint_hidden=hf_config.joint_hidden,
+            num_prompts=hf_config.num_prompts,
+            filterbank=torch.zeros(_N_MELS, _STFT_FREQ_BINS),
+            window=torch.zeros(_WIN_LENGTH),
+            policy=policy,
+        )
+        # The encoder is the source of truth for its layer count.
+        n_layers = len(self.core.encoder.layers)
+        self._state_pages = self._build_state_pages(
+            n_layers, hf_config, policy
+        )
+        register_state_pages(vllm_config, self._state_pages)
+
+    def _build_state_pages(
+        self, n_layers: int, cfg: Any, policy: PrecisionPolicy
+    ) -> list[Any]:
+        """The four page kinds under F4-compliant prefixes."""
+        pages: list[Any] = []
+        for kind, prefix in state_page_prefixes(n_layers):
+            if kind == "window":
+                pages.append(
+                    WindowCachePage(
+                        prefix=prefix,
+                        window=cfg.att_context_left,
+                        d_model=cfg.d_model,
+                        policy=policy,
+                    )
+                )
+            elif kind == "conv":
+                pages.append(
+                    ConvCachePage(
+                        prefix=prefix,
+                        d_model=cfg.d_model,
+                        kernel=cfg.conv_kernel,
+                        policy=policy,
+                    )
+                )
+            elif kind == "lstm":
+                pages.append(
+                    LSTMStatePage(
+                        prefix=prefix,
+                        pred_rnn_layers=cfg.pred_rnn_layers,
+                        pred_hidden=cfg.pred_hidden,
+                        policy=policy,
+                    )
+                )
+            elif kind == "replay":
+                pages.append(
+                    ReplayQueuePage(
+                        prefix=prefix,
+                        max_symbols_per_step=MAX_SYMBOLS_PER_STEP,
+                        max_frames_per_chunk=_MAX_FRAMES_PER_CHUNK,
+                        policy=policy,
+                    )
+                )
+        return pages
 
     def load_weights(self, weights: Any) -> set[str]:
         """Load converted safetensors by the name ledger (PORT-WGT-001).
 
-        Consumes an iterable of ``(name, tensor)`` under the
-        ``NEMO_RULES`` mapping, strict consume-exactly-once with
-        hard-fail on a missing or unexpected name (no warn-and-proceed,
-        the ``convert`` posture). ``prompt_kernel`` absence is fatal —
+        Consumes an iterable of ``(name, tensor)`` — the served
+        safetensors are already in the port's tree naming (the
+        conversion publisher writes them that way), so this is a strict
+        consume-exactly-once copy: an unexpected name or a shape
+        mismatch hard-fails (no warn-and-proceed, the ``convert``
+        posture), and a missing name hard-fails at the end.
+        ``prompt_kernel`` absence is called out explicitly and fatal —
         the model never degrades to unconditioned transcription
         (PORT-WGT-003). Returns the set of loaded parameter names.
         """
-        raise NotImplementedError("BU-a code phase")
+        expected: dict[str, torch.Tensor] = dict(
+            self.core.named_parameters()
+        )
+        expected.update(self.core.named_buffers())
+        consumed: set[str] = set()
+        for name, tensor in weights:
+            if name not in expected:
+                raise ValueError(
+                    f"unexpected weight {name!r}: not in the model's "
+                    "parameter/buffer set"
+                )
+            target = expected[name]
+            if tuple(target.shape) != tuple(tensor.shape):
+                raise ValueError(
+                    f"shape mismatch for {name!r}: expected "
+                    f"{tuple(target.shape)}, got {tuple(tensor.shape)}"
+                )
+            with torch.no_grad():
+                target.copy_(tensor)
+            consumed.add(name)
+        missing = set(expected) - consumed
+        lid_missing = sorted(
+            n for n in missing if LID_REQUIRED_PATTERN.search(n)
+        )
+        if lid_missing:
+            raise ValueError(
+                f"LID weights absent ({lid_missing}); the model never "
+                "degrades to unconditioned transcription (PORT-WGT-003)"
+            )
+        if missing:
+            raise ValueError(
+                f"{len(missing)} expected weights not provided, e.g. "
+                f"{sorted(missing)[:3]}"
+            )
+        return consumed
 
     @classmethod
     async def buffer_realtime_audio(
