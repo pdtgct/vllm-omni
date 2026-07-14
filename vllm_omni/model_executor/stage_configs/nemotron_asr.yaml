@@ -1,0 +1,12 @@
+# Nemotron cache-aware streaming RNN-T ASR — single-stage deploy
+# (PORT-INT-001; step_audio_2_asr.yaml pattern). Sampling defaults
+# here are advisory: pipeline.py sampling_constraints win the merge.
+stages:
+  - stage_id: 0
+    stage_type: llm
+    worker_type: ar
+    scheduler_cls: OmniARScheduler
+    engine_args:
+      model_arch: Nemotron3_5AsrForRNNT
+    default_sampling_params:
+      temperature: 0.0

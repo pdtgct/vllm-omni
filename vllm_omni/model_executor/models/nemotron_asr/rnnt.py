@@ -409,3 +409,25 @@ def replay_step(
     new_heads = torch.where(drained, heads, heads + 1)
     book_pool[state_indices, QUEUE_HEAD] = new_heads.to(book_pool.dtype)
     return labels
+
+
+def verify_replay_echo(
+    observed: torch.Tensor, forced: torch.Tensor
+) -> None:
+    """The model-owned sampling guard (PORT-DEC-007).
+
+    On every replay step the token id the engine fed back must equal
+    the id the decision carrier forced last step. A mismatch means
+    something between compute_logits and the next forward corrupted
+    the emission (hostile params, an exclusion mask, a processor) —
+    the session is unrecoverable and must abort loudly
+    (PORT-STATE-005 posture), never continue on a corrupted
+    transcript.
+
+    Raises:
+        ValueError: On any per-session mismatch, naming both ids.
+            (ValueError, not RuntimeError: NotImplementedError is a
+            RuntimeError subclass, and the guard's negative test must
+            never pass against an unimplemented stub.)
+    """
+    raise NotImplementedError("α4 code phase")

@@ -325,12 +325,23 @@ class HybridStateModelMixin:
     α4 registration wires the real config through.
     """
 
-    #: Attention-spec-free: nothing to align. Grouping was measured
-    #: RAW_PURE_STATE_GROUPS_FORMED=True at the pin (heterogeneous
-    #: pure-state dicts form groups unpadded — padding-free first);
-    #: the padded fallback is one cache_config value away if the
-    #: allocator stage disagrees at the α4 rung.
-    is_hybrid: bool = False
+    #: is_hybrid is core's CONFIG-ROUTING channel, not an attention
+    #: claim: for an arch absent from MODELS_CONFIG_MAP, the
+    #: ``model_config.is_hybrid`` branch of try_verify_and_update_config
+    #: is the only path to MambaModelConfig's pre-pass, which sets the
+    #: ``mamba_block_size`` that ``MambaBase.get_kv_cache_spec``
+    #: hard-asserts (abstract.py:45-46 @ the pin) — so the flag is
+    #: load-bearing and stays True (α4 consult, correcting the
+    #: migration's False). The attention-align phase still never runs:
+    #: with every backend SSM, ``_find_non_ssm_backend`` returns None
+    #: and the platform hook early-returns before both the block-size
+    #: pick and the align (interface.py:608-611), so
+    #: ``mamba_page_size_padded`` stays unset and grouping runs over
+    #: raw heterogeneous pages (measured
+    #: RAW_PURE_STATE_GROUPS_FORMED=True). The upstream-native form is
+    #: a one-line MODELS_CONFIG_MAP entry (arch → MambaModelConfig);
+    #: this flag is the no-core-change downstream channel until then.
+    is_hybrid: bool = True
 
     _DEFAULT_D_MODEL = 1024
     _DEFAULT_WINDOW = 56

@@ -11,11 +11,15 @@ per-chunk state.
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
 audio runs featurizer -> encoder -> LID -> the complete greedy
 label-looping decode in-model, parks the emitted labels in a per-request
-replay queue, and every generation step emits the next queued label by
-±inf logits masking; the reserved park token (blank id reused — never
-detokenized) ends the run. Greedy sampling is pinned by the model, not
-trusted from the entrypoint (PORT-DEC-005).
+replay queue, and every generation step emits the next queued label via
+a forced-logits row from ``compute_logits`` (0 at the chosen id, -inf
+elsewhere); the park token — the checkpoint's ``eos_token_id`` — ends
+the burst through the resumable stop path. Greedy sampling is pinned
+declaratively per update by ``pipeline.py sampling_constraints`` and
+actively by the replay-echo guard (PORT-DEC-005/007).
 """
+
+from typing import Any
 
 import torch
 from torch import nn
@@ -238,3 +242,61 @@ __all__ = [
     "load_core_from_dump",
     "resolve_prompt_index",
 ]
+
+
+class NemotronASRForRNNT(nn.Module):
+    """The engine-facing model class (α4 tests-first skeleton).
+
+    Single-stage LLM_AR omni model implementing ``SupportsRealtime``
+    (structural protocol) over ``NemotronASRCore``; registered as
+    ``Nemotron3_5AsrForRNNT`` (PORT-INT-001/002). The serving methods
+    below are the α4 seams; each raises until its code phase.
+    """
+
+    supports_realtime = True
+    #: Secondary framework guard only — the omni realtime route reads
+    #: the pipeline's explicit ``max_tokens`` (see pipeline.py); this
+    #: classvar is the core-route value (PORT-INT-002), worst case
+    #: 14 frames × 10 symbols + park.
+    realtime_max_tokens = 141
+
+    def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
+        super().__init__()
+        raise NotImplementedError("α4 code phase")
+
+    @classmethod
+    async def buffer_realtime_audio(
+        cls,
+        audio_stream: Any,
+        input_stream: Any,
+        model_config: Any,
+    ) -> Any:
+        """Chunk client audio: one yield = one StreamingUpdate.
+
+        Fixed segmenter built once at generator start from the
+        session's admitted chunk config (PORT-SESS-002); holds chunk
+        N+1 until the park token id for chunk N appears on
+        ``input_stream`` (buffer-until-drained, PORT-SESS-001 —
+        defense in depth over core's park-time queue consumption);
+        applies the NeMo tail rules on finalize (PORT-SESS-003:
+        partial tails as-is, sub-8-mel-frame remainders dropped,
+        never zero-padded).
+        """
+        raise NotImplementedError("α4 code phase")
+        yield  # pragma: no cover — makes the stub an async GENERATOR
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """Chunk-ingest or replay step; hidden rows carry decisions."""
+        raise NotImplementedError("α4 code phase")
+
+    def compute_logits(
+        self, hidden_states: torch.Tensor, sampling_metadata: Any = None
+    ) -> torch.Tensor:
+        """Forced-logits rows from the hidden-row decision carrier.
+
+        The engine's ``logits_indices`` gather hands this exactly the
+        last-scheduled-token rows, row-aligned per request in batch
+        order (PORT-DEC-002) — ids are read by ROW POSITION, never by
+        request id.
+        """
+        raise NotImplementedError("α4 code phase")

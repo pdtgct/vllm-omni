@@ -230,12 +230,14 @@ def test_raw_unpadded_mix_still_dies_in_core_unification():
 # ---- IsHybrid conformance surface (consult D-α2a) -----------------------------
 
 
-def test_mixin_is_attention_free_and_reports_the_window_bundle():
-    # Post-migration (OPEN-α3-VEHICLE): every state kind is a MambaSpec
-    # page, so there is no attention spec to align against — is_hybrid
-    # is False and the reference bundle is the largest per-layer kind,
-    # now the window page.
-    assert HybridStateModelMixin.is_hybrid is False
+def test_mixin_keeps_the_config_routing_flag_and_window_bundle():
+    # α4 consult correction: is_hybrid is core's config-routing channel
+    # (the only path to MambaModelConfig's pre-pass, which sets the
+    # mamba_block_size that get_kv_cache_spec hard-asserts) — it stays
+    # True even though the model is attention-spec-free; the align
+    # phase never fires (all-SSM early return). The reference bundle
+    # is the largest per-layer kind, the window page.
+    assert HybridStateModelMixin.is_hybrid is True
     shapes = HybridStateModelMixin.get_mamba_state_shape_from_config(
         duck_vllm_config()
     )
