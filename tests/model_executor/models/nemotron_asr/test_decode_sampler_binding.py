@@ -24,6 +24,7 @@ _NUM_LOGITS = 13089
 
 def _greedy_metadata(batch: int):
     """SamplingMetadata as the model-pinned params produce it."""
+    from vllm.v1.sample.logits_processor import LogitsProcessors
     from vllm.v1.sample.metadata import SamplingMetadata
 
     return SamplingMetadata(
@@ -42,7 +43,11 @@ def _greedy_metadata(batch: int):
         output_token_ids=[[] for _ in range(batch)],
         allowed_token_ids_mask=None,
         bad_words_token_ids={},
-        logitsprocs=None,
+        # v0.24.0 types this field `LogitsProcessors`, not
+        # `LogitsProcessors | None`; the empty-list construction is the
+        # real "no processors installed" state (both invariant lists
+        # start empty — see LogitsProcessors.__init__).
+        logitsprocs=LogitsProcessors(),
     )
 
 
@@ -72,8 +77,13 @@ def test_exclusion_mask_kills_forced_emission_on_the_real_sampler():
     chosen = torch.tensor([7], dtype=torch.long)
     rows = forced_logits_rows(chosen, num_logits=_NUM_LOGITS)
     meta = _greedy_metadata(1)
-    mask = torch.ones(1, _NUM_LOGITS, dtype=torch.bool)
-    mask[0, 7] = False  # mask=True means "not allowed" at the pin
+    # mask=True means "not allowed" (Sampler.apply_logits_processors does
+    # `logits.masked_fill_(mask, -inf)`); forced_logits_rows already puts
+    # -inf everywhere but the chosen id, so excluding id 7 only requires
+    # marking that single position True — the original all-True-except-7
+    # construction inverted this and instead forced id 7 to survive.
+    mask = torch.zeros(1, _NUM_LOGITS, dtype=torch.bool)
+    mask[0, 7] = True
     meta.allowed_token_ids_mask = mask
     out = Sampler().forward(rows, meta)
     assert int(out.sampled_token_ids.view(-1)[0]) != 7
@@ -86,9 +96,25 @@ def test_resumable_stop_seam_exists_for_the_park_path():
     # status member and the Request streaming surfaces must exist so a
     # core rename breaks loudly here, not at bring-up.
     assert hasattr(RequestStatus, "WAITING_FOR_STREAMING_REQ")
+    # vllm_omni substitutes vllm.v1.request.Request with OmniRequest,
+    # which delegates to the base class via `super().__init__(*args,
+    # **kwargs)` — the streaming_queue reference lives in the base
+    # class's own __init__, not the most-derived one, so the seam
+    # check must walk the MRO rather than inspect Request.__init__
+    # alone (that would have inspected OmniRequest.__init__ and missed
+    # it even though the seam is intact).
+    mro_init_names: set[str] = set()
+    mro_init_doc = ""
+    for cls in Request.__mro__:
+        init = cls.__dict__.get("__init__")
+        if init is None:
+            continue
+        mro_init_doc += init.__doc__ or ""
+        code = getattr(init, "__code__", None)
+        if code is not None:
+            mro_init_names.update(code.co_names)
+            mro_init_names.update(code.co_varnames)
     assert hasattr(Request, "streaming_queue") or (
-        "streaming_queue" in getattr(Request.__init__, "__doc__", "")
-        or "streaming_queue"
-        in Request.__init__.__code__.co_names
-        + Request.__init__.__code__.co_varnames
+        "streaming_queue" in mro_init_doc
+        or "streaming_queue" in mro_init_names
     )
