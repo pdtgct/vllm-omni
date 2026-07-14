@@ -249,10 +249,12 @@ def author_config(
         ("eos_token_id/park", eos_token_id),
         ("audio_chunk_token_id/placeholder", audio_chunk_token_id),
     ):
-        if sid < v:
+        # ids 0..V-1 are labels and V is blank, so a minted special
+        # must be strictly past blank (> V), not merely >= V.
+        if sid <= v:
             raise ConversionError(
-                f"{label}={sid} shadows a real label; a minted special "
-                f"must be a new id (>= V={v})"
+                f"{label}={sid} collides with a label (0..{v - 1}) or "
+                f"blank ({v}); a minted special must be a new id (> V={v})"
             )
     # vocab_size is the logit width: it must cover every id, specials
     # included (contiguous V, V+1 gives V+2).
@@ -261,7 +263,7 @@ def author_config(
         "architectures": [ARCHITECTURE],
         "model_type": MODEL_TYPE,
         "vocab_size": vocab_size,
-        "num_labels": v,
+        "num_asr_labels": v,
         "hidden_size": hidden_size,
         "eos_token_id": eos_token_id,
         "audio_chunk_token_id": audio_chunk_token_id,

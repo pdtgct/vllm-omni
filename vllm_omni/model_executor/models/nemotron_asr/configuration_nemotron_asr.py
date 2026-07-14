@@ -36,8 +36,8 @@ class NemotronASRConfig(PretrainedConfig):
     def __init__(
         self,
         *,
-        vocab_size: int = 13089,
-        num_labels: int = 13087,
+        vocab_size: int = 13090,
+        num_asr_labels: int = 13087,
         hidden_size: int = 15488,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
@@ -56,8 +56,11 @@ class NemotronASRConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         #: The decoded label-set size V (blank = V, joint emits V+1);
         #: distinct from ``vocab_size``, the engine logit width that
-        #: also covers the minted park/placeholder specials.
-        self.num_labels = num_labels
+        #: also covers the minted park/placeholder specials. NOT named
+        #: ``num_labels`` — that is a reserved ``PretrainedConfig``
+        #: field (it drives ``id2label`` and is reset to a 2-label
+        #: default by ``super().__init__``, silently clobbering ours).
+        self.num_asr_labels = num_asr_labels
         self.hidden_size = hidden_size
         self.audio_chunk_token_id = audio_chunk_token_id
         self.d_model = d_model
@@ -69,9 +72,14 @@ class NemotronASRConfig(PretrainedConfig):
         self.joint_hidden = joint_hidden
         self.num_prompts = num_prompts
         self.max_position_embeddings = max_position_embeddings
+        # ``architectures`` rides kwargs, never an explicit arg: a
+        # config.json (from author_config or to_dict) already carries
+        # it, and ``from_dict`` re-passes every key — an explicit
+        # ``architectures=`` would then collide with **kwargs and raise
+        # on every reload.
+        kwargs.setdefault("architectures", [ARCHITECTURE])
         super().__init__(
             eos_token_id=eos_token_id,
             torch_dtype=torch_dtype,
-            architectures=[ARCHITECTURE],
             **kwargs,
         )

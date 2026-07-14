@@ -88,9 +88,32 @@ def test_config_registers_with_autoconfig():
 
     import vllm_omni.transformers_utils.configs.nemotron_asr  # noqa: F401
 
-    built = AutoConfig.for_model(MODEL_TYPE, vocab_size=13089)
+    built = AutoConfig.for_model(MODEL_TYPE, vocab_size=13090)
     assert isinstance(built, NemotronASRConfig)
-    assert built.vocab_size == 13089
+    assert built.vocab_size == 13090
+
+
+def test_config_roundtrips_through_from_dict():
+    # Regression (pod BU-a): from_dict re-passes EVERY key, so a config
+    # whose dict already carries "architectures" (author_config and
+    # to_dict both do) must not collide with an explicit arg. This is
+    # exactly the AutoConfig.from_pretrained path for a real
+    # checkpoint's config.json.
+    d = NemotronASRConfig(vocab_size=13090, eos_token_id=13088).to_dict()
+    assert d["architectures"] == [ARCHITECTURE]
+    rebuilt = NemotronASRConfig.from_dict(d)
+    assert rebuilt.vocab_size == 13090
+    assert rebuilt.architectures == [ARCHITECTURE]
+
+
+def test_num_asr_labels_survives_construction():
+    # Regression (pod BU-a): the label count must NOT use the reserved
+    # ``num_labels`` field — PretrainedConfig resets that to a 2-label
+    # default in super().__init__, clobbering it. The renamed field
+    # survives.
+    cfg = NemotronASRConfig(num_asr_labels=13087)
+    assert cfg.num_asr_labels == 13087
+    assert cfg.to_dict()["num_asr_labels"] == 13087
 
 
 # ---- vocab derivation from tensor shapes (PORT-WGT-004, OPEN-α4-ARCH) ----------
@@ -120,17 +143,21 @@ def test_derive_vocab_size_rejects_missing_tensor():
 
 
 def test_author_config_accounts_for_minted_specials():
+    # ids 0..V-1 are labels and V is blank, so the minted specials are
+    # the two ids past blank: park = V+1, placeholder = V+2.
     cfg = author_config(
         _checkpoint_shaped_state_dict(V),
-        eos_token_id=V,  # park = first new id past the labels
-        audio_chunk_token_id=V + 1,  # placeholder = second new id
+        eos_token_id=V + 1,
+        audio_chunk_token_id=V + 2,
         hidden_size=15488,
     )
-    assert cfg["vocab_size"] == V + 2  # labels + park + placeholder
+    # width covers 0..V+2 = labels + blank + park + placeholder.
+    assert cfg["vocab_size"] == V + 3
+    assert cfg["num_asr_labels"] == V
     assert cfg["architectures"] == [ARCHITECTURE]
     assert cfg["hidden_size"] == 15488
-    assert cfg["eos_token_id"] == V
-    assert cfg["audio_chunk_token_id"] == V + 1
+    assert cfg["eos_token_id"] == V + 1
+    assert cfg["audio_chunk_token_id"] == V + 2
     assert cfg["torch_dtype"] == "float32"
 
 
@@ -142,28 +169,30 @@ def test_author_config_hardfails_on_reference_disagreement():
     with pytest.raises(ConversionError):
         author_config(
             _checkpoint_shaped_state_dict(V),
-            eos_token_id=V,
-            audio_chunk_token_id=V + 1,
+            eos_token_id=V + 1,
+            audio_chunk_token_id=V + 2,
             hidden_size=15488,
             reference_vocab_size=V + 1,
         )
 
 
-def test_author_config_rejects_specials_that_overwrite_labels():
-    # Minted specials must be genuinely NEW ids (>= V) and distinct —
-    # an id < V would shadow a real label.
+def test_author_config_rejects_specials_that_shadow_labels_or_blank():
+    # A minted special must be a NEW id past blank (> V) and distinct.
+    # An id <= V shadows a real label (< V) or blank (= V) — the pod
+    # facts confirmed blank = V = 13087, so eos = V is a collision.
+    for bad_eos in (5, V):  # 5 = a real label; V = blank
+        with pytest.raises(ConversionError):
+            author_config(
+                _checkpoint_shaped_state_dict(V),
+                eos_token_id=bad_eos,
+                audio_chunk_token_id=V + 2,
+                hidden_size=15488,
+            )
     with pytest.raises(ConversionError):
         author_config(
             _checkpoint_shaped_state_dict(V),
-            eos_token_id=5,  # collides with a real label
-            audio_chunk_token_id=V + 1,
-            hidden_size=15488,
-        )
-    with pytest.raises(ConversionError):
-        author_config(
-            _checkpoint_shaped_state_dict(V),
-            eos_token_id=V,
-            audio_chunk_token_id=V,  # not distinct from park
+            eos_token_id=V + 1,
+            audio_chunk_token_id=V + 1,  # not distinct from park
             hidden_size=15488,
         )
 

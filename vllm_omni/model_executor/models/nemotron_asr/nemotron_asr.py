@@ -284,7 +284,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     realtime_max_tokens = 141
     #: Engine logit width: tokenizer vocab + the park special token
     #: (checkpoint default; __init__ re-reads it from the config).
-    num_logits = 13089
+    num_logits = 13090
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
         """Build the core from the config and register the state pages.
@@ -304,7 +304,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         self.num_logits = hf_config.vocab_size
         policy = FP32_BRINGUP
         self.core = NemotronASRCore(
-            vocab_size=hf_config.num_labels,
+            vocab_size=hf_config.num_asr_labels,
             att_context=(
                 hf_config.att_context_left,
                 hf_config.att_context_right,
