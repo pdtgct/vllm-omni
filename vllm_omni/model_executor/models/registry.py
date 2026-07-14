@@ -5,6 +5,10 @@ from vllm.model_executor.models.registry import (
     _resolve_module_name,
 )
 
+from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+    ARCHITECTURE as NEMOTRON_ASR_ARCHITECTURE,
+)
+
 _OMNI_MODELS = {
     # Nemotron cache-aware streaming RNN-T ASR (single-stage LLM_AR).
     # Key must equal the served checkpoint's config.json
@@ -12,7 +16,7 @@ _OMNI_MODELS = {
     # volume holds only the .nemo (no HF config.json); verification
     # against the HF model card's config.json is an open pod-round
     # item (ledger OPEN-α4-ARCH).
-    "Nemotron3_5AsrForRNNT": (
+    NEMOTRON_ASR_ARCHITECTURE: (
         "nemotron_asr",
         "nemotron_asr",
         "NemotronASRForRNNT",

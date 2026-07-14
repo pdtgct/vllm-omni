@@ -381,3 +381,21 @@ class HybridStateModelMixin:
             "prefix caching is off for the streaming ASR model; "
             "mamba_cache_mode stays 'none'"
         )
+
+
+def state_page_prefixes(n_encoder_layers: int) -> list[tuple[str, str]]:
+    """(kind, prefix) for every state page, F4-compliant.
+
+    ``bind_kv_cache`` runs ``extract_layer_index`` on each registered
+    layer name and asserts exactly ONE integer path component
+    (``utils.py`` @ the pin). The per-encoder-layer window/conv pages
+    carry the layer index natively; the model-global LSTM and replay
+    pages get a synthetic ``.0.`` slot so they satisfy the same rule.
+    """
+    prefixes: list[tuple[str, str]] = []
+    for i in range(n_encoder_layers):
+        prefixes.append(("window", f"encoder.layers.{i}.window"))
+        prefixes.append(("conv", f"encoder.layers.{i}.conv"))
+    prefixes.append(("lstm", "predictor.layers.0.lstm_state"))
+    prefixes.append(("replay", "decode.layers.0.replay"))
+    return prefixes

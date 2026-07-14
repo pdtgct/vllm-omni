@@ -170,3 +170,45 @@ def diff_against_referee(
             )
     if diffs:
         raise ConversionError("referee diff: " + "; ".join(diffs))
+
+
+# ---- config authoring (PORT-WGT-004, bring-up sub-slice BU-a) -----------------
+
+
+def derive_vocab_size(state_dict: Mapping[str, torch.Tensor]) -> int:
+    """The label-set size V, derived from checkpoint tensor shapes.
+
+    Reality wins over metadata (the .nemo meta.json and the HF model
+    card disagree on 13087 vs 13088): the joint final linear has
+    ``out_features = V + 1`` (blank last) and the predictor embedding
+    has ``V + 1`` rows. Both must agree with each other; this returns V.
+
+    Raises:
+        ConversionError: If the two corroborating tensors imply
+            different V, or either is absent.
+    """
+    raise NotImplementedError("BU-a code phase")
+
+
+def author_config(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    eos_token_id: int,
+    audio_chunk_token_id: int,
+    hidden_size: int,
+    reference_vocab_size: int | None = None,
+) -> dict:
+    """Assemble the served ``config.json`` dict (PORT-WGT-004).
+
+    ``vocab_size`` = derived V + the minted specials (park =
+    ``eos_token_id`` and the audio-chunk placeholder must be distinct
+    and both >= V, i.e. genuinely new ids); ``architectures`` = the
+    shared ``ARCHITECTURE`` constant; ``hidden_size`` = the mm-carrier
+    width; ``eos_token_id`` = the park token; ``torch_dtype`` = float32.
+
+    Raises:
+        ConversionError: If ``reference_vocab_size`` (a metadata
+            cross-check, when supplied) disagrees with the derived V,
+            or if the two minted special ids are not distinct new ids.
+    """
+    raise NotImplementedError("BU-a code phase")

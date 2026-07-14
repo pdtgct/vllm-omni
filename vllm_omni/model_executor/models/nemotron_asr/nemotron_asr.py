@@ -268,8 +268,29 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     num_logits = 13089
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
+        """Build the core from the config and register the state pages.
+
+        Reads ``NemotronASRConfig`` off ``vllm_config.model_config``,
+        builds ``NemotronASRCore`` at the config's dims, sets
+        ``num_logits`` from the config's ``vocab_size``, and constructs
+        + registers the four state-page kinds under F4-compliant
+        prefixes (``state_page_prefixes``). Weights load afterward via
+        ``load_weights``; page pools bind at forward (BU-b).
+        """
         super().__init__()
-        raise NotImplementedError("α4 code phase")
+        raise NotImplementedError("BU-a code phase")
+
+    def load_weights(self, weights: Any) -> set[str]:
+        """Load converted safetensors by the name ledger (PORT-WGT-001).
+
+        Consumes an iterable of ``(name, tensor)`` under the
+        ``NEMO_RULES`` mapping, strict consume-exactly-once with
+        hard-fail on a missing or unexpected name (no warn-and-proceed,
+        the ``convert`` posture). ``prompt_kernel`` absence is fatal —
+        the model never degrades to unconditioned transcription
+        (PORT-WGT-003). Returns the set of loaded parameter names.
+        """
+        raise NotImplementedError("BU-a code phase")
 
     @classmethod
     async def buffer_realtime_audio(

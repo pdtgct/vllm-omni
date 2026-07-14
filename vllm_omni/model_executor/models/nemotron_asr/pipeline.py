@@ -18,6 +18,9 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+    ARCHITECTURE,
+)
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
 )
