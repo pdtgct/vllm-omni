@@ -240,6 +240,69 @@ def window_page_len_slot(
     return pool[block_id, -1:]
 
 
+class _PagedRows:
+    """Per-layer page views behind the stacked-tensor indexing.
+
+    ``stream_step`` reads ``caches.channel[idx]`` and writes
+    ``caches.channel[idx] = advanced`` — slice assignment. This facade
+    keeps those exact semantics over per-layer page VIEWS: reads
+    return the view (batch dim restored), writes ``copy_`` into it —
+    so the golden-proven advance writes through to the page pool
+    without touching ``stream_step`` at all (OPEN-α3-VEHICLE).
+    """
+
+    def __init__(self, views: Sequence[torch.Tensor]) -> None:
+        self._views = list(views)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self._views[idx].unsqueeze(0)
+
+    def __setitem__(self, idx: int, value: torch.Tensor) -> None:
+        self._views[idx].copy_(value.squeeze(0))
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        head = self._views[0]
+        return (len(self._views), 1, *head.shape)
+
+
+class PagedStreamingCaches:
+    """``StreamingCaches``' page-backed twin (one session, B=1).
+
+    Same attribute surface ``stream_step`` consumes — ``channel``,
+    ``time``, ``valid``, ``left_context`` — with channel/time as
+    :class:`_PagedRows` over window/conv page views and ``valid`` as a
+    property writing through to every window page's valid-length slot
+    (``stream_step`` REPLACES ``caches.valid`` each step, so a plain
+    attribute would silently detach from the pages).
+    """
+
+    def __init__(
+        self,
+        *,
+        channel_views: Sequence[torch.Tensor],
+        time_views: Sequence[torch.Tensor],
+        len_slots: Sequence[torch.Tensor],
+        left_context: int,
+    ) -> None:
+        if not (len(channel_views) == len(time_views) == len(len_slots)):
+            raise ValueError("one window/conv/len view per layer")
+        self.left_context = left_context
+        self.channel = _PagedRows(channel_views)
+        self.time = _PagedRows(time_views)
+        self._len_slots = list(len_slots)
+
+    @property
+    def valid(self) -> torch.Tensor:
+        return self._len_slots[0].to(torch.long)
+
+    @valid.setter
+    def valid(self, value: torch.Tensor) -> None:
+        new = value.reshape(1).to(self._len_slots[0].dtype)
+        for slot in self._len_slots:
+            slot.copy_(new)
+
+
 class HybridStateModelMixin:
     """The ``IsHybrid`` conformance surface (consult D-α2a).
 

@@ -193,3 +193,95 @@ def test_page_backed_channel_cache_matches_streaming_caches():
     len_slot = window_page_len_slot(pool, block_id=2, d_model=D_MODEL)
     len_slot.fill_(42.0)
     assert pool[2, -1] == 42.0
+
+
+# ---- the stream_step-literal advance (the vehicle's core property) --------------
+
+
+def _tiny_encoder():
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        FastConformerEncoder,
+    )
+
+    torch.manual_seed(31)
+    enc = FastConformerEncoder(
+        feat_in=16,
+        d_model=32,
+        d_ff=64,
+        n_layers=2,
+        n_heads=4,
+        conv_kernel=5,
+        subsampling_channels=16,
+        att_context=(8, 1),
+    )
+    enc.eval()
+    return enc
+
+
+def test_stream_step_advances_page_backed_caches_bit_for_bit():
+    # THE vehicle property: the UNTOUCHED golden-proven stream_step,
+    # run over PagedStreamingCaches (views into page pools), must be
+    # bit-for-bit identical to the in-module StreamingCaches run —
+    # outputs, channel cache, conv tails, valid counts — and the pool
+    # must hold the advanced state (write-through, never a copy).
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        StreamingCaches,
+        stream_step,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
+        PagedStreamingCaches,
+        window_page_channel_view,
+        window_page_len_slot,
+    )
+
+    enc = _tiny_encoder()
+    d_model, kernel, n_layers, window = 32, 5, 2, 8
+    reference = StreamingCaches(
+        n_layers=n_layers,
+        batch=1,
+        d_model=d_model,
+        left_context=window,
+        conv_kernel=kernel,
+        device=torch.device("cpu"),
+    )
+    # Page pools: one window block and one conv block per layer.
+    window_pool = torch.zeros(n_layers, window * d_model + 1)
+    conv_pool = torch.zeros(n_layers, d_model * (kernel - 1))
+    paged = PagedStreamingCaches(
+        channel_views=[
+            window_page_channel_view(window_pool, block_id=i, d_model=d_model)
+            for i in range(n_layers)
+        ],
+        time_views=[
+            conv_pool[i].view(d_model, kernel - 1) for i in range(n_layers)
+        ],
+        len_slots=[
+            window_page_len_slot(window_pool, block_id=i, d_model=d_model)
+            for i in range(n_layers)
+        ],
+        left_context=window,
+    )
+    torch.manual_seed(7)
+    for step in range(4):
+        mel = torch.randn(1, 16, 32)
+        with torch.no_grad():
+            want = stream_step(
+                enc, mel, reference, drop_extra=0 if step == 0 else 2
+            )
+            got = stream_step(
+                enc, mel, paged, drop_extra=0 if step == 0 else 2
+            )
+        torch.testing.assert_close(got, want)
+        for i in range(n_layers):
+            torch.testing.assert_close(
+                paged.channel[i].squeeze(0), reference.channel[i, 0]
+            )
+            torch.testing.assert_close(
+                paged.time[i].squeeze(0), reference.time[i, 0]
+            )
+        assert int(paged.valid[0]) == int(reference.valid[0])
+    # Write-through: the POOL holds the advanced state (a fresh view
+    # over the same pool sees it — no hidden copies anywhere).
+    fresh = window_page_channel_view(window_pool, block_id=0, d_model=d_model)
+    torch.testing.assert_close(fresh, reference.channel[0, 0])
+    assert window_pool[0, -1] == float(int(reference.valid[0]))
