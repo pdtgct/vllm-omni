@@ -16,6 +16,7 @@ This module is the single boundary the decode choice lives behind
 reference the fused/batched implementation is held to by tests).
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -231,7 +232,13 @@ def park_token_id(hf_config: Any) -> int:
         ValueError: If the config carries no ``eos_token_id`` — the
             park path cannot exist without it, so fail at load.
     """
-    raise NotImplementedError("α3 code phase")
+    eos_token_id = getattr(hf_config, "eos_token_id", None)
+    if eos_token_id is None:
+        raise ValueError(
+            "hf_config has no eos_token_id: the park path (PORT-DEC-003) "
+            "requires the checkpoint to publish one"
+        )
+    return eos_token_id
 
 
 def realtime_token_budget(
@@ -243,7 +250,7 @@ def realtime_token_budget(
     (PORT-INT-002; the output counter clears per update, so the budget
     is per-burst, not per-session).
     """
-    raise NotImplementedError("α3 code phase")
+    return frames_per_chunk * max_symbols + 1
 
 
 def forced_logits_rows(
@@ -258,7 +265,21 @@ def forced_logits_rows(
     Raises:
         ValueError: If any chosen id falls outside ``num_logits``.
     """
-    raise NotImplementedError("α3 code phase")
+    if chosen.numel() and (
+        int(chosen.min()) < 0 or int(chosen.max()) >= num_logits
+    ):
+        raise ValueError(
+            f"chosen id out of range for num_logits={num_logits}: "
+            f"{chosen.tolist()}"
+        )
+    rows = torch.full(
+        (chosen.shape[0], num_logits),
+        float("-inf"),
+        dtype=torch.float32,
+        device=chosen.device,
+    )
+    rows.scatter_(1, chosen.view(-1, 1), 0.0)
+    return rows
 
 
 def write_decision_carrier(
@@ -276,12 +297,20 @@ def write_decision_carrier(
             exactly (integer-exact range must cover the id space; a
             bf16 carrier corrupts ids > 256).
     """
-    raise NotImplementedError("α3 code phase")
+    dtype = hidden.dtype
+    mantissa_bits = round(-math.log2(torch.finfo(dtype).eps))
+    bound = 2 ** (mantissa_bits + 1)
+    if ids.numel() and int(ids.max()) >= bound:
+        raise ValueError(
+            f"{dtype} is not integer-exact past {bound}; the decision "
+            f"carrier cannot represent id {int(ids.max())}"
+        )
+    hidden[:, 0] = ids.to(dtype)
 
 
 def read_decision_carrier(hidden: torch.Tensor) -> torch.Tensor:
     """Recover the per-session ids ``write_decision_carrier`` wrote."""
-    raise NotImplementedError("α3 code phase")
+    return hidden[:, 0].long()
 
 
 def decode_chunk_paged(
@@ -307,7 +336,52 @@ def decode_chunk_paged(
     ``queue_pool`` rows, and updates the 4-slot bookkeeping vector in
     ``book_pool`` (QUEUE_* indices).
     """
-    raise NotImplementedError("α3 code phase")
+    batch = enc_frames.shape[0]
+    blank = predictor.blank_id
+    # Page rows hold (layers, hidden); the predictor takes
+    # (layers, batch, hidden).
+    h = h_pool[state_indices].transpose(0, 1).contiguous()
+    c = c_pool[state_indices].transpose(0, 1).contiguous()
+    last_label = book_pool[state_indices, QUEUE_LAST_LABEL].long()
+    lens = torch.zeros(
+        batch, dtype=torch.long, device=enc_frames.device
+    )
+
+    pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
+    for t in range(enc_frames.shape[1]):
+        frame = enc_frames[:, t]
+        active = torch.ones(
+            batch, dtype=torch.bool, device=enc_frames.device
+        )
+        for _ in range(max_symbols):
+            logits = joint.logits(frame, pred_out)
+            labels = logits.argmax(dim=-1)
+            emit = active & (labels != blank)
+            # Masked trip: non-emitting rows pass through every
+            # torch.where untouched, so the extra trips the oracle's
+            # early break skips are bit-exact no-ops here.
+            rows = state_indices[emit]
+            queue_pool[rows, lens[emit]] = labels[emit].to(
+                queue_pool.dtype
+            )
+            lens = lens + emit.long()
+            gate = emit.view(1, -1, 1)
+            last_label = torch.where(emit, labels, last_label)
+            h = torch.where(gate, pred_h, h)
+            c = torch.where(gate, pred_c, c)
+            new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
+            pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
+            pred_h = torch.where(gate, new_h, pred_h)
+            pred_c = torch.where(gate, new_c, pred_c)
+            active = emit
+    h_pool[state_indices] = h.transpose(0, 1)
+    c_pool[state_indices] = c.transpose(0, 1)
+    # A fresh burst: head rewinds, length is this chunk's emissions.
+    book_pool[state_indices, QUEUE_HEAD] = 0.0
+    book_pool[state_indices, QUEUE_LEN] = lens.to(book_pool.dtype)
+    book_pool[state_indices, QUEUE_LAST_LABEL] = last_label.to(
+        book_pool.dtype
+    )
 
 
 def replay_step(
@@ -323,4 +397,15 @@ def replay_step(
     it), or ``park_id`` for a drained/empty queue (PORT-DEC-002/003;
     a blank-only chunk parks immediately, PORT-DEC-004).
     """
-    raise NotImplementedError("α3 code phase")
+    heads = book_pool[state_indices, QUEUE_HEAD].long()
+    lens = book_pool[state_indices, QUEUE_LEN].long()
+    drained = heads >= lens
+    # Clamp so the gather stays in-bounds for drained rows too — the
+    # gathered value is discarded by torch.where for those rows.
+    clamped_heads = torch.clamp(heads, max=queue_pool.shape[1] - 1)
+    queued = queue_pool[state_indices, clamped_heads].long()
+    park = torch.full_like(queued, park_id)
+    labels = torch.where(drained, park, queued)
+    new_heads = torch.where(drained, heads, heads + 1)
+    book_pool[state_indices, QUEUE_HEAD] = new_heads.to(book_pool.dtype)
+    return labels
