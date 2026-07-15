@@ -19,12 +19,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
-    NemotronASRForRNNT,
-)
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     verify_replay_echo,
     write_decision_carrier,
+)
+from vllm_omni.model_executor.models.nemotron_asr.streaming import (
+    buffer_stream,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -54,7 +54,7 @@ async def _collect_yields(chunks_of_samples, park_after_each=True):
     input_stream: asyncio.Queue = asyncio.Queue()
     model_config = None  # the α4 code phase binds the real config read
     yields = []
-    agen = NemotronASRForRNNT.buffer_realtime_audio(
+    agen = buffer_stream(
         audio_stream(), input_stream, model_config
     )
     async for prompt in agen:
@@ -102,7 +102,7 @@ def test_next_chunk_holds_until_park_echo():
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
-        agen = NemotronASRForRNNT.buffer_realtime_audio(
+        agen = buffer_stream(
             audio_stream(), input_stream, None
         )
         first = await asyncio.wait_for(agen.__anext__(), timeout=2)
@@ -130,7 +130,7 @@ def test_yield_carries_the_placeholder_token():
 
         input_stream: asyncio.Queue = asyncio.Queue()
         model_config = SimpleNamespace(audio_chunk_token_id=13089)
-        agen = NemotronASRForRNNT.buffer_realtime_audio(
+        agen = buffer_stream(
             audio_stream(), input_stream, model_config
         )
         prompt = await agen.__anext__()
@@ -167,6 +167,13 @@ def test_compute_logits_reads_rows_by_batch_position():
     # hands them to compute_logits — the carrier is read by ROW
     # POSITION. Permuting the rows must permute the outputs
     # identically: no hidden per-request bookkeeping.
+    # ``compute_logits`` is a method on the (now vLLM-coupled) model
+    # class, so this seam is pod/engine-covered; it skips off-engine.
+    pytest.importorskip("vllm.multimodal")
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRForRNNT,
+    )
+
     model = object.__new__(NemotronASRForRNNT)  # seam only; no __init__
     hidden = torch.zeros(3, 32, dtype=torch.float32)
     ids = torch.tensor([11, 22, 33], dtype=torch.long)

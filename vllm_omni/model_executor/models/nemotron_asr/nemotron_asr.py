@@ -21,9 +21,9 @@ actively by the replay-echo guard (PORT-DEC-005/007).
 
 from typing import Any
 
-import numpy as np
 import torch
 from torch import nn
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.convert import (
     LID_REQUIRED_PATTERN,
@@ -41,6 +41,11 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+)
+from vllm_omni.model_executor.models.nemotron_asr.processor import (
+    NemotronASRDummyInputsBuilder,
+    NemotronASRMultiModalProcessor,
+    NemotronASRProcessingInfo,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
@@ -267,15 +272,30 @@ __all__ = [
 ]
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    NemotronASRMultiModalProcessor,
+    info=NemotronASRProcessingInfo,
+    dummy_inputs=NemotronASRDummyInputsBuilder,
+)
 class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     """The engine-facing model class (α4 tests-first skeleton).
 
-    Single-stage LLM_AR omni model implementing ``SupportsRealtime``
-    (structural protocol) over ``NemotronASRCore``; registered as
-    ``Nemotron3_5AsrForRNNT`` (PORT-INT-001/002). The serving methods
-    below are the α4 seams; each raises until its code phase.
+    Single-stage LLM_AR omni model implementing ``SupportsRealtime`` and
+    ``SupportsMultiModal`` (structural protocols — the classvars below
+    are what the engine reads, so protocol inheritance is unnecessary)
+    over ``NemotronASRCore``; registered as ``Nemotron3_5AsrForRNNT``
+    (PORT-INT-001/002). The ``register_processor`` decorator is the one
+    top-level vLLM coupling that takes this file off the macOS loader
+    path (BU-c2): the pure helpers stay loader-tested, this class is
+    ruff/mypy + pod-gated (static-analysis-for-vllm-coupled-code).
     """
 
+    #: Raw-audio multimodal in (one chunk carrier per prompt); read by
+    #: ``vllm.multimodal.supports_multimodal`` via ``getattr``.
+    supports_multimodal = True
+    #: Keep the raw input ids alongside ``inputs_embeds`` — the only
+    #: chunk-vs-replay signal at forward (D-BUc-2); read at the runner.
+    requires_raw_input_tokens = True
     supports_realtime = True
     #: Secondary framework guard only — the omni realtime route reads
     #: the pipeline's explicit ``max_tokens`` (see pipeline.py); this
@@ -437,52 +457,21 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         input_stream: Any,
         model_config: Any,
     ) -> Any:
-        """Chunk client audio: one yield = one StreamingUpdate.
+        """The ``SupportsRealtime`` segmenter seam — delegates to the
+        engine-free ``buffer_stream`` (PORT-SESS-001/002/003).
 
-        Fixed segmenter built once at generator start from the
-        session's admitted chunk config (PORT-SESS-002); holds chunk
-        N+1 until the park token id for chunk N appears on
-        ``input_stream`` (buffer-until-drained, PORT-SESS-001 —
-        defense in depth over core's park-time queue consumption);
-        applies the NeMo tail rules on finalize (PORT-SESS-003:
-        partial tails as-is, sub-8-mel-frame remainders dropped,
-        never zero-padded).
+        The chunking behaviour lives in ``streaming.buffer_stream`` so it
+        stays CPU/loader-tested; this classmethod is the thin protocol
+        surface the engine calls (pod-tested).
         """
-        chunk_samples = getattr(model_config, "nemotron_chunk_samples", 8960)
-        park_id = getattr(model_config, "park_token_id", None)
-        placeholder_id = getattr(model_config, "audio_chunk_token_id", 13089)
-        # 8 mel frames * 160-sample hop: the shortest tail worth decoding.
-        min_tail_samples = 1280
+        from vllm_omni.model_executor.models.nemotron_asr.streaming import (
+            buffer_stream,
+        )
 
-        async def hold_until_park() -> None:
-            while True:
-                ids = await input_stream.get()
-                if park_id is None or park_id in ids:
-                    return
-
-        def prompt(chunk: np.ndarray) -> dict[str, Any]:
-            # TokensPrompt shape: one placeholder token per chunk
-            # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
-            # invalid on the real render path.
-            return {
-                "prompt_token_ids": [placeholder_id],
-                "multi_modal_data": {"audio": chunk},
-            }
-
-        buffer = np.zeros(0, dtype=np.float32)
-        yielded = False
-        async for frame in audio_stream:
-            buffer = np.concatenate([buffer, frame])
-            while buffer.shape[0] >= chunk_samples:
-                chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
-                if yielded:
-                    await hold_until_park()
-                yield prompt(chunk)
-                yielded = True
-        if buffer.shape[0] >= min_tail_samples:
-            if yielded:
-                await hold_until_park()
-            yield prompt(buffer)
+        async for update in buffer_stream(
+            audio_stream, input_stream, model_config
+        ):
+            yield update
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         """Stateless mel front-end → one carrier row per chunk (BU-c1).
