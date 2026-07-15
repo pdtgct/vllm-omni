@@ -87,6 +87,10 @@ def main() -> None:
         model=str(args.served_dir),
         trust_remote_code=False,
         enforce_eager=True,
+        # fp32: the FP32_BRINGUP policy the goldens were made under, and
+        # the decision carrier rides the hidden dtype (bf16 cannot hold
+        # ids > 256 integer-exact). Do not let vLLM downcast.
+        dtype="float32",
         gpu_memory_utilization=args.gpu_mem,
         max_model_len=512,
     )
