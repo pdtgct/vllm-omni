@@ -500,6 +500,10 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         audios = kwargs.get("audio")
         if audios is None:
             raise ValueError("embed_multimodal expects an 'audio' item")
+        # Raw-audio mm fields ride as np arrays, which the batched-field
+        # reducer leaves on CPU (it only h2d-moves torch tensors); move to
+        # the model device so the featurizer's on-device window/fb match.
+        device = next(self.parameters()).device
         rows = []
         for chunk in audios:
             wav = (
@@ -507,7 +511,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 if isinstance(chunk, torch.Tensor)
                 else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
             )
-            wav = wav.to(torch.float32).reshape(1, -1)
+            wav = wav.to(device=device, dtype=torch.float32).reshape(1, -1)
             mel, _ = self.core.featurizer(
                 wav, torch.tensor([wav.shape[-1]], device=wav.device)
             )
