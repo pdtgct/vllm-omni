@@ -115,13 +115,19 @@ class NemotronASRMultiModalProcessor(
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         # No HF processor: pass the raw waveform through untouched as the
-        # single ``audio`` field. The model featurizes it in
-        # ``embed_multimodal``; nothing here computes mel.
+        # ``audio`` field (the model featurizes it in ``embed_multimodal``;
+        # nothing here computes mel), and synthesise the token stream the
+        # base ``_apply_hf_processor_text_mm`` pops as ``input_ids``. The
+        # streaming prompt is one carrier placeholder per audio chunk;
+        # ``requires_raw_input_tokens`` supplies the real ids at serving,
+        # so this path only has to hold for the text/profiling render.
         audios = mm_data.get("audio", [])
         if not isinstance(audios, list):
             audios = [audios]
         arrays = [np.asarray(a, dtype=np.float32) for a in audios]
-        return BatchFeature({"audio": arrays})
+        placeholder_id = self.info.get_hf_config().audio_chunk_token_id
+        input_ids = [placeholder_id] * len(arrays)
+        return BatchFeature({"input_ids": [input_ids], "audio": arrays})
 
     def _get_mm_fields_config(
         self,
