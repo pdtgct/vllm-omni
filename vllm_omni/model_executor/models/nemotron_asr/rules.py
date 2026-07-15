@@ -13,14 +13,20 @@ buffers are inputs, never recomputed). Enforced by
 from vllm_omni.model_executor.models.nemotron_asr.convert import TensorRule
 
 NEMO_RULES: tuple[TensorRule, ...] = (
-    # Featurizer buffers (persisted in the checkpoint).
+    # Featurizer buffers (persisted in the checkpoint). NeMo wraps these
+    # in a leading singleton dim; squeeze to the port featurizer's bare
+    # (n_mels, n_freq) / (win_length,) and assert the canonical shape.
     TensorRule(
         source=r"preprocessor\.featurizer\.fb",
         target="featurizer.fb",
+        transform="squeeze",
+        expect_shape=(128, 257),
     ),
     TensorRule(
         source=r"preprocessor\.featurizer\.window",
         target="featurizer.window",
+        transform="squeeze",
+        expect_shape=(400,),
     ),
     # Subsampling + conformer layers: identity under the encoder root.
     TensorRule(

@@ -32,6 +32,11 @@ Transform = Callable[[torch.Tensor], torch.Tensor]
 TRANSFORMS: dict[str, Transform] = {
     "identity": lambda t: t,
     "transpose01": lambda t: t.transpose(0, 1).contiguous(),
+    # NeMo persists the featurizer's fb/window buffers wrapped in leading
+    # singleton dim(s); the port featurizer wants the bare (n_mels,
+    # n_freq) / (win_length,) tensors. Squeeze normalizes at conversion
+    # so the served checkpoint is canonical (paired with expect_shape).
+    "squeeze": lambda t: t.squeeze().contiguous(),
 }
 
 LID_REQUIRED_PATTERN = re.compile(r"prompt_kernel")
