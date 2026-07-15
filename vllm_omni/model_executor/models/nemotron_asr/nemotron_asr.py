@@ -518,7 +518,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             rows.append(
                 pack_audio_carrier(mel[0], hidden_size=self.config.hidden_size)
             )
-        return torch.stack(rows)
+        # SupportsMultiModal contract (sanity_check_mm_encoder_outputs): a
+        # sequence of one 2D (num_tokens, hidden_size) tensor PER audio
+        # item — each chunk is a single carrier token, so (1, hidden_size).
+        # The runner caches these per item and slices them in
+        # _gather_mm_embeddings.
+        return [row.unsqueeze(0) for row in rows]
 
     def embed_input_ids(
         self,

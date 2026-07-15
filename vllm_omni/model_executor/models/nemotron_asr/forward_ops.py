@@ -17,6 +17,8 @@ decode step (D-BU-4 / PORT-DEC-009) are read from the token id alone —
 the only signal that distinguishes single-token chunk/replay/flush rows.
 """
 
+from collections.abc import Sequence
+
 import torch
 
 #: Row roles at a scheduler step.
@@ -65,7 +67,7 @@ def unpack_audio_carrier(
 
 def merge_mm_embeddings(
     input_ids: torch.Tensor,
-    mm_embeds: torch.Tensor,
+    mm_embeds: torch.Tensor | Sequence[torch.Tensor],
     is_multimodal: torch.Tensor,
     *,
     hidden_size: int,
@@ -78,10 +80,25 @@ def merge_mm_embeddings(
     marked by ``is_multimodal``, receive ``mm_embeds`` in order.
     Returns ``(len(input_ids), hidden_size)``.
 
+    ``mm_embeds`` arrives either as one flat ``(n_mm, hidden_size)``
+    tensor or, from the runner's ``_gather_mm_embeddings``, as a
+    sequence of per-item 2D ``(num_tokens_i, hidden_size)`` tensors;
+    both normalize to ``(n_mm, hidden_size)`` carrier rows.
+
     Raises:
-        ValueError: If ``is_multimodal.sum()`` does not equal
-            ``len(mm_embeds)``.
+        ValueError: If ``is_multimodal.sum()`` does not equal the total
+            number of carrier rows.
     """
+    if isinstance(mm_embeds, torch.Tensor):
+        mm_embeds = mm_embeds.reshape(-1, hidden_size)
+    elif len(mm_embeds):
+        mm_embeds = torch.cat(
+            [e.reshape(-1, hidden_size) for e in mm_embeds], dim=0
+        )
+    else:
+        mm_embeds = torch.zeros(
+            0, hidden_size, dtype=torch.float32, device=input_ids.device
+        )
     n_mm = int(is_multimodal.sum())
     if n_mm != mm_embeds.shape[0]:
         raise ValueError(
