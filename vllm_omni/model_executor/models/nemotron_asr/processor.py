@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 from transformers import BatchFeature
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import (
@@ -127,7 +128,12 @@ class NemotronASRMultiModalProcessor(
         audios = mm_data.get("audios", [])
         if not isinstance(audios, list):
             audios = [audios]
-        arrays = [np.asarray(a, dtype=np.float32) for a in audios]
+        # torch tensors, not np arrays: the engine serializes the mm field
+        # via _encode_nested_tensors, which only handles torch tensors
+        # (it recurses into an ndarray and chokes on the scalar leaves).
+        arrays = [
+            torch.as_tensor(np.asarray(a, dtype=np.float32)) for a in audios
+        ]
         placeholder_id = self.info.get_hf_config().audio_chunk_token_id
         input_ids = [placeholder_id] * len(arrays)
         return BatchFeature({"input_ids": [input_ids], "audio": arrays})
