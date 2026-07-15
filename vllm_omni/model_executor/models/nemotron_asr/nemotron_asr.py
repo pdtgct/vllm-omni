@@ -454,7 +454,11 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 f"{len(missing)} expected weights not provided, e.g. "
                 f"{sorted(missing)[:3]}"
             )
-        return consumed
+        # Return MODEL-qualified names: the weights load into ``self.core``,
+        # so the engine's post-load audit (``track_weights_loading`` diffs
+        # against ``model.named_parameters()``) expects the ``core.`` prefix
+        # the checkpoint's core-relative names lack.
+        return {f"core.{name}" for name in consumed}
 
     @classmethod
     async def buffer_realtime_audio(
@@ -581,6 +585,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         # (one-token rows); _p is populated only by the profiling batch
         # (which took the branch above).
         meta = md[self._window_pages[0].prefix]
+        # meta is the group's ShortConvAttentionMetadata (Any off-engine).
         state_indices = meta.state_indices_tensor_d
 
         return run_forward_step(
