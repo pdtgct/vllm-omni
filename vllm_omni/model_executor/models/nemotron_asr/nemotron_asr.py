@@ -418,6 +418,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             self.core.named_parameters()
         )
         expected.update(self.core.named_buffers())
+        # Require only the PERSISTENT state (params + persistent buffers,
+        # i.e. state_dict) from the checkpoint; derived buffers registered
+        # persistent=False (e.g. the relative-position ``pos_enc.pe``, an
+        # init-computed sinusoid, never persisted by NeMo) are valid copy
+        # targets but must NOT be demanded of the checkpoint.
+        required = set(self.core.state_dict())
         consumed: set[str] = set()
         for name, tensor in weights:
             if name not in expected:
@@ -434,7 +440,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             with torch.no_grad():
                 target.copy_(tensor)
             consumed.add(name)
-        missing = set(expected) - consumed
+        missing = required - consumed
         lid_missing = sorted(
             n for n in missing if LID_REQUIRED_PATTERN.search(n)
         )
