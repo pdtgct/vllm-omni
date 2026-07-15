@@ -121,7 +121,10 @@ class NemotronASRMultiModalProcessor(
         # streaming prompt is one carrier placeholder per audio chunk;
         # ``requires_raw_input_tokens`` supplies the real ids at serving,
         # so this path only has to hold for the text/profiling render.
-        audios = mm_data.get("audio", [])
+        # AudioProcessorItems delivers the batch under the plural key
+        # ``audios`` (get_processor_data -> f"{modality}s"); the OUTPUT
+        # field stays ``audio`` (embed_multimodal + the field config key).
+        audios = mm_data.get("audios", [])
         if not isinstance(audios, list):
             audios = [audios]
         arrays = [np.asarray(a, dtype=np.float32) for a in audios]
