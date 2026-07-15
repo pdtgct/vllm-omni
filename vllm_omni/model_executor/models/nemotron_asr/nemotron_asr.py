@@ -590,12 +590,27 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 dtype=inputs_embeds.dtype, device=inputs_embeds.device,
             )
         # All four page kinds share one uniform group → one metadata
-        # object; read the state indices once. Real serving is all-decode
-        # (one-token rows); _p is populated only by the profiling batch
-        # (which took the branch above).
+        # object (ShortConvAttentionMetadata; Any off-engine). The batch
+        # is ordered decodes-then-prefills (short_conv splits
+        # [num_decode_tokens, num_prefill_tokens]); every row is a single
+        # token (replay id, or a chunk placeholder — the first chunk of a
+        # session prefills, later chunks decode), so the per-row page
+        # index is decode indices then prefill indices concatenated,
+        # aligned to ``input_ids``.
         meta = md[self._window_pages[0].prefix]
-        # meta is the group's ShortConvAttentionMetadata (Any off-engine).
-        state_indices = meta.state_indices_tensor_d
+        parts = [
+            t
+            for t in (
+                meta.state_indices_tensor_d,
+                meta.state_indices_tensor_p,
+            )
+            if t is not None and t.numel()
+        ]
+        state_indices = (
+            torch.cat(parts)
+            if parts
+            else input_ids.new_zeros(0)
+        )
 
         return run_forward_step(
             self.core, input_ids, inputs_embeds,
