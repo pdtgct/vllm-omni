@@ -142,7 +142,10 @@ def run_forward_step(
             decode_chunk_paged(
                 conditioned, core.predictor, core.joint,
                 h_pool=h_pool, c_pool=c_pool, queue_pool=queue_pool,
-                book_pool=book_pool, state_indices=torch.tensor([block]),
+                book_pool=book_pool,
+                # on the pools' device — the decode gathers with GPU
+                # emit-masks, so a CPU index tensor mismatches.
+                state_indices=torch.tensor([block], device=queue_pool.device),
             )
 
     # One replay/drain over all rows; the emitted id is the decision.
