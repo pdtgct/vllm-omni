@@ -24,10 +24,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from transformers import BatchFeature
+from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
+    MultiModalKwargsOptionalItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import (
@@ -146,7 +147,7 @@ class NemotronASRMultiModalProcessor(
         self,
         mm_items: MultiModalDataItems,
         prompt_ids: list[int],
-        mm_kwargs: MultiModalKwargsItems,
+        mm_kwargs: MultiModalKwargsOptionalItems,
         mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
