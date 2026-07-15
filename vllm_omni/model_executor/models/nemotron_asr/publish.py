@@ -42,6 +42,21 @@ _PLACEHOLDER_OFFSET = 2
 #: The measured carrier width (BU-c1: 128 × (113 stft cols + 9 overlap)
 #: + 1 frame-count slot).
 _HIDDEN_SIZE = 15617
+#: Tokenizer artifacts to copy into the served dir. A strict whitelist,
+#: NOT "every file in tokenizer_dir": the .nemo dump mixes the tokenizer
+#: with the raw-name ``nemo_state.safetensors`` + ``meta.json``, and
+#: copying those would leave a second *.safetensors that the engine's
+#: HF loader globs and feeds to ``load_weights`` under raw NeMo names.
+_TOKENIZER_FILES = frozenset({
+    "tokenizer.model",
+    "spiece.model",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "added_tokens.json",
+})
 
 
 def publish(
@@ -84,7 +99,7 @@ def publish(
     config.save_pretrained(str(out_dir))
     if tokenizer_dir is not None and tokenizer_dir.exists():
         for f in tokenizer_dir.iterdir():
-            if f.is_file():
+            if f.is_file() and f.name in _TOKENIZER_FILES:
                 shutil.copy2(f, out_dir / f.name)
 
     summary = {
