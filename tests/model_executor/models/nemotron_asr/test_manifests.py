@@ -9,30 +9,19 @@ bypassing the ``vllm_omni`` package ``__init__`` chain (which pulls
 ``vllm``, uninstallable on macOS). That is what lets this file run
 locally; every other nemotron_asr test file is pod-tier.
 
-``canonical_json``/``manifest_hash``/``CADENCES`` are real, PASSING
-tests. ``author_*`` and ``verify_state_manifest`` are tests-first
-stubs (Phase 5): calls raise ``NotImplementedError`` until Phase 6,
-which is the recorded expected-fail evidence for those cases.
+``canonical_json``/``manifest_hash`` and the canonical name/order/
+arithmetic pins are real, PASSING tests. Every ``author_*`` /
+``verify_state_manifest`` test below is BEHAVIORAL: it calls the
+function and asserts the exact intended output (or the specific
+``ValueError``). Those tests are EXPECTED TO FAIL today — the stubs
+raise ``NotImplementedError`` — and turn green in Phase 6 without
+being rewritten (the LID tests-first rule).
 
-The canonical layout below pins the DECIDED design inventory
+The canonical layout pins the DECIDED design inventory
 (PORT-STATE-001/009, ``port-design.md``'s state-page table): total
-6,314,864 bytes (~6.0223 MiB) FP32 bring-up. Current pool code totals
-6,302,368 bytes — Phase 6 owes exactly the difference before these
-tests can go green against a live model:
-
-- the frontend-continuity state page (PORT-STATE-001; no
-  ``state_layers.py`` class yet): a 1,953-sample raw audio tail
-  (fp32) + a ``(128, 9)`` mel tail (fp32) + eight int64 control
-  counters = ``1953*4 + 128*9*4 + 8*8`` = 12,484 bytes;
-- three more int32 session-book fields (the decided 7-field book —
-  admitted geometry, pending-echo flag, expected label — beyond the
-  current 4: ``rnnt.QUEUE_HEAD/QUEUE_LEN/QUEUE_LAST_LABEL/
-  QUEUE_PROMPT``): ``3 * 4`` = 12 bytes;
-- dtype alignment: the valid-length scalar, queue, and book are
-  int32 in the design manifest (byte-identical to today's
-  float-pool storage, so only naming, not size, changes).
-
-``12,484 + 12 == 12,496``; ``6,302,368 + 12,496 == 6,314,864``.
+6,314,864 bytes (~6.0223 MiB) FP32 bring-up =
+6,291,552 (24-layer window/conv/valid) + 12,484 (frontend page)
++ 10,240 (predictor h/c) + 560 (queue) + 28 (7-slot book).
 """
 
 from __future__ import annotations
@@ -65,48 +54,51 @@ def _load_manifests() -> Any:
 
 manifests = _load_manifests()
 
-# ---- the DESIGN canonical FP32 bring-up layout ----------------------------
-#
-# Geometry from the fork's live pool construction, extended by the
-# decided design inventory (port-design.md state-page table):
-#   - encoder.py FastConformerEncoder(n_layers=24) (nemotron_asr.py's
-#     NemotronASRCore default and state_layers.py's n_layers source);
-#   - configuration_nemotron_asr.py: d_model=1024, conv_kernel=9,
-#     att_context_left=56, pred_hidden=640, pred_rnn_layers=2;
-#   - rnnt.py: MAX_SYMBOLS_PER_STEP=10;
-#   - nemotron_asr.py: _MAX_FRAMES_PER_CHUNK=14 → queue capacity
-#     10*14=140 (ReplayQueuePage);
-#   - the DESIGN 7-slot session book (head, len, last label, prompt,
-#     admitted geometry, pending-echo flag, expected label);
-#   - the frontend-continuity page: raw tail capacity
-#     pre_encode_cache(9) × hop(160) + n_fft(512) + 1 = 1,953 samples,
-#     a (128, 9) mel tail, eight int64 control counters.
-_N_LAYERS = 24
-_WINDOW = 56
-_D_MODEL = 1024
-_CONV_TAIL = 8  # conv_kernel(9) - 1
-_PRED_LAYERS = 2
-_PRED_HIDDEN = 640
-_QUEUE_CAPACITY = 140  # MAX_SYMBOLS_PER_STEP(10) * _MAX_FRAMES_PER_CHUNK(14)
-_BOOK_WIDTH = 7  # design book: 4 current fields + geometry/echo/expected
-_RAW_TAIL = 1953  # pre_encode_cache(9) * hop(160) + n_fft(512) + 1
-_MEL_TAIL = (128, 9)
-_FRONTEND_COUNTERS = 8  # int64
-_FP32 = 4  # bytes
+
+def _checkpoint_config() -> Any:
+    """The published checkpoint's geometry, as the authors consume it."""
+    return types.SimpleNamespace(
+        n_layers=24,
+        att_context_left=56,
+        d_model=1024,
+        conv_kernel=9,
+        pred_rnn_layers=2,
+        pred_hidden=640,
+        n_mels=128,
+        hidden_size=17_926,  # >= 6 header slots + 17,920 raw samples
+    )
 
 
-def _canonical_entries() -> list[dict[str, Any]]:
+def _tiny_config() -> Any:
+    """A deliberately different geometry — proves the authors derive
+    from ``config`` rather than hardcoding the checkpoint."""
+    return types.SimpleNamespace(
+        n_layers=2,
+        att_context_left=8,
+        d_model=32,
+        conv_kernel=5,
+        pred_rnn_layers=2,
+        pred_hidden=16,
+        n_mels=16,
+        hidden_size=17_926,
+    )
+
+
+def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
+    """The exact ``author_state_manifest`` entry list for ``cfg`` —
+    written out independently here so the author test is behavioral,
+    not a shared-helper tautology."""
     entries: list[dict[str, Any]] = []
-    for i in range(_N_LAYERS):
+    for i in range(cfg.n_layers):
         entries.append({
             "name": f"encoder.layers.{i}.window.channel",
-            "shape": [_WINDOW, _D_MODEL],
+            "shape": [cfg.att_context_left, cfg.d_model],
             "dtype": "float32",
             "init": "zeros",
         })
         entries.append({
             "name": f"encoder.layers.{i}.conv.time",
-            "shape": [_D_MODEL, _CONV_TAIL],
+            "shape": [cfg.d_model, cfg.conv_kernel - 1],
             "dtype": "float32",
             "init": "zeros",
         })
@@ -118,46 +110,60 @@ def _canonical_entries() -> list[dict[str, Any]]:
         })
     entries.append({
         "name": "frontend.raw_tail",
-        "shape": [_RAW_TAIL],
+        "shape": [1953],
         "dtype": "float32",
         "init": "zeros",
     })
     entries.append({
         "name": "frontend.mel_tail",
-        "shape": list(_MEL_TAIL),
+        "shape": [cfg.n_mels, 9],
         "dtype": "float32",
         "init": "zeros",
     })
-    entries.append({
-        "name": "frontend.counters",
-        "shape": [_FRONTEND_COUNTERS],
-        "dtype": "int64",
-        "init": "zeros",
-    })
-    entries.append({
-        "name": "predictor.layers.0.lstm_state.h",
-        "shape": [_PRED_LAYERS, _PRED_HIDDEN],
-        "dtype": "float32",
-        "init": "zeros",
-    })
-    entries.append({
-        "name": "predictor.layers.0.lstm_state.c",
-        "shape": [_PRED_LAYERS, _PRED_HIDDEN],
-        "dtype": "float32",
-        "init": "zeros",
-    })
+    for counter in (
+        "total_valid_samples",
+        "committed_mel_frames",
+        "encoded_mel_frames",
+        "raw_tail_origin",
+        "raw_tail_length",
+        "mel_tail_length",
+        "expected_chunk_sequence",
+        "finalized",
+    ):
+        entries.append({
+            "name": f"frontend.counters.{counter}",
+            "shape": [1],
+            "dtype": "int64",
+            "init": "zeros",
+        })
+    for tensor in ("h", "c"):
+        entries.append({
+            "name": f"predictor.layers.0.lstm_state.{tensor}",
+            "shape": [cfg.pred_rnn_layers, cfg.pred_hidden],
+            "dtype": "float32",
+            "init": "zeros",
+        })
     entries.append({
         "name": "decode.layers.0.replay.queue",
-        "shape": [_QUEUE_CAPACITY],
+        "shape": [140],
         "dtype": "int32",
         "init": "zeros",
     })
-    entries.append({
-        "name": "decode.layers.0.replay.book",
-        "shape": [_BOOK_WIDTH],
-        "dtype": "int32",
-        "init": "blank_label",
-    })
+    for name, init in (
+        ("queue_head", "zeros"),
+        ("queue_length", "zeros"),
+        ("last_label", "blank_label"),
+        ("prompt", "admitted_prompt"),
+        ("geometry", "admitted_geometry"),
+        ("pending_echo", "zeros"),
+        ("expected_label", "zeros"),
+    ):
+        entries.append({
+            "name": f"decode.layers.0.replay.book.{name}",
+            "shape": [1],
+            "dtype": "int32",
+            "init": init,
+        })
     return entries
 
 
@@ -172,57 +178,119 @@ def _entry_bytes(entry: dict[str, Any]) -> int:
     return n * size
 
 
-def _canonical_total_page_bytes() -> int:
-    return sum(_entry_bytes(e) for e in _canonical_entries())
-
-
-def _canonical_state_manifest() -> dict[str, Any]:
+def _expected_state_manifest(cfg: Any) -> dict[str, Any]:
+    entries = _expected_entries(cfg)
     return {
         "schema": "state-manifest-v1",
-        "entries": _canonical_entries(),
-        "total_page_bytes": _canonical_total_page_bytes(),
+        "precision_policy": "fp32-bringup-v1",
+        "entries": entries,
+        "total_page_bytes": sum(_entry_bytes(e) for e in entries),
     }
+
+
+def _specs_from_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The live registered-page inventory matching ``entries`` — the
+    ``verify_state_manifest`` comparison target (no ``init``: the
+    engine's specs carry name/shape/dtype only)."""
+    return [
+        {"name": e["name"], "shape": list(e["shape"]), "dtype": e["dtype"]}
+        for e in entries
+    ]
+
+
+# ---- canonical name/order/arithmetic pins: real, PASSING ------------------
+
+
+def test_book_fields_are_the_seven_decided_slots_in_order() -> None:
+    # @spec PORT-STATE-001
+    # First four slots must keep rnnt.py's pinned queue-book order.
+    assert manifests.BOOK_FIELDS == (
+        ("queue_head", "zeros"),
+        ("queue_length", "zeros"),
+        ("last_label", "blank_label"),
+        ("prompt", "admitted_prompt"),
+        ("geometry", "admitted_geometry"),
+        ("pending_echo", "zeros"),
+        ("expected_label", "zeros"),
+    )
+
+
+def test_frontend_counters_are_the_eight_decided_slots_in_order() -> None:
+    # @spec PORT-STATE-001
+    assert manifests.FRONTEND_COUNTER_FIELDS == (
+        "total_valid_samples",
+        "committed_mel_frames",
+        "encoded_mel_frames",
+        "raw_tail_origin",
+        "raw_tail_length",
+        "mel_tail_length",
+        "expected_chunk_sequence",
+        "finalized",
+    )
+
+
+def test_envelope_header_fields_are_the_six_decided_slots_in_order() -> None:
+    # @spec PORT-REGIME-001
+    assert manifests.ENVELOPE_HEADER_FIELDS == (
+        "version",
+        "valid_samples",
+        "geometry_id",
+        "final_tail",
+        "prompt_index",
+        "chunk_sequence",
+    )
+
+
+def test_frontend_constants_pin_the_checkpoint_featurizer() -> None:
+    # @spec PORT-STATE-009
+    fc = manifests.FRONTEND_CONSTANTS
+    assert fc["sample_rate"] == 16_000
+    assert fc["n_fft"] == 512
+    assert fc["win_length"] == 400
+    assert fc["hop_length"] == 160
+    assert fc["n_mels"] == 128
+    assert fc["pre_encode_cache_frames"] == 9
+    assert fc["subsampling_factor"] == 8
+    # The raw-tail bound honors its own published formula.
+    assert fc["raw_tail_capacity"] == 9 * 160 + 512 + 1 == 1953
+    assert fc["final_tail_min_new_mel_frames"] == 8
+
+
+def test_session_limits_are_fp32_representable() -> None:
+    # @spec PORT-REGIME-001
+    # Every envelope header integer must be exact in FP32.
+    limits = manifests.SESSION_LIMITS
+    assert limits["max_session_chunks"] == 2**24 - 1
+    assert limits["queue_capacity"] == (
+        limits["max_symbols_per_step"] * limits["max_frames_per_chunk"]
+    )
 
 
 def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
     # @spec PORT-STATE-009
     # Per-layer: channel (56*1024*4=229376) + time (1024*8*4=32768) +
     # valid (1*4=4) = 262148 bytes/layer; * 24 layers = 6,291,552.
-    per_layer = _WINDOW * _D_MODEL * _FP32 + _D_MODEL * _CONV_TAIL * _FP32 + _FP32
+    per_layer = 56 * 1024 * 4 + 1024 * 8 * 4 + 4
     assert per_layer == 262_148
-    window_and_conv_total = per_layer * _N_LAYERS
-    assert window_and_conv_total == 6_291_552
-
-    # Predictor h/c: 2*640*4 = 5120 bytes each; two tensors = 10,240.
-    predictor_total = 2 * (_PRED_LAYERS * _PRED_HIDDEN * _FP32)
-    assert predictor_total == 10_240
-
-    # Emission queue: 140*4 = 560; the DESIGN 7-slot book: 7*4 = 28.
-    queue_total = _QUEUE_CAPACITY * 4
-    book_total = _BOOK_WIDTH * 4
-    assert queue_total == 560
-    assert book_total == 28
-
-    # Frontend continuity: 1953*4 + 128*9*4 + 8*8 = 12,484.
-    frontend_total = (
-        _RAW_TAIL * _FP32
-        + _MEL_TAIL[0] * _MEL_TAIL[1] * _FP32
-        + _FRONTEND_COUNTERS * 8
-    )
-    assert frontend_total == 12_484
-
-    total = (
-        window_and_conv_total
-        + predictor_total
-        + queue_total
-        + book_total
-        + frontend_total
-    )
-    # The PORT-STATE-009 / A8-decided FP32 bring-up pin (port-design.md
-    # state-page table). Current pool code totals 6,302,368 — Phase 6
-    # owes the frontend page + 3 book slots (module docstring).
+    assert per_layer * 24 == 6_291_552
+    # Frontend: 1953*4 + 128*9*4 + 8 counters * 8 bytes = 12,484.
+    assert 1953 * 4 + 128 * 9 * 4 + 8 * 8 == 12_484
+    # Predictor h/c: 2 * (2*640*4) = 10,240; queue 140*4 = 560;
+    # 7-slot int32 book = 28.
+    total = 6_291_552 + 12_484 + 10_240 + 560 + 28
+    # The PORT-STATE-009 / A8-decided FP32 bring-up pin.
     assert total == 6_314_864
-    assert total == _canonical_total_page_bytes()
+    entries = _expected_entries(_checkpoint_config())
+    assert sum(_entry_bytes(e) for e in entries) == 6_314_864
+
+
+def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
+    # @spec PORT-REGIME-001
+    needed = len(manifests.ENVELOPE_HEADER_FIELDS) + max(
+        manifests.RAW_SAMPLES_PER_CHUNK.values()
+    )
+    assert needed == 17_926
+    assert _checkpoint_config().hidden_size >= needed
 
 
 # ---- canonical_json / manifest_hash: real, PASSING helpers ----------------
@@ -255,9 +323,6 @@ def test_manifest_hash_is_deterministic_and_content_sensitive() -> None:
     assert h1 != h3
 
 
-# ---- five-cadence completeness: local-pass ---------------------------------
-
-
 def test_cadences_are_the_five_published_pairs_exactly() -> None:
     assert manifests.CADENCES == {
         "80ms": (56, 0),
@@ -268,122 +333,227 @@ def test_cadences_are_the_five_published_pairs_exactly() -> None:
     }
 
 
-# ---- PORT-WGT-004: author_* stubs (expected-fail evidence) -----------------
+# ---- PORT-WGT-004: authors produce their exact manifests ------------------
+# BEHAVIORAL, red until Phase 6: the stubs raise NotImplementedError.
 
 
-@pytest.mark.parametrize(
-    "fn_name",
-    [
-        "author_state_manifest",
-        "author_geometry_manifest",
-        "author_transition_manifest",
-        "author_emission_manifest",
-    ],
-)
-def test_author_functions_pin_their_schema_and_fail_until_phase_6(
-    fn_name: str,
-) -> None:
+def test_author_state_manifest_produces_the_exact_canonical_layout() -> None:
     # @spec PORT-WGT-004
-    fn = getattr(manifests, fn_name)
-    config = types.SimpleNamespace()
-    with pytest.raises(NotImplementedError):
-        fn(config)
+    authored = manifests.author_state_manifest(_checkpoint_config())
+    expected = _expected_state_manifest(_checkpoint_config())
+    assert authored == expected
+    assert authored["total_page_bytes"] == 6_314_864
 
 
-# ---- PORT-STATE-009: verify_state_manifest stub ----------------------------
-
-
-def test_verify_state_manifest_accepts_the_canonical_layout_stub() -> None:
-    # @spec PORT-STATE-009
-    # Written against the real accept contract; fails NotImplementedError
-    # on the stub until Phase 6 (expected-fail evidence) — see the module
-    # docstring for why this canonical layout's total is 6,302,368, not
-    # the final 6,314,864 pin.
-    with pytest.raises(NotImplementedError):
-        manifests.verify_state_manifest(
-            _canonical_state_manifest(),
-            n_layers=_N_LAYERS,
-            window=_WINDOW,
-            feat=128,
-            hidden=_D_MODEL,
-            queue_capacity=_QUEUE_CAPACITY,
-            dtype="float32",
-        )
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda m: m["entries"].pop(),  # missing entry
-        lambda m: m["entries"].__setitem__(
-            0, {**m["entries"][0], "shape": [1, 1]}
-        ),  # wrong shape
-        lambda m: m["entries"].__setitem__(
-            0, {**m["entries"][0], "dtype": "float16"}
-        ),  # wrong dtype
-        lambda m: m.__setitem__("total_page_bytes", 1),  # wrong total
-    ],
-    ids=["missing_entry", "wrong_shape", "wrong_dtype", "wrong_total_bytes"],
-)
-def test_verify_state_manifest_rejects_each_defect_class(
-    mutate: Any,
-) -> None:
-    # @spec PORT-STATE-009
-    manifest = _canonical_state_manifest()
-    mutate(manifest)
-    # Phase 6: each defect raises ValueError naming the offending
-    # entry/field. Today the stub raises NotImplementedError first —
-    # expected-fail evidence, not a claim that ValueError is observed.
-    with pytest.raises(NotImplementedError):
-        manifests.verify_state_manifest(
-            manifest,
-            n_layers=_N_LAYERS,
-            window=_WINDOW,
-            feat=128,
-            hidden=_D_MODEL,
-            queue_capacity=_QUEUE_CAPACITY,
-            dtype="float32",
-        )
-
-
-# ---- PORT-INT-005: checkpoint-profile content-hash recomputation ----------
-
-
-def test_checkpoint_profile_content_hash_recomputation_matches() -> None:
-    # @spec PORT-INT-005
-    # Exercises manifest_hash/canonical_json directly (both real, not
-    # stubs) — author_checkpoint_profile itself is a Phase-5 stub, but
-    # the recomputation property it must satisfy is checkable now.
-    profile_body = {
-        "schema": "checkpoint-profile-v1",
-        "id": "cp-nemotron-3.5-asr-streaming-0.6b",
-        "state_manifest_hash": "sha256:" + "1" * 64,
-        "geometry_manifest_hash": "sha256:" + "2" * 64,
-        "transition_manifest_hash": "sha256:" + "3" * 64,
-        "emission_manifest_hash": "sha256:" + "4" * 64,
-    }
-    recomputed = manifests.manifest_hash(profile_body)
-    assert recomputed == manifests.manifest_hash(dict(profile_body))
-
-
-def test_checkpoint_profile_content_hash_is_sensitive_to_each_manifest_hash() -> (
+def test_author_state_manifest_derives_from_config_not_the_checkpoint() -> (
     None
 ):
+    # @spec PORT-WGT-004
+    authored = manifests.author_state_manifest(_tiny_config())
+    assert authored == _expected_state_manifest(_tiny_config())
+
+
+def test_author_geometry_manifest_produces_the_exact_manifest() -> None:
+    # @spec PORT-WGT-004
+    authored = manifests.author_geometry_manifest(_checkpoint_config())
+    assert authored == {
+        "schema": "geometry-manifest-v1",
+        "cadences": {
+            "80ms": {
+                "att_context": [56, 0],
+                "frames_per_chunk": 1,
+                "raw_samples_per_chunk": 1_280,
+            },
+            "160ms": {
+                "att_context": [56, 1],
+                "frames_per_chunk": 2,
+                "raw_samples_per_chunk": 2_560,
+            },
+            "320ms": {
+                "att_context": [56, 3],
+                "frames_per_chunk": 4,
+                "raw_samples_per_chunk": 5_120,
+            },
+            "560ms": {
+                "att_context": [56, 6],
+                "frames_per_chunk": 7,
+                "raw_samples_per_chunk": 8_960,
+            },
+            "1120ms": {
+                "att_context": [56, 13],
+                "frames_per_chunk": 14,
+                "raw_samples_per_chunk": 17_920,
+            },
+        },
+        "envelope": {
+            "version": 1,
+            "header_fields": [
+                "version",
+                "valid_samples",
+                "geometry_id",
+                "final_tail",
+                "prompt_index",
+                "chunk_sequence",
+            ],
+        },
+        "carrier_width": 17_926,
+        "frontend": manifests.FRONTEND_CONSTANTS,
+    }
+
+
+def test_author_geometry_manifest_rejects_a_narrow_carrier() -> None:
+    # @spec PORT-WGT-004
+    cfg = _checkpoint_config()
+    cfg.hidden_size = 17_925  # one short of header + largest cadence
+    with pytest.raises(ValueError, match="carrier_width|hidden_size"):
+        manifests.author_geometry_manifest(cfg)
+
+
+def test_author_transition_manifest_produces_the_exact_manifest() -> None:
+    # @spec PORT-WGT-004
+    authored = manifests.author_transition_manifest(_checkpoint_config())
+    assert authored == {
+        "schema": "transition-manifest-v1",
+        "transition": "advance_session-v1",
+        "roles": ["CHUNK", "REPLAY", "FLUSH"],
+        "chunk_roles_entering_transition": ["CHUNK"],
+        "session_first_init": "metadata-books-zero-scratch",
+        "encode_overlap": "pre-encode-cache-on-non-first-chunks",
+        "final_tail": "actual-residual-final-stft",
+        "echo_policy": "mrv1-echo-verify",
+    }
+
+
+def test_author_emission_manifest_produces_the_exact_manifest() -> None:
+    # @spec PORT-WGT-004 / PORT-INT-002
+    authored = manifests.author_emission_manifest(_checkpoint_config())
+    per_geometry = {
+        label: {
+            "max_valid_encoder_frames": right + 1,
+            "max_symbols_per_step": 10,
+            "max_emission_tokens": (right + 1) * 10 + 1,
+        }
+        for label, (_, right) in manifests.CADENCES.items()
+    }
+    assert authored == {
+        "schema": "emission-manifest-v1",
+        "limits": manifests.SESSION_LIMITS,
+        "per_geometry": per_geometry,
+    }
+    # Spot-check the budget formula's + 1 park slot at both extremes.
+    assert authored["per_geometry"]["80ms"]["max_emission_tokens"] == 11
+    assert authored["per_geometry"]["1120ms"]["max_emission_tokens"] == 141
+
+
+# ---- PORT-INT-005: checkpoint profile -------------------------------------
+
+
+def _four_hashes() -> dict[str, str]:
+    return {
+        "state": "sha256:" + "1" * 64,
+        "geometry": "sha256:" + "2" * 64,
+        "transition": "sha256:" + "3" * 64,
+        "emission": "sha256:" + "4" * 64,
+    }
+
+
+def test_author_checkpoint_profile_produces_the_exact_profile() -> None:
     # @spec PORT-INT-005
-    base = {
+    profile = manifests.author_checkpoint_profile(_four_hashes())
+    body = {
         "schema": "checkpoint-profile-v1",
         "id": "cp-nemotron-3.5-asr-streaming-0.6b",
+        "precision_policy": "fp32-bringup-v1",
+        "limits": manifests.SESSION_LIMITS,
         "state_manifest_hash": "sha256:" + "1" * 64,
         "geometry_manifest_hash": "sha256:" + "2" * 64,
         "transition_manifest_hash": "sha256:" + "3" * 64,
         "emission_manifest_hash": "sha256:" + "4" * 64,
     }
-    base_hash = manifests.manifest_hash(base)
-    for key in (
-        "state_manifest_hash",
-        "geometry_manifest_hash",
-        "transition_manifest_hash",
-        "emission_manifest_hash",
-    ):
-        changed = dict(base, **{key: "sha256:" + "9" * 64})
-        assert manifests.manifest_hash(changed) != base_hash
+    assert profile == dict(body, content_hash=manifests.manifest_hash(body))
+
+
+def test_author_checkpoint_profile_content_hash_recomputes() -> None:
+    # @spec PORT-INT-005
+    # The recomputation rule: strip content_hash, rehash, get it back.
+    profile = manifests.author_checkpoint_profile(_four_hashes())
+    body = {k: v for k, v in profile.items() if k != "content_hash"}
+    assert manifests.manifest_hash(body) == profile["content_hash"]
+
+
+def test_author_checkpoint_profile_rejects_a_missing_manifest_key() -> None:
+    # @spec PORT-INT-005
+    hashes = _four_hashes()
+    del hashes["transition"]
+    with pytest.raises(ValueError, match="transition"):
+        manifests.author_checkpoint_profile(hashes)
+
+
+def test_author_checkpoint_profile_rejects_a_malformed_hash() -> None:
+    # @spec PORT-INT-005
+    hashes = _four_hashes()
+    hashes["state"] = "md5:" + "1" * 32
+    with pytest.raises(ValueError, match="state"):
+        manifests.author_checkpoint_profile(hashes)
+
+
+# ---- PORT-STATE-009: verify_state_manifest --------------------------------
+# BEHAVIORAL, red until Phase 6.
+
+
+def test_verify_state_manifest_accepts_matching_registered_specs() -> None:
+    # @spec PORT-STATE-009
+    manifest = _expected_state_manifest(_checkpoint_config())
+    specs = _specs_from_entries(manifest["entries"])
+    assert manifests.verify_state_manifest(manifest, specs) is None
+
+
+@pytest.mark.parametrize(
+    ("mutate", "names_the_defect"),
+    [
+        (
+            lambda m, s: m["entries"].pop(),
+            "decode.layers.0.replay.book.expected_label",
+        ),
+        (
+            lambda m, s: m["entries"][0].__setitem__("shape", [1, 1]),
+            "encoder.layers.0.window.channel",
+        ),
+        (
+            lambda m, s: m["entries"][0].__setitem__("dtype", "float16"),
+            "encoder.layers.0.window.channel",
+        ),
+        (
+            lambda m, s: m["entries"][-1].__setitem__("init", "banana"),
+            "init",
+        ),
+        (
+            lambda m, s: m.__setitem__("total_page_bytes", 1),
+            "total_page_bytes",
+        ),
+        (
+            lambda m, s: s[3].__setitem__("shape", [2, 2]),
+            "encoder.layers.1.window.channel",
+        ),
+    ],
+    ids=[
+        "missing_entry",
+        "wrong_shape",
+        "wrong_dtype",
+        "unknown_init",
+        "wrong_total_bytes",
+        "live_spec_disagrees",
+    ],
+)
+def test_verify_state_manifest_names_each_defect(
+    mutate: Any, names_the_defect: str
+) -> None:
+    # @spec PORT-STATE-009
+    # Each defect raises ValueError NAMING the first offending
+    # entry/field — canonical and corrupted inputs must never receive
+    # indistinguishable treatment.
+    manifest = _expected_state_manifest(_checkpoint_config())
+    specs = _specs_from_entries(manifest["entries"])
+    mutate(manifest, specs)
+    with pytest.raises(ValueError, match=names_the_defect):
+        manifests.verify_state_manifest(manifest, specs)

@@ -16,7 +16,6 @@ two-stage config pass runs the same hooks on the CPU platform
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
