@@ -14,7 +14,7 @@ Usage:
     /opt/venv-port/bin/python p2_parity_probe.py \
         --dump /workspace/weights/nemo-dump \
         --clip /workspace/datasets/clips/en-US_sample.wav \
-        --golden-set /workspace/goldens/<matrix>/en-US_sample/full-context \
+        --golden-set /workspace/goldens/<matrix>/en-US_sample/1120ms \
         --target-lang en-US [--device cuda]
 """
 

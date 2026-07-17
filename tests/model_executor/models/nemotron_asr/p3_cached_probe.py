@@ -47,8 +47,11 @@ def main() -> None:
     device = torch.device(args.device)
 
     manifest = json.loads((args.golden_set / "manifest.json").read_text())
-    att_context = tuple(manifest["att_context_size"])
+    att_context = tuple(manifest["workload_fingerprint"]["att_context_size"])
     lookahead = att_context[1]
+    # New-schema goldens append one synthetic zero-work final-tail entry
+    # (repeats the last hypothesis); zip below ignores it until the
+    # Phase-5 final-tail transition produces the matching port entry.
     golden_partials = manifest["partial_transcripts"]
     n_chunks = len(golden_partials)
 

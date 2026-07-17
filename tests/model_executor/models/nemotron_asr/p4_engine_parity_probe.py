@@ -51,7 +51,10 @@ def main() -> None:
     args = ap.parse_args()
 
     manifest = json.loads((args.golden_set / "manifest.json").read_text())
-    att_context = tuple(manifest["att_context_size"])
+    # Five-cadence golden schema: cell workload identity is nested
+    # (harness EVAL-GOLD-004); pre-P5-0 six-cell matrices are not
+    # valid evidence and are deliberately unreadable here.
+    att_context = tuple(manifest["workload_fingerprint"]["att_context_size"])
     lookahead = int(att_context[1])
     frames_per_chunk = lookahead + 1
     chunk_samples = frames_per_chunk * _SAMPLES_PER_ENC_FRAME
