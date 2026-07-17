@@ -33,7 +33,25 @@ from vllm_omni.model_executor.models.nemotron_asr.convert import (
     author_config,
     convert_state_dict,
 )
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    author_checkpoint_profile,
+    author_emission_manifest,
+    author_geometry_manifest,
+    author_state_manifest,
+    author_transition_manifest,
+    canonical_json,
+    manifest_hash,
+)
 from vllm_omni.model_executor.models.nemotron_asr.rules import NEMO_RULES
+
+#: (attribute name, output filename) for the four checkpoint-derived
+#: manifests (PORT-WGT-004) written alongside config.json.
+_MANIFEST_FILES = (
+    ("state", "state-manifest.json"),
+    ("geometry", "geometry-manifest.json"),
+    ("transition", "transition-manifest.json"),
+    ("emission", "emission-manifest.json"),
+)
 
 #: Minted engine specials, strictly past blank (= V): park = V+1,
 #: placeholder = V+2 (author_config enforces > V and distinctness).
@@ -102,6 +120,29 @@ def publish(
             if f.is_file() and f.name in _TOKENIZER_FILES:
                 shutil.copy2(f, out_dir / f.name)
 
+    # Author the four checkpoint-derived manifests (PORT-WGT-004) and
+    # the checkpoint profile naming their hashes (PORT-INT-005). The
+    # author_* calls are tests-first stubs at this Phase-5 slice (see
+    # manifests.py) — they raise NotImplementedError until Phase 6;
+    # this plumbing is pinned by tests that observe that failure on
+    # the pod, not by a passing publish() run.
+    manifest_authors = {
+        "state": author_state_manifest,
+        "geometry": author_geometry_manifest,
+        "transition": author_transition_manifest,
+        "emission": author_emission_manifest,
+    }
+    manifest_hashes: dict[str, str] = {}
+    for key, filename in _MANIFEST_FILES:
+        authored = manifest_authors[key](config)
+        (out_dir / filename).write_text(canonical_json(authored) + "\n")
+        manifest_hashes[key] = manifest_hash(authored)
+
+    profile = author_checkpoint_profile(manifest_hashes)
+    (out_dir / "checkpoint-profile.json").write_text(
+        canonical_json(profile) + "\n"
+    )
+
     summary = {
         "derived_V": v,
         "vocab_size": cfg_dict["vocab_size"],
@@ -111,6 +152,12 @@ def publish(
         "architectures": cfg_dict["architectures"],
         "tensors_consumed": len(report.consumed),
         "out_dir": str(out_dir),
+        "checkpoint_profile_id": profile["id"],
+        "state_manifest_hash": manifest_hashes["state"],
+        "geometry_manifest_hash": manifest_hashes["geometry"],
+        "transition_manifest_hash": manifest_hashes["transition"],
+        "emission_manifest_hash": manifest_hashes["emission"],
+        "checkpoint_profile_content_hash": profile["content_hash"],
     }
     (out_dir / "publish_summary.json").write_text(json.dumps(summary, indent=2))
     return summary
