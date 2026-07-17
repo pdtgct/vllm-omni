@@ -43,6 +43,9 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     manifest_hash,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rules import NEMO_RULES
+from vllm_omni.model_executor.models.nemotron_asr.staging import (
+    atomic_publish_dir,
+)
 
 #: (attribute name, output filename) for the four checkpoint-derived
 #: manifests (PORT-WGT-004) written alongside config.json.
@@ -57,9 +60,11 @@ _MANIFEST_FILES = (
 #: placeholder = V+2 (author_config enforces > V and distinctness).
 _PARK_OFFSET = 1
 _PLACEHOLDER_OFFSET = 2
-#: The measured carrier width (BU-c1: 128 × (113 stft cols + 9 overlap)
-#: + 1 frame-count slot).
-_HIDDEN_SIZE = 15617
+#: The chunk-envelope carrier width: six header slots + the largest
+#: admitted raw cadence (1120 ms at 16 kHz = 17,920 samples). Derived,
+#: not measured — author_geometry_manifest re-validates it (supersedes
+#: the BU-c1 mel-carrier width 15,617; PORT-REGIME-001 raw envelope).
+_HIDDEN_SIZE = 17_926
 #: Tokenizer artifacts to copy into the served dir. A strict whitelist,
 #: NOT "every file in tokenizer_dir": the .nemo dump mixes the tokenizer
 #: with the raw-name ``nemo_state.safetensors`` + ``meta.json``, and
@@ -109,39 +114,40 @@ def publish(
         audio_chunk_token_id=cfg_dict["audio_chunk_token_id"],
     )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    save_file(
-        {k: t.contiguous() for k, t in converted.items()},
-        str(out_dir / "model.safetensors"),
-    )
-    config.save_pretrained(str(out_dir))
-    if tokenizer_dir is not None and tokenizer_dir.exists():
-        for f in tokenizer_dir.iterdir():
-            if f.is_file() and f.name in _TOKENIZER_FILES:
-                shutil.copy2(f, out_dir / f.name)
-
-    # Author the four checkpoint-derived manifests (PORT-WGT-004) and
-    # the checkpoint profile naming their hashes (PORT-INT-005). The
-    # author_* calls are tests-first stubs at this Phase-5 slice (see
-    # manifests.py) — they raise NotImplementedError until Phase 6;
-    # this plumbing is pinned by tests that observe that failure on
-    # the pod, not by a passing publish() run.
+    # Author and validate EVERYTHING before touching the filesystem
+    # (PORT-WGT-004 / PORT-INT-005): a failing author must not damage
+    # an existing artifact or leave a plausible-looking partial one.
     manifest_authors = {
         "state": author_state_manifest,
         "geometry": author_geometry_manifest,
         "transition": author_transition_manifest,
         "emission": author_emission_manifest,
     }
+    authored_manifests: dict[str, dict] = {}
     manifest_hashes: dict[str, str] = {}
-    for key, filename in _MANIFEST_FILES:
+    for key, _filename in _MANIFEST_FILES:
         authored = manifest_authors[key](config)
-        (out_dir / filename).write_text(canonical_json(authored) + "\n")
+        authored_manifests[key] = authored
         manifest_hashes[key] = manifest_hash(authored)
-
     profile = author_checkpoint_profile(manifest_hashes)
-    (out_dir / "checkpoint-profile.json").write_text(
-        canonical_json(profile) + "\n"
-    )
+
+    def _build(staging_dir: Path) -> None:
+        save_file(
+            {k: t.contiguous() for k, t in converted.items()},
+            str(staging_dir / "model.safetensors"),
+        )
+        config.save_pretrained(str(staging_dir))
+        if tokenizer_dir is not None and tokenizer_dir.exists():
+            for f in tokenizer_dir.iterdir():
+                if f.is_file() and f.name in _TOKENIZER_FILES:
+                    shutil.copy2(f, staging_dir / f.name)
+        for key, filename in _MANIFEST_FILES:
+            (staging_dir / filename).write_text(
+                canonical_json(authored_manifests[key]) + "\n"
+            )
+        (staging_dir / "checkpoint-profile.json").write_text(
+            canonical_json(profile) + "\n"
+        )
 
     summary = {
         "derived_V": v,
@@ -159,7 +165,14 @@ def publish(
         "emission_manifest_hash": manifest_hashes["emission"],
         "checkpoint_profile_content_hash": profile["content_hash"],
     }
-    (out_dir / "publish_summary.json").write_text(json.dumps(summary, indent=2))
+
+    def _build_with_summary(staging_dir: Path) -> None:
+        _build(staging_dir)
+        (staging_dir / "publish_summary.json").write_text(
+            json.dumps(summary, indent=2)
+        )
+
+    atomic_publish_dir(out_dir, _build_with_summary)
     return summary
 
 

@@ -18,16 +18,14 @@ formulas — ``advance.py``'s torch-side slot constants and the Phase-6
 STDLIB ONLY — no ``torch``, no ``vllm_omni`` package import. This is
 what lets ``test_manifests.py`` load this module by file path and run
 locally on macOS, unlike the rest of the port (contrast
-``test_advance.py``, which is pod-tier). ``author_*`` and
-``verify_state_manifest`` are tests-first stubs (Phase 5): they raise
-``NotImplementedError``; the behavioral tests that call them and
-assert their exact outputs are EXPECTED TO FAIL until Phase 6.
+``test_advance.py``, which is pod-tier).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 #: The five published att-context (left, right) pairs, by nominal
@@ -152,6 +150,21 @@ def manifest_hash(obj: Any) -> str:
     return f"sha256:{digest}"
 
 
+_DTYPE_BYTES = {"float32": 4, "int32": 4, "int64": 8}
+
+_INIT_VOCABULARY = frozenset(
+    {"zeros", "blank_label", "admitted_prompt", "admitted_geometry"}
+)
+
+
+def _entry_bytes(entry: dict[str, Any]) -> int:
+    size = _DTYPE_BYTES[entry["dtype"]]
+    n = 1
+    for dim in entry["shape"]:
+        n *= dim
+    return n * size
+
+
 def author_state_manifest(config: Any) -> dict[str, Any]:
     """Author the state manifest (PORT-WGT-004).
 
@@ -192,14 +205,72 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
 
     Returns:
         The state manifest dict.
-
-    Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
     """
-    raise NotImplementedError(
-        "author_state_manifest lands in Phase 6 (PORT-WGT-004)"
-    )
+    entries: list[dict[str, Any]] = []
+    for i in range(config.n_layers):
+        entries.append({
+            "name": f"encoder.layers.{i}.window.channel",
+            "shape": [config.att_context_left, config.d_model],
+            "dtype": "float32",
+            "init": "zeros",
+        })
+        entries.append({
+            "name": f"encoder.layers.{i}.conv.time",
+            "shape": [config.d_model, config.conv_kernel - 1],
+            "dtype": "float32",
+            "init": "zeros",
+        })
+        entries.append({
+            "name": f"encoder.layers.{i}.window.valid",
+            "shape": [1],
+            "dtype": "int32",
+            "init": "zeros",
+        })
+    entries.append({
+        "name": "frontend.raw_tail",
+        "shape": [FRONTEND_CONSTANTS["raw_tail_capacity"]],
+        "dtype": "float32",
+        "init": "zeros",
+    })
+    entries.append({
+        "name": "frontend.mel_tail",
+        "shape": [config.n_mels, FRONTEND_CONSTANTS["pre_encode_cache_frames"]],
+        "dtype": "float32",
+        "init": "zeros",
+    })
+    for counter in FRONTEND_COUNTER_FIELDS:
+        entries.append({
+            "name": f"frontend.counters.{counter}",
+            "shape": [1],
+            "dtype": "int64",
+            "init": "zeros",
+        })
+    for tensor in ("h", "c"):
+        entries.append({
+            "name": f"predictor.layers.0.lstm_state.{tensor}",
+            "shape": [config.pred_rnn_layers, config.pred_hidden],
+            "dtype": "float32",
+            "init": "zeros",
+        })
+    entries.append({
+        "name": "decode.layers.0.replay.queue",
+        "shape": [SESSION_LIMITS["queue_capacity"]],
+        "dtype": "int32",
+        "init": "zeros",
+    })
+    for name, init in BOOK_FIELDS:
+        entries.append({
+            "name": f"decode.layers.0.replay.book.{name}",
+            "shape": [1],
+            "dtype": "int32",
+            "init": init,
+        })
+    return {
+        "schema": "state-manifest-v1",
+        "precision_policy": PRECISION_POLICY_ID,
+        "entries": entries,
+        "total_page_bytes": sum(_entry_bytes(e) for e in entries),
+    }
 
 
 def author_geometry_manifest(config: Any) -> dict[str, Any]:
@@ -219,12 +290,33 @@ def author_geometry_manifest(config: Any) -> dict[str, Any]:
     constant.
 
     Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
+        ValueError: if ``config.hidden_size`` cannot carry the header
+            plus the largest admitted raw cadence.
     """
-    raise NotImplementedError(
-        "author_geometry_manifest lands in Phase 6 (PORT-WGT-004)"
-    )
+    needed = len(ENVELOPE_HEADER_FIELDS) + max(RAW_SAMPLES_PER_CHUNK.values())
+    if config.hidden_size < needed:
+        raise ValueError(
+            f"carrier_width (hidden_size={config.hidden_size}) cannot "
+            f"carry the chunk envelope: need >= {needed} "
+            "(header + largest admitted raw cadence)"
+        )
+    return {
+        "schema": "geometry-manifest-v1",
+        "cadences": {
+            label: {
+                "att_context": [left, right],
+                "frames_per_chunk": right + 1,
+                "raw_samples_per_chunk": RAW_SAMPLES_PER_CHUNK[label],
+            }
+            for label, (left, right) in CADENCES.items()
+        },
+        "envelope": {
+            "version": 1,
+            "header_fields": list(ENVELOPE_HEADER_FIELDS),
+        },
+        "carrier_width": config.hidden_size,
+        "frontend": FRONTEND_CONSTANTS,
+    }
 
 
 def author_transition_manifest(config: Any) -> dict[str, Any]:
@@ -238,14 +330,20 @@ def author_transition_manifest(config: Any) -> dict[str, Any]:
     "final_tail": "actual-residual-final-stft",
     "echo_policy": "mrv1-echo-verify"}`` — the fixed contract every
     native/fallback/probe caller invokes through (PORT-ADV-001/003).
-
-    Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
+    ``config`` is accepted for signature uniformity; the transition
+    contract is checkpoint-family-fixed.
     """
-    raise NotImplementedError(
-        "author_transition_manifest lands in Phase 6 (PORT-WGT-004)"
-    )
+    del config
+    return {
+        "schema": "transition-manifest-v1",
+        "transition": "advance_session-v1",
+        "roles": ["CHUNK", "REPLAY", "FLUSH"],
+        "chunk_roles_entering_transition": ["CHUNK"],
+        "session_first_init": "metadata-books-zero-scratch",
+        "encode_overlap": "pre-encode-cache-on-non-first-chunks",
+        "final_tail": "actual-residual-final-stft",
+        "echo_policy": "mrv1-echo-verify",
+    }
 
 
 def author_emission_manifest(config: Any) -> dict[str, Any]:
@@ -258,15 +356,22 @@ def author_emission_manifest(config: Any) -> dict[str, Any]:
     frames * symbols + 1}, ...}}`` — the PORT-INT-002 budget formula,
     ``+ 1`` for the park token, one entry per :data:`CADENCES` label
     with ``max_valid_encoder_frames = frames_per_chunk`` for that
-    cadence.
-
-    Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
+    cadence. ``config`` is accepted for signature uniformity.
     """
-    raise NotImplementedError(
-        "author_emission_manifest lands in Phase 6 (PORT-WGT-004)"
-    )
+    del config
+    symbols = SESSION_LIMITS["max_symbols_per_step"]
+    return {
+        "schema": "emission-manifest-v1",
+        "limits": SESSION_LIMITS,
+        "per_geometry": {
+            label: {
+                "max_valid_encoder_frames": right + 1,
+                "max_symbols_per_step": symbols,
+                "max_emission_tokens": (right + 1) * symbols + 1,
+            }
+            for label, (_, right) in CADENCES.items()
+        },
+    }
 
 
 def author_checkpoint_profile(
@@ -288,15 +393,29 @@ def author_checkpoint_profile(
             ``"state"``/``"geometry"``/``"transition"``/``"emission"``.
 
     Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
-        ValueError: (Phase 6 behavior, pinned now) if
-            ``manifest_hashes`` is missing a key or a value is not a
-            well-formed ``"sha256:" + 64-hex`` string.
+        ValueError: if ``manifest_hashes`` is missing a key or a value
+            is not a well-formed ``"sha256:" + 64-hex`` string.
     """
-    raise NotImplementedError(
-        "author_checkpoint_profile lands in Phase 6 (PORT-INT-005)"
-    )
+    for key in ("state", "geometry", "transition", "emission"):
+        value = manifest_hashes.get(key)
+        if value is None:
+            raise ValueError(f"manifest_hashes missing the '{key}' hash")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError(
+                f"manifest_hashes['{key}'] is not a sha256:<64-hex> "
+                f"string: {value!r}"
+            )
+    body: dict[str, Any] = {
+        "schema": "checkpoint-profile-v1",
+        "id": "cp-nemotron-3.5-asr-streaming-0.6b",
+        "precision_policy": PRECISION_POLICY_ID,
+        "limits": SESSION_LIMITS,
+        "state_manifest_hash": manifest_hashes["state"],
+        "geometry_manifest_hash": manifest_hashes["geometry"],
+        "transition_manifest_hash": manifest_hashes["transition"],
+        "emission_manifest_hash": manifest_hashes["emission"],
+    }
+    return dict(body, content_hash=manifest_hash(body))
 
 
 def verify_state_manifest(
@@ -324,11 +443,55 @@ def verify_state_manifest(
             above.
 
     Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6.
-        ValueError: (Phase 6 behavior, pinned now) naming the first
-            mismatching entry/field — never a bare mismatch count.
+        ValueError: naming the first mismatching entry/field — never a
+            bare mismatch count.
     """
-    raise NotImplementedError(
-        "verify_state_manifest lands in Phase 6 (PORT-STATE-009)"
-    )
+    if manifest.get("schema") != "state-manifest-v1":
+        raise ValueError(
+            f"state manifest schema is {manifest.get('schema')!r}, "
+            "expected 'state-manifest-v1'"
+        )
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("state manifest has no 'entries' list")
+    for i in range(max(len(entries), len(page_specs))):
+        if i >= len(entries):
+            raise ValueError(
+                "state manifest is missing entry "
+                f"'{page_specs[i]['name']}' (registered page {i})"
+            )
+        if i >= len(page_specs):
+            raise ValueError(
+                f"state manifest entry '{entries[i]['name']}' has no "
+                f"registered page (entry {i})"
+            )
+        entry, spec = entries[i], page_specs[i]
+        if entry["name"] != spec["name"]:
+            raise ValueError(
+                f"state manifest entry {i} is '{entry['name']}' but the "
+                f"registered page is '{spec['name']}'"
+            )
+        if list(entry["shape"]) != list(spec["shape"]):
+            raise ValueError(
+                f"entry '{entry['name']}' shape {list(entry['shape'])} "
+                f"disagrees with the registered page shape "
+                f"{list(spec['shape'])}"
+            )
+        if entry["dtype"] != spec["dtype"]:
+            raise ValueError(
+                f"entry '{entry['name']}' dtype {entry['dtype']!r} "
+                f"disagrees with the registered page dtype "
+                f"{spec['dtype']!r}"
+            )
+        if entry.get("init") not in _INIT_VOCABULARY:
+            raise ValueError(
+                f"entry '{entry['name']}' has unknown init "
+                f"{entry.get('init')!r} (allowed: "
+                f"{sorted(_INIT_VOCABULARY)})"
+            )
+    summed = sum(_entry_bytes(e) for e in entries)
+    if manifest.get("total_page_bytes") != summed:
+        raise ValueError(
+            f"total_page_bytes {manifest.get('total_page_bytes')!r} "
+            f"disagrees with the summed entries ({summed})"
+        )
