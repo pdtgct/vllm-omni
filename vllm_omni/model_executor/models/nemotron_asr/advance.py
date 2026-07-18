@@ -170,6 +170,11 @@ class AdvanceResult:
     :token_lengths[b]]``, ordered, NONBLANK, bounded by
     ``valid_encoder_frames × max_symbols_per_step`` for the row's
     geometry (PORT-INT-002), NOT by the attention window.
+    ``row_valid``: ``(B,)`` bool — device-resolved per-row protocol
+    validity (PORT-ADV-004): a False row mutated no state and its
+    burst is zero-length; the transaction consumes this tensor at its
+    commit synchronization to suppress or abort exactly the affected
+    sessions (PORT-STATE-008's row tier).
     ``captures``: :class:`PreparedCaptures` or ``None`` when capture
     is disabled.
 
@@ -181,6 +186,7 @@ class AdvanceResult:
 
     token_ids: torch.Tensor
     token_lengths: torch.Tensor
+    row_valid: torch.Tensor | None = None
     captures: PreparedCaptures | None = None
 
 
@@ -303,12 +309,13 @@ def make_mrv1_adapter(
     )
 
 
-# @spec PORT-ADV-001
+# @spec PORT-ADV-001, PORT-ADV-004
 def advance_session(
     core: NemotronASRCore,
     batch: ChunkBatch,
     state: SessionStateBatch,
     *,
+    geometry: int,
     capture: bool = False,
 ) -> AdvanceResult:
     """The ONE storage- and adapter-agnostic CHUNK transition.
@@ -322,28 +329,46 @@ def advance_session(
     mutates ``state`` in place into the next state and returns the
     adapter-neutral :class:`AdvanceResult`.
 
+    Length-aware (PORT-ADV-004): one call serves one profile+geometry
+    bucket carrying mixed session-first / continuing / final /
+    zero-frame rows. Every shape is host-derived from the bucket
+    geometry (padded frontend width ``C + 7``, encoder width from the
+    subsampling formula); validity is per-row length tensors. Per-row
+    protocol violations — wrong chunk sequence, audio after
+    finalization, an envelope geometry different from the bucket's —
+    are masked no-ops reported in ``AdvanceResult.row_valid``; the
+    transaction consumes that tensor at its commit synchronization.
+    The valid path issues no host/device synchronization outside the
+    selected decode variant (the eager compact loop, until the
+    PORT-DEC-008 dense-vs-compact profile selects otherwise at
+    startup).
+
     Args:
         core: the assembled pipeline (encoder / lid / predictor /
             joint / featurizer).
         batch: raw PCM plus validated controls, one row per CHUNK.
         state: gathered checkpoint state, read and mutated into the
             next state.
+        geometry: the bucket's admitted geometry id — a host value,
+            per the profile+geometry bucket contract (PORT-PERF-001).
         capture: the explicit capture policy (PORT-HOOK-001). OFF by
             default: performance runs return ``captures=None`` with no
             capture-only allocations and no extended lifetime for the
             raw/conditioned encoder tensors. ON stages the three named
-            tensors with exact valid lengths — including at zero
-            length for a finalized zero-frame CHUNK.
+            tensors at the bucket's fixed padded widths with exact
+            logical lengths — including zero length for a finalized
+            zero-frame CHUNK.
 
     Returns:
         The GPU-resident :class:`AdvanceResult` (padded token
-        tensors + prepared captures).
+        tensors, per-row validity, prepared captures).
 
     Raises:
-        ValueError: on a control-field violation (non-integer value,
-            out-of-range geometry/prompt, wrong chunk sequence), a
-            frontend protocol error, or a design-margin violation
-            (via ``advance_frontend``).
+        ValueError: if ``geometry`` is not an admitted geometry id
+            (a host configuration error, not a row condition).
+        RuntimeError: via device-side assertion on a design-invariant
+            violation inside the frontend (margin shortfall, raw-tail
+            overflow, target below the committed boundary).
     """
     from vllm_omni.model_executor.models.nemotron_asr.encoder import (
         stream_step,
@@ -352,8 +377,9 @@ def advance_session(
         CTR_COMMITTED_MEL_FRAMES,
         CTR_ENCODED_MEL_FRAMES,
         CTR_EXPECTED_CHUNK_SEQUENCE,
+        CTR_FINALIZED,
+        MEL_TAIL_FRAMES,
         advance_frontend,
-        cadence_boundary,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
         CADENCES,
@@ -364,50 +390,42 @@ def advance_session(
     )
 
     n_rows = batch.samples.shape[0]
+    device = batch.samples.device
     lookaheads = [right for (_, right) in CADENCES.values()]
+    if not 0 <= geometry < len(lookaheads):
+        raise ValueError(f"unknown bucket geometry id {geometry}")
+    lookahead = lookaheads[geometry]
+    cadence = 8 * (lookahead + 1)
+    # The bucket's padded frontend width: a first row commits C-7, a
+    # continuing row C, a final tail at most C+7 (its raw payload is
+    # at most one cadence unit past a kC-7 boundary) — design §Exact
+    # Bounded Frontend.
+    pad_frames = cadence + 7
+    mel_width = MEL_TAIL_FRAMES + pad_frames
 
-    # Validate controls (design §Chunk envelope): integer-valued,
-    # in-range, in sequence — before any state mutation.
-    targets = torch.zeros(n_rows, dtype=torch.long)
-    for b in range(n_rows):
-        geometry = int(batch.geometry_id[b])
-        if not 0 <= geometry < len(lookaheads):
-            raise ValueError(f"row {b}: geometry id {geometry} unknown")
-        seq = int(batch.chunk_sequence[b])
-        expected = int(
-            state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE]
+    counters = state.frontend_counters
+    # Per-row protocol validity (PORT-ADV-004), all on device: the
+    # envelope geometry must match the bucket, the sequence must match
+    # the session's expected counter, and a finalized session accepts
+    # no further audio.
+    row_valid = (
+        (batch.geometry_id.to(device) == geometry)
+        & (
+            batch.chunk_sequence.to(device)
+            == counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]
         )
-        if seq != expected:
-            raise ValueError(
-                f"row {b}: chunk sequence {seq}, expected {expected}"
-            )
-        if int(batch.valid_samples[b]) < 0:
-            raise ValueError(f"row {b}: negative valid_samples")
-        targets[b] = cadence_boundary(
-            seq + 1, lookahead=lookaheads[geometry]
-        )
+        & (counters[:, CTR_FINALIZED] == 0)
+    )
+    # Regular-cadence targets, vectorized: B_{seq+1} = (8L+1) + seq·C
+    # (final rows ignore targets inside the frontend).
+    targets = (8 * lookahead + 1) + batch.chunk_sequence * cadence
+    session_first = batch.chunk_sequence == 0
 
     # Pre-consume snapshot: the fixed-width mel-tail prefix is the
     # encoder's pre-encode cache (NeMo semantics: the FULL nine-slot
     # tail, zeros where not yet valid, with the CONFIGURED two-output
     # post-first-chunk drop — never a dynamic overlap); session-first
     # rows take no prefix and drop nothing.
-    session_first = [
-        int(batch.chunk_sequence[b]) == 0 for b in range(n_rows)
-    ]
-    if len(set(session_first)) != 1:
-        # TEMPORARY transition assertion — NOT the production
-        # contract: the normative bucket key is execution profile +
-        # immutable geometry only (PORT-PERF-001); phase and drop
-        # metadata become per-row inputs in the length-aware
-        # tensorized path.
-        raise ValueError(
-            "mixed session-first and continuing rows in one bucket "
-            "(temporary transition assertion)"
-        )
-    first = session_first[0]
-    # Snapshot the pre-consume mel tail as ONE batched tensor (the
-    # nine-slot pre-encode prefix; advance_frontend rolls it forward).
     prefix = state.mel_tail.clone()
 
     new_frames, counts = advance_frontend(
@@ -419,52 +437,53 @@ def advance_session(
         raw_tail=state.raw_tail,
         mel_tail=state.mel_tail,
         counters=state.frontend_counters,
+        pad_frames=pad_frames,
+        row_valid=row_valid,
     )
-    state.frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
+    counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += row_valid.to(torch.int64)
 
-    # Zero-work rows (a final tail whose short residual was dropped):
-    # no encoder, LID, or RNN-T work runs at all. advance_frontend
-    # already enforced per-call frame-count uniformity (its temporary
-    # transition assertion), so counts[0] speaks for the batch.
-    device = batch.samples.device
-    n_new_frames = int(counts[0]) if n_rows else 0
-    if n_new_frames == 0:
-        # A finalized zero-frame CHUNK still stages all three named
-        # captures at zero valid length (the checkpoint record).
-        d_model = state.channel[0].shape[2]
-        n_mels = state.mel_tail.shape[1]
-        zero = torch.zeros(n_rows, dtype=torch.long, device=device)
-        return AdvanceResult(
-            token_ids=torch.zeros(
-                n_rows, 0, dtype=torch.int32, device=device
-            ),
-            token_lengths=torch.zeros(
-                n_rows, dtype=torch.int32, device=device
-            ),
-            captures=PreparedCaptures(
-                frontend_mel=torch.zeros(
-                    n_rows, n_mels, 0, device=device
-                ),
-                mel_lengths=zero,
-                encoder_raw=torch.zeros(
-                    n_rows, 0, d_model, device=device
-                ),
-                encoder_conditioned=torch.zeros(
-                    n_rows, 0, d_model, device=device
-                ),
-                encoder_lengths=zero.clone(),
-            ) if capture else None,
-        )
+    # Per-row encoder input on the bucket's fixed grid: column j of
+    # row b reads [prefix | new][j + 9 - p_b] — p_b is 9 for
+    # continuing rows (the full nine-slot pre-encode cache) and 0 for
+    # session-first rows. One batched gather, no phase branch.
+    p = torch.where(
+        session_first,
+        torch.zeros_like(counts),
+        torch.full_like(counts, MEL_TAIL_FRAMES),
+    )
+    combined = torch.cat([prefix, new_frames], dim=2)
+    col = torch.arange(mel_width, device=device).view(1, 1, -1)
+    gidx = (col + (MEL_TAIL_FRAMES - p).view(-1, 1, 1)).clamp(
+        max=combined.shape[2] - 1
+    )
+    mel = combined.gather(
+        2, gidx.expand(n_rows, combined.shape[1], mel_width)
+    )
+    mel_len = p + counts
+    mel = torch.where(
+        col < mel_len.view(-1, 1, 1), mel, mel.new_zeros(())
+    )
 
-    # Tensor-native encoder input: advance_frontend returns ONE
-    # (B, n_mels, n_new) tensor; continuing rows prepend the batched
-    # nine-slot prefix (one cat, no per-row construction).
-    if first:
-        mel = new_frames
-        drop_extra = 0
-    else:
-        mel = torch.cat([prefix, new_frames], dim=2)
-        drop_extra = PRE_ENCODE_DROP
+    # Per-row pre-encode drop and logical encoder lengths; the padded
+    # encoder width is the host formula on the fixed mel width.
+    drop = torch.where(
+        session_first,
+        torch.zeros_like(counts),
+        torch.full_like(counts, PRE_ENCODE_DROP),
+    )
+    enc_lengths = torch.where(
+        counts > 0,
+        torch.clamp(
+            core.encoder.pre_encode.output_lengths(mel_len) - drop,
+            min=0,
+        ),
+        torch.zeros_like(counts),
+    )
+    out_width = int(
+        core.encoder.pre_encode.output_lengths(
+            torch.tensor([mel_width])
+        )[0]
+    )
 
     caches = _GatheredCaches(state)
     with torch.no_grad():
@@ -474,22 +493,27 @@ def advance_session(
             # .channel/.time/.valid surface (the forward_step.py
             # precedent, migration-proven bit-for-bit).
             core.encoder, mel, caches,  # type: ignore[arg-type]
-            drop_extra=drop_extra,
+            out_offsets=drop,
+            out_lengths=enc_lengths,
+            out_width=out_width,
         )
         # Row-wise language conditioning in ONE call: the
         # conditioner takes the (B,) prompt tensor directly (no
         # per-prompt fragmentation or host set construction).
         conditioned = core.lid(enc, prompt_index=batch.prompt_index)
+        # Padded-position zeroing for the conditioned stream (the
+        # conditioner may bias padded rows away from zero; decode
+        # masks by length, but captures and determinism want zeros).
+        fcol = torch.arange(out_width, device=device).view(1, -1, 1)
+        conditioned = torch.where(
+            fcol < enc_lengths.view(-1, 1, 1),
+            conditioned,
+            conditioned.new_zeros(()),
+        )
         decode = DecodeState(
             h=state.h.transpose(0, 1).contiguous(),
             c=state.c.transpose(0, 1).contiguous(),
             last_label=state.last_label,
-        )
-        # Per-row valid encoder lengths: uniform under the temporary
-        # homogeneity assertion; the length-aware encoder transition
-        # makes these genuinely per-row.
-        enc_lengths = torch.full(
-            (n_rows,), enc.shape[1], dtype=torch.long, device=device
         )
         token_ids, token_lengths, decode = decode_compact_active(
             conditioned, enc_lengths, core.predictor, core.joint, decode
@@ -497,23 +521,40 @@ def advance_session(
     state.h.copy_(decode.h.transpose(0, 1))
     state.c.copy_(decode.c.transpose(0, 1))
     state.last_label.copy_(decode.last_label)
-    for b in range(n_rows):
-        state.frontend_counters[b, CTR_ENCODED_MEL_FRAMES] = int(
-            state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
-        )
+    counters[:, CTR_ENCODED_MEL_FRAMES] = torch.where(
+        row_valid,
+        counters[:, CTR_COMMITTED_MEL_FRAMES],
+        counters[:, CTR_ENCODED_MEL_FRAMES],
+    )
 
+    if not capture:
+        return AdvanceResult(
+            token_ids=token_ids,
+            token_lengths=token_lengths,
+            row_valid=row_valid,
+        )
+    # Capture lengths come from logical lengths (PORT-HOOK-001): a
+    # zero-commit row stages all three tensors at zero length — its
+    # mel capture is fully zero even where the encoder input carried
+    # the pre-encode prefix.
+    cap_mel_len = torch.where(
+        counts > 0, mel_len, torch.zeros_like(mel_len)
+    )
     return AdvanceResult(
         token_ids=token_ids,
         token_lengths=token_lengths,
+        row_valid=row_valid,
         captures=PreparedCaptures(
-            frontend_mel=mel,
-            mel_lengths=torch.full(
-                (n_rows,), mel.shape[2], dtype=torch.long, device=device
+            frontend_mel=torch.where(
+                col < cap_mel_len.view(-1, 1, 1),
+                mel,
+                mel.new_zeros(()),
             ),
+            mel_lengths=cap_mel_len,
             encoder_raw=enc,
             encoder_conditioned=conditioned,
             encoder_lengths=enc_lengths,
-        ) if capture else None,
+        ),
     )
 
 

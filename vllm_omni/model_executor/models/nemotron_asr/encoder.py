@@ -407,12 +407,20 @@ def _stream_attention(
     cache: torch.Tensor,
     valid: torch.Tensor,
     pos_emb: torch.Tensor,
+    new_valid: torch.Tensor,
+    new_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
     ``x`` is the normed attention input for the NEW frames (B, F, d);
-    ``cache`` holds the previous normed inputs (B, C, d). Returns the
-    attention output for the new frames and the advanced cache.
+    ``cache`` holds the previous normed inputs (B, C, d). ``new_valid``
+    is the (B, F) per-row frame-validity mask and ``new_lengths`` the
+    (B,) logical frame counts: padded new frames are masked as keys AND
+    queries (a fully masked query row softmaxes uniform then zeroes,
+    so its output is exactly 0 — never NaN), and the cache advances by
+    each row's LOGICAL length via a per-row gather over [cache | new].
+    Returns the attention output for the new frames and the advanced
+    cache.
     """
     attn = layer.self_attn
     batch, new_frames, _ = x.shape
@@ -436,33 +444,58 @@ def _stream_attention(
     scores = (
         matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]
     ) / attn.s_d_k
-    # Mask: cache rows beyond each element's valid count are dead; new
-    # frames all attend each other (intra-chunk lookahead).
+    # Mask: cache rows beyond each element's valid count are dead;
+    # padded new frames are dead keys; padded queries mask fully.
     row = torch.arange(capacity, device=x.device).unsqueeze(0)
     dead = row < (capacity - valid.unsqueeze(1))  # (B, C) True = dead
     mask = torch.zeros(
         batch, 1, new_frames, t2, dtype=torch.bool, device=x.device
     )
     mask[:, :, :, :capacity] = dead.unsqueeze(1).unsqueeze(2)
+    mask[:, :, :, capacity:] = (~new_valid).unsqueeze(1).unsqueeze(2)
+    mask = mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
     scores = scores.masked_fill(mask, -_LOG_BASE)
     weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
     out = torch.matmul(weights, v)
     out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
-    # Advance cache: keep the last `capacity` of [cache | x].
-    new_cache = keys[:, -capacity:].to(cache.dtype)
+    # Advance cache by each row's logical length: slot j of the new
+    # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
+    # bit-identical; gather indices never touch padded frames.
+    aidx = (
+        new_lengths.view(-1, 1)
+        + torch.arange(capacity, device=x.device).unsqueeze(0)
+    ).unsqueeze(-1).expand(b, capacity, keys.shape[2])
+    new_cache = (
+        torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, aidx)
+    )
     return attn.linear_out(out), new_cache
 
 
 def _stream_conv(
-    layer: ConformerLayer, x: torch.Tensor, cache: torch.Tensor
+    layer: ConformerLayer,
+    x: torch.Tensor,
+    cache: torch.Tensor,
+    *,
+    new_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Conv module over [time_cache | new] (CausalConv1D.update_cache)."""
+    """Conv module over [time_cache | new] (CausalConv1D.update_cache).
+
+    The causal depthwise conv makes every valid output independent of
+    padded columns (and the norm is per-position), so only the cache
+    tail needs length awareness: slot j of the new tail gathers
+    [cache | glu][j + F_b], each row's own logical append.
+    """
     conv = layer.conv
     y = x.transpose(1, 2)
     y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
-    new_cache = padded[:, :, -cache.shape[-1] :].to(cache.dtype)
+    cw = cache.shape[-1]
+    aidx = (
+        new_lengths.view(-1, 1)
+        + torch.arange(cw, device=y.device).unsqueeze(0)
+    ).unsqueeze(1).expand(y.shape[0], y.shape[1], cw)
+    new_cache = padded.gather(2, aidx).to(cache.dtype)
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
@@ -474,26 +507,72 @@ def stream_step(
     chunk_mel: torch.Tensor,
     caches: StreamingCaches,
     *,
-    drop_extra: int,
+    drop_extra: int | None = None,
+    out_offsets: torch.Tensor | None = None,
+    out_lengths: torch.Tensor | None = None,
+    out_width: int | None = None,
 ) -> torch.Tensor:
     """One cached streaming encoder step (batch of sessions).
 
-    ``chunk_mel``: (B, feat, chunk-mel [+9-mel pre-encode context for
-    non-first chunks]). Returns the chunk's valid encoder frames
-    (B, F, d) and advances the caches in place — numerically the cached
-    form of the prefix computation the P3 probes proved golden-exact.
+    ``chunk_mel``: (B, feat, mel [+9-mel pre-encode context for
+    non-first chunks]). Advances the caches in place — numerically the
+    cached form of the prefix computation the P3 probes proved
+    golden-exact.
+
+    Length-aware form (PORT-ADV-004): ``out_offsets`` (B,) is each
+    row's pre-encode drop, ``out_lengths`` (B,) its logical encoder
+    frame count, and ``out_width`` the fixed host-derived output
+    width. Rows are realigned per-row after subsampling (the causal
+    conv makes valid outputs independent of trailing padding),
+    attention masks padded keys AND queries, caches append by logical
+    lengths, ``window_valid`` accumulates logical lengths, and output
+    frames at or past a row's length are exactly zero. A zero-length
+    row leaves its caches bit-identical. No tensor value determines a
+    shape; the call issues no host/device synchronization.
+
+    ``drop_extra`` is the uniform legacy adapter (``run_forward_step``
+    and the P3/P4 probes): equivalent to offsets = ``drop_extra``,
+    lengths = full width, over the same single algorithm.
     """
-    lengths = torch.full(
-        (chunk_mel.shape[0],), chunk_mel.shape[2], device=chunk_mel.device
-    )
+    b = chunk_mel.shape[0]
+    device = chunk_mel.device
+    lengths = torch.full((b,), chunk_mel.shape[2], device=device)
     x, _ = encoder.pre_encode(chunk_mel, lengths)
-    if drop_extra:
-        x = x[:, drop_extra:]
+    if drop_extra is not None:
+        if out_offsets is not None or out_lengths is not None:
+            raise ValueError(
+                "pass either drop_extra (uniform legacy) or the "
+                "per-row out_offsets/out_lengths/out_width form"
+            )
+        out_width = x.shape[1] - drop_extra
+        out_offsets = torch.full(
+            (b,), drop_extra, dtype=torch.long, device=device
+        )
+        out_lengths = torch.full(
+            (b,), out_width, dtype=torch.long, device=device
+        )
+    assert (
+        out_offsets is not None
+        and out_lengths is not None
+        and out_width is not None
+    )
+    # Per-row realignment: row b's encoder frames start at its own
+    # pre-encode drop. Clamp keeps padded columns in-bounds; their
+    # values are masked everywhere below.
+    gidx = (
+        out_offsets.view(-1, 1)
+        + torch.arange(out_width, device=device).unsqueeze(0)
+    ).clamp(max=max(x.shape[1] - 1, 0))
+    x = x.gather(1, gidx.unsqueeze(-1).expand(b, out_width, x.shape[2]))
+    new_valid = (
+        torch.arange(out_width, device=device).unsqueeze(0)
+        < out_lengths.view(-1, 1)
+    )
     cache_len = caches.channel.shape[2]
     pos_emb = encoder.pos_enc(
         torch.zeros(
-            1, x.shape[1] + cache_len, x.shape[2],
-            device=x.device, dtype=x.dtype,
+            1, out_width + cache_len, x.shape[2],
+            device=device, dtype=x.dtype,
         )
     )
     for idx, layer in enumerate(encoder.layers):
@@ -506,17 +585,22 @@ def stream_step(
             cache=caches.channel[idx],
             valid=caches.valid,
             pos_emb=pos_emb,
+            new_valid=new_valid,
+            new_lengths=out_lengths,
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)
         conv_out, caches.time[idx] = _stream_conv(
-            layer, y, caches.time[idx]
+            layer, y, caches.time[idx], new_lengths=out_lengths
         )
         residual = residual + conv_out
         y = layer.norm_feed_forward2(residual)
         residual = residual + 0.5 * layer.feed_forward2(y)
         x = layer.norm_out(residual)
     caches.valid = torch.clamp(
-        caches.valid + x.shape[1], max=caches.left_context
+        caches.valid + out_lengths.to(caches.valid.dtype),
+        max=caches.left_context,
     )
-    return x
+    # Padded-output zeroing (PORT-ADV-004): frames at or past each
+    # row's logical length are exactly zero.
+    return torch.where(new_valid.unsqueeze(-1), x, x.new_zeros(()))

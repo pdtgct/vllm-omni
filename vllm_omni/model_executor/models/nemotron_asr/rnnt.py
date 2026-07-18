@@ -309,6 +309,104 @@ def decode_compact_active(
     )
 
 
+def decode_dense_masked(
+    enc_frames: torch.Tensor,
+    enc_lengths: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    state: DecodeState,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> tuple[torch.Tensor, torch.Tensor, DecodeState]:
+    """Length-aware fixed-trip dense greedy decode (PORT-ADV-004).
+
+    The synchronization-free candidate the dense-vs-compact profile
+    (PORT-DEC-008) selects from at startup: exactly ``T_pad ×
+    max_symbols`` full-batch joint/predictor trips with GPU masks for
+    semantic activity — a row is active at frame ``t`` only while
+    ``t < enc_lengths[row]`` and, within a frame, only while its
+    previous trip emitted. Non-emitting rows pass through every
+    ``torch.where`` untouched, so the extra trips the compact loop's
+    compaction skips are exact no-ops here (the ``decode_chunk_paged``
+    masked-trip pattern). Token writes use gather/where/scatter with
+    one unique index per row — deterministic and sync-free. No
+    ``nonzero``, ``.item()``, ``.tolist()``, host booleans, or
+    data-dependent shapes anywhere; the out-of-range guard is a
+    device-side assertion.
+
+    Args:
+        enc_frames: ``(B, T_pad, enc_hidden)`` conditioned frames.
+        enc_lengths: ``(B,)`` long valid frame counts (rows may be
+            padded to ``T_pad``).
+        predictor: The prediction network.
+        joint: The joint network.
+        state: Stacked decode state (NOT mutated; the advanced state
+            is returned). A zero-length row's state returns
+            bit-identical.
+        max_symbols: Per-frame emission cap (checkpoint value 10).
+
+    Returns:
+        ``token_ids`` ``(B, T_pad * max_symbols)`` int32 padded,
+        ``token_lengths`` ``(B,)`` int32, and the advanced state.
+
+    Raises:
+        RuntimeError: via device-side assertion when any
+            ``enc_lengths`` entry is negative or exceeds ``T_pad``
+            (eager on CPU; a trapping device assert on CUDA).
+    """
+    batch, t_pad, _ = enc_frames.shape
+    device = enc_frames.device
+    blank = predictor.blank_id
+    torch._assert_async(
+        ((enc_lengths >= 0) & (enc_lengths <= t_pad)).all(),
+        f"decode_dense_masked: enc_lengths out of range for "
+        f"T_pad={t_pad}",
+    )
+    h = state.h.clone()
+    c = state.c.clone()
+    last_label = state.last_label.clone()
+    capacity = max(t_pad * max_symbols, 1)
+    token_ids = torch.zeros(
+        batch, t_pad * max_symbols, dtype=torch.int32, device=device
+    )
+    token_lengths = torch.zeros(batch, dtype=torch.long, device=device)
+    pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
+    for t in range(t_pad):
+        frame = enc_frames[:, t]
+        active = t < enc_lengths
+        for _ in range(max_symbols):
+            logits = joint.logits(frame, pred_out)
+            labels = logits.argmax(dim=-1)
+            emit = active & (labels != blank)
+            idx = token_lengths.clamp(max=capacity - 1).unsqueeze(1)
+            token_ids.scatter_(
+                1,
+                idx,
+                torch.where(
+                    emit.unsqueeze(1),
+                    labels.unsqueeze(1).to(torch.int32),
+                    token_ids.gather(1, idx),
+                ),
+            )
+            token_lengths = token_lengths + emit.long()
+            gate = emit.view(1, -1, 1)
+            last_label = torch.where(emit, labels, last_label)
+            # Commit the state that produced this pred_out, emitters
+            # only; blank never advances the predictor.
+            h = torch.where(gate, pred_h, h)
+            c = torch.where(gate, pred_c, c)
+            new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
+            pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
+            pred_h = torch.where(gate, new_h, pred_h)
+            pred_c = torch.where(gate, new_c, pred_c)
+            active = emit
+    return (
+        token_ids,
+        token_lengths.to(torch.int32),
+        DecodeState(h=h, c=c, last_label=last_label),
+    )
+
+
 # ---- engine-tier decode seams (α3 tests-first; PORT-DEC-002/003/007/008) -----
 
 #: Slot indices in the replay-queue page's SEVEN-slot session book

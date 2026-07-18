@@ -138,7 +138,7 @@ def _clone_caches(c: StreamingCaches) -> tuple:
     return (c.channel.clone(), c.time.clone(), c.valid.clone())
 
 
-def test_stream_step_mixed_lengths_match_single_rows():
+def test_stream_step_mixed_lengths_match_single_rows() -> None:
     # @spec PORT-ADV-004
     # THE length-aware encoder differential: rows with different valid
     # mel widths and different pre-encode drops advance in ONE padded
@@ -154,7 +154,12 @@ def test_stream_step_mixed_lengths_match_single_rows():
     mel_lens = torch.tensor([41, 33, 24])
     offsets = torch.tensor([2, 2, 0])
     for b, n in enumerate(mel_lens.tolist()):
-        mel[b, :, n:] = 77.0  # poison the padding
+        # Padded mel columns must be ZERO (the stream_step input
+        # contract): the subsampling's last valid output legitimately
+        # covers input position n — the exact computation's causal
+        # right-pad, which zero padding reproduces. advance_session
+        # zeroes its gathered mel grid for exactly this reason.
+        mel[b, :, n:] = 0.0
     out_lens = enc.pre_encode.output_lengths(mel_lens) - offsets
     out_width = int(enc.pre_encode.output_lengths(
         torch.tensor([width])
@@ -214,7 +219,7 @@ def test_stream_step_mixed_lengths_match_single_rows():
         assert int(caches3.valid[b]) == int(c1.valid[0])
 
 
-def test_stream_step_zero_length_row_is_a_masked_no_op():
+def test_stream_step_zero_length_row_is_a_masked_no_op() -> None:
     # @spec PORT-ADV-004
     # A zero-valid row beside an active one: output all-zero, window,
     # conv tail, and window_valid BIT-identical (no advancement).
@@ -250,7 +255,7 @@ def test_stream_step_zero_length_row_is_a_masked_no_op():
     assert int(caches.valid[0]) == min(5 + out_width, 8)
 
 
-def test_stream_step_window_valid_saturates_per_row():
+def test_stream_step_window_valid_saturates_per_row() -> None:
     # @spec PORT-ADV-004
     # window_valid accumulates each row's logical length and clamps at
     # the window capacity independently per row.

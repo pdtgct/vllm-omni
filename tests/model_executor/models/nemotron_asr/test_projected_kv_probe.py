@@ -129,7 +129,16 @@ def _run_both(
                 active.view(batch, 1, 1), stream[step], 0.0
             )
             out_ref, cache_ref = _stream_attention(
-                layer, x, cache=cache_ref, valid=valid, pos_emb=pos_emb
+                layer, x, cache=cache_ref, valid=valid, pos_emb=pos_emb,
+                # Uniform full-valid rows: the probe's raggedness is
+                # carried by ``valid`` (dead cache rows), matching the
+                # pre-length-aware reference semantics exactly.
+                new_valid=torch.ones(
+                    x.shape[0], x.shape[1], dtype=torch.bool
+                ),
+                new_lengths=torch.full(
+                    (x.shape[0],), x.shape[1], dtype=torch.long
+                ),
             )
             out_prj, k_cache, v_cache = _stream_attention_projected(
                 attn, x,

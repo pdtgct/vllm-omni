@@ -21,13 +21,16 @@ pad. Pre-emphasis continuity costs one extra retained sample
 (``y[t] = x[t] - p*x[t-1]``); an absent sample (index < 0) is zero,
 which also reproduces ``y[0] = x[0]``.
 
-Batching: within a geometry+phase bucket every row commits the
-same frame count per regular chunk (8L+1 first, C continuing), so
-frame geometry is per-call constant and only absolute stream offsets
-vary per row — the whole update runs as batched tensor ops with two
-shape-determining host syncs per call (PORT-PERF-001). Heterogeneous
-frame counts raise (a TEMPORARY transition assertion; the
-length-aware path carries per-row counts).
+Batching: one call serves one profile+geometry bucket and carries
+mixed session-first / continuing / final / zero-frame rows — the
+committed frame count is a per-row tensor, never a batch-shape
+property. Every shape is host-derived (``pad_frames``, the raw-tail
+capacity); no tensor value determines a shape, so the valid path
+issues NO host/device synchronization (PORT-PERF-001/PORT-ADV-004).
+Per-row protocol violations are masked no-ops (``row_valid``);
+design-invariant violations surface as fused device-side assertions
+(``torch._assert_async`` — an eager RuntimeError on CPU, a trapping
+device assert on CUDA).
 
 The frontend counters live in the ``(B, 8)`` int64 tensor whose slot
 names/order are pinned by ``manifests.FRONTEND_COUNTER_FIELDS``; the
@@ -135,8 +138,10 @@ def advance_frontend(
     raw_tail: torch.Tensor,
     mel_tail: torch.Tensor,
     counters: torch.Tensor,
+    pad_frames: int,
+    row_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Advance the bounded frontend for a batch of CHUNK rows.
+    """Advance the bounded frontend for one profile+geometry bucket.
 
     Boundary-capped (the option-(d) resolution, ledger 2026-07-17):
     each row commits mel frames only through its cumulative cadence
@@ -150,6 +155,18 @@ def advance_frontend(
     on a later update (exactness is preserved). A final tail ignores
     ``target_frames`` and commits through ``final_frames`` under the
     separate residual rules.
+
+    Length-aware (PORT-ADV-004): rows commit PER-ROW counts — mixed
+    session-first / continuing / final / zero-frame rows share one
+    call. The returned mel tensor has the fixed host-derived width
+    ``pad_frames`` (the bucket bound is ``C + 7``, design §Exact
+    Bounded Frontend); columns at or past a row's count are exactly
+    zero. A row that is protocol-invalid (``row_valid`` False, or
+    already finalized — the frontend derives that predicate itself)
+    mutates nothing and commits nothing. No tensor value determines a
+    shape and no host/device synchronization occurs on the valid
+    path; design-invariant violations trap via fused device-side
+    assertions.
 
     Args:
         featurizer: the checkpoint ``MelFeaturizer`` (supplies
@@ -165,21 +182,23 @@ def advance_frontend(
         mel_tail: ``(B, n_mels, MEL_TAIL_FRAMES)`` committed-boundary
             mel tail, updated in place.
         counters: ``(B, 8)`` int64 counters, updated in place.
+        pad_frames: host-derived padded output width; must bound every
+            row's commit (device-asserted).
+        row_valid: optional ``(B,)`` bool protocol validity from the
+            caller; ``None`` means all rows valid.
 
     Returns:
-        The newly committed mel frames as ONE ``(B, n_mels, n_new)``
-        tensor (possibly zero-width) and the ``(B,)`` long new-frame
-        counts. Fully tensorized: exactly two shape-determining host
-        syncs per call (the uniform frame count and the retention
-        width), never per-row host work (PORT-PERF-001).
+        The committed mel frames as ONE zero-padded
+        ``(B, n_mels, pad_frames)`` tensor and the ``(B,)`` long
+        per-row committed counts.
 
     Raises:
-        ValueError: on a chunk after finalization (protocol error), a
-            regular chunk whose stable frames fall SHORT of its target
-            (the design margin was violated — never silently deferred),
-            a target below the already-committed boundary, or a
-            raw-tail overflow (the derived bound was violated — never
-            silently dropped).
+        RuntimeError: via device-side assertion on a design-invariant
+            violation — a regular target below the committed boundary,
+            stable frames short of a target (margin violated), a
+            commit past ``pad_frames``, negative ``valid_samples``, or
+            raw-tail overflow. Eager on CPU; a trapping device assert
+            on CUDA.
     """
     n_fft = featurizer.n_fft
     hop = featurizer.hop_length
@@ -198,15 +217,23 @@ def advance_frontend(
     finalized = counters[:, CTR_FINALIZED].clone()
     tail_origin0 = counters[:, CTR_RAW_TAIL_ORIGIN].clone()
     tail_length0 = counters[:, CTR_RAW_TAIL_LENGTH].clone()
-    if bool((finalized > 0).any()):
-        row = int((finalized > 0).long().argmax())
-        raise ValueError(
-            f"row {row}: chunk after finalization (a finalized "
-            "session accepts no further audio)"
-        )
     total_before = counters[:, CTR_TOTAL_VALID_SAMPLES].clone()
     committed = counters[:, CTR_COMMITTED_MEL_FRAMES].clone()
-    total = total_before + valid_samples
+    mel_len0 = counters[:, CTR_MEL_TAIL_LENGTH].clone()
+
+    # Per-row protocol validity: the caller's predicate AND'd with the
+    # frontend-owned finalization state (audio after finalization is a
+    # masked no-op, PORT-ADV-004).
+    valid = finalized == 0
+    if row_valid is not None:
+        valid &= row_valid.to(device=device, dtype=torch.bool)
+    torch._assert_async(
+        (~valid | (valid_samples >= 0)).all(),
+        "advance_frontend: negative valid_samples",
+    )
+
+    eff_samples = torch.where(valid, valid_samples, valid_samples.new_zeros(()))
+    total = total_before + eff_samples
     stable = torch.clamp((total - half) // hop + 1, min=0)
     # Final residual rule (design §Exact Bounded Frontend): commit the
     # remaining valid frames only when at least EIGHT new mel frames
@@ -217,41 +244,34 @@ def advance_frontend(
         n_final - committed >= 8, n_final, committed
     )
     regular = ~is_final
-    bad = regular & (target_frames < committed)
-    if bool(bad.any()):
-        row = int(bad.long().argmax())
-        raise ValueError(
-            f"row {row}: cadence target {int(target_frames[row])} is "
-            f"below the committed boundary {int(committed[row])}"
-        )
-    bad = regular & (stable < target_frames)
-    if bool(bad.any()):
-        row = int(bad.long().argmax())
-        raise ValueError(
-            f"row {row}: only {int(stable[row])} stable mel frames "
-            f"for cadence target {int(target_frames[row])} (design "
-            "margin violated)"
-        )
+    # Design-invariant assertions, valid regular rows only: port
+    # defects fail loudly with zero host synchronization.
+    chk = valid & regular
+    torch._assert_async(
+        (~chk | (target_frames >= committed)).all(),
+        "advance_frontend: cadence target below the committed boundary",
+    )
+    torch._assert_async(
+        (~chk | (stable >= target_frames)).all(),
+        "advance_frontend: stable mel frames short of the cadence "
+        "target (design margin violated)",
+    )
     target = torch.where(is_final, final_target, target_frames)
-    n_new_t = target - committed
-    if bool((n_new_t != n_new_t[0]).any()):
-        # TEMPORARY transition assertion — the length-aware path
-        # carries per-row frame counts instead (PORT-PERF-001).
-        raise ValueError(
-            f"heterogeneous new-frame counts in one call: "
-            f"{n_new_t.tolist()} (temporary transition assertion)"
-        )
-    # ONE shape-determining host sync per call (never per row).
-    n_new = int(n_new_t[0])
-    counts = torch.full((batch,), n_new, dtype=torch.long, device=device)
+    target = torch.where(valid, target, committed)
+    counts = target - committed  # (B,) per-row commit
+    torch._assert_async(
+        (counts <= pad_frames).all(),
+        "advance_frontend: pad_frames below a row's committed count",
+    )
     n_mels = featurizer.fb.shape[0]
 
-    if n_new > 0:
-        # Segment covering frames [committed, target): preemphasized
-        # samples [committed*hop - half, (target-1)*hop + half), plus
-        # one leading raw sample for pre-emphasis continuity.
+    if pad_frames > 0:
+        # Segment covering frames [committed, committed + pad_frames):
+        # preemphasized samples from ``committed*hop - half``, plus one
+        # leading raw sample for pre-emphasis continuity. Width is the
+        # host constant; each row's valid columns are its own commit.
         seg_start = committed * hop - half
-        seg_len = (n_new - 1) * hop + n_fft
+        seg_len = (pad_frames - 1) * hop + n_fft
         idx = (seg_start - 1).unsqueeze(1) + torch.arange(
             seg_len + 1, device=device
         ).unsqueeze(0)
@@ -261,7 +281,7 @@ def advance_frontend(
             tail_origin=tail_origin0,
             tail_length=tail_length0,
             samples=samples,
-            valid_samples=valid_samples,
+            valid_samples=eff_samples,
             new_origin=total_before,
             valid_limit=total,
         )
@@ -287,39 +307,50 @@ def advance_frontend(
         power = magnitude.pow(2.0)
         mel = torch.matmul(featurizer.fb, power)
         new_frames = torch.log(mel + featurizer.log_zero_guard)[
-            :, :, :n_new
+            :, :, :pad_frames
         ]
-        keep = min(MEL_TAIL_FRAMES, n_new)
-        mel_tail.copy_(torch.cat(
-            [mel_tail[:, :, keep:], new_frames[:, :, n_new - keep:]],
-            dim=2,
-        ))
+        # Padded-column zeroing: columns at or past the row's commit
+        # are exactly zero (PORT-ADV-004).
+        col = torch.arange(pad_frames, device=device).view(1, 1, -1)
+        new_frames = torch.where(
+            col < counts.view(-1, 1, 1),
+            new_frames,
+            new_frames.new_zeros(()),
+        )
+        # Per-row mel-tail advance: the last MEL_TAIL_FRAMES of
+        # [old tail | this row's committed frames] — one batched
+        # gather at each row's own offset. Zero-commit rows gather
+        # their old tail back bit-identically.
+        combined = torch.cat([mel_tail, new_frames], dim=2)
+        tidx = (
+            counts.view(-1, 1, 1)
+            + torch.arange(MEL_TAIL_FRAMES, device=device).view(1, 1, -1)
+        ).expand(batch, n_mels, MEL_TAIL_FRAMES)
+        mel_tail.copy_(combined.gather(2, tidx))
     else:
         new_frames = torch.zeros(batch, n_mels, 0, device=device)
 
     counters[:, CTR_TOTAL_VALID_SAMPLES] = total
     counters[:, CTR_COMMITTED_MEL_FRAMES] = target
-    counters[:, CTR_MEL_TAIL_LENGTH] = torch.clamp(
-        target, max=MEL_TAIL_FRAMES
+    counters[:, CTR_MEL_TAIL_LENGTH] = torch.where(
+        valid, torch.clamp(target, max=MEL_TAIL_FRAMES), mel_len0
     )
 
     # Raw-tail retention: nonfinal rows retain from one sample before
-    # the next frame's window; final rows clear.
+    # the next frame's window; final rows clear. Fixed-width gather
+    # (the capacity is the host constant); the per-row write mask is
+    # the logical retention length.
     keep_from = torch.clamp(target * hop - half - 1, min=0)
     keep_len = torch.clamp(total - keep_from, min=0)
-    bad = regular & (keep_len > capacity)
-    if bool(bad.any()):
-        row = int(bad.long().argmax())
-        raise ValueError(
-            f"row {row}: raw-tail overflow ({int(keep_len[row])} > "
-            f"{capacity}) — the derived bound was violated"
-        )
+    torch._assert_async(
+        (~chk | (keep_len <= capacity)).all(),
+        "advance_frontend: raw-tail overflow (the derived bound was "
+        "violated)",
+    )
     retain_len = torch.where(regular, keep_len, keep_len.new_zeros(()))
-    # The SECOND (and last) shape-determining host sync per call.
-    k_max = int(retain_len.max()) if batch else 0
-    if k_max > 0:
+    if batch and capacity:
         kidx = keep_from.unsqueeze(1) + torch.arange(
-            k_max, device=device
+            capacity, device=device
         ).unsqueeze(0)
         kept = _gather_rows(
             kidx,
@@ -327,24 +358,24 @@ def advance_frontend(
             tail_origin=tail_origin0,
             tail_length=tail_length0,
             samples=samples,
-            valid_samples=valid_samples,
+            valid_samples=eff_samples,
             new_origin=total_before,
             valid_limit=total,
         )
-        write = regular.unsqueeze(1) & (
-            torch.arange(k_max, device=device).unsqueeze(0)
+        write = (valid & regular).unsqueeze(1) & (
+            torch.arange(capacity, device=device).unsqueeze(0)
             < keep_len.unsqueeze(1)
         )
-        raw_tail[:, :k_max] = torch.where(
-            write, kept, raw_tail[:, :k_max]
-        )
+        raw_tail.copy_(torch.where(write, kept, raw_tail))
     counters[:, CTR_RAW_TAIL_ORIGIN] = torch.where(
-        is_final, total, keep_from
+        valid,
+        torch.where(is_final, total, keep_from),
+        tail_origin0,
     )
     counters[:, CTR_RAW_TAIL_LENGTH] = torch.where(
-        is_final, keep_len.new_zeros(()), keep_len
+        valid, retain_len, tail_length0
     )
     counters[:, CTR_FINALIZED] = torch.where(
-        is_final, finalized.new_ones(()), finalized
+        valid & is_final, finalized.new_ones(()), finalized
     )
     return new_frames, counts
