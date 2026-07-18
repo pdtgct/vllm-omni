@@ -29,11 +29,13 @@ report:
   ``nonzero`` syncs must fire the tripwire and appear in the trace.
 
 ``graph``   — CUDA-graph capture of the sync-free path
-  (``decode_dense_masked``) after side-stream warmup, replayed from a
-  state snapshot and compared against the eager run: token surfaces
-  exact, state at the provisional 1e-6 bound. A compact-arm capture
-  attempt is the negative control (its shape sync must refuse
-  capture).
+  (``decode_dense_masked``) after side-stream warmup, per geometry:
+  replay compared against the eager run over token surfaces AND the
+  complete state snapshot (integer/raw-tail exact, floating caches at
+  the provisional 1e-6 bound), one eager carried-state successor
+  chunk, and input tracking derived from replay-2-vs-eager plus a
+  replay1-vs-replay2 sensitivity gate. A compact-arm capture attempt
+  is the negative control (its shape sync must refuse capture).
 
 The transition's dependency closure is torch-only, loaded by file
 path under a stubbed package chain (the ``test_advance_session_local``
@@ -280,6 +282,72 @@ def _state_restore(state: Any, snap: dict[str, Any]) -> None:
     state.h.copy_(snap["h"])
     state.c.copy_(snap["c"])
     state.last_label.copy_(snap["last_label"])
+
+
+def _compare_snapshots(
+    check: Check,
+    a: dict[str, Any],
+    b: dict[str, Any],
+    ctx: str,
+    *,
+    float_atol: float,
+) -> None:
+    """Compare two COMPLETE state snapshots family by family — PORT
+    state is all of it; corruption in any cache may only show on the
+    next chunk. Integer control state, labels, and the raw sample
+    tail (copied input samples) compare exactly; floating caches at
+    ``float_atol`` (0.0 makes everything bit-exact)."""
+    for key in ("frontend_counters", "last_label", "raw_tail"):
+        check.close(
+            a[key].float(), b[key].float(), 0.0, f"{ctx}.{key}"
+        )
+    for key in ("mel_tail", "h", "c"):
+        check.close(a[key], b[key], float_atol, f"{ctx}.{key}")
+    for layer in range(N_LAYERS):
+        check.close(
+            a["channel"][layer], b["channel"][layer], float_atol,
+            f"{ctx}.channel{layer}",
+        )
+        check.close(
+            a["time"][layer], b["time"][layer], float_atol,
+            f"{ctx}.time{layer}",
+        )
+        check.close(
+            a["window_valid"][layer].float(),
+            b["window_valid"][layer].float(),
+            0.0,
+            f"{ctx}.window_valid{layer}",
+        )
+
+
+def _compare_snapshot_rows(
+    check: Check,
+    a: dict[str, Any],
+    b: dict[str, Any],
+    rows: list[int],
+    ctx: str,
+) -> None:
+    """Bit-identical comparison of the FULL snapshot for the given
+    rows (PORT-ADV-004: a failed row mutates no state — not merely
+    the fields a partial sample happens to look at)."""
+    for key in (
+        "frontend_counters", "last_label", "raw_tail", "mel_tail",
+        "h", "c",
+    ):
+        for row in rows:
+            check.close(
+                a[key][row].float(), b[key][row].float(), 0.0,
+                f"{ctx}.{key}[{row}]",
+            )
+    for layer in range(N_LAYERS):
+        for fam in ("channel", "time", "window_valid"):
+            for row in rows:
+                check.close(
+                    a[fam][layer][row].float(),
+                    b[fam][layer][row].float(),
+                    0.0,
+                    f"{ctx}.{fam}{layer}[{row}]",
+                )
 
 
 def _chunk(
@@ -751,20 +819,12 @@ def run_protocol_rows(
             int(result.token_lengths[row]), 0,
             f"{ctx}.masked_burst[{row}]",
         )
-        check.close(
-            stateN.frontend_counters[row].float(),
-            before["frontend_counters"][row].float(),
-            0.0,
-            f"{ctx}.counters_unchanged[{row}]",
-        )
-        check.close(
-            stateN.h[row], before["h"][row], 0.0,
-            f"{ctx}.h_unchanged[{row}]",
-        )
-        check.close(
-            stateN.channel[0][row], before["channel"][0][row], 0.0,
-            f"{ctx}.channel_unchanged[{row}]",
-        )
+    # PORT-ADV-004: a failed row mutates NO state — bit-identical over
+    # the whole snapshot, not a partial sample.
+    _compare_snapshot_rows(
+        check, before, _state_snapshot(stateN), [0, 1, 2],
+        f"{ctx}.unchanged",
+    )
     # Audio after finalization: FINALIZED bit, no mutation.
     s = singles[3]
     fin = _chunk(
@@ -786,11 +846,9 @@ def run_protocol_rows(
         frontend.ROW_STATUS_FINALIZED,
         f"{ctx}.finalized_bit",
     )
-    check.close(
-        s.frontend_counters.float(),
-        after_final["frontend_counters"].float(),
-        0.0,
-        f"{ctx}.finalized_counters_unchanged",
+    _compare_snapshots(
+        check, after_final, _state_snapshot(s),
+        f"{ctx}.finalized_unchanged", float_atol=0.0,
     )
 
 
@@ -836,8 +894,6 @@ def run_sync_arm(
 
     report: dict[str, Any] = {}
     for gid, label, lookahead, cadence, chunk in GEOMETRIES:
-        if label not in ("80ms", "1120ms"):
-            continue
         core, batch, state = _sync_bucket(
             gid, lookahead, cadence, chunk, device, seed
         )
@@ -954,12 +1010,29 @@ def run_sync_arm(
 def run_graph_arm(
     check: Check, device: str, seed: int
 ) -> dict[str, Any]:
-    """CUDA-graph capture of the sync-free path after warmup."""
+    """CUDA-graph capture of the sync-free path after warmup, per
+    geometry: whole-state replay-vs-eager equivalence, one eager
+    carried-state successor chunk, input tracking derived from
+    assertions (with a replay1-vs-replay2 sensitivity gate), and the
+    compact negative control."""
     report: dict[str, Any] = {}
-    gid, label, lookahead, cadence, chunk = GEOMETRIES[4]
+    for gid, label, lookahead, cadence, chunk in GEOMETRIES:
+        report[label] = _graph_cell(
+            check, device, seed, gid, label, lookahead, cadence,
+            chunk,
+        )
+    return report
+
+
+def _graph_cell(
+    check: Check, device: str, seed: int, gid: int, label: str,
+    lookahead: int, cadence: int, chunk: int,
+) -> dict[str, Any]:
+    cell: dict[str, Any] = {}
     core, batch, state = _sync_bucket(
         gid, lookahead, cadence, chunk, device, seed
     )
+    n = batch.samples.shape[0]
     snap = _state_snapshot(state)
 
     side = torch.cuda.Stream()
@@ -980,26 +1053,25 @@ def run_graph_arm(
             captured = _advance(
                 core, batch, state, gid, rnnt.decode_dense_masked
             )
-        report["dense_capture"] = "ok"
+        cell["dense_capture"] = "ok"
     except RuntimeError as err:
-        report["dense_capture"] = f"FAILED: {err}"
-        report["dense_capture_traceback"] = traceback.format_exc()
+        cell["dense_capture"] = f"FAILED: {err}"
+        cell["dense_capture_traceback"] = traceback.format_exc()
         check.ok(False, f"graph[{label}].dense capture: {err}")
-        return report
-    check.ok(True, "")
+        return cell
 
-    # Replay from the snapshot and compare against the eager run.
+    # Replay 1: token surfaces AND the complete state transition must
+    # match the eager run — a graph could replay correct labels while
+    # corrupting a cache only the next chunk reads.
+    pre = len(check.failures)
     _state_restore(state, snap)
     graph.replay()
     torch.accelerator.synchronize()
-    replay_tokens = [
-        _tokens(captured, row)
-        for row in range(batch.samples.shape[0])
-    ]
+    replay_tokens = [_tokens(captured, row) for row in range(n)]
     replay_status = captured.row_status.tolist()
-    replay_state = _state_snapshot(state)
+    replay1 = _state_snapshot(state)
 
-    eager_state = _fresh_state(batch.samples.shape[0], device)
+    eager_state = _fresh_state(n, device)
     _state_restore(eager_state, snap)
     eager = _advance(
         core, batch, eager_state, gid, rnnt.decode_dense_masked
@@ -1009,45 +1081,101 @@ def run_graph_arm(
         replay_status, eager.row_status.tolist(),
         f"graph[{label}].replay row_status",
     )
-    for row in range(batch.samples.shape[0]):
+    for row in range(n):
         check.equal(
             replay_tokens[row], _tokens(eager, row),
             f"graph[{label}].replay tokens[{row}]",
         )
-    for key in ("h", "c"):
-        check.close(
-            replay_state[key], getattr(eager_state, key), 1e-6,
-            f"graph[{label}].replay {key}",
-        )
-    check.close(
-        replay_state["frontend_counters"].float(),
-        eager_state.frontend_counters.float(),
-        0.0,
-        f"graph[{label}].replay counters",
+    _compare_snapshots(
+        check, replay1, _state_snapshot(eager_state),
+        f"graph[{label}].replay", float_atol=1e-6,
     )
-    report["replay_matches_eager"] = not check.failures
 
-    # New input values through the SAME static tensors and graph.
+    # Carried state: one EAGER successor chunk from the replayed
+    # state must equal the same successor from the eager state.
+    torch.manual_seed(seed + 8)
+    succ = _chunk(
+        torch.randn(n, chunk, device=device) * 0.1,
+        torch.full((n,), chunk, dtype=torch.long, device=device),
+        gid=gid,
+        finals=torch.zeros(n, dtype=torch.bool, device=device),
+        prompts=batch.prompt_index,
+        seqs=batch.chunk_sequence + 1,
+    )
+    r_succ_replay = _advance(
+        core, succ, state, gid, rnnt.decode_dense_masked
+    )
+    r_succ_eager = _advance(
+        core, succ, eager_state, gid, rnnt.decode_dense_masked
+    )
+    torch.accelerator.synchronize()
+    check.equal(
+        r_succ_replay.row_status.tolist(),
+        r_succ_eager.row_status.tolist(),
+        f"graph[{label}].successor row_status",
+    )
+    for row in range(n):
+        check.equal(
+            _tokens(r_succ_replay, row), _tokens(r_succ_eager, row),
+            f"graph[{label}].successor tokens[{row}]",
+        )
+    _compare_snapshots(
+        check, _state_snapshot(state), _state_snapshot(eager_state),
+        f"graph[{label}].successor", float_atol=1e-6,
+    )
+    cell["replay_matches_eager"] = len(check.failures) == pre
+
+    # Replay 2: new audio through the SAME static tensors. Tracking
+    # is proven only if (a) replay-2 equals its eager run across
+    # tokens and complete state AND (b) an input-sensitive tensor
+    # differs from replay-1 — token equality alone can persist across
+    # different audio.
+    pre2 = len(check.failures)
     torch.manual_seed(seed + 9)
     batch.samples.copy_(torch.randn_like(batch.samples) * 0.1)
     _state_restore(state, snap)
     graph.replay()
     torch.accelerator.synchronize()
-    replay2 = [
-        _tokens(captured, row)
-        for row in range(batch.samples.shape[0])
-    ]
+    replay2_tokens = [_tokens(captured, row) for row in range(n)]
+    replay2_status = captured.row_status.tolist()
+    replay2 = _state_snapshot(state)
     _state_restore(eager_state, snap)
     eager2 = _advance(
         core, batch, eager_state, gid, rnnt.decode_dense_masked
     )
     torch.accelerator.synchronize()
-    for row in range(batch.samples.shape[0]):
+    check.equal(
+        replay2_status, eager2.row_status.tolist(),
+        f"graph[{label}].replay2 row_status",
+    )
+    for row in range(n):
         check.equal(
-            replay2[row], _tokens(eager2, row),
+            replay2_tokens[row], _tokens(eager2, row),
             f"graph[{label}].replay2 tokens[{row}]",
         )
-    report["replay_tracks_new_inputs"] = True
+    _compare_snapshots(
+        check, replay2, _state_snapshot(eager_state),
+        f"graph[{label}].replay2", float_atol=1e-6,
+    )
+    sensitivity = max(
+        float(
+            (replay1["mel_tail"] - replay2["mel_tail"]).abs().max()
+        ),
+        float(
+            (replay1["channel"][0] - replay2["channel"][0])
+            .abs()
+            .max()
+        ),
+    )
+    cell["input_sensitivity_max_diff"] = f"{sensitivity:.3e}"
+    check.ok(
+        sensitivity > 0.0,
+        f"graph[{label}].replay2 state identical to replay1 — new "
+        "inputs not consumed",
+    )
+    cell["replay_tracks_new_inputs"] = (
+        len(check.failures) == pre2 and sensitivity > 0.0
+    )
 
     # Negative control: the compact arm's shape sync must refuse
     # capture.
@@ -1058,13 +1186,13 @@ def run_graph_arm(
             _advance(
                 core, batch, state, gid, rnnt.decode_compact_active
             )
-        report["compact_capture"] = "captured (UNEXPECTED)"
+        cell["compact_capture"] = "captured (UNEXPECTED)"
         check.ok(
             False, f"graph[{label}].compact capture unexpectedly ok"
         )
     except RuntimeError:
-        report["compact_capture"] = "refused-as-expected"
-    return report
+        cell["compact_capture"] = "refused-as-expected"
+    return cell
 
 
 def main() -> None:

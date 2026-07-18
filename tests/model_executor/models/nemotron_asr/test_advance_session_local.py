@@ -152,6 +152,45 @@ def _stack_states(states: list[Any]) -> Any:
     )
 
 
+def _row_clone(state: Any, row: int) -> dict[str, Any]:
+    """Clone EVERY state family for one row (PORT-ADV-004's
+    no-mutation promise covers the whole snapshot)."""
+    r = slice(row, row + 1)
+    return {
+        "raw_tail": state.raw_tail[r].clone(),
+        "mel_tail": state.mel_tail[r].clone(),
+        "frontend_counters": state.frontend_counters[r].clone(),
+        "channel": [t[r].clone() for t in state.channel],
+        "window_valid": [t[r].clone() for t in state.window_valid],
+        "time": [t[r].clone() for t in state.time],
+        "h": state.h[r].clone(),
+        "c": state.c[r].clone(),
+        "last_label": state.last_label[r].clone(),
+    }
+
+
+def _assert_row_unchanged(
+    state: Any, row: int, before: dict[str, Any]
+) -> None:
+    """Bit-identical comparison over the full row snapshot."""
+    r = slice(row, row + 1)
+    for key in (
+        "raw_tail", "mel_tail", "frontend_counters", "h", "c",
+        "last_label",
+    ):
+        torch.testing.assert_close(
+            getattr(state, key)[r], before[key], rtol=0, atol=0
+        )
+    for fam in ("channel", "window_valid", "time"):
+        for layer in range(N_LAYERS):
+            torch.testing.assert_close(
+                getattr(state, fam)[layer][r],
+                before[fam][layer],
+                rtol=0,
+                atol=0,
+            )
+
+
 def _chunk(
     samples: torch.Tensor,
     *,
@@ -270,11 +309,7 @@ def test_wrong_sequence_row_is_masked_and_reported() -> None:
     torch.manual_seed(24)
     samples = torch.randn(2, CHUNK) * 0.1
     state = _fresh_state(2)
-    before = {
-        "counters": state.frontend_counters[1].clone(),
-        "h": state.h[1].clone(),
-        "channel": state.channel[0][1].clone(),
-    }
+    before = _row_clone(state, 1)
     batch = _chunk(samples, seq=0)
     batch.chunk_sequence[1] = 3  # wrong: expected 0
     result = _advance(core, batch, state, capture=True)
@@ -283,13 +318,7 @@ def test_wrong_sequence_row_is_masked_and_reported() -> None:
         0, frontend.ROW_STATUS_SEQUENCE,
     ]
     assert int(result.token_lengths[1]) == 0
-    torch.testing.assert_close(
-        state.frontend_counters[1], before["counters"], rtol=0, atol=0
-    )
-    torch.testing.assert_close(state.h[1], before["h"], rtol=0, atol=0)
-    torch.testing.assert_close(
-        state.channel[0][1], before["channel"], rtol=0, atol=0
-    )
+    _assert_row_unchanged(state, 1, before)
     # The valid row matches its single-row run.
     state1 = _fresh_state(1)
     r1 = _advance(
@@ -315,16 +344,14 @@ def test_geometry_mismatch_row_is_masked() -> None:
     torch.manual_seed(27)
     samples = torch.randn(1, CHUNK) * 0.1
     state = _fresh_state(1)
-    before = state.frontend_counters.clone()
+    before = _row_clone(state, 0)
     batch = _chunk(samples, seq=0)
     batch.geometry_id[0] = 2  # bucket is GEOMETRY_1120 = 4
     result = _advance(core, batch, state)
     assert result.row_valid.tolist() == [False]
     assert result.row_status.tolist() == [frontend.ROW_STATUS_GEOMETRY]
     assert int(result.token_lengths[0]) == 0
-    torch.testing.assert_close(
-        state.frontend_counters, before, rtol=0, atol=0
-    )
+    _assert_row_unchanged(state, 0, before)
 
 
 def test_zero_frame_final_leaves_state_and_stages_captures() -> None:
@@ -561,7 +588,7 @@ def test_oversize_final_row_is_masked_and_reported() -> None:
     torch.manual_seed(28)
     samples = torch.randn(1, 2 * CHUNK) * 0.1
     _advance(core, _chunk(samples[:, :CHUNK], seq=0), state)
-    before = state.frontend_counters.clone()
+    before = _row_clone(state, 0)
     result = _advance(
         core,
         _chunk(samples[:, CHUNK:], seq=1, final=True),
@@ -572,8 +599,6 @@ def test_oversize_final_row_is_masked_and_reported() -> None:
         frontend.ROW_STATUS_FINAL_OVERSIZE
     ]
     assert int(result.token_lengths[0]) == 0
-    torch.testing.assert_close(
-        state.frontend_counters, before, rtol=0, atol=0
-    )
+    _assert_row_unchanged(state, 0, before)
     # The session is NOT finalized — recoverable, per the row tier.
     assert int(state.frontend_counters[0, frontend.CTR_FINALIZED]) == 0
