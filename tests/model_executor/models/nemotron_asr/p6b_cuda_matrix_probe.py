@@ -55,6 +55,7 @@ import platform
 import re
 import sys
 import time
+import traceback
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,13 +78,22 @@ VOCAB = 12
 PRED_HIDDEN = 16
 RAW_TAIL = 1_953
 HOP = 160
+#: CUDA-side synchronization evidence — the dense-path hard gate.
+#: Pageable HtoD/DtoH memcpys synchronize; a CUDA-tensor ``item()``
+#: shows up here as its stream sync + DtoH pair.
 SYNC_MARKERS = (
     "cudaStreamSynchronize",
     "cudaDeviceSynchronize",
-    "aten::_local_scalar_dense",
-    "aten::item",
     "aten::nonzero",
     "Memcpy DtoH",
+    "Memcpy HtoD",
+)
+#: Host-tensor readbacks (``int()`` on a CPU tensor) are legal — no
+#: device is involved — but reported so shape-math regressions stay
+#: visible.
+HOST_READ_MARKERS = (
+    "aten::_local_scalar_dense",
+    "aten::item",
 )
 
 
@@ -850,6 +860,9 @@ def run_sync_arm(
             cell["tripwire_dense"] = "clean"
         except RuntimeError as err:
             cell["tripwire_dense"] = f"FIRED: {err}"
+            # The raise happens AT the synchronizing op — this
+            # traceback is the diagnosis, keep all of it.
+            cell["tripwire_dense_traceback"] = traceback.format_exc()
         finally:
             torch.cuda.set_sync_debug_mode(0)
         torch.accelerator.synchronize()
@@ -880,31 +893,34 @@ def run_sync_arm(
             ("compact", rnnt.decode_compact_active),
         ):
             _state_restore(state, snap)
+            torch.accelerator.synchronize()
             with profile(
                 activities=[
                     ProfilerActivity.CPU, ProfilerActivity.CUDA
                 ]
             ) as prof:
                 _advance(core, batch, state, gid, fn)
-                torch.accelerator.synchronize()
+            torch.accelerator.synchronize()
             counts: dict[str, int] = {}
+            host_reads: dict[str, int] = {}
             for evt in prof.events():
                 for marker in SYNC_MARKERS:
                     if marker in evt.name:
                         counts[marker] = counts.get(marker, 0) + 1
-            # The closing torch.accelerator.synchronize() is the harness's
-            # own barrier — one cudaDeviceSynchronize is expected.
-            counts["cudaDeviceSynchronize"] = max(
-                counts.get("cudaDeviceSynchronize", 0) - 1, 0
-            )
+                for marker in HOST_READ_MARKERS:
+                    if marker in evt.name:
+                        host_reads[marker] = (
+                            host_reads.get(marker, 0) + 1
+                        )
             trace = out_dir / f"trace-{label}-{name}.json"
             prof.export_chrome_trace(str(trace))
             cell[f"profiler_{name}"] = counts
+            cell[f"host_reads_{name}"] = host_reads
             cell[f"trace_{name}"] = str(trace)
         dense_counts = cell["profiler_dense"]
         check.equal(
             sum(dense_counts.values()), 0,
-            f"sync[{label}].dense host-sync count {dense_counts}",
+            f"sync[{label}].dense device-sync count {dense_counts}",
         )
         compact_counts = cell["profiler_compact"]
         check.ok(
@@ -948,6 +964,7 @@ def run_graph_arm(
         report["dense_capture"] = "ok"
     except RuntimeError as err:
         report["dense_capture"] = f"FAILED: {err}"
+        report["dense_capture_traceback"] = traceback.format_exc()
         check.ok(False, f"graph[{label}].dense capture: {err}")
         return report
     check.ok(True, "")
