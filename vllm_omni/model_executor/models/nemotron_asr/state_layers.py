@@ -4,12 +4,13 @@
 
 The cache-aware streaming capability declares all cross-chunk model
 state through `kv_cache_interface` spec pages (PORT-STATE-001/002) —
-ALL FOUR kinds as constant-size ``MambaSpec`` pages: the encoder
+ALL FIVE kinds as constant-size ``MambaSpec`` pages: the encoder
 left-context window (the OPEN-α3-VEHICLE decision, measured
 2026-07-14 — paged sliding-window KV evicts live audio under RNN-T
 token cadence; see docs/intent/port/decisions/
 attention-window-vehicle.md in the notes repo), the depthwise-conv
-tails, the predictor LSTM, and the replay queue. ``MambaSpec`` is the
+tails, the predictor LSTM, the replay queue + session book, and the
+frontend continuity page. ``MambaSpec`` is the
 landed mechanism for constant-size per-session state (``ShortConv``
 precedent), not a Mamba-specific hack (ledger §8 addendum: the
 capability is general; ``MambaSpec`` is today's vehicle).
@@ -34,10 +35,10 @@ from vllm_omni.model_executor.models.nemotron_asr.precision import (
 try:  # engine-integration imports; absent in GPU-free unit tests
     from vllm.model_executor.layers.mamba.abstract import MambaBase
 except ImportError:  # pragma: no cover - exercised only off-engine
-    MambaBase = object  # type: ignore[assignment,misc]
+    MambaBase = object  # noqa: N816 - engine-absent fallback
 
 
-class _StatePage(MambaBase):  # type: ignore[misc]
+class _StatePage(MambaBase):
     """One constant-size per-session state page."""
 
     #: Lifecycle class (D-BUc-4): persistent recurrent state that
@@ -65,13 +66,23 @@ class _StatePage(MambaBase):  # type: ignore[misc]
     def get_state_shape(self) -> Iterable[tuple[int, ...]]:
         return self._shapes
 
+    #: Integer tensor classes resolve OUTSIDE the precision policy:
+    #: control counters/ids are not a precision axis (they are never
+    #: precision-tradeable), so they neither enter nor perturb a
+    #: policy's content-hash identifier (PORT-PREC-005 scope is
+    #: numeric state). A8: control counters and ids use integer page
+    #: tensors — total_valid_samples alone overflows fp32-exact past
+    #: ~17 minutes of 16 kHz audio.
+    _INT_CLASSES = {"int32": torch.int32, "int64": torch.int64}
+
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return tuple(
-            self._policy.dtype_for(cls) for cls in self._tensor_classes
+            self._INT_CLASSES.get(cls) or self._policy.dtype_for(cls)
+            for cls in self._tensor_classes
         )
 
     @property
-    def mamba_type(self):  # MambaAttentionBackendEnum at runtime
+    def mamba_type(self) -> Any:  # MambaAttentionBackendEnum at runtime
         from vllm.v1.attention.backends.registry import (
             MambaAttentionBackendEnum,
         )
@@ -148,28 +159,24 @@ class WindowCachePage(_StatePage):
         super().__init__(
             prefix=prefix,
             shapes=((window, d_model), (1,)),
-            tensor_classes=("attention_cache", "queue_state"),
+            tensor_classes=("attention_cache", "int32"),
             policy=policy,
         )
 
 
 class ReplayQueuePage(_StatePage):
-    """D-b replay queue + decode bookkeeping (PORT-DEC-002).
+    """Replay queue + the seven-slot session book (PORT-DEC-002).
 
     Slots: ``max_symbols_per_step * max_frames_per_chunk`` queued label
-    ids, plus a 4-slot bookkeeping vector (queue head, queue length,
-    last label, prompt index). Label ids store losslessly in the
-    ``queue_state`` tensor class's float dtype (vocab 13088 << 2**24 at
-    fp32), keeping the provenance-locked fp32-all policy identifier
-    intact rather than introducing an integer dtype axis.
+    ids, plus the manifest-pinned seven-slot book (queue head, queue
+    length, last label, prompt, admitted geometry, pending-echo flag,
+    expected label — ``manifests.BOOK_FIELDS`` order, each with its own
+    init rule). Both tensors are int32 control state (A8), outside the
+    precision-policy axis. The PAGE PERSISTS ACROSS PARK as a whole
+    (reconciled design, port-design.md §Session State Pages): the
+    queue is empty at a legal park, but last-label, prompt, geometry,
+    and echo state share the page and are load-bearing on resume.
     """
-
-    #: Intra-burst scratch, not persistent state (D-BUc-4): the queue is
-    #: provably empty at park (a session parks only via the
-    #: drained-queue → park-token → resumable-stop path), so the offload
-    #: path skips it. A D-b decode artifact that vanishes if a
-    #: first-class emission seam (RFC Q2) lands.
-    persist_across_session_park: bool = False
 
     def __init__(
         self,
@@ -182,8 +189,37 @@ class ReplayQueuePage(_StatePage):
         capacity = max_symbols_per_step * max_frames_per_chunk
         super().__init__(
             prefix=prefix,
-            shapes=((capacity,), (4,)),
-            tensor_classes=("queue_state", "queue_state"),
+            shapes=((capacity,), (7,)),
+            tensor_classes=("int32", "int32"),
+            policy=policy,
+        )
+
+
+class FrontendStatePage(_StatePage):
+    """Frontend continuity: raw tail, mel tail, eight counters.
+
+    The fifth state-page kind (design §Exact Bounded Frontend): the
+    bounded raw-sample tail and committed-boundary mel tail ride the
+    ``frontend_state`` tensor class — fp32 under the bring-up wildcard;
+    a sub-fp32 policy that has not explicitly scoped this component
+    fails loudly at use (PrecisionPolicy's partial-resolution posture)
+    rather than silently inheriting a compute dtype. The counters are
+    int64 (``manifests.FRONTEND_COUNTER_FIELDS`` order), outside the
+    precision axis.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefix: str,
+        raw_tail: int,
+        n_mels: int,
+        policy: PrecisionPolicy,
+    ) -> None:
+        super().__init__(
+            prefix=prefix,
+            shapes=((raw_tail,), (n_mels, 9), (8,)),
+            tensor_classes=("frontend_state", "frontend_state", "int64"),
             policy=policy,
         )
 
@@ -416,4 +452,5 @@ def state_page_prefixes(n_encoder_layers: int) -> list[tuple[str, str]]:
         prefixes.append(("conv", f"encoder.layers.{i}.conv"))
     prefixes.append(("lstm", "predictor.layers.0.lstm_state"))
     prefixes.append(("replay", "decode.layers.0.replay"))
+    prefixes.append(("frontend", "frontend.layers.0.state"))
     return prefixes

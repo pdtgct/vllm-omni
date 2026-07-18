@@ -101,9 +101,10 @@ class Joint(nn.Module):
         dtype — both inputs cast to the weights here (PORT-PREC-001).
         """
         dtype = self.enc.weight.dtype
-        return self.joint_net(
+        out: torch.Tensor = self.joint_net(
             self.enc(enc_frame.to(dtype)) + self.pred(pred_out.to(dtype))
         )
+        return out
 
 
 def greedy_decode_chunk(
@@ -216,10 +217,13 @@ def greedy_decode_batch(
 
 # ---- engine-tier decode seams (α3 tests-first; PORT-DEC-002/003/007/008) -----
 
-#: Slot indices in the replay-queue page's 4-slot bookkeeping vector
-#: (ReplayQueuePage's second tensor): queue head, queue length, last
-#: emitted label, prompt index.
+#: Slot indices in the replay-queue page's SEVEN-slot session book
+#: (ReplayQueuePage's second tensor) — manifests.BOOK_FIELDS order
+#: (the manifest is the single source; test-pinned): queue head,
+#: queue length, last emitted label, prompt index, admitted geometry,
+#: pending-echo flag, expected label.
 QUEUE_HEAD, QUEUE_LEN, QUEUE_LAST_LABEL, QUEUE_PROMPT = 0, 1, 2, 3
+BOOK_GEOMETRY, BOOK_PENDING_ECHO, BOOK_EXPECTED_LABEL = 4, 5, 6
 
 
 def park_token_id(hf_config: Any) -> int:
@@ -238,7 +242,7 @@ def park_token_id(hf_config: Any) -> int:
             "hf_config has no eos_token_id: the park path (PORT-DEC-003) "
             "requires the checkpoint to publish one"
         )
-    return eos_token_id
+    return int(eos_token_id)
 
 
 def realtime_token_budget(

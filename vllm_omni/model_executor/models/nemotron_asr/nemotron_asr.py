@@ -38,6 +38,9 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
     PromptConditioner,
     resolve_prompt_index,
 )
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    FRONTEND_CONSTANTS,
+)
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
@@ -56,6 +59,7 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
     ConvCachePage,
+    FrontendStatePage,
     HybridStateModelMixin,
     LSTMStatePage,
     ReplayQueuePage,
@@ -353,6 +357,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         self._conv_pages = [p for k, p in paired if k == "conv"]
         self._lstm_page = next(p for k, p in paired if k == "lstm")
         self._replay_page = next(p for k, p in paired if k == "replay")
+        self._frontend_page = next(p for k, p in paired if k == "frontend")
         # The pre-encode overlap dropped from non-first chunks
         # (drop_extra); session-first chunks use 0 (run_forward_step).
         self._drop_extra = 2
@@ -396,6 +401,15 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                         prefix=prefix,
                         max_symbols_per_step=MAX_SYMBOLS_PER_STEP,
                         max_frames_per_chunk=_MAX_FRAMES_PER_CHUNK,
+                        policy=policy,
+                    )
+                )
+            elif kind == "frontend":
+                pages.append(
+                    FrontendStatePage(
+                        prefix=prefix,
+                        raw_tail=FRONTEND_CONSTANTS["raw_tail_capacity"],
+                        n_mels=_N_MELS,
                         policy=policy,
                     )
                 )
