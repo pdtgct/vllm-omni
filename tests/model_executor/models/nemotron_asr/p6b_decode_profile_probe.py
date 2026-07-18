@@ -172,6 +172,36 @@ def _sm_clock_mhz() -> int | None:
         return None
 
 
+def _driver_version() -> str | None:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip().splitlines()[0]
+    except Exception:
+        return None
+
+
+def _probe_revision() -> dict[str, Any]:
+    """The fork revision + dirty flag this probe ran from — evidence
+    identity, so an artifact binds to exact code."""
+    root = Path(__file__).resolve().parents[4]
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip())
+        return {"fork_commit": rev, "dirty_tree": dirty}
+    except Exception:
+        return {"fork_commit": None, "dirty_tree": None}
+
+
 def _t_pad(cadence: int) -> int:
     """The bucket's padded encoder width, from the same host formula
     advance_session uses; dims don't matter, only kernel/stride/
@@ -575,11 +605,15 @@ def main() -> None:
                         # BF16 argmax is not batch-shape-invariant:
                         # compact's compacted GEMMs change reduction
                         # order, and the speech calibration parks
-                        # blank-vs-label logits near a tie, so bf16
-                        # cross-arm flips at large B are a measured
-                        # property of the lane, not a decoder defect
-                        # (L4 round: 18/300 bf16 cells, 0/300 fp32).
-                        # Recorded, gating only the fp32 lane.
+                        # blank-vs-label logits near a tie (L4 round:
+                        # 18/300 bf16 cells, 0/300 fp32). The bf16
+                        # lane is therefore EXPLORATORY — timed but
+                        # correctness-unqualified, never generator
+                        # input (PORT-DEC-008: candidates match
+                        # before they are dispatchable; bf16 dispatch
+                        # waits on real-checkpoint precision
+                        # qualification). Counted per lane; never
+                        # silently ignored.
                         if row["precision"] == "fp32":
                             mismatches += 1
                         else:
@@ -604,13 +638,42 @@ def main() -> None:
                 torch.cuda.get_device_name(0)
                 if device == "cuda" else platform.processor()
             ),
+            "driver": _driver_version(),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+            **_probe_revision(),
+            "weights": f"synthetic-seed-{args.seed}",
+            "config_source": (
+                "configuration_nemotron_asr defaults"
+                if config_asserted else "unasserted (shape-only)"
+            ),
             "dims": dims,
             "model_shape_digest": shape_digest,
             "config_asserted": config_asserted,
             "max_symbols": rnnt.MAX_SYMBOLS_PER_STEP,
+            "lanes": {
+                "fp32": {
+                    "definition": "all decode modules fp32",
+                    "status": "performance-qualified",
+                },
+                "bf16-joint": {
+                    "definition": (
+                        "joint BF16; predictor + recurrent state "
+                        "fp32 (PORT-PREC-001/005 seam)"
+                    ),
+                    "status": (
+                        "EXPLORATORY: performance-measured, "
+                        "correctness-unqualified (BF16 argmax not "
+                        "batch-shape-invariant); dispatch pending "
+                        "real-checkpoint precision qualification"
+                    ),
+                },
+            },
+            "activity_forcing": (
+                "synthetic blank-bias calibration; table generation "
+                "must bind its own versioned activity-envelope id"
+            ),
             "tiers": tiers,
             "iters_cap": args.iters,
             "brackets": args.brackets,
