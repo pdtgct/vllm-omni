@@ -272,13 +272,160 @@ def advance_session(
         Per-row nonblank bursts and named captures.
 
     Raises:
-        NotImplementedError: Always, at this tests-first stub — lands
-            in Phase 6 with ``forward_step.py``'s deletion.
+        ValueError: on a control-field violation (non-integer value,
+            out-of-range geometry/prompt, wrong chunk sequence), a
+            frontend protocol error, or a design-margin violation
+            (via ``advance_frontend``).
     """
-    raise NotImplementedError(
-        "advance_session lands in Phase 6 with the forward_step.py "
-        "deletion (ledger P5-1)"
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        stream_step,
     )
+    from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+        CTR_COMMITTED_MEL_FRAMES,
+        CTR_ENCODED_MEL_FRAMES,
+        CTR_EXPECTED_CHUNK_SEQUENCE,
+        advance_frontend,
+        cadence_boundary,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+        CADENCES,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        DecodeState,
+        greedy_decode_batch,
+    )
+
+    n_rows = batch.samples.shape[0]
+    lookaheads = [right for (_, right) in CADENCES.values()]
+
+    # Validate controls (design §Chunk envelope): integer-valued,
+    # in-range, in sequence — before any state mutation.
+    targets = torch.zeros(n_rows, dtype=torch.long)
+    for b in range(n_rows):
+        geometry = int(batch.geometry_id[b])
+        if not 0 <= geometry < len(lookaheads):
+            raise ValueError(f"row {b}: geometry id {geometry} unknown")
+        seq = int(batch.chunk_sequence[b])
+        expected = int(
+            state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE]
+        )
+        if seq != expected:
+            raise ValueError(
+                f"row {b}: chunk sequence {seq}, expected {expected}"
+            )
+        if int(batch.valid_samples[b]) < 0:
+            raise ValueError(f"row {b}: negative valid_samples")
+        targets[b] = cadence_boundary(
+            seq + 1, lookahead=lookaheads[geometry]
+        )
+
+    # Pre-consume snapshot: encoder input = mel-tail prefix (the
+    # pre-encode cache; empty on session-first) + this update's newly
+    # committed frames.
+    tail_valid = [
+        min(
+            int(state.frontend_counters[b, CTR_ENCODED_MEL_FRAMES]),
+            state.mel_tail.shape[2],
+        )
+        for b in range(n_rows)
+    ]
+    prefixes = [
+        state.mel_tail[b, :, state.mel_tail.shape[2] - tail_valid[b]:]
+        .clone()
+        for b in range(n_rows)
+    ]
+
+    new_frames, _counts = advance_frontend(
+        core.featurizer,
+        batch.samples,
+        batch.valid_samples,
+        batch.final_tail,
+        targets,
+        raw_tail=state.raw_tail,
+        mel_tail=state.mel_tail,
+        counters=state.frontend_counters,
+    )
+
+    # One geometry bucket per call is the caller's contract
+    # (advance_model_rows groups by execution profile + geometry), so
+    # every row shares the same encoder-input width here.
+    mel_inputs = [
+        torch.cat([prefixes[b], new_frames[b]], dim=1)
+        for b in range(n_rows)
+    ]
+    widths = {m.shape[1] for m in mel_inputs}
+    if len(widths) != 1:
+        raise ValueError(
+            f"heterogeneous encoder-input widths in one bucket: "
+            f"{sorted(widths)} (caller must bucket by geometry/phase)"
+        )
+    mel = torch.stack(mel_inputs)
+    drops = {-(-tail_valid[b] // 8) for b in range(n_rows)}
+    if len(drops) != 1:
+        raise ValueError(
+            "heterogeneous pre-encode overlap in one bucket "
+            f"(tail_valid={tail_valid})"
+        )
+    drop_extra = drops.pop()
+
+    caches = _GatheredCaches(state)
+    with torch.no_grad():
+        enc = stream_step(
+            # _GatheredCaches is StreamingCaches' structural twin over
+            # the gathered batch; stream_step reads only the shared
+            # .channel/.time/.valid surface (the forward_step.py
+            # precedent, migration-proven bit-for-bit).
+            core.encoder, mel, caches,  # type: ignore[arg-type]
+            drop_extra=drop_extra,
+        )
+        conditioned = core.lid(enc, prompt_index=batch.prompt_index)
+        decode = DecodeState(
+            h=state.h.transpose(0, 1).contiguous(),
+            c=state.c.transpose(0, 1).contiguous(),
+            last_label=state.last_label,
+        )
+        bursts, decode = greedy_decode_batch(
+            conditioned, core.predictor, core.joint, decode
+        )
+    state.h.copy_(decode.h.transpose(0, 1))
+    state.c.copy_(decode.c.transpose(0, 1))
+    state.last_label.copy_(decode.last_label)
+    for b in range(n_rows):
+        state.frontend_counters[b, CTR_ENCODED_MEL_FRAMES] = int(
+            state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
+        )
+        state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
+
+    captures = {
+        "frontend_mel": [mel[b] for b in range(n_rows)],
+        "encoder_raw": [enc[b] for b in range(n_rows)],
+        "encoder_conditioned": [conditioned[b] for b in range(n_rows)],
+    }
+    return AdvanceResult(bursts=bursts, captures=captures)
+
+
+class _GatheredCaches:
+    """``StreamingCaches``' surface over a gathered
+    :class:`SessionStateBatch` (channel/time/valid/left_context) —
+    ``stream_step`` advances the gathered views directly, so the
+    golden-proven advance IS the scratch write."""
+
+    def __init__(self, state: SessionStateBatch) -> None:
+        self.channel = state.channel
+        self.time = state.time
+        self._window_valid = state.window_valid
+        self.left_context = state.channel[0].shape[1]
+
+    @property
+    def valid(self) -> torch.Tensor:
+        return self._window_valid[0].reshape(-1).to(torch.long)
+
+    @valid.setter
+    def valid(self, value: torch.Tensor) -> None:
+        for slot in self._window_valid:
+            slot.copy_(
+                value.reshape(slot.shape).to(slot.dtype)
+            )
 
 
 # @spec PORT-ADV-003, PORT-STATE-007, PORT-STATE-008
