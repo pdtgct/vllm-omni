@@ -19,8 +19,16 @@ kernel shapes regardless of emission), so the dense arms run once per
 (geometry, tier, precision) at the speech bias; compact — the only
 distribution-sensitive arm — runs all four activity levels.
 
-Activity is forced by a CALIBRATED blank-logit bias per (geometry,
-precision); realized labels-per-chunk is recorded next to every cell.
+Activity is REALIZED, not merely declared (PR #94 round 3): the
+blank-logit bias is calibrated PER CELL on the cell's exact frames
+and lengths (a delta minted on scout frames does not transfer — the
+first L4 round realized 0–20 labels/chunk against target 3). Every
+dcp cell records target, realized, absolute error, and
+`policy_realized` against the declared tolerance window; a cell
+outside its window is NONSELECTIVE (the generator must pick the
+sync-free arm there — small tiers that cannot realize a fractional
+target become dense-only, which is costless since dense wins them
+uncontested). Saturated and mixed are explicitly nonselective.
 Timing reports BOTH protocols: per-call latency (terminal sync per
 call) and K-calls-one-sync throughput; the host/GPU occupancy ratio
 under the throughput protocol is the recorded proxy for compact's
@@ -124,13 +132,19 @@ GEOMETRIES = [
     )
 ]
 
-#: Labels-per-chunk calibration targets; ``None`` = saturated (strong
-#: negative bias, emission at the cap). "mixed" reuses the speech
-#: bias with 50% zero-length rows — no separate calibration.
-ACTIVITY_TARGETS = {
-    "silence": 0.3,
-    "speech": 3.0,
-    "saturated": None,
+#: The dispatch-calibration policy the artifact must REALIZE, not
+#: merely declare (decisions/decode-dispatch-regime.md): selective
+#: cells (silence/speech) are calibrated per cell on the cell's own
+#: frames and must land inside the declared tolerance window to be
+#: `policy_realized`; a cell that misses is NONSELECTIVE — the
+#: generator must pick the sync-free arm there and may not select
+#: compact from it. Saturated and mixed are explicitly nonselective
+#: (stress/heterogeneity bounds outside dcp-v1).
+DCP_V1: dict[str, Any] = {
+    "version": "dcp-v1",
+    "targets": {"silence": 0.3, "speech": 3.0},
+    "tolerance": {"silence": (0.0, 1.0), "speech": (1.5, 4.5)},
+    "selective_activities": ("silence", "speech"),
 }
 COMPACT_ACTIVITIES = ("silence", "speech", "saturated", "mixed")
 
@@ -284,11 +298,15 @@ def calibrate_blank_bias(
     dims: dict[str, int],
     device: str,
     target: float | None,
+    warm_delta: float | None = None,
 ) -> tuple[float, float]:
     """Binary-search a blank-logit bias delta realizing ~target labels
-    per chunk; returns (delta, realized). Random-init nets at a wide
-    argmax emit near the cap by default, so positive deltas suppress
-    emission."""
+    per chunk ON THESE EXACT frames/lengths; returns (delta,
+    realized). The first L4 round proved a delta minted on scout
+    frames does NOT transfer (realized 0–20 against target 3), so
+    calibration runs per cell — ``warm_delta`` only narrows the
+    initial bracket. Random-init nets at a wide argmax emit near the
+    cap by default, so positive deltas suppress emission."""
     out = joint.joint_net[1]
     blank = dims["vocab"]
     base = out.bias.detach().clone()
@@ -306,6 +324,12 @@ def calibrate_blank_bias(
             delta = -8.0
             return delta, realized(delta)
         lo, hi = -8.0, 24.0
+        if warm_delta is not None:
+            wlo, whi = warm_delta - 3.0, warm_delta + 3.0
+            # Only narrow if the tight bracket still straddles the
+            # target (emission decreases as delta rises).
+            if realized(wlo) >= target >= realized(whi):
+                lo, hi = wlo, whi
         got = 0.0
         for _ in range(18):
             mid = (lo + hi) / 2
@@ -399,7 +423,7 @@ def run_cells_for_tier(
     t_pad: int,
     batch: int,
     precision: str,
-    deltas: dict[str, tuple[float, float]],
+    warm: dict[str, float],
     dims: dict[str, int],
     predictor: Any,
     joint: Any,
@@ -422,15 +446,49 @@ def run_cells_for_tier(
     rows: list[dict[str, Any]] = []
 
     def cell_base(activity: str, lengths: torch.Tensor) -> dict:
-        delta, cal = deltas[
+        # Per-cell dcp realization: silence/speech calibrate on THIS
+        # cell's frames/lengths (warm-started from the previous tier);
+        # mixed reuses this tier's speech delta (nonselective);
+        # saturated is the fixed strong-negative bias (nonselective).
+        cal_activity = (
             "speech" if activity == "mixed" else activity
-        ]
+        )
+        target = DCP_V1["targets"].get(cal_activity)
+        # Restore the pristine bias FIRST: calibration captures the
+        # current bias as its base, and the previous activity's delta
+        # is still applied at this point (base-drift bug caught in
+        # the r6 smoke: silence cells realized at the cap).
+        with torch.no_grad():
+            out.bias.copy_(bias_base)
+        if activity == "saturated":
+            delta, _ = calibrate_blank_bias(
+                joint, frames, lengths, predictor, dims, device,
+                None,
+            )
+        elif activity == "mixed":
+            delta = warm.get("speech", 0.0)
+        else:
+            delta, _ = calibrate_blank_bias(
+                joint, frames, lengths, predictor, dims, device,
+                target, warm_delta=warm.get(activity),
+            )
+            warm[activity] = delta
         with torch.no_grad():
             out.bias.copy_(bias_base)
             out.bias[dims["vocab"]] += delta
         realized = _labels_per_chunk(
             frames, lengths, predictor, joint, dims, device
         )
+        selective_intent = (
+            activity in DCP_V1["selective_activities"]
+        )
+        if selective_intent:
+            lo_t, hi_t = DCP_V1["tolerance"][activity]
+            policy_realized = lo_t <= realized <= hi_t
+            abs_error = abs(realized - float(target))
+        else:
+            policy_realized = False
+            abs_error = None
         state = _fresh_state(batch, dims, device)
         with torch.no_grad():
             d_ids, d_len, _ = rnnt.decode_dense_masked(
@@ -446,8 +504,18 @@ def run_cells_for_tier(
             "precision": precision,
             "activity": activity,
             "blank_bias": round(delta, 3),
+            "target_labels_per_chunk": target,
             "labels_per_chunk": round(realized, 3),
-            "calibration_labels_per_chunk": round(cal, 3),
+            "abs_error": (
+                round(abs_error, 3) if abs_error is not None else None
+            ),
+            "policy_realized": policy_realized,
+            # A cell the generator may select compact FROM: dcp
+            # activity realized within tolerance. Everything else is
+            # sync-free-forced (small tiers that cannot realize a
+            # fractional target become dense-only — costless, dense
+            # wins them uncontested anyway).
+            "selective": selective_intent and policy_realized,
             "tokens_match": bool(
                 torch.equal(d_len, c_len)
                 and torch.equal(d_ids, c_ids)
@@ -577,25 +645,13 @@ def main() -> None:
     for gid, label, lookahead, cadence in GEOMETRIES:
         t_pad = _t_pad(cadence)
         for precision, joint in joints.items():
-            torch.manual_seed(args.seed + gid)
-            cal_frames = (
-                torch.randn(
-                    16, t_pad, dims["enc_hidden"], device=device
-                ) * 0.1
-            )
-            cal_lengths = torch.full(
-                (16,), t_pad, dtype=torch.long, device=device
-            )
-            deltas = {
-                activity: calibrate_blank_bias(
-                    joint, cal_frames, cal_lengths, predictor,
-                    dims, device, target,
-                )
-                for activity, target in ACTIVITY_TARGETS.items()
-            }
+            # Warm-start bounds carried across ascending tiers within
+            # one (geometry, lane) — calibration itself is PER CELL,
+            # on the cell's own frames (dcp realization, PR #94 r3).
+            warm: dict[str, float] = {}
             for batch in tiers:
                 rows = run_cells_for_tier(
-                    label, t_pad, batch, precision, deltas, dims,
+                    label, t_pad, batch, precision, warm, dims,
                     predictor, joint, device,
                     args.seed + 31 * gid + batch, args.iters,
                     args.brackets, budget_us,
@@ -686,14 +742,34 @@ def main() -> None:
     # "pass" a generator could mistake for whole-run qualification.
     # execution_ok means the sweep completed; dispatch eligibility is
     # a lane property.
+    def _lane_policy(lane: str) -> dict[str, int]:
+        intended = [
+            c for c in cells
+            if c["precision"] == lane
+            and c["activity"] in DCP_V1["selective_activities"]
+        ]
+        realized_n = sum(1 for c in intended if c["policy_realized"])
+        return {
+            "dcp_intended_cells": len(intended),
+            "dcp_realized_cells": realized_n,
+            "dcp_nonselective_fallback_cells": (
+                len(intended) - realized_n
+            ),
+        }
+
     lane_results: dict[str, dict[str, Any]] = {
         lane: {
             "mismatch_cells": (
                 mismatches if lane == "fp32" else bf16_mismatches
             ),
+            **_lane_policy(lane),
             "performance_qualified": (
                 lane == "fp32" and mismatches == 0
             ),
+            # Eligibility = correctness-clean; every dcp cell is
+            # either policy_realized (selective) or explicitly
+            # nonselective (sync-free-forced) — the generator applies
+            # the fallback, never a drifted measurement.
             "dispatch_eligible": (
                 lane == "fp32" and mismatches == 0
             ),
@@ -706,6 +782,15 @@ def main() -> None:
         if res["dispatch_eligible"]
     ]
     report["execution_ok"] = True
+    report["dcp"] = {
+        **{
+            k: v for k, v in DCP_V1.items()
+        },
+        "fallback_rule": (
+            "a dcp cell outside tolerance is nonselective: the "
+            "generator must select the sync-free arm there"
+        ),
+    }
     report["lane_results"] = lane_results
     report["generator_eligible_lanes"] = eligible
     text = json.dumps(report, indent=2)
