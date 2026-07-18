@@ -255,6 +255,13 @@ def decode_compact_active(
     batch, t_pad, _ = enc_frames.shape
     device = enc_frames.device
     blank = predictor.blank_id
+    if bool((enc_lengths < 0).any()) or bool(
+        (enc_lengths > t_pad).any()
+    ):
+        raise ValueError(
+            f"enc_lengths out of range for T_pad={t_pad}: "
+            f"{enc_lengths.tolist()}"
+        )
     h = state.h.clone()
     c = state.c.clone()
     last_label = state.last_label.clone()

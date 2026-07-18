@@ -308,6 +308,8 @@ def advance_session(
     core: NemotronASRCore,
     batch: ChunkBatch,
     state: SessionStateBatch,
+    *,
+    capture: bool = False,
 ) -> AdvanceResult:
     """The ONE storage- and adapter-agnostic CHUNK transition.
 
@@ -326,6 +328,12 @@ def advance_session(
         batch: raw PCM plus validated controls, one row per CHUNK.
         state: gathered checkpoint state, read and mutated into the
             next state.
+        capture: the explicit capture policy (PORT-HOOK-001). OFF by
+            default: performance runs return ``captures=None`` with no
+            capture-only allocations and no extended lifetime for the
+            raw/conditioned encoder tensors. ON stages the three named
+            tensors with exact valid lengths — including at zero
+            length for a finalized zero-frame CHUNK.
 
     Returns:
         The GPU-resident :class:`AdvanceResult` (padded token
@@ -398,7 +406,9 @@ def advance_session(
             "(temporary transition assertion)"
         )
     first = session_first[0]
-    prefixes = [state.mel_tail[b].clone() for b in range(n_rows)]
+    # Snapshot the pre-consume mel tail as ONE batched tensor (the
+    # nine-slot pre-encode prefix; advance_frontend rolls it forward).
+    prefix = state.mel_tail.clone()
 
     new_frames, counts = advance_frontend(
         core.featurizer,
@@ -410,22 +420,15 @@ def advance_session(
         mel_tail=state.mel_tail,
         counters=state.frontend_counters,
     )
-    for b in range(n_rows):
-        state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
+    state.frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
 
     # Zero-work rows (a final tail whose short residual was dropped):
-    # no encoder, LID, or RNN-T work runs at all.
-    n_new = [int(c) for c in counts]
-    if len(set(n_new)) != 1:
-        # TEMPORARY transition assertion (see above): the length-aware
-        # path carries per-row valid lengths through every state
-        # transition instead of exact-length sub-buckets.
-        raise ValueError(
-            f"heterogeneous new-frame counts in one bucket: {n_new} "
-            "(temporary transition assertion)"
-        )
+    # no encoder, LID, or RNN-T work runs at all. advance_frontend
+    # already enforced per-call frame-count uniformity (its temporary
+    # transition assertion), so counts[0] speaks for the batch.
     device = batch.samples.device
-    if n_new[0] == 0:
+    n_new_frames = int(counts[0]) if n_rows else 0
+    if n_new_frames == 0:
         # A finalized zero-frame CHUNK still stages all three named
         # captures at zero valid length (the checkpoint record).
         d_model = state.channel[0].shape[2]
@@ -450,17 +453,17 @@ def advance_session(
                     n_rows, 0, d_model, device=device
                 ),
                 encoder_lengths=zero.clone(),
-            ),
+            ) if capture else None,
         )
 
+    # Tensor-native encoder input: advance_frontend returns ONE
+    # (B, n_mels, n_new) tensor; continuing rows prepend the batched
+    # nine-slot prefix (one cat, no per-row construction).
     if first:
-        mel = torch.stack(new_frames)
+        mel = new_frames
         drop_extra = 0
     else:
-        mel = torch.stack([
-            torch.cat([prefixes[b], new_frames[b]], dim=1)
-            for b in range(n_rows)
-        ])
+        mel = torch.cat([prefix, new_frames], dim=2)
         drop_extra = PRE_ENCODE_DROP
 
     caches = _GatheredCaches(state)
@@ -499,7 +502,6 @@ def advance_session(
             state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
         )
 
-    lengths = enc_lengths
     return AdvanceResult(
         token_ids=token_ids,
         token_lengths=token_lengths,
@@ -510,8 +512,8 @@ def advance_session(
             ),
             encoder_raw=enc,
             encoder_conditioned=conditioned,
-            encoder_lengths=lengths,
-        ),
+            encoder_lengths=enc_lengths,
+        ) if capture else None,
     )
 
 

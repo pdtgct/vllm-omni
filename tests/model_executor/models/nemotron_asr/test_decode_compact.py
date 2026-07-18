@@ -19,6 +19,7 @@ import types
 from pathlib import Path
 from typing import Any
 
+import pytest
 import torch
 
 _PKG = (
@@ -216,3 +217,93 @@ def test_cap_saturated_burst_matches() -> None:
     for b, burst in enumerate(expected):
         assert len(burst) == int(lengths[b]) * rnnt.MAX_SYMBOLS_PER_STEP
         assert ids[b, : int(lens[b])].tolist() == burst
+
+
+def test_mixed_carried_state_rows_match_the_oracle() -> None:
+    # @spec PORT-DEC-001 / PORT-DEC-008
+    # Rows arriving with DISTINCT nonzero h/c/last_label (mid-session
+    # resumes) must each evolve exactly as their own single-row run.
+    predictor, joint = _nets(15)
+    torch.manual_seed(16)
+    enc = torch.randn(3, 5, ENC)
+    lengths = torch.tensor([5, 2, 4])
+    carried = rnnt.DecodeState(
+        h=torch.randn(2, 3, PRED) * 0.2,
+        c=torch.randn(2, 3, PRED) * 0.2,
+        last_label=torch.tensor([1, 7, VOCAB]),
+    )
+    with torch.no_grad():
+        ids, lens, state = rnnt.decode_compact_active(
+            enc, lengths, predictor, joint, carried
+        )
+        for b in range(3):
+            single = rnnt.DecodeState(
+                h=carried.h[:, b : b + 1].clone(),
+                c=carried.c[:, b : b + 1].clone(),
+                last_label=carried.last_label[b : b + 1].clone(),
+            )
+            burst, out = rnnt.greedy_decode_batch(
+                enc[b : b + 1, : int(lengths[b])], predictor, joint,
+                single,
+            )
+            assert ids[b, : int(lens[b])].tolist() == burst[0]
+            torch.testing.assert_close(
+                state.h[:, b : b + 1], out.h, rtol=0, atol=1e-6
+            )
+            assert int(state.last_label[b]) == int(out.last_label[0])
+
+
+def test_zero_length_carried_row_state_is_bit_identical() -> None:
+    # @spec PORT-PERF-001
+    # A zero-length row alongside active peers: its carried state must
+    # come back BIT-identical (no masked-arithmetic residue).
+    predictor, joint = _nets(17)
+    torch.manual_seed(18)
+    enc = torch.randn(2, 4, ENC)
+    carried = rnnt.DecodeState(
+        h=torch.randn(2, 2, PRED) * 0.2,
+        c=torch.randn(2, 2, PRED) * 0.2,
+        last_label=torch.tensor([3, 9]),
+    )
+    with torch.no_grad():
+        _, lens, state = rnnt.decode_compact_active(
+            enc, torch.tensor([4, 0]), predictor, joint, carried
+        )
+    assert int(lens[1]) == 0
+    torch.testing.assert_close(
+        state.h[:, 1], carried.h[:, 1], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        state.c[:, 1], carried.c[:, 1], rtol=0, atol=0
+    )
+    assert int(state.last_label[1]) == 9
+
+
+def test_out_of_range_lengths_are_rejected() -> None:
+    # @spec PORT-DEC-008
+    predictor, joint = _nets()
+    enc = torch.randn(2, 4, ENC)
+    for bad in ([-1, 2], [2, 5]):
+        with pytest.raises(ValueError, match="enc_lengths"):
+            rnnt.decode_compact_active(
+                enc, torch.tensor(bad), predictor, joint, _state(2)
+            )
+
+
+def test_manual_lstm_initializes_its_parameters() -> None:
+    # @spec PORT-DEC-001
+    # Regression for the uninitialized-parameter landmine (2026-07-18):
+    # every parameter must be finite and inside nn.LSTM's uniform
+    # bound after construction — removal of reset_parameters() fails
+    # here deterministically, not as an allocator-dependent flap.
+    cell_mod = sys.modules[
+        "vllm_omni.model_executor.models.nemotron_asr.rnnt_cell"
+    ]
+    torch.manual_seed(0)
+    lstm = cell_mod.ManualLSTM(
+        input_size=8, hidden_size=8, num_layers=2
+    )
+    bound = 1.0 / (8**0.5)
+    for name, param in lstm.named_parameters():
+        assert bool(param.isfinite().all()), name
+        assert float(param.abs().max()) <= bound, name

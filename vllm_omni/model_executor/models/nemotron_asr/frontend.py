@@ -135,7 +135,7 @@ def advance_frontend(
     raw_tail: torch.Tensor,
     mel_tail: torch.Tensor,
     counters: torch.Tensor,
-) -> tuple[list[torch.Tensor], torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance the bounded frontend for a batch of CHUNK rows.
 
     Boundary-capped (the option-(d) resolution, ledger 2026-07-17):
