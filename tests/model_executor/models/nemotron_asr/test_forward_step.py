@@ -153,6 +153,13 @@ def test_forward_step_emits_the_burst_then_parks():
     hidden = CARRIER_HIDDEN
     torch.manual_seed(5)
     mel = torch.randn(1, FEAT, MEL_FRAMES)
+    # Distinctness by construction: under the deterministic ManualLSTM
+    # init the tiny joint is single-label on unstructured noise (the
+    # old incidental two-distinct burst rode uninitialized predictor
+    # memory — the confirmed 2026-07-17 flap). Contrasting the mel
+    # halves forces frame-dependent labels; the assert stays the guard.
+    mel[:, :, : MEL_FRAMES // 2] *= 0.1
+    mel[:, :, MEL_FRAMES // 2 :] *= 30.0
     expected = _reference_burst(core, mel, prompt_index=0)
     assert len(expected) >= 2 and len(set(expected)) >= 2, (
         "need a multi-label, multi-distinct burst to test drain order"
@@ -283,11 +290,13 @@ def test_persist_across_session_park_by_kind():
         max_frames_per_chunk=4, policy=FP32_BRINGUP,
     )
     # window / conv / lstm are persistent recurrent state; the replay
-    # queue is intra-burst scratch (offload-exempt).
+    # page is persistent too since it widened to the 7-slot session
+    # book — pending-echo and expected-label must survive a session
+    # park to validate replay echoes after resume.
     assert window.persist_across_session_park is True
     assert conv.persist_across_session_park is True
     assert lstm.persist_across_session_park is True
-    assert replay.persist_across_session_park is False
+    assert replay.persist_across_session_park is True
 
 
 # ---- carrier width is a measurement, not the formula (D-BUc-3) -----------------
