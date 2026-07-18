@@ -46,6 +46,20 @@ if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRCore,
     )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        DecodeState,
+    )
+
+#: An RNN-T bucket decode: ``(conditioned_frames, enc_lengths,
+#: predictor, joint, state) -> (token_ids, token_lengths, next_state)``.
+#: Both production candidates (``decode_compact_active``,
+#: ``decode_dense_masked``) satisfy it; selection is a startup
+#: dispatch-table decision from the measured dense-vs-compact profile
+#: (PORT-DEC-008), never a hardcoded default.
+RnntDecodeFn = Callable[
+    ...,
+    "tuple[torch.Tensor, torch.Tensor, DecodeState]",
+]
 
 #: Chunk-envelope header layout (design §Chunk envelope): the versioned
 #: FP32 carrier row is ``[version, valid_samples, geometry_id,
@@ -170,11 +184,15 @@ class AdvanceResult:
     :token_lengths[b]]``, ordered, NONBLANK, bounded by
     ``valid_encoder_frames × max_symbols_per_step`` for the row's
     geometry (PORT-INT-002), NOT by the attention window.
-    ``row_valid``: ``(B,)`` bool — device-resolved per-row protocol
-    validity (PORT-ADV-004): a False row mutated no state and its
-    burst is zero-length; the transaction consumes this tensor at its
-    commit synchronization to suppress or abort exactly the affected
-    sessions (PORT-STATE-008's row tier).
+    ``row_status``: ``(B,)`` int32 — the device-resolved per-row
+    status bitmask (PORT-ADV-004; bit names are
+    ``frontend.ROW_STATUS_*``, 0 == committed clean). A row with any
+    bit set mutated no state and its burst is zero-length; the
+    transaction consumes this tensor through its existing
+    asynchronous output readback at the commit boundary, mapping
+    protocol bits to PORT-STATE-008's row tier and invariant bits to
+    port-defect escalation — never a raise or device assertion from
+    inside the transition.
     ``captures``: :class:`PreparedCaptures` or ``None`` when capture
     is disabled.
 
@@ -186,8 +204,15 @@ class AdvanceResult:
 
     token_ids: torch.Tensor
     token_lengths: torch.Tensor
-    row_valid: torch.Tensor | None = None
+    row_status: torch.Tensor | None = None
     captures: PreparedCaptures | None = None
+
+    @property
+    def row_valid(self) -> torch.Tensor | None:
+        """``(B,)`` bool view of ``row_status``: True == clean."""
+        if self.row_status is None:
+            return None
+        return self.row_status == 0
 
 
 @dataclass(frozen=True)
@@ -316,6 +341,7 @@ def advance_session(
     state: SessionStateBatch,
     *,
     geometry: int,
+    decode_fn: RnntDecodeFn,
     capture: bool = False,
 ) -> AdvanceResult:
     """The ONE storage- and adapter-agnostic CHUNK transition.
@@ -332,16 +358,17 @@ def advance_session(
     Length-aware (PORT-ADV-004): one call serves one profile+geometry
     bucket carrying mixed session-first / continuing / final /
     zero-frame rows. Every shape is host-derived from the bucket
-    geometry (padded frontend width ``C + 7``, encoder width from the
-    subsampling formula); validity is per-row length tensors. Per-row
-    protocol violations — wrong chunk sequence, audio after
-    finalization, an envelope geometry different from the bucket's —
-    are masked no-ops reported in ``AdvanceResult.row_valid``; the
-    transaction consumes that tensor at its commit synchronization.
-    The valid path issues no host/device synchronization outside the
-    selected decode variant (the eager compact loop, until the
-    PORT-DEC-008 dense-vs-compact profile selects otherwise at
-    startup).
+    geometry (padded frontend width ``C + 6`` — a legal final residual
+    is strictly under one cadence per PORT-SESS-001/003 — and encoder
+    width from the subsampling formula); validity is per-row length
+    tensors. Every per-row failure — wrong chunk sequence, audio
+    after finalization, an envelope geometry different from the
+    bucket's, an oversized final residual, or a frontend design
+    invariant — is a masked no-op reported as a bit in
+    ``AdvanceResult.row_status``; the transaction consumes that
+    tensor at its commit readback. The transition never raises on a
+    device predicate and never uses a device assertion. The call
+    issues no host/device synchronization outside ``decode_fn``.
 
     Args:
         core: the assembled pipeline (encoder / lid / predictor /
@@ -351,6 +378,14 @@ def advance_session(
             next state.
         geometry: the bucket's admitted geometry id — a host value,
             per the profile+geometry bucket contract (PORT-PERF-001).
+        decode_fn: the RNN-T decode to run — REQUIRED and never
+            defaulted here (PORT-DEC-008): ``decode_compact_active``
+            (eager, synchronizes on compaction) and
+            ``decode_dense_masked`` (fixed-trip, sync-free) stay
+            unselected candidates until the measured dense-vs-compact
+            profile; startup then builds a dispatch table keyed by
+            geometry, padded batch tier, and execution/precision
+            profile, and passes the selected callable per bucket.
         capture: the explicit capture policy (PORT-HOOK-001). OFF by
             default: performance runs return ``captures=None`` with no
             capture-only allocations and no extended lifetime for the
@@ -361,14 +396,11 @@ def advance_session(
 
     Returns:
         The GPU-resident :class:`AdvanceResult` (padded token
-        tensors, per-row validity, prepared captures).
+        tensors, per-row status, prepared captures).
 
     Raises:
         ValueError: if ``geometry`` is not an admitted geometry id
             (a host configuration error, not a row condition).
-        RuntimeError: via device-side assertion on a design-invariant
-            violation inside the frontend (margin shortfall, raw-tail
-            overflow, target below the committed boundary).
     """
     from vllm_omni.model_executor.models.nemotron_asr.encoder import (
         stream_step,
@@ -377,8 +409,10 @@ def advance_session(
         CTR_COMMITTED_MEL_FRAMES,
         CTR_ENCODED_MEL_FRAMES,
         CTR_EXPECTED_CHUNK_SEQUENCE,
-        CTR_FINALIZED,
         MEL_TAIL_FRAMES,
+        ROW_STATUS_FINAL_OVERSIZE,
+        ROW_STATUS_GEOMETRY,
+        ROW_STATUS_SEQUENCE,
         advance_frontend,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
@@ -386,7 +420,6 @@ def advance_session(
     )
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
         DecodeState,
-        decode_compact_active,
     )
 
     n_rows = batch.samples.shape[0]
@@ -397,25 +430,34 @@ def advance_session(
     lookahead = lookaheads[geometry]
     cadence = 8 * (lookahead + 1)
     # The bucket's padded frontend width: a first row commits C-7, a
-    # continuing row C, a final tail at most C+7 (its raw payload is
-    # at most one cadence unit past a kC-7 boundary) — design §Exact
-    # Bounded Frontend.
-    pad_frames = cadence + 7
+    # continuing row C, and a legal final tail at most C+6 — the
+    # segmentation contract (PORT-SESS-001/003) drains complete
+    # cadences as regular units before minting the actual residual,
+    # so a final carrier holds strictly less than one cadence unit
+    # (design §Exact Bounded Frontend).
+    pad_frames = cadence + 6
     mel_width = MEL_TAIL_FRAMES + pad_frames
 
     counters = state.frontend_counters
-    # Per-row protocol validity (PORT-ADV-004), all on device: the
+    # Envelope-protocol status bits (PORT-ADV-004), all on device: the
     # envelope geometry must match the bucket, the sequence must match
-    # the session's expected counter, and a finalized session accepts
-    # no further audio.
-    row_valid = (
-        (batch.geometry_id.to(device) == geometry)
-        & (
-            batch.chunk_sequence.to(device)
-            == counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]
-        )
-        & (counters[:, CTR_FINALIZED] == 0)
+    # the session's expected counter, and a final residual must be
+    # strictly smaller than one cadence unit (an oversized final is an
+    # ingress defect, never priced into the padded width). The
+    # frontend composes in its own FINALIZED and invariant bits.
+    hop = core.featurizer.hop_length
+    incoming = (
+        (batch.geometry_id.to(device) != geometry).to(torch.int32)
+        * ROW_STATUS_GEOMETRY
     )
+    incoming |= (
+        batch.chunk_sequence.to(device)
+        != counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]
+    ).to(torch.int32) * ROW_STATUS_SEQUENCE
+    incoming |= (
+        batch.final_tail.to(device)
+        & (batch.valid_samples.to(device) >= cadence * hop)
+    ).to(torch.int32) * ROW_STATUS_FINAL_OVERSIZE
     # Regular-cadence targets, vectorized: B_{seq+1} = (8L+1) + seq·C
     # (final rows ignore targets inside the frontend).
     targets = (8 * lookahead + 1) + batch.chunk_sequence * cadence
@@ -428,7 +470,7 @@ def advance_session(
     # rows take no prefix and drop nothing.
     prefix = state.mel_tail.clone()
 
-    new_frames, counts = advance_frontend(
+    new_frames, counts, row_status = advance_frontend(
         core.featurizer,
         batch.samples,
         batch.valid_samples,
@@ -438,9 +480,10 @@ def advance_session(
         mel_tail=state.mel_tail,
         counters=state.frontend_counters,
         pad_frames=pad_frames,
-        row_valid=row_valid,
+        row_status=incoming,
     )
-    counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += row_valid.to(torch.int64)
+    row_ok = row_status == 0
+    counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += row_ok.to(torch.int64)
 
     # Per-row encoder input on the bucket's fixed grid: column j of
     # row b reads [prefix | new][j + 9 - p_b] — p_b is 9 for
@@ -515,14 +558,14 @@ def advance_session(
             c=state.c.transpose(0, 1).contiguous(),
             last_label=state.last_label,
         )
-        token_ids, token_lengths, decode = decode_compact_active(
+        token_ids, token_lengths, decode = decode_fn(
             conditioned, enc_lengths, core.predictor, core.joint, decode
         )
     state.h.copy_(decode.h.transpose(0, 1))
     state.c.copy_(decode.c.transpose(0, 1))
     state.last_label.copy_(decode.last_label)
     counters[:, CTR_ENCODED_MEL_FRAMES] = torch.where(
-        row_valid,
+        row_ok,
         counters[:, CTR_COMMITTED_MEL_FRAMES],
         counters[:, CTR_ENCODED_MEL_FRAMES],
     )
@@ -531,7 +574,7 @@ def advance_session(
         return AdvanceResult(
             token_ids=token_ids,
             token_lengths=token_lengths,
-            row_valid=row_valid,
+            row_status=row_status,
         )
     # Capture lengths come from logical lengths (PORT-HOOK-001): a
     # zero-commit row stages all three tensors at zero length — its
@@ -543,7 +586,7 @@ def advance_session(
     return AdvanceResult(
         token_ids=token_ids,
         token_lengths=token_lengths,
-        row_valid=row_valid,
+        row_status=row_status,
         captures=PreparedCaptures(
             frontend_mel=torch.where(
                 col < cap_mel_len.view(-1, 1, 1),

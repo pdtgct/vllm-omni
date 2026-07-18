@@ -98,7 +98,7 @@ def _stream(
             - int(state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES])
             + (frontend.MEL_TAIL_FRAMES if is_final else 0)
         )
-        out, counts = frontend.advance_frontend(
+        out, counts, status = frontend.advance_frontend(
             feat,
             chunk.unsqueeze(0),
             torch.tensor([n], dtype=torch.long),
@@ -107,6 +107,7 @@ def _stream(
             **state,
             pad_frames=max(pad, 0),
         )
+        assert status.tolist() == [0]
         assert out.shape[2] == max(pad, 0)  # fixed host-derived width
         if int(counts[0]):
             committed.append(out[0, :, : int(counts[0])])
@@ -254,9 +255,10 @@ def test_zero_sample_final_tail_finalizes_and_drops_short_residual() -> (
 def test_chunk_after_finalization_is_a_masked_no_op() -> None:
     # @spec PORT-ADV-004
     # Audio after finalization is a per-row protocol violation: the row
-    # mutates nothing and commits nothing (device-resolved, never a
-    # raise — the transaction consumes row validity at its commit
-    # sync). The frontend derives the finalized predicate itself.
+    # mutates nothing and commits nothing, and the named status bit is
+    # set (device-resolved, never a raise — the transaction consumes
+    # the status at its commit sync). The frontend derives the
+    # finalized predicate itself.
     feat = _featurizer()
     state = _fresh_state()
     args = (
@@ -267,10 +269,11 @@ def test_chunk_after_finalization_is_a_masked_no_op() -> None:
     )
     frontend.advance_frontend(feat, *args, **state, pad_frames=8)
     before = {k: v.clone() for k, v in state.items()}
-    out, counts = frontend.advance_frontend(
+    out, counts, status = frontend.advance_frontend(
         feat, *args, **state, pad_frames=8
     )
     assert int(counts[0]) == 0
+    assert status.tolist() == [frontend.ROW_STATUS_FINALIZED]
     torch.testing.assert_close(
         out, torch.zeros_like(out), rtol=0, atol=0
     )
@@ -323,11 +326,12 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     signal = torch.randn(3 * chunk) * 0.1
     state = _fresh_state()
     committed: list[torch.Tensor] = []
-    # The production bucket bound: C + 7 (design §Exact Bounded
-    # Frontend), uniform for first and continuing rows.
-    pad = 8 * (la + 1) + 7
+    # The production bucket bound: C + 6 (design §Exact Bounded
+    # Frontend — a legal final residual is strictly under one cadence
+    # per PORT-SESS-001/003), uniform for first and continuing rows.
+    pad = 8 * (la + 1) + 6
     for k in (1, 2, 3):
-        out, counts = frontend.advance_frontend(
+        out, counts, status = frontend.advance_frontend(
             feat,
             signal[(k - 1) * chunk : k * chunk].unsqueeze(0),
             torch.tensor([chunk], dtype=torch.long),
@@ -339,6 +343,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
             **state,
             pad_frames=pad,
         )
+        assert status.tolist() == [0]
         committed.append(out[0, :, : int(counts[0])])
         assert int(
             state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES]
@@ -350,7 +355,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     torch.testing.assert_close(
         state["mel_tail"][0], streamed[:, -k9:], rtol=0, atol=2e-6
     )
-    out, counts = frontend.advance_frontend(
+    out, counts, status = frontend.advance_frontend(
         feat,
         torch.zeros(1, 0),
         torch.zeros(1, dtype=torch.long),
@@ -363,6 +368,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     # remain — below eight, so the residual is DROPPED and the
     # committed stream ends exactly at the capped boundary (the design
     # final residual rule; nothing further reaches the encoder).
+    assert status.tolist() == [0]
     assert int(counts[0]) == 0
     torch.testing.assert_close(
         out, torch.zeros_like(out), rtol=0, atol=0
@@ -376,21 +382,27 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
 
 def test_target_past_stability_is_a_margin_violation() -> None:
     # @spec PORT-ADV-004
-    # Design-invariant violations are port defects and surface as
-    # device-side assertions (torch._assert_async): RuntimeError,
-    # eagerly, on the CPU tier.
+    # Design-invariant violations are port defects reported as named
+    # status bits — never a raise, never a device assertion (a fired
+    # CUDA assert corrupts the context and kills every resident
+    # session): the row is a safe masked no-op.
     feat = _featurizer()
     state = _fresh_state()
-    with pytest.raises(RuntimeError, match="margin"):
-        frontend.advance_frontend(
-            feat,
-            torch.zeros(1, 1600),
-            torch.tensor([1600], dtype=torch.long),
-            torch.tensor([False]),
-            torch.tensor([99], dtype=torch.long),  # stable is only 9
-            **state,
-            pad_frames=99,
-        )
+    before = {k: v.clone() for k, v in state.items()}
+    out, counts, status = frontend.advance_frontend(
+        feat,
+        torch.zeros(1, 1600),
+        torch.tensor([1600], dtype=torch.long),
+        torch.tensor([False]),
+        torch.tensor([99], dtype=torch.long),  # stable is only 9
+        **state,
+        pad_frames=99,
+    )
+    assert status.tolist() == [frontend.ROW_STATUS_MARGIN]
+    assert int(counts[0]) == 0
+    assert not bool(out.any())
+    for key, prev in before.items():
+        torch.testing.assert_close(state[key], prev, rtol=0, atol=0)
 
 
 def test_target_below_committed_is_rejected() -> None:
@@ -399,16 +411,22 @@ def test_target_below_committed_is_rejected() -> None:
     torch.manual_seed(19)
     signal = torch.randn(17920) * 0.1
     _, state = _stream(feat, signal, [17920], final=False)
-    with pytest.raises(RuntimeError, match="below the committed"):
-        frontend.advance_frontend(
-            feat,
-            torch.zeros(1, 160),
-            torch.tensor([160], dtype=torch.long),
-            torch.tensor([False]),
-            torch.tensor([1], dtype=torch.long),
-            **state,
-            pad_frames=8,
-        )
+    before = {k: v.clone() for k, v in state.items()}
+    out, counts, status = frontend.advance_frontend(
+        feat,
+        torch.zeros(1, 160),
+        torch.tensor([160], dtype=torch.long),
+        torch.tensor([False]),
+        torch.tensor([1], dtype=torch.long),
+        **state,
+        pad_frames=8,
+    )
+    assert (
+        int(status[0]) & frontend.ROW_STATUS_TARGET_ORDER
+    ) == frontend.ROW_STATUS_TARGET_ORDER
+    assert int(counts[0]) == 0
+    for key, prev in before.items():
+        torch.testing.assert_close(state[key], prev, rtol=0, atol=0)
 
 
 def test_counter_slots_mirror_the_manifest_order() -> None:
@@ -440,7 +458,7 @@ def test_batched_rows_with_shared_geometry_match_single_rows() -> None:
     b = torch.randn(17920) * 0.2
     stable = frontend.stable_frames(17920, n_fft=512, hop=160)
     state2 = _fresh_state(batch=2)
-    out2, counts2 = frontend.advance_frontend(
+    out2, counts2, status2 = frontend.advance_frontend(
         feat,
         torch.stack([a, b]),
         torch.tensor([17920, 17920], dtype=torch.long),
@@ -449,6 +467,7 @@ def test_batched_rows_with_shared_geometry_match_single_rows() -> None:
         **state2,
         pad_frames=stable,
     )
+    assert status2.tolist() == [0, 0]
     for row, signal in ((0, a), (1, b)):
         streamed, state1 = _stream(feat, signal, [17920], final=False)
         assert int(counts2[row]) == streamed.shape[1]
@@ -481,7 +500,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
     chunk, la = 17920, 13
     b1 = frontend.cadence_boundary(1, lookahead=la)
     b2 = frontend.cadence_boundary(2, lookahead=la)
-    pad = 8 * (la + 1) + 7  # the bucket bound C + 7 = 119
+    pad = 8 * (la + 1) + 6  # the bucket bound C + 6 = 118
     n_rows = 5
     signals = [
         torch.randn(3 * chunk) * s for s in (0.1, 0.2, 0.15, 0.3, 0.25)
@@ -490,8 +509,10 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
     # Row phases: 0 = session-first regular (commit b1 = 105);
     # 1 = continuing regular (commit C = 112);
     # 2 = continuing final, partial residual (commit 174 - 105 = 69);
-    # 3 = continuing final, full cadence unit (commit 224 - 105 = 119
-    #     — exactly the C + 7 pad bound);
+    # 3 = continuing final at the MAXIMUM legal residual — one sample
+    #     short of a full cadence unit (commit 223 - 105 = 118,
+    #     exactly the C + 6 bound; PORT-SESS-001/003 make a full-unit
+    #     final illegal ingress);
     # 4 = zero-sample final after TWO units (residual 224 - 217 = 7,
     #     below eight: DROPPED, zero commit).
     pre_units = [0, 1, 1, 1, 2]
@@ -520,7 +541,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         signals[0][:chunk],  # first regular
         signals[1][chunk : 2 * chunk],  # continuing regular
         signals[2][chunk : chunk + 10_000],  # final, 69-frame residual
-        signals[3][chunk : 2 * chunk],  # final, full unit: 119 = pad
+        signals[3][chunk : 2 * chunk - 160],  # max legal final: 118
         signals[4][2 * chunk : 2 * chunk],  # zero-sample final
     ]
     samples = torch.zeros(n_rows, chunk)
@@ -532,7 +553,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
     targets = torch.tensor(
         [b1, b2, 0, 0, 0], dtype=torch.long
     )  # targets ignored on final rows
-    outN, countsN = frontend.advance_frontend(
+    outN, countsN, statusN = frontend.advance_frontend(
         feat,
         samples,
         valid,
@@ -541,18 +562,19 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         **stateN,
         pad_frames=pad,
     )
+    assert statusN.tolist() == [0] * n_rows
 
     expected_counts = [
         b1,
         b2 - b1,
         (chunk + 10_000) // 160 - b1,
-        2 * chunk // 160 - b1,
+        (2 * chunk - 160) // 160 - b1,
         0,
     ]
     assert expected_counts[3] == pad
     for row in range(n_rows):
         s1 = pre[row]
-        out1, counts1 = frontend.advance_frontend(
+        out1, counts1, _ = frontend.advance_frontend(
             feat,
             second[row].unsqueeze(0),
             torch.tensor([second[row].shape[0]], dtype=torch.long),
@@ -606,11 +628,13 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         )
 
 
-def test_row_valid_false_is_a_masked_no_op() -> None:
+def test_incoming_status_bit_is_a_masked_no_op() -> None:
     # @spec PORT-ADV-004
-    # A protocol-invalid row (row_valid False from the caller) mutates
-    # nothing and commits nothing; sibling valid rows are unaffected
-    # and equal their single-row runs.
+    # A row arriving with a caller-set protocol bit (advance_session's
+    # sequence/geometry/oversize predicates) mutates nothing and
+    # commits nothing, and the bit survives in the returned status;
+    # sibling clean rows are unaffected and equal their single-row
+    # runs.
     feat = _featurizer()
     torch.manual_seed(42)
     a = torch.randn(17920) * 0.1
@@ -618,7 +642,10 @@ def test_row_valid_false_is_a_masked_no_op() -> None:
     stable = frontend.stable_frames(17920, n_fft=512, hop=160)
     state2 = _fresh_state(batch=2)
     before_row1 = {k: v[1].clone() for k, v in state2.items()}
-    out2, counts2 = frontend.advance_frontend(
+    incoming = torch.tensor(
+        [0, frontend.ROW_STATUS_SEQUENCE], dtype=torch.int32
+    )
+    out2, counts2, status2 = frontend.advance_frontend(
         feat,
         torch.stack([a, b]),
         torch.tensor([17920, 17920], dtype=torch.long),
@@ -626,8 +653,9 @@ def test_row_valid_false_is_a_masked_no_op() -> None:
         torch.tensor([stable] * 2, dtype=torch.long),
         **state2,
         pad_frames=stable,
-        row_valid=torch.tensor([True, False]),
+        row_status=incoming,
     )
+    assert status2.tolist() == [0, frontend.ROW_STATUS_SEQUENCE]
     assert int(counts2[1]) == 0
     torch.testing.assert_close(
         out2[1], torch.zeros_like(out2[1]), rtol=0, atol=0
@@ -646,4 +674,92 @@ def test_row_valid_false_is_a_masked_no_op() -> None:
     ):
         torch.testing.assert_close(
             state2[key][0:1], state1[key], rtol=0, atol=bound
+        )
+
+
+def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
+    # @spec PORT-ADV-004
+    # A stream ending exactly on a cadence boundary: PORT-SESS-001/003
+    # force the decomposition [regular CHUNK, zero-sample final] — the
+    # residual past B_k is seven frames and DROPS, deterministically.
+    # The coalesced full-unit-final form is illegal ingress: the caller
+    # flags it (advance_session's oversize predicate) and the frontend
+    # masks it to a no-op, so no packetization/finalize coalescing can
+    # produce different committed output for the same audio.
+    feat = _featurizer()
+    torch.manual_seed(43)
+    chunk, la = 17920, 13
+    b1 = frontend.cadence_boundary(1, lookahead=la)
+    b2 = frontend.cadence_boundary(2, lookahead=la)
+    pad = 8 * (la + 1) + 6
+    signal = torch.randn(2 * chunk) * 0.1
+
+    # Legal decomposition: unit 2 as a regular CHUNK, then the
+    # zero-sample final (7-frame residual dropped).
+    legal = _fresh_state()
+    committed: list[torch.Tensor] = []
+    for k in (1, 2):
+        out, counts, status = frontend.advance_frontend(
+            feat,
+            signal[(k - 1) * chunk : k * chunk].unsqueeze(0),
+            torch.tensor([chunk], dtype=torch.long),
+            torch.tensor([False]),
+            torch.tensor(
+                [frontend.cadence_boundary(k, lookahead=la)],
+                dtype=torch.long,
+            ),
+            **legal,
+            pad_frames=pad,
+        )
+        assert status.tolist() == [0]
+        committed.append(out[0, :, : int(counts[0])])
+    _, counts, status = frontend.advance_frontend(
+        feat,
+        torch.zeros(1, 0),
+        torch.zeros(1, dtype=torch.long),
+        torch.tensor([True]),
+        torch.zeros(1, dtype=torch.long),
+        **legal,
+        pad_frames=pad,
+    )
+    assert status.tolist() == [0]
+    assert int(counts[0]) == 0  # the 224 - 217 = 7 residual drops
+    assert int(
+        legal["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES]
+    ) == b2
+    assert int(legal["counters"][0, frontend.CTR_FINALIZED]) == 1
+    _assert_prefix_equal(feat, signal, torch.cat(committed, dim=1))
+
+    # Illegal coalesced form: a final tail carrying the whole second
+    # unit. The caller's oversize predicate marks it; the frontend
+    # masks it — state untouched, nothing committed, bit reported.
+    coalesced = _fresh_state()
+    frontend.advance_frontend(
+        feat,
+        signal[:chunk].unsqueeze(0),
+        torch.tensor([chunk], dtype=torch.long),
+        torch.tensor([False]),
+        torch.tensor([b1], dtype=torch.long),
+        **coalesced,
+        pad_frames=pad,
+    )
+    before = {k: v.clone() for k, v in coalesced.items()}
+    out, counts, status = frontend.advance_frontend(
+        feat,
+        signal[chunk:].unsqueeze(0),
+        torch.tensor([chunk], dtype=torch.long),
+        torch.tensor([True]),
+        torch.zeros(1, dtype=torch.long),
+        **coalesced,
+        pad_frames=pad,
+        row_status=torch.tensor(
+            [frontend.ROW_STATUS_FINAL_OVERSIZE], dtype=torch.int32
+        ),
+    )
+    assert status.tolist() == [frontend.ROW_STATUS_FINAL_OVERSIZE]
+    assert int(counts[0]) == 0
+    assert not bool(out.any())
+    for key, prev in before.items():
+        torch.testing.assert_close(
+            coalesced[key], prev, rtol=0, atol=0
         )

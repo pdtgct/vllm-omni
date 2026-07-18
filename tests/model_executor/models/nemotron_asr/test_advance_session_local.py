@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 _PKG = (
@@ -69,8 +70,9 @@ CHUNK = 17_920  # 1120 ms cadence (geometry id 4, lookahead 13)
 GEOMETRY_1120 = 4
 LOOKAHEAD = 13
 CADENCE = 8 * (LOOKAHEAD + 1)  # 112
-PAD_FRAMES = CADENCE + 7  # the bucket bound (design §Exact Bounded
-# Frontend); mel width = MEL_TAIL_FRAMES + PAD_FRAMES
+PAD_FRAMES = CADENCE + 6  # the bucket bound (design §Exact Bounded
+# Frontend: a legal final residual is strictly under one cadence per
+# PORT-SESS-001/003); mel width = MEL_TAIL_FRAMES + PAD_FRAMES
 MEL_WIDTH = frontend.MEL_TAIL_FRAMES + PAD_FRAMES
 RAW_TAIL = 1_953
 
@@ -176,6 +178,10 @@ def _chunk(
 
 
 def _advance(core: Any, batch: Any, state: Any, **kw: Any) -> Any:
+    # Decode selection is NEVER a hardcoded default (PORT-DEC-008):
+    # the harness passes the eager compact loop explicitly; the
+    # mixed-phase differential runs both candidates.
+    kw.setdefault("decode_fn", rnnt.decode_compact_active)
     return advance.advance_session(
         core, batch, state, geometry=GEOMETRY_1120, **kw
     )
@@ -273,6 +279,9 @@ def test_wrong_sequence_row_is_masked_and_reported() -> None:
     batch.chunk_sequence[1] = 3  # wrong: expected 0
     result = _advance(core, batch, state, capture=True)
     assert result.row_valid.tolist() == [True, False]
+    assert result.row_status.tolist() == [
+        0, frontend.ROW_STATUS_SEQUENCE,
+    ]
     assert int(result.token_lengths[1]) == 0
     torch.testing.assert_close(
         state.frontend_counters[1], before["counters"], rtol=0, atol=0
@@ -311,6 +320,7 @@ def test_geometry_mismatch_row_is_masked() -> None:
     batch.geometry_id[0] = 2  # bucket is GEOMETRY_1120 = 4
     result = _advance(core, batch, state)
     assert result.row_valid.tolist() == [False]
+    assert result.row_status.tolist() == [frontend.ROW_STATUS_GEOMETRY]
     assert int(result.token_lengths[0]) == 0
     torch.testing.assert_close(
         state.frontend_counters, before, rtol=0, atol=0
@@ -396,13 +406,20 @@ def test_mixed_prompts_condition_row_wise() -> None:
         )
 
 
-def test_mixed_phase_bucket_rows_match_single_rows() -> None:
+@pytest.mark.parametrize(
+    "decode_name", ["decode_compact_active", "decode_dense_masked"]
+)
+def test_mixed_phase_bucket_rows_match_single_rows(
+    decode_name: str,
+) -> None:
     # @spec PORT-ADV-004
-    # THE length-aware transition differential: session-first,
-    # continuing, committable-final, and zero-frame-final rows advance
-    # in ONE bucket call, each equal to its own single-row run —
-    # counters exact, states and captures at the provisional
-    # cross-shape bound, token bursts identical.
+    # THE length-aware transition differential, run under BOTH
+    # unselected decode candidates (PORT-DEC-008 keeps them unselected
+    # until the profile): session-first, continuing, committable-final,
+    # and zero-frame-final rows advance in ONE bucket call, each equal
+    # to its own single-row run — counters exact, states and captures
+    # at the provisional cross-shape bound, token bursts identical.
+    decode_fn = getattr(rnnt, decode_name)
     core = _core()
     torch.manual_seed(31)
     signals = [
@@ -425,6 +442,7 @@ def test_mixed_phase_bucket_rows_match_single_rows() -> None:
                 core,
                 _chunk(signals[row][:CHUNK].unsqueeze(0), seq=0),
                 s1,
+                decode_fn=decode_fn,
             )
         singles.append(s1)
     stateN = _stack_states(singles)
@@ -443,8 +461,11 @@ def test_mixed_phase_bucket_rows_match_single_rows() -> None:
         prompt_index=torch.tensor([0, 2, 1, 0], dtype=torch.long),
         chunk_sequence=torch.tensor(seqs, dtype=torch.long),
     )
-    resultN = _advance(core, batchN, stateN, capture=True)
+    resultN = _advance(
+        core, batchN, stateN, capture=True, decode_fn=decode_fn
+    )
     assert resultN.row_valid.tolist() == [True] * 4
+    assert resultN.row_status.tolist() == [0] * 4
 
     for row in range(4):
         s1 = singles[row]
@@ -457,7 +478,9 @@ def test_mixed_phase_bucket_rows_match_single_rows() -> None:
             prompt_index=batchN.prompt_index[row : row + 1],
             chunk_sequence=torch.tensor([seqs[row]], dtype=torch.long),
         )
-        r1 = _advance(core, batch1, s1, capture=True)
+        r1 = _advance(
+            core, batch1, s1, capture=True, decode_fn=decode_fn
+        )
         results1.append(r1)
         # Token bursts identical.
         nb = int(resultN.token_lengths[row])
@@ -525,3 +548,32 @@ def test_mixed_phase_bucket_rows_match_single_rows() -> None:
         stateN.frontend_counters[3, frontend.CTR_FINALIZED]
     ) == 1
     assert int(resultN.token_lengths[3]) == 0
+
+
+def test_oversize_final_row_is_masked_and_reported() -> None:
+    # @spec PORT-ADV-004
+    # A final-tail carrier holding one full cadence unit or more is
+    # illegal ingress (PORT-SESS-001/003 drain complete cadences as
+    # regular units before minting the actual residual): the row is a
+    # masked no-op with the named status bit; nothing commits.
+    core = _core()
+    state = _fresh_state(1)
+    torch.manual_seed(28)
+    samples = torch.randn(1, 2 * CHUNK) * 0.1
+    _advance(core, _chunk(samples[:, :CHUNK], seq=0), state)
+    before = state.frontend_counters.clone()
+    result = _advance(
+        core,
+        _chunk(samples[:, CHUNK:], seq=1, final=True),
+        state,
+    )
+    assert result.row_valid.tolist() == [False]
+    assert result.row_status.tolist() == [
+        frontend.ROW_STATUS_FINAL_OVERSIZE
+    ]
+    assert int(result.token_lengths[0]) == 0
+    torch.testing.assert_close(
+        state.frontend_counters, before, rtol=0, atol=0
+    )
+    # The session is NOT finalized — recoverable, per the row tier.
+    assert int(state.frontend_counters[0, frontend.CTR_FINALIZED]) == 0

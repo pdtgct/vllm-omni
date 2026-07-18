@@ -301,22 +301,32 @@ def test_zero_length_carried_row_state_is_bit_identical(
     assert int(state.last_label[1]) == 9
 
 
-def test_out_of_range_lengths_are_rejected() -> None:
-    # @spec PORT-DEC-008
-    # The eager compact loop raises ValueError from its host check; the
-    # sync-free dense loop surfaces the same defect as a device-side
-    # assertion (RuntimeError on the CPU tier, PORT-ADV-004).
+def test_out_of_range_lengths_are_rejected_or_clamped() -> None:
+    # @spec PORT-DEC-008 / PORT-ADV-004
+    # The eager compact loop raises ValueError from its host check
+    # (it synchronizes anyway). The sync-free dense loop must not
+    # raise, assert on device, or synchronize: it clamps lengths to
+    # [0, T_pad] — a safe no-op posture; range defects upstream are
+    # advance_session row-status territory.
     predictor, joint = _nets()
+    torch.manual_seed(21)
     enc = torch.randn(2, 4, ENC)
-    for bad in ([-1, 2], [2, 5]):
+    for bad, clamped in (([-1, 2], [0, 2]), ([2, 5], [2, 4])):
         with pytest.raises(ValueError, match="enc_lengths"):
             rnnt.decode_compact_active(
                 enc, torch.tensor(bad), predictor, joint, _state(2)
             )
-        with pytest.raises(RuntimeError, match="enc_lengths"):
-            rnnt.decode_dense_masked(
+        with torch.no_grad():
+            ids_b, lens_b, st_b = rnnt.decode_dense_masked(
                 enc, torch.tensor(bad), predictor, joint, _state(2)
             )
+            ids_c, lens_c, st_c = rnnt.decode_dense_masked(
+                enc, torch.tensor(clamped), predictor, joint, _state(2)
+            )
+        assert ids_b.tolist() == ids_c.tolist()
+        assert lens_b.tolist() == lens_c.tolist()
+        torch.testing.assert_close(st_b.h, st_c.h, rtol=0, atol=0)
+        assert st_b.last_label.tolist() == st_c.last_label.tolist()
 
 
 def test_dense_and_compact_agree() -> None:

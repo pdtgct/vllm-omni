@@ -330,14 +330,18 @@ def decode_dense_masked(
     compaction skips are exact no-ops here (the ``decode_chunk_paged``
     masked-trip pattern). Token writes use gather/where/scatter with
     one unique index per row — deterministic and sync-free. No
-    ``nonzero``, ``.item()``, ``.tolist()``, host booleans, or
-    data-dependent shapes anywhere; the out-of-range guard is a
-    device-side assertion.
+    ``nonzero``, ``.item()``, ``.tolist()``, host booleans,
+    data-dependent shapes, raises on device predicates, or device
+    assertions anywhere (a fired CUDA assert corrupts the context —
+    PORT-ADV-004): out-of-range lengths clamp to ``[0, T_pad]`` as a
+    safe no-op posture; a range defect upstream is ``advance_session``
+    row-status territory.
 
     Args:
         enc_frames: ``(B, T_pad, enc_hidden)`` conditioned frames.
         enc_lengths: ``(B,)`` long valid frame counts (rows may be
-            padded to ``T_pad``).
+            padded to ``T_pad``); values outside ``[0, T_pad]`` are
+            clamped.
         predictor: The prediction network.
         joint: The joint network.
         state: Stacked decode state (NOT mutated; the advanced state
@@ -348,20 +352,11 @@ def decode_dense_masked(
     Returns:
         ``token_ids`` ``(B, T_pad * max_symbols)`` int32 padded,
         ``token_lengths`` ``(B,)`` int32, and the advanced state.
-
-    Raises:
-        RuntimeError: via device-side assertion when any
-            ``enc_lengths`` entry is negative or exceeds ``T_pad``
-            (eager on CPU; a trapping device assert on CUDA).
     """
     batch, t_pad, _ = enc_frames.shape
     device = enc_frames.device
     blank = predictor.blank_id
-    torch._assert_async(
-        ((enc_lengths >= 0) & (enc_lengths <= t_pad)).all(),
-        f"decode_dense_masked: enc_lengths out of range for "
-        f"T_pad={t_pad}",
-    )
+    enc_lengths = enc_lengths.clamp(min=0, max=t_pad)
     h = state.h.clone()
     c = state.c.clone()
     last_label = state.last_label.clone()
