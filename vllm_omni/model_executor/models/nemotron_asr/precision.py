@@ -29,6 +29,10 @@ TENSOR_CLASSES: Final = (
     "conv_state",
     "lstm_state",
     "queue_state",
+    # The frontend raw/mel tails (Phase 6b): golden-boundary audio
+    # state, fp32 at bring-up; sub-fp32 policies must scope it
+    # explicitly (BF16_COMPUTE pins it fp32 below).
+    "frontend_state",
 )
 
 RECURRENT_STATE_CLASSES: Final = ("conv_state", "lstm_state")
@@ -130,6 +134,11 @@ BF16_COMPUTE: Final = PrecisionPolicy(
         "conv_state": "fp32",
         "lstm_state": "fp32",
         "queue_state": "fp32",
+        # Frontend tails stay fp32 under reduced compute: they are the
+        # golden input boundary (adding this key restamps this
+        # policy's content-hash identifier; only FP32_BRINGUP's id is
+        # pinned by value, and its mapping is unchanged).
+        "frontend_state": "fp32",
     }
 )
 """The first reviewed sub-fp32 policy (PORT-PREC-003): compute classes

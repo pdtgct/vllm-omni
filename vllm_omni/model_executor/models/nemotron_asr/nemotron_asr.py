@@ -59,7 +59,8 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
     ConvCachePage,
-    FrontendStatePage,
+    FrontendBufferPage,
+    FrontendCounterPage,
     HybridStateModelMixin,
     LSTMStatePage,
     ReplayQueuePage,
@@ -357,7 +358,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         self._conv_pages = [p for k, p in paired if k == "conv"]
         self._lstm_page = next(p for k, p in paired if k == "lstm")
         self._replay_page = next(p for k, p in paired if k == "replay")
-        self._frontend_page = next(p for k, p in paired if k == "frontend")
+        self._frontend_buffer_page = next(
+            p for k, p in paired if k == "frontend_buffer"
+        )
+        self._frontend_counter_page = next(
+            p for k, p in paired if k == "frontend_counter"
+        )
         # The pre-encode overlap dropped from non-first chunks
         # (drop_extra); session-first chunks use 0 (run_forward_step).
         self._drop_extra = 2
@@ -404,14 +410,18 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                         policy=policy,
                     )
                 )
-            elif kind == "frontend":
+            elif kind == "frontend_buffer":
                 pages.append(
-                    FrontendStatePage(
+                    FrontendBufferPage(
                         prefix=prefix,
                         raw_tail=FRONTEND_CONSTANTS["raw_tail_capacity"],
                         n_mels=_N_MELS,
                         policy=policy,
                     )
+                )
+            elif kind == "frontend_counter":
+                pages.append(
+                    FrontendCounterPage(prefix=prefix, policy=policy)
                 )
         return pages
 

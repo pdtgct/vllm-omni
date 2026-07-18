@@ -319,23 +319,23 @@ def advance_session(
             seq + 1, lookahead=lookaheads[geometry]
         )
 
-    # Pre-consume snapshot: encoder input = mel-tail prefix (the
-    # pre-encode cache; empty on session-first) + this update's newly
-    # committed frames.
-    tail_valid = [
-        min(
-            int(state.frontend_counters[b, CTR_ENCODED_MEL_FRAMES]),
-            state.mel_tail.shape[2],
+    # Pre-consume snapshot: the fixed-width mel-tail prefix is the
+    # encoder's pre-encode cache (NeMo semantics: the FULL nine-slot
+    # tail, zeros where not yet valid, with the CONFIGURED two-output
+    # post-first-chunk drop — never a dynamic overlap); session-first
+    # rows take no prefix and drop nothing.
+    session_first = [
+        int(batch.chunk_sequence[b]) == 0 for b in range(n_rows)
+    ]
+    if len(set(session_first)) != 1:
+        raise ValueError(
+            "mixed session-first and continuing rows in one bucket "
+            "(caller must bucket by phase)"
         )
-        for b in range(n_rows)
-    ]
-    prefixes = [
-        state.mel_tail[b, :, state.mel_tail.shape[2] - tail_valid[b]:]
-        .clone()
-        for b in range(n_rows)
-    ]
+    first = session_first[0]
+    prefixes = [state.mel_tail[b].clone() for b in range(n_rows)]
 
-    new_frames, _counts = advance_frontend(
+    new_frames, counts = advance_frontend(
         core.featurizer,
         batch.samples,
         batch.valid_samples,
@@ -345,28 +345,30 @@ def advance_session(
         mel_tail=state.mel_tail,
         counters=state.frontend_counters,
     )
+    for b in range(n_rows):
+        state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
 
-    # One geometry bucket per call is the caller's contract
-    # (advance_model_rows groups by execution profile + geometry), so
-    # every row shares the same encoder-input width here.
-    mel_inputs = [
-        torch.cat([prefixes[b], new_frames[b]], dim=1)
-        for b in range(n_rows)
-    ]
-    widths = {m.shape[1] for m in mel_inputs}
-    if len(widths) != 1:
+    # Zero-work rows (a final tail whose short residual was dropped):
+    # no encoder, LID, or RNN-T work runs at all.
+    n_new = [int(c) for c in counts]
+    if len(set(n_new)) != 1:
         raise ValueError(
-            f"heterogeneous encoder-input widths in one bucket: "
-            f"{sorted(widths)} (caller must bucket by geometry/phase)"
+            f"heterogeneous new-frame counts in one bucket: {n_new} "
+            "(caller must bucket by geometry/phase; padded "
+            "variable-length batching is the transaction's job)"
         )
-    mel = torch.stack(mel_inputs)
-    drops = {-(-tail_valid[b] // 8) for b in range(n_rows)}
-    if len(drops) != 1:
-        raise ValueError(
-            "heterogeneous pre-encode overlap in one bucket "
-            f"(tail_valid={tail_valid})"
-        )
-    drop_extra = drops.pop()
+    if n_new[0] == 0:
+        return AdvanceResult(bursts=[[] for _ in range(n_rows)])
+
+    if first:
+        mel = torch.stack(new_frames)
+        drop_extra = 0
+    else:
+        mel = torch.stack([
+            torch.cat([prefixes[b], new_frames[b]], dim=1)
+            for b in range(n_rows)
+        ])
+        drop_extra = PRE_ENCODE_DROP
 
     caches = _GatheredCaches(state)
     with torch.no_grad():
@@ -378,7 +380,15 @@ def advance_session(
             core.encoder, mel, caches,  # type: ignore[arg-type]
             drop_extra=drop_extra,
         )
-        conditioned = core.lid(enc, prompt_index=batch.prompt_index)
+        # Per-row language conditioning: PromptConditioner takes ONE
+        # prompt index — group rows by prompt so mixed-language
+        # batches never share a multi-hot prompt.
+        conditioned = torch.empty_like(enc)
+        for prompt in {int(x) for x in batch.prompt_index}:
+            mask = batch.prompt_index == prompt
+            conditioned[mask] = core.lid(
+                enc[mask], prompt_index=prompt
+            )
         decode = DecodeState(
             h=state.h.transpose(0, 1).contiguous(),
             c=state.c.transpose(0, 1).contiguous(),
@@ -394,7 +404,6 @@ def advance_session(
         state.frontend_counters[b, CTR_ENCODED_MEL_FRAMES] = int(
             state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
         )
-        state.frontend_counters[b, CTR_EXPECTED_CHUNK_SEQUENCE] += 1
 
     captures = {
         "frontend_mel": [mel[b] for b in range(n_rows)],
@@ -404,6 +413,32 @@ def advance_session(
     return AdvanceResult(bursts=bursts, captures=captures)
 
 
+#: The configured pre-encode overlap dropped from every non-first
+#: chunk's encoder output (the checkpoint's nine-mel cache -> two
+#: subsampled outputs; a value, never derived per row).
+PRE_ENCODE_DROP = 2
+
+
+class _StackedRows:
+    """Per-layer gathered views behind stacked-tensor indexing:
+    ``stream_step`` reads ``caches.channel.shape[2]`` and does
+    ``caches.channel[idx]`` reads / slice-assign writes; reads return
+    the (B, ...) view, writes copy through to the gathered tensors."""
+
+    def __init__(self, views: list[torch.Tensor]) -> None:
+        self._views = views
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self._views[idx]
+
+    def __setitem__(self, idx: int, value: torch.Tensor) -> None:
+        self._views[idx].copy_(value)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (len(self._views), *self._views[0].shape)
+
+
 class _GatheredCaches:
     """``StreamingCaches``' surface over a gathered
     :class:`SessionStateBatch` (channel/time/valid/left_context) —
@@ -411,8 +446,8 @@ class _GatheredCaches:
     golden-proven advance IS the scratch write."""
 
     def __init__(self, state: SessionStateBatch) -> None:
-        self.channel = state.channel
-        self.time = state.time
+        self.channel = _StackedRows(state.channel)
+        self.time = _StackedRows(state.time)
         self._window_valid = state.window_valid
         self.left_context = state.channel[0].shape[1]
 

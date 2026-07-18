@@ -10,7 +10,8 @@ left-context window (the OPEN-α3-VEHICLE decision, measured
 token cadence; see docs/intent/port/decisions/
 attention-window-vehicle.md in the notes repo), the depthwise-conv
 tails, the predictor LSTM, the replay queue + session book, and the
-frontend continuity page. ``MambaSpec`` is the
+frontend continuity pair (fp32 buffers + int64 counters, split for
+typed-view alignment). ``MambaSpec`` is the
 landed mechanism for constant-size per-session state (``ShortConv``
 precedent), not a Mamba-specific hack (ledger §8 addendum: the
 capability is general; ``MambaSpec`` is today's vehicle).
@@ -195,17 +196,22 @@ class ReplayQueuePage(_StatePage):
         )
 
 
-class FrontendStatePage(_StatePage):
-    """Frontend continuity: raw tail, mel tail, eight counters.
+class FrontendBufferPage(_StatePage):
+    """Frontend continuity buffers: the raw tail and mel tail.
 
-    The fifth state-page kind (design §Exact Bounded Frontend): the
-    bounded raw-sample tail and committed-boundary mel tail ride the
-    ``frontend_state`` tensor class — fp32 under the bring-up wildcard;
-    a sub-fp32 policy that has not explicitly scoped this component
-    fails loudly at use (PrecisionPolicy's partial-resolution posture)
-    rather than silently inheriting a compute dtype. The counters are
-    int64 (``manifests.FRONTEND_COUNTER_FIELDS`` order), outside the
-    precision axis.
+    Physically SPLIT from the int64 counters (:class:`
+    FrontendCounterPage`): the pinned runner constructs typed views
+    with dtype-aligned offsets and strides (gpu_model_runner.py:7160
+    @ v0.24.0/ee0da84), and a mixed FP32/INT64 page would place the
+    counters at byte 12,420 with a 12,484-byte stride — neither
+    8-byte-aligned. Two homogeneous pages preserve the exact
+    12,484-byte frontend inventory (12,420 + 64) and the 6,314,864-
+    byte session total. This is the new source evidence that reverses
+    the earlier mixed-dtype-split rejection (ledger A8 note): mixed
+    dtypes ARE supported per ``MambaSpec``'s parallel tuples, but only
+    when every typed offset satisfies the target dtype's alignment.
+    Both tensors ride ``frontend_state`` — fp32 at bring-up, pinned
+    fp32 under ``BF16_COMPUTE`` (the golden input boundary).
     """
 
     def __init__(
@@ -218,8 +224,23 @@ class FrontendStatePage(_StatePage):
     ) -> None:
         super().__init__(
             prefix=prefix,
-            shapes=((raw_tail,), (n_mels, 9), (8,)),
-            tensor_classes=("frontend_state", "frontend_state", "int64"),
+            shapes=((raw_tail,), (n_mels, 9)),
+            tensor_classes=("frontend_state", "frontend_state"),
+            policy=policy,
+        )
+
+
+class FrontendCounterPage(_StatePage):
+    """The eight int64 frontend counters
+    (``manifests.FRONTEND_COUNTER_FIELDS`` order) — control state
+    outside the precision axis, on their own page for int64 view
+    alignment (see :class:`FrontendBufferPage`)."""
+
+    def __init__(self, *, prefix: str, policy: PrecisionPolicy) -> None:
+        super().__init__(
+            prefix=prefix,
+            shapes=((8,),),
+            tensor_classes=("int64",),
             policy=policy,
         )
 
@@ -452,5 +473,6 @@ def state_page_prefixes(n_encoder_layers: int) -> list[tuple[str, str]]:
         prefixes.append(("conv", f"encoder.layers.{i}.conv"))
     prefixes.append(("lstm", "predictor.layers.0.lstm_state"))
     prefixes.append(("replay", "decode.layers.0.replay"))
-    prefixes.append(("frontend", "frontend.layers.0.state"))
+    prefixes.append(("frontend_buffer", "frontend.layers.0.buffers"))
+    prefixes.append(("frontend_counter", "frontend.layers.0.counters"))
     return prefixes

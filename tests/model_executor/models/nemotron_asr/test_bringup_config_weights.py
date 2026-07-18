@@ -202,11 +202,14 @@ def test_author_config_rejects_specials_that_shadow_labels_or_blank():
 
 def test_state_page_prefixes_are_extract_layer_index_safe():
     prefixes = state_page_prefixes(24)
-    # 24 window + 24 conv + 1 lstm + 1 replay.
-    assert len(prefixes) == 50
+    # 24 window + 24 conv + 1 lstm + 1 replay + the frontend pair
+    # (fp32 buffers + int64 counters, split for typed-view alignment).
+    assert len(prefixes) == 52
     kinds = [k for k, _ in prefixes]
     assert kinds.count("window") == 24 and kinds.count("conv") == 24
     assert kinds.count("lstm") == 1 and kinds.count("replay") == 1
+    assert kinds.count("frontend_buffer") == 1
+    assert kinds.count("frontend_counter") == 1
     for _, prefix in prefixes:
         ints = [p for p in prefix.split(".") if p.lstrip("-").isdigit()]
         # extract_layer_index asserts exactly one integer component.
@@ -216,6 +219,8 @@ def test_state_page_prefixes_are_extract_layer_index_safe():
     assert "encoder.layers.23.conv" in names
     assert "predictor.layers.0.lstm_state" in names  # synthetic .0.
     assert "decode.layers.0.replay" in names
+    assert "frontend.layers.0.buffers" in names
+    assert "frontend.layers.0.counters" in names
 
 
 # ---- model __init__ and load_weights (PORT-WGT-001/003) -----------------------

@@ -79,9 +79,9 @@ WINDOW_PAGE_BYTES = (WINDOW * D_MODEL + 1) * 4
 def test_window_page_shapes_and_policy_dtypes():
     page = make_window_page()
     assert tuple(page.get_state_shape()) == ((WINDOW, D_MODEL), (1,))
-    # attention_cache + queue_state classes, both fp32 in the bring-up
+    # attention_cache (policy fp32) + the int32 valid-length control
     # policy (PORT-PREC-001/005).
-    assert page.get_state_dtype() == (torch.float32, torch.float32)
+    assert page.get_state_dtype() == (torch.float32, torch.int32)
 
 
 def test_window_page_is_now_the_largest_kind():

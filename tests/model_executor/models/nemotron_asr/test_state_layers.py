@@ -56,4 +56,8 @@ def test_replay_queue_capacity_is_symbols_times_frames():
         policy=FP32_BRINGUP,
     )
     shapes = tuple(page.get_state_shape())
-    assert shapes == ((140,), (4,))
+    # 7-slot book (manifests.BOOK_FIELDS) + int32 control tensors +
+    # whole-page park persistence: the reconciled Phase-6 contract.
+    assert shapes == ((140,), (7,))
+    assert page.get_state_dtype() == (torch.int32, torch.int32)
+    assert page.persist_across_session_park is True

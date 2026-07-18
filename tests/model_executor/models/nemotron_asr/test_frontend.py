@@ -215,18 +215,22 @@ def test_partial_final_tail_off_the_hop_grid() -> None:
     torch.testing.assert_close(streamed, whole, rtol=0, atol=2e-6)
 
 
-def test_zero_sample_final_tail_finalizes() -> None:
+def test_zero_sample_final_tail_finalizes_and_drops_short_residual() -> (
+    None
+):
     # @spec PORT-FEAT-002
-    # A final tail carrying zero samples still atomically finalizes.
+    # A final tail carrying zero samples still atomically finalizes;
+    # its 1-frame residual past the committed boundary (112 - 111) is
+    # BELOW eight and therefore dropped, never committed (design final
+    # residual rule).
     feat = _featurizer()
     torch.manual_seed(15)
     signal = torch.randn(17920) * 0.1
     streamed, state = _stream(feat, signal, [17920, 0], final=True)
-    # The lone catch-up frame runs in a 1-frame STFT call — cross-shape
-    # FFT ulps only (see the ragged-splits test).
-    torch.testing.assert_close(
-        streamed, _whole_mel(feat, signal), rtol=0, atol=2e-6
+    assert streamed.shape[1] == frontend.stable_frames(
+        17920, n_fft=512, hop=160
     )
+    _assert_prefix_equal(feat, signal, streamed)
     assert int(state["counters"][0, frontend.CTR_FINALIZED]) == 1
 
 
@@ -313,7 +317,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     torch.testing.assert_close(
         state["mel_tail"][0], streamed[:, -k9:], rtol=0, atol=2e-6
     )
-    out, _ = frontend.advance_frontend(
+    out, counts = frontend.advance_frontend(
         feat,
         torch.zeros(1, 0),
         torch.zeros(1, dtype=torch.long),
@@ -321,10 +325,17 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
         torch.zeros(1, dtype=torch.long),
         **state,
     )
-    full = torch.cat([streamed, out[0]], dim=1)
-    whole = _whole_mel(feat, signal)
-    assert full.shape == whole.shape
-    torch.testing.assert_close(full, whole, rtol=0, atol=2e-6)
+    # Exact-cadence finalization: final_frames - B_3 = 7 new frames
+    # remain — below eight, so the residual is DROPPED and the
+    # committed stream ends exactly at the capped boundary (the design
+    # final residual rule; nothing further reaches the encoder).
+    assert int(counts[0]) == 0
+    assert out[0].shape[1] == 0
+    assert int(
+        state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES]
+    ) == frontend.cadence_boundary(3, lookahead=la)
+    assert int(state["counters"][0, frontend.CTR_FINALIZED]) == 1
+    _assert_prefix_equal(feat, signal, streamed)
 
 
 def test_target_past_stability_is_a_margin_violation() -> None:

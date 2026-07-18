@@ -793,21 +793,17 @@ def test_persist_across_session_park_by_kind() -> None:
     # The reconciled design: EVERY state page persists across a legal
     # park — the replay/session-book page too (it also carries
     # last-label, prompt, geometry, and echo state; port-design.md
-    # §Session State Pages), and the frontend-continuity page exists
-    # as a first-class state layer. Red until Phase 6 flips the replay
-    # page and adds FrontendStatePage.
-    from vllm_omni.model_executor.models.nemotron_asr import state_layers
+    # §Session State Pages), and the frontend-continuity pair (fp32
+    # buffers + int64 counters, physically split for typed-view
+    # alignment) exists as first-class state layers.
     from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
         ConvCachePage,
+        FrontendBufferPage,
+        FrontendCounterPage,
         LSTMStatePage,
         ReplayQueuePage,
         WindowCachePage,
     )
-
-    # getattr, not a from-import: the class does not exist yet, and its
-    # absence must fail THIS test at runtime (tests-first red), not
-    # static analysis of the whole file.
-    frontend_cls = getattr(state_layers, "FrontendStatePage")  # noqa: B009
 
     window = WindowCachePage(
         prefix="encoder.layers.0.window", window=WINDOW, d_model=D_MODEL,
@@ -825,15 +821,19 @@ def test_persist_across_session_park_by_kind() -> None:
         prefix="decode.layers.0.replay", max_symbols_per_step=10,
         max_frames_per_chunk=4, policy=FP32_BRINGUP,
     )
-    frontend = frontend_cls(
-        prefix="frontend", raw_tail=RAW_TAIL, n_mels=FEAT,
-        policy=FP32_BRINGUP,
+    frontend = FrontendBufferPage(
+        prefix="frontend.layers.0.buffers", raw_tail=RAW_TAIL,
+        n_mels=FEAT, policy=FP32_BRINGUP,
+    )
+    counters = FrontendCounterPage(
+        prefix="frontend.layers.0.counters", policy=FP32_BRINGUP,
     )
     assert window.persist_across_session_park is True
     assert conv.persist_across_session_park is True
     assert lstm.persist_across_session_park is True
     assert replay.persist_across_session_park is True
     assert frontend.persist_across_session_park is True
+    assert counters.persist_across_session_park is True
 
 
 def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:

@@ -86,8 +86,10 @@ def _gather_absolute(
     len)``), and zeros for indices below 0 or at/after
     ``valid_limit`` (the whole-signal mask + constant-pad semantics).
     """
-    out = torch.zeros(length, dtype=raw_tail.dtype)
-    idx = torch.arange(start, start + length)
+    out = torch.zeros(
+        length, dtype=raw_tail.dtype, device=raw_tail.device
+    )
+    idx = torch.arange(start, start + length, device=raw_tail.device)
     in_tail = (
         (idx >= tail_origin) & (idx < tail_origin + tail_length)
         & (idx < valid_limit) & (idx >= 0)
@@ -191,8 +193,14 @@ def advance_frontend(
         total = total_before + n_valid
         stable = stable_frames(total, n_fft=n_fft, hop=hop)
         if bool(final_tail[b]):
-            target = max(final_frames(total, n_fft=n_fft, hop=hop),
-                         committed)
+            # Final residual rule (design §Exact Bounded Frontend):
+            # commit the remaining valid frames as a partial chunk
+            # only when at least EIGHT new mel frames remain past the
+            # committed (encoder) boundary; a shorter remainder is
+            # DROPPED — finalization still marks atomically either
+            # way.
+            n_final = final_frames(total, n_fft=n_fft, hop=hop)
+            target = n_final if n_final - committed >= 8 else committed
         else:
             target = int(target_frames[b])
             if target < committed:
@@ -224,7 +232,10 @@ def advance_frontend(
 
     counts = torch.zeros(batch, dtype=torch.long)
     out: list[torch.Tensor] = [
-        torch.zeros(featurizer.fb.shape[0], 0) for _ in range(batch)
+        torch.zeros(
+            featurizer.fb.shape[0], 0, device=featurizer.fb.device
+        )
+        for _ in range(batch)
     ]
 
     # Group rows with identical segment geometry: one batched
