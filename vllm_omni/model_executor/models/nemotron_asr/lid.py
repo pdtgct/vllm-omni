@@ -53,14 +53,17 @@ class PromptConditioner(nn.Module):
         )
 
     def forward(
-        self, encoded: torch.Tensor, *, prompt_index: int
+        self, encoded: torch.Tensor, *, prompt_index: int | torch.Tensor
     ) -> torch.Tensor:
         """Condition encoder frames on the session's language prompt.
 
         Args:
             encoded: ``(batch, time, enc_hidden)`` encoder output
                 (``encoder_raw`` in capture-hook terms).
-            prompt_index: the session's admitted prompt index.
+            prompt_index: the admitted prompt index — a scalar for
+                one session, or a ``(batch,)`` long tensor for
+                ROW-WISE conditioning (one call, no per-prompt
+                fragmentation; PORT-PERF-001).
 
         Returns:
             ``(batch, time, enc_hidden)`` conditioned frames
@@ -74,8 +77,16 @@ class PromptConditioner(nn.Module):
             dtype=encoded.dtype,
             device=encoded.device,
         )
-        prompt[:, :, prompt_index] = 1.0
+        if isinstance(prompt_index, torch.Tensor):
+            prompt[
+                torch.arange(batch, device=encoded.device),
+                :,
+                prompt_index.to(encoded.device),
+            ] = 1.0
+        else:
+            prompt[:, :, prompt_index] = 1.0
         out_dtype = encoded.dtype
-        return self.prompt_kernel(
+        conditioned: torch.Tensor = self.prompt_kernel(
             torch.cat([encoded, prompt], dim=-1)
         ).to(out_dtype)
+        return conditioned

@@ -133,7 +133,7 @@ class LSTMStatePage(_StatePage):
 
 
 class WindowCachePage(_StatePage):
-    """The encoder left-context window: the fourth state-page kind.
+    """The encoder left-context window state page.
 
     The OPEN-α3-VEHICLE decision (docs/intent/port/decisions/
     attention-window-vehicle.md, measured 2026-07-14): the 56-frame
@@ -442,7 +442,7 @@ class HybridStateModelMixin:
         One dtype per tensor in the reference bundle (window channel
         cache + valid-length slot).
         """
-        return (torch.float32, torch.float32)
+        return (torch.float32, torch.int32)
 
     @classmethod
     def get_mamba_state_copy_func(cls, vllm_config: Any) -> Any:

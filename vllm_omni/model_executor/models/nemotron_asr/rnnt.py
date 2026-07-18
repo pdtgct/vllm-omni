@@ -337,7 +337,7 @@ def decode_chunk_paged(
     must match bit-for-bit (labels, predictor state, queue contents),
     never the implementation. Reads/writes ``(h, c)`` at
     ``h_pool[state_indices]``/``c_pool``, appends emissions to
-    ``queue_pool`` rows, and updates the 4-slot bookkeeping vector in
+    ``queue_pool`` rows, and updates the session book's queue slots in
     ``book_pool`` (QUEUE_* indices).
     """
     batch = enc_frames.shape[0]

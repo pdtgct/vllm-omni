@@ -49,6 +49,7 @@ class NemotronASRConfig(PretrainedConfig):
         pred_rnn_layers: int = 2,
         joint_hidden: int = 640,
         num_prompts: int = 128,
+        n_mels: int = 128,
         max_position_embeddings: int = 32768,
         torch_dtype: str = "float32",
         **kwargs: object,
@@ -71,6 +72,7 @@ class NemotronASRConfig(PretrainedConfig):
         self.pred_rnn_layers = pred_rnn_layers
         self.joint_hidden = joint_hidden
         self.num_prompts = num_prompts
+        self.n_mels = n_mels
         self.max_position_embeddings = max_position_embeddings
         # ``architectures`` rides kwargs, never an explicit arg: a
         # config.json (from author_config or to_dict) already carries

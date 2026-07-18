@@ -317,7 +317,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         Reads ``NemotronASRConfig`` off ``vllm_config.model_config``,
         builds ``NemotronASRCore`` at the config's dims, sets
         ``num_logits`` from the config's ``vocab_size``, and constructs
-        + registers the four state-page kinds under F4-compliant
+        + registers the five state-page kinds under F4-compliant
         prefixes (``state_page_prefixes``). Weights load afterward via
         ``load_weights``; page pools bind at forward (BU-b).
         """
@@ -371,7 +371,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     def _build_state_pages(
         self, n_layers: int, cfg: Any, policy: PrecisionPolicy
     ) -> list[Any]:
-        """The four page kinds under F4-compliant prefixes."""
+        """The five page kinds under F4-compliant prefixes."""
         pages: list[Any] = []
         for kind, prefix in state_page_prefixes(n_layers):
             if kind == "window":
@@ -415,7 +415,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                     FrontendBufferPage(
                         prefix=prefix,
                         raw_tail=FRONTEND_CONSTANTS["raw_tail_capacity"],
-                        n_mels=_N_MELS,
+                        n_mels=cfg.n_mels,
                         policy=policy,
                     )
                 )
@@ -613,7 +613,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 inputs_embeds.shape[0], inputs_embeds.shape[1],
                 dtype=inputs_embeds.dtype, device=inputs_embeds.device,
             )
-        # All four page kinds share one uniform group → one metadata
+        # All five page kinds share one uniform group → one metadata
         # object (ShortConvAttentionMetadata; Any off-engine). The batch
         # is ordered decodes-then-prefills (short_conv splits
         # [num_decode_tokens, num_prefill_tokens]); every row is a single

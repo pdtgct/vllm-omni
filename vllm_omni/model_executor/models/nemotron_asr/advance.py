@@ -37,7 +37,7 @@ path).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -141,25 +141,47 @@ class SessionStateBatch:
 
 
 @dataclass(frozen=True)
-class AdvanceResult:
-    """The adapter-neutral result of one :func:`advance_session` call.
+class PreparedCaptures:
+    """GPU-resident named captures: padded storage + exact valid
+    lengths, never Python lists (PORT-PERF-001). A finalized
+    zero-frame CHUNK stages all three tensors with zero valid length
+    — the checkpoint record survives even when no model work ran.
 
-    ``bursts``: one ordered, bounded, NONBLANK label list per CHUNK row
-    (``bursts[i]`` never contains ``blank_id``); each burst is bounded
-    by ``valid_encoder_frames × max_symbols_per_step`` for that row's
-    geometry (PORT-INT-002), NOT by the attention window.
-    ``captures``: a dict with EXACTLY the keys ``frontend_mel``,
-    ``encoder_raw``, ``encoder_conditioned`` — each a list of one
-    tensor per row, in row order. Empty when capture is disabled.
-
-    The result carries no MRV1/runner projection: a model-local
-    emission adapter (selected in :func:`advance_model_rows`) turns
-    these bursts into either MRV1 one-token rows plus the persistent
-    replay book or a padded variable-length runner result.
+    ``frontend_mel``: ``(B, n_mels, T_mel_pad)``; ``mel_lengths``:
+    ``(B,)`` long. ``encoder_raw`` / ``encoder_conditioned``:
+    ``(B, T_enc_pad, d_model)``; ``encoder_lengths``: ``(B,)`` long.
     """
 
-    bursts: list[list[int]]
-    captures: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    frontend_mel: torch.Tensor
+    mel_lengths: torch.Tensor
+    encoder_raw: torch.Tensor
+    encoder_conditioned: torch.Tensor
+    encoder_lengths: torch.Tensor
+
+
+@dataclass(frozen=True)
+class AdvanceResult:
+    """The adapter-neutral, GPU-RESIDENT result of one
+    :func:`advance_session` call (no host synchronization on the
+    result path, PORT-PERF-001).
+
+    ``token_ids``: ``(B, K)`` int32, padded; ``token_lengths``:
+    ``(B,)`` int32 — row ``b``'s burst is ``token_ids[b,
+    :token_lengths[b]]``, ordered, NONBLANK, bounded by
+    ``valid_encoder_frames × max_symbols_per_step`` for the row's
+    geometry (PORT-INT-002), NOT by the attention window.
+    ``captures``: :class:`PreparedCaptures` or ``None`` when capture
+    is disabled.
+
+    The result carries no MRV1/runner projection: the selected
+    emission adapter turns it into runner rows via an explicit
+    :class:`EmissionProjection`; the outer transaction is the sole
+    scatter owner.
+    """
+
+    token_ids: torch.Tensor
+    token_lengths: torch.Tensor
+    captures: PreparedCaptures | None = None
 
 
 @dataclass(frozen=True)
@@ -208,19 +230,54 @@ class RowPlan:
     prompt_index: torch.Tensor
 
 
+@dataclass
+class EmissionContext:
+    """Per-call row context + GATHERED emission scratch the adapter
+    consumes. The transaction gathers ``queue``/``book`` copies for
+    the batch and later scatters the projection's updated scratch —
+    the adapter NEVER mutates resident pools (the transaction is the
+    sole scatter owner).
+
+    ``roles``: ``(N,)`` int (CHUNK/REPLAY/FLUSH); ``input_ids``:
+    ``(N,)`` long; ``chunk_rows``: ``(B,)`` long positions of the
+    CHUNK rows within the N-row batch; ``queue`` ``(N, cap)`` /
+    ``book`` ``(N, 7)``: gathered emission scratch.
+    """
+
+    roles: torch.Tensor
+    input_ids: torch.Tensor
+    chunk_rows: torch.Tensor
+    queue: torch.Tensor
+    book: torch.Tensor
+
+
+@dataclass(frozen=True)
+class EmissionProjection:
+    """What the adapter returns: the runner rows plus the UPDATED
+    emission scratch for the transaction to scatter at commit.
+
+    ``rows``: ``(N, H)`` runner output (e.g. MRV1 decision carriers);
+    ``queue`` / ``book``: the updated scratch, same shapes as the
+    context's.
+    """
+
+    rows: torch.Tensor
+    queue: torch.Tensor
+    book: torch.Tensor
+
+
 #: A model-local emission adapter: projects a committed
-#: :class:`AdvanceResult` into the runner's row shape (MRV1 one-token
-#: rows + persistent replay book, or a padded variable-length burst).
-#: Selection happens once at model init (runner-mode configuration),
-#: and the selected adapter is passed into every
-#: :func:`advance_model_rows` call.
-EmissionAdapter = Callable[["AdvanceResult"], torch.Tensor]
+#: :class:`AdvanceResult` under an :class:`EmissionContext` into an
+#: :class:`EmissionProjection`. Selection happens once at model init
+#: (runner-mode configuration); the transaction owns every resident
+#: scatter.
+EmissionAdapter = Callable[
+    ["AdvanceResult", "EmissionContext"], "EmissionProjection"
+]
 
 
 def make_mrv1_adapter(
     *,
-    queue_pool: torch.Tensor,
-    book_pool: torch.Tensor,
     hidden_size: int,
     park_id: int,
     blank_id: int,
@@ -228,11 +285,13 @@ def make_mrv1_adapter(
     """Build the MRV1 emission adapter (the correctness fallback,
     PORT-DEC-010's burst adapter arrives behind the same seam).
 
-    The returned adapter projects a committed :class:`AdvanceResult`
-    into MRV1 one-token decision-carrier rows: first burst label out
-    now, the remainder into the bound persistent replay queue/book
-    (pending-echo and expected-label stamped for echo verification),
-    ``park_id`` once a session's queue is drained.
+    The returned adapter is POOL-FREE: it consumes the context's
+    gathered queue/book scratch and the committed
+    :class:`AdvanceResult`, and returns an
+    :class:`EmissionProjection` — first burst label as each CHUNK
+    row's decision carrier, the remainder queued with pending-echo and
+    expected-label stamped, ``park_id`` for drained rows. The
+    transaction scatters.
 
     Raises:
         NotImplementedError: Always, at this tests-first stub — lands
@@ -328,9 +387,14 @@ def advance_session(
         int(batch.chunk_sequence[b]) == 0 for b in range(n_rows)
     ]
     if len(set(session_first)) != 1:
+        # TEMPORARY transition assertion — NOT the production
+        # contract: the normative bucket key is execution profile +
+        # immutable geometry only (PORT-PERF-001); phase and drop
+        # metadata become per-row inputs in the length-aware
+        # tensorized path.
         raise ValueError(
             "mixed session-first and continuing rows in one bucket "
-            "(caller must bucket by phase)"
+            "(temporary transition assertion)"
         )
     first = session_first[0]
     prefixes = [state.mel_tail[b].clone() for b in range(n_rows)]
@@ -352,13 +416,41 @@ def advance_session(
     # no encoder, LID, or RNN-T work runs at all.
     n_new = [int(c) for c in counts]
     if len(set(n_new)) != 1:
+        # TEMPORARY transition assertion (see above): the length-aware
+        # path carries per-row valid lengths through every state
+        # transition instead of exact-length sub-buckets.
         raise ValueError(
             f"heterogeneous new-frame counts in one bucket: {n_new} "
-            "(caller must bucket by geometry/phase; padded "
-            "variable-length batching is the transaction's job)"
+            "(temporary transition assertion)"
         )
+    device = batch.samples.device
     if n_new[0] == 0:
-        return AdvanceResult(bursts=[[] for _ in range(n_rows)])
+        # A finalized zero-frame CHUNK still stages all three named
+        # captures at zero valid length (the checkpoint record).
+        d_model = state.channel[0].shape[2]
+        n_mels = state.mel_tail.shape[1]
+        zero = torch.zeros(n_rows, dtype=torch.long, device=device)
+        return AdvanceResult(
+            token_ids=torch.zeros(
+                n_rows, 0, dtype=torch.int32, device=device
+            ),
+            token_lengths=torch.zeros(
+                n_rows, dtype=torch.int32, device=device
+            ),
+            captures=PreparedCaptures(
+                frontend_mel=torch.zeros(
+                    n_rows, n_mels, 0, device=device
+                ),
+                mel_lengths=zero,
+                encoder_raw=torch.zeros(
+                    n_rows, 0, d_model, device=device
+                ),
+                encoder_conditioned=torch.zeros(
+                    n_rows, 0, d_model, device=device
+                ),
+                encoder_lengths=zero.clone(),
+            ),
+        )
 
     if first:
         mel = torch.stack(new_frames)
@@ -380,15 +472,10 @@ def advance_session(
             core.encoder, mel, caches,  # type: ignore[arg-type]
             drop_extra=drop_extra,
         )
-        # Per-row language conditioning: PromptConditioner takes ONE
-        # prompt index — group rows by prompt so mixed-language
-        # batches never share a multi-hot prompt.
-        conditioned = torch.empty_like(enc)
-        for prompt in {int(x) for x in batch.prompt_index}:
-            mask = batch.prompt_index == prompt
-            conditioned[mask] = core.lid(
-                enc[mask], prompt_index=prompt
-            )
+        # Row-wise language conditioning in ONE call: the
+        # conditioner takes the (B,) prompt tensor directly (no
+        # per-prompt fragmentation or host set construction).
+        conditioned = core.lid(enc, prompt_index=batch.prompt_index)
         decode = DecodeState(
             h=state.h.transpose(0, 1).contiguous(),
             c=state.c.transpose(0, 1).contiguous(),
@@ -405,12 +492,37 @@ def advance_session(
             state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
         )
 
-    captures = {
-        "frontend_mel": [mel[b] for b in range(n_rows)],
-        "encoder_raw": [enc[b] for b in range(n_rows)],
-        "encoder_conditioned": [conditioned[b] for b in range(n_rows)],
-    }
-    return AdvanceResult(bursts=bursts, captures=captures)
+    # Boundary conversion to the GPU-resident result; the interior
+    # loop tensorizes in the compact-active slice (PORT-PERF-001).
+    max_len = max((len(b) for b in bursts), default=0)
+    token_ids = torch.zeros(
+        n_rows, max_len, dtype=torch.int32, device=device
+    )
+    token_lengths = torch.zeros(
+        n_rows, dtype=torch.int32, device=device
+    )
+    for b, burst in enumerate(bursts):
+        token_lengths[b] = len(burst)
+        if burst:
+            token_ids[b, : len(burst)] = torch.tensor(
+                burst, dtype=torch.int32, device=device
+            )
+    lengths = torch.full(
+        (n_rows,), enc.shape[1], dtype=torch.long, device=device
+    )
+    return AdvanceResult(
+        token_ids=token_ids,
+        token_lengths=token_lengths,
+        captures=PreparedCaptures(
+            frontend_mel=mel,
+            mel_lengths=torch.full(
+                (n_rows,), mel.shape[2], dtype=torch.long, device=device
+            ),
+            encoder_raw=enc,
+            encoder_conditioned=conditioned,
+            encoder_lengths=lengths,
+        ),
+    )
 
 
 #: The configured pre-encode overlap dropped from every non-first

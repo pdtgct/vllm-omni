@@ -44,6 +44,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     AdvanceResult,
     ChunkBatch,
     EmissionAdapter,
+    PreparedCaptures,
     RowPlan,
     SessionStateBatch,
     advance_model_rows,
@@ -326,8 +327,15 @@ def _envelope(
     return row
 
 
-def _refuse_adapter(_result: AdvanceResult) -> torch.Tensor:
+def _refuse_adapter(*_args: Any) -> Any:
     raise AssertionError("adapter must not be reached in this test")
+
+
+def _empty_result(n: int) -> AdvanceResult:
+    return AdvanceResult(
+        token_ids=torch.zeros(n, 0, dtype=torch.int32),
+        token_lengths=torch.zeros(n, dtype=torch.int32),
+    )
 
 
 def _call(
@@ -340,7 +348,6 @@ def _call(
 ) -> torch.Tensor:
     if adapter is None:
         adapter = make_mrv1_adapter(
-            queue_pool=pools["queue_pool"], book_pool=pools["book_pool"],
             hidden_size=CARRIER_HIDDEN, park_id=PARK_ID,
             blank_id=core.blank_id,
         )
@@ -509,8 +516,7 @@ def test_composition_orders_decode_rows_before_prefill_rows(
     ) -> AdvanceResult:
         seen["h"] = state.h.clone()
         seen["seq"] = batch.chunk_sequence.clone()
-        n = batch.samples.shape[0]
-        return AdvanceResult(bursts=[[] for _ in range(n)])
+        return _empty_result(batch.samples.shape[0])
 
     monkeypatch.setattr(advance_mod, "advance_session", _recorder)
     core = _tiny_core()
@@ -594,8 +600,7 @@ def test_mixed_batch_calls_advance_session_with_only_chunk_rows(
         _core: Any, batch: ChunkBatch, _state: SessionStateBatch
     ) -> AdvanceResult:
         seen["n_chunk_rows"] = batch.samples.shape[0]
-        n = batch.samples.shape[0]
-        return AdvanceResult(bursts=[[] for _ in range(n)])
+        return _empty_result(batch.samples.shape[0])
 
     monkeypatch.setattr(advance_mod, "advance_session", _recorder)
     core = _tiny_core()
@@ -646,16 +651,21 @@ def test_advance_session_result_contract() -> None:
     )
     result = advance_session(core, batch, state)
     assert isinstance(result, AdvanceResult)
-    assert len(result.bursts) == 1
-    assert core.blank_id not in result.bursts[0]
+    # GPU-resident result: padded token_ids + per-row lengths, never
+    # Python lists (PORT-PERF-001).
+    n_tok = int(result.token_lengths[0])
+    burst = result.token_ids[0, :n_tok]
+    assert result.token_ids.dtype == torch.int32
+    assert not bool((burst == core.blank_id).any())
     # PORT-INT-002: bounded by valid encoder frames × max symbols per
     # step — NOT by the attention window.
-    assert len(result.bursts[0]) <= enc_frames * MAX_SYMBOLS_PER_STEP
-    assert set(result.captures) == {
-        "frontend_mel", "encoder_raw", "encoder_conditioned",
-    }
-    for tensors in result.captures.values():
-        assert len(tensors) == 1  # one capture per row
+    assert n_tok <= enc_frames * MAX_SYMBOLS_PER_STEP
+    caps = result.captures
+    assert isinstance(caps, PreparedCaptures)
+    assert caps.frontend_mel.shape[0] == 1
+    assert int(caps.mel_lengths[0]) == caps.frontend_mel.shape[2]
+    assert caps.encoder_raw.shape == caps.encoder_conditioned.shape
+    assert int(caps.encoder_lengths[0]) == caps.encoder_raw.shape[1]
     # The transition advanced the frontend state it was handed.
     ctr = state.frontend_counters[0]
     assert int(ctr[_CTR["total_valid_samples"]]) == SAMPLES
