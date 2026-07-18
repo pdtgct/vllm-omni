@@ -630,7 +630,7 @@ def main() -> None:
                     flush=True,
                 )
 
-    report = {
+    report: dict[str, Any] = {
         "probe": "p6b_decode_profile",
         "fingerprint": {
             "device": device,
@@ -681,21 +681,53 @@ def main() -> None:
             "seed": args.seed,
         },
         "cells": cells,
-        "token_mismatch_cells": mismatches,
-        "bf16_token_mismatch_cells": bf16_mismatches,
-        "pass": mismatches == 0,
     }
+    # Qualification is structurally PER LANE — there is no global
+    # "pass" a generator could mistake for whole-run qualification.
+    # execution_ok means the sweep completed; dispatch eligibility is
+    # a lane property.
+    lane_results: dict[str, dict[str, Any]] = {
+        lane: {
+            "mismatch_cells": (
+                mismatches if lane == "fp32" else bf16_mismatches
+            ),
+            "performance_qualified": (
+                lane == "fp32" and mismatches == 0
+            ),
+            "dispatch_eligible": (
+                lane == "fp32" and mismatches == 0
+            ),
+        }
+        for lane in joints
+    }
+    eligible = [
+        lane
+        for lane, res in lane_results.items()
+        if res["dispatch_eligible"]
+    ]
+    report["execution_ok"] = True
+    report["lane_results"] = lane_results
+    report["generator_eligible_lanes"] = eligible
     text = json.dumps(report, indent=2)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text)
     print(text[-1_500:] if len(text) > 1_500 else text)
-    print(
-        f"{'PASS' if report['pass'] else 'FAIL'}: {len(cells)} cells, "
-        f"{mismatches} token-mismatch cells",
-        flush=True,
+    fp32_ok = mismatches == 0
+    summary = [
+        f"FP32 {'PASS' if fp32_ok else 'FAIL'} "
+        f"({mismatches} mismatch cells)"
+    ]
+    if "bf16-joint" in joints:
+        summary.append(
+            f"BF16 UNQUALIFIED ({bf16_mismatches} mismatch cells, "
+            "exploratory)"
+        )
+    summary.append(
+        "generator-eligible lanes: " + (", ".join(eligible) or "NONE")
     )
-    sys.exit(0 if report["pass"] else 1)
+    print(f"{len(cells)} cells; " + "; ".join(summary), flush=True)
+    sys.exit(0 if fp32_ok else 1)
 
 
 if __name__ == "__main__":
