@@ -48,7 +48,7 @@ sys.modules[f"{_BASE}.decode_dispatch"] = _mod
 _spec.loader.exec_module(_mod)
 
 DispatchTable = _mod.DispatchTable
-FingerprintMismatch = _mod.FingerprintMismatch
+FingerprintMismatchError = _mod.FingerprintMismatchError
 generate_dispatch_table = _mod.generate_dispatch_table
 
 
@@ -218,12 +218,21 @@ def test_nonselective_cell_forces_sync_free() -> None:
 
 
 def test_unmeasured_tier_resolves_nearest_measured() -> None:
-    table = generate_dispatch_table(_two_tier_report())
-    # 12 is nearest to 8 (both dense) — dense-eager.
+    # Nearest-tier resolution applies only when the bracketing tiers
+    # AGREE (PORT-DEC-008; disagreement is the crossover-gap rule,
+    # tested separately) — so give 900 agreeing compact brackets.
+    report = _two_tier_report()
+    report["cells"] += _tier_cells(
+        "1120ms", 512,
+        dense_eager=430_000, dense_graphed=420_000,
+        compact_silence=110_000, compact_speech=210_000,
+    )
+    table = generate_dispatch_table(report)
+    # Below the lowest tier: only one side exists — dense tier 8.
     assert table.select(
-        "1120ms", 12, lane="fp32", graph_covers_decode=False,
+        "1120ms", 2, lane="fp32", graph_covers_decode=False,
     ) == "dense-eager"
-    # 900 is nearest to 1024 (compact tier).
+    # 900 sits between 512 and 1024, BOTH compact — nearest (1024).
     assert table.select(
         "1120ms", 900, lane="fp32", graph_covers_decode=False,
     ) == "compact-eager"
@@ -251,7 +260,7 @@ def test_fingerprint_mismatch_fails_closed_when_gated() -> None:
     table = generate_dispatch_table(_two_tier_report())
     runtime = dict(table.fingerprint)
     runtime["device_name"] = "NVIDIA A100 80GB PCIe"
-    with pytest.raises(FingerprintMismatch):
+    with pytest.raises(FingerprintMismatchError):
         table.validate_runtime(runtime, performance_gated=True)
     # Dev profile: warns (returns the mismatched keys), no raise.
     assert "device_name" in table.validate_runtime(
