@@ -87,11 +87,15 @@ def _stream(
         chunk = signal[offset : offset + n]
         offset += n
         is_final = final and i == len(splits) - 1
+        # Arbitrary-packet differentials cap at stability itself (the
+        # loosest legal target); cadence tests pass real boundaries.
+        target = frontend.stable_frames(offset, n_fft=512, hop=160)
         out, counts = frontend.advance_frontend(
             feat,
             chunk.unsqueeze(0),
             torch.tensor([n], dtype=torch.long),
             torch.tensor([is_final]),
+            torch.tensor([target], dtype=torch.long),
             **state,
         )
         if int(counts[0]):
@@ -234,6 +238,7 @@ def test_chunk_after_finalization_is_a_protocol_error() -> None:
         torch.zeros(1, 160),
         torch.tensor([160], dtype=torch.long),
         torch.tensor([True]),
+        torch.zeros(1, dtype=torch.long),  # target ignored on final
     )
     frontend.advance_frontend(feat, *args, **state)
     with pytest.raises(ValueError, match="finaliz"):
@@ -255,6 +260,103 @@ def test_mel_tail_holds_the_frames_before_the_boundary() -> None:
     assert int(
         state["counters"][0, frontend.CTR_MEL_TAIL_LENGTH]
     ) == k
+
+
+LOOKAHEADS = {1280: 0, 2560: 1, 5120: 3, 8960: 6, 17920: 13}
+
+
+@pytest.mark.parametrize(("chunk", "la"), sorted(LOOKAHEADS.items()))
+def test_cadence_boundary_margin_is_six(chunk: int, la: int) -> None:
+    # @spec PORT-FEAT-002
+    # The option-(d) premise (ledger 2026-07-17): after k regular
+    # cadence units, stable frames exceed the approved encoder
+    # boundary B_k = (8L+1)+(k-1)C = kC-7 by EXACTLY six, uniformly.
+    for k in (1, 2, 3, 7):
+        stable = frontend.stable_frames(k * chunk, n_fft=512, hop=160)
+        boundary = frontend.cadence_boundary(k, lookahead=la)
+        assert boundary == k * 8 * (la + 1) - 7
+        assert stable - boundary == 6
+
+
+def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
+    # @spec PORT-FEAT-002
+    # Regular 1120 ms units under real cadence targets: commits land
+    # exactly on B_k each update, remain a prefix of the whole-signal
+    # featurization, and the final tail flushes the residual so the
+    # full stream equals the whole signal.
+    feat = _featurizer()
+    torch.manual_seed(18)
+    chunk, la = 17920, 13
+    signal = torch.randn(3 * chunk) * 0.1
+    state = _fresh_state()
+    committed: list[torch.Tensor] = []
+    for k in (1, 2, 3):
+        out, counts = frontend.advance_frontend(
+            feat,
+            signal[(k - 1) * chunk : k * chunk].unsqueeze(0),
+            torch.tensor([chunk], dtype=torch.long),
+            torch.tensor([False]),
+            torch.tensor(
+                [frontend.cadence_boundary(k, lookahead=la)],
+                dtype=torch.long,
+            ),
+            **state,
+        )
+        committed.append(out[0])
+        assert int(
+            state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES]
+        ) == frontend.cadence_boundary(k, lookahead=la)
+    streamed = torch.cat(committed, dim=1)
+    _assert_prefix_equal(feat, signal, streamed)
+    # The mel tail sits relative to the CAPPED boundary.
+    k9 = frontend.MEL_TAIL_FRAMES
+    torch.testing.assert_close(
+        state["mel_tail"][0], streamed[:, -k9:], rtol=0, atol=2e-6
+    )
+    out, _ = frontend.advance_frontend(
+        feat,
+        torch.zeros(1, 0),
+        torch.zeros(1, dtype=torch.long),
+        torch.tensor([True]),
+        torch.zeros(1, dtype=torch.long),
+        **state,
+    )
+    full = torch.cat([streamed, out[0]], dim=1)
+    whole = _whole_mel(feat, signal)
+    assert full.shape == whole.shape
+    torch.testing.assert_close(full, whole, rtol=0, atol=2e-6)
+
+
+def test_target_past_stability_is_a_margin_violation() -> None:
+    # @spec PORT-FEAT-002
+    feat = _featurizer()
+    state = _fresh_state()
+    with pytest.raises(ValueError, match="margin"):
+        frontend.advance_frontend(
+            feat,
+            torch.zeros(1, 1600),
+            torch.tensor([1600], dtype=torch.long),
+            torch.tensor([False]),
+            torch.tensor([99], dtype=torch.long),  # stable is only 9
+            **state,
+        )
+
+
+def test_target_below_committed_is_rejected() -> None:
+    # @spec PORT-FEAT-002
+    feat = _featurizer()
+    torch.manual_seed(19)
+    signal = torch.randn(17920) * 0.1
+    _, state = _stream(feat, signal, [17920], final=False)
+    with pytest.raises(ValueError, match="below the committed"):
+        frontend.advance_frontend(
+            feat,
+            torch.zeros(1, 160),
+            torch.tensor([160], dtype=torch.long),
+            torch.tensor([False]),
+            torch.tensor([1], dtype=torch.long),
+            **state,
+        )
 
 
 def test_counter_slots_mirror_the_manifest_order() -> None:
@@ -290,6 +392,10 @@ def test_batched_rows_with_shared_geometry_match_single_rows() -> None:
         torch.stack([a, b]),
         torch.tensor([17920, 17920], dtype=torch.long),
         torch.tensor([False, False]),
+        torch.tensor(
+            [frontend.stable_frames(17920, n_fft=512, hop=160)] * 2,
+            dtype=torch.long,
+        ),
         **state2,
     )
     for row, signal in ((0, a), (1, b)):

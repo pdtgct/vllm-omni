@@ -104,17 +104,44 @@ def _gather_absolute(
     return out
 
 
+def cadence_boundary(
+    chunk_index: int, *, lookahead: int
+) -> int:
+    """The approved cumulative encoder boundary after ``chunk_index``
+    regular cadence units (design boundary formulas): ``B_k = (8L+1) +
+    (k-1)·C`` mel frames with ``C = 8(L+1)`` — i.e. ``kC - 7``. Zero
+    before the first unit."""
+    if chunk_index <= 0:
+        return 0
+    cadence = 8 * (lookahead + 1)
+    return (8 * lookahead + 1) + (chunk_index - 1) * cadence
+
+
 def advance_frontend(
     featurizer: Any,
     samples: torch.Tensor,
     valid_samples: torch.Tensor,
     final_tail: torch.Tensor,
+    target_frames: torch.Tensor,
     *,
     raw_tail: torch.Tensor,
     mel_tail: torch.Tensor,
     counters: torch.Tensor,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Advance the bounded frontend for a batch of CHUNK rows.
+
+    Boundary-capped (the option-(d) resolution, ledger 2026-07-17):
+    each row commits mel frames only through its cumulative cadence
+    target (``cadence_boundary`` for regular chunks, derived by the
+    caller from the admitted geometry and chunk sequence), never
+    through every currently stable frame — stability yields a uniform
+    6-frame margin over the ``kC-7`` boundary, and the mel tail is
+    retained relative to the TARGET so the encoder's pre-encode cache
+    always holds the frames before its actual boundary. Frames stable
+    beyond the target stay in the raw tail and recompute identically
+    on a later update (exactness is preserved). A final tail ignores
+    ``target_frames`` and commits through ``final_frames`` under the
+    separate residual rules.
 
     Args:
         featurizer: the checkpoint ``MelFeaturizer`` (supplies
@@ -124,6 +151,8 @@ def advance_frontend(
         samples: ``(B, S)`` padded raw FP32 rows.
         valid_samples: ``(B,)`` true sample counts.
         final_tail: ``(B,)`` bool final-tail markers.
+        target_frames: ``(B,)`` long cumulative cadence targets
+            (ignored for final-tail rows).
         raw_tail: ``(B, R)`` retained-tail storage, updated in place.
         mel_tail: ``(B, n_mels, MEL_TAIL_FRAMES)`` committed-boundary
             mel tail, updated in place.
@@ -135,9 +164,12 @@ def advance_frontend(
         counts.
 
     Raises:
-        ValueError: on a duplicate final tail or a chunk after
-            finalization (protocol errors), or a raw-tail overflow
-            (the derived bound was violated — never silently dropped).
+        ValueError: on a chunk after finalization (protocol error), a
+            regular chunk whose stable frames fall SHORT of its target
+            (the design margin was violated — never silently deferred),
+            a target below the already-committed boundary, or a
+            raw-tail overflow (the derived bound was violated — never
+            silently dropped).
     """
     n_fft = featurizer.n_fft
     hop = featurizer.hop_length
@@ -157,11 +189,23 @@ def advance_frontend(
         committed = int(counters[b, CTR_COMMITTED_MEL_FRAMES])
         n_valid = int(valid_samples[b])
         total = total_before + n_valid
+        stable = stable_frames(total, n_fft=n_fft, hop=hop)
         if bool(final_tail[b]):
-            target = final_frames(total, n_fft=n_fft, hop=hop)
+            target = max(final_frames(total, n_fft=n_fft, hop=hop),
+                         committed)
         else:
-            target = stable_frames(total, n_fft=n_fft, hop=hop)
-        target = max(target, committed)
+            target = int(target_frames[b])
+            if target < committed:
+                raise ValueError(
+                    f"row {b}: cadence target {target} is below the "
+                    f"committed boundary {committed}"
+                )
+            if stable < target:
+                raise ValueError(
+                    f"row {b}: only {stable} stable mel frames for "
+                    f"cadence target {target} (design margin "
+                    "violated)"
+                )
         n_new = target - committed
         # Segment covering frames [committed, target): preemphasized
         # samples [committed*hop - half, (target-1)*hop + half), plus
