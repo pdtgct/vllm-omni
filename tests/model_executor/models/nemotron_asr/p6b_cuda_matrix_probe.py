@@ -849,6 +849,19 @@ def run_sync_arm(
         torch.accelerator.synchronize()
 
         cell: dict[str, Any] = {}
+        # Profiler self-overhead baseline: an empty profiled region
+        # (Kineto emits its own device sync at start). The dense gate
+        # subtracts it per marker.
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        ) as prof0:
+            pass
+        baseline: dict[str, int] = {}
+        for evt in prof0.events():
+            for marker in SYNC_MARKERS:
+                if marker in evt.name:
+                    baseline[marker] = baseline.get(marker, 0) + 1
+        cell["profiler_baseline"] = baseline
         # TRIPWIRE: the dense valid path must survive error mode; the
         # compact arm is the positive control (its nonzero must fire).
         _state_restore(state, snap)
@@ -918,13 +931,19 @@ def run_sync_arm(
             cell[f"host_reads_{name}"] = host_reads
             cell[f"trace_{name}"] = str(trace)
         dense_counts = cell["profiler_dense"]
+        over_baseline = sum(
+            max(n - baseline.get(marker, 0), 0)
+            for marker, n in dense_counts.items()
+        )
         check.equal(
-            sum(dense_counts.values()), 0,
-            f"sync[{label}].dense device-sync count {dense_counts}",
+            over_baseline, 0,
+            f"sync[{label}].dense device-sync count {dense_counts} "
+            f"over baseline {baseline}",
         )
         compact_counts = cell["profiler_compact"]
         check.ok(
-            sum(compact_counts.values()) > 0,
+            sum(compact_counts.values())
+            > sum(baseline.values()),
             f"sync[{label}].compact control saw no syncs "
             f"{compact_counts}",
         )

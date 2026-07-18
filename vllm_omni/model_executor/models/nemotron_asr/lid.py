@@ -70,20 +70,28 @@ class PromptConditioner(nn.Module):
             (``encoder_conditioned``), in the input dtype.
         """
         batch, time, _ = encoded.shape
-        prompt = torch.zeros(
-            batch,
-            time,
-            self.num_prompts,
-            dtype=encoded.dtype,
-            device=encoded.device,
-        )
         if isinstance(prompt_index, torch.Tensor):
-            prompt[
-                torch.arange(batch, device=encoded.device),
-                :,
-                prompt_index.to(encoded.device),
-            ] = 1.0
+            # One-hot by comparison, not index_put: scattering the
+            # Python scalar 1.0 wraps it as a pageable CPU tensor —
+            # a synchronizing HtoD copy on the valid path that also
+            # aborts CUDA-graph capture (PORT-ADV-004).
+            one_hot = (
+                prompt_index.to(encoded.device).view(-1, 1)
+                == torch.arange(
+                    self.num_prompts, device=encoded.device
+                )
+            ).to(encoded.dtype)
+            prompt = one_hot.unsqueeze(1).expand(
+                batch, time, self.num_prompts
+            )
         else:
+            prompt = torch.zeros(
+                batch,
+                time,
+                self.num_prompts,
+                dtype=encoded.dtype,
+                device=encoded.device,
+            )
             prompt[:, :, prompt_index] = 1.0
         out_dtype = encoded.dtype
         conditioned: torch.Tensor = self.prompt_kernel(
