@@ -116,13 +116,25 @@ def _oracle_rows(
     )
 
 
+#: Both length-aware production decodes are held to the SAME oracle
+#: bar (PORT-DEC-008): the eager compact loop and the fixed-trip dense
+#: masked loop (the sync-free candidate the dense-vs-compact profile
+#: selects from at startup).
+DECODE_FN_NAMES = ("decode_compact_active", "decode_dense_masked")
+
+
 def _assert_matches_oracle(
-    enc: torch.Tensor, lengths: torch.Tensor, *, seed: int = 7
+    enc: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    seed: int = 7,
+    fn_name: str = "decode_compact_active",
 ) -> None:
     predictor, joint = _nets(seed)
+    decode = getattr(rnnt, fn_name)
     with torch.no_grad():
         expected, exp_state = _oracle_rows(predictor, joint, enc, lengths)
-        ids, lens, state = rnnt.decode_compact_active(
+        ids, lens, state = decode(
             enc, lengths, predictor, joint, _state(enc.shape[0])
         )
     for b, burst in enumerate(expected):
@@ -139,14 +151,16 @@ def _assert_matches_oracle(
     assert state.last_label.tolist() == exp_state.last_label.tolist()
 
 
-def test_uniform_lengths_match_the_oracle() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_uniform_lengths_match_the_oracle(fn_name: str) -> None:
     # @spec PORT-DEC-008
     torch.manual_seed(11)
     enc = torch.randn(3, 6, ENC)
-    _assert_matches_oracle(enc, torch.tensor([6, 6, 6]))
+    _assert_matches_oracle(enc, torch.tensor([6, 6, 6]), fn_name=fn_name)
 
 
-def test_padded_rows_never_decode_past_their_length() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_padded_rows_never_decode_past_their_length(fn_name: str) -> None:
     # @spec PORT-DEC-008 / PORT-PERF-001
     # Mixed lengths incl. a zero-length row: padded frames carry loud
     # garbage that MUST NOT reach the joint.
@@ -155,15 +169,16 @@ def test_padded_rows_never_decode_past_their_length() -> None:
     lengths = torch.tensor([8, 3, 0, 5])
     for b, n in enumerate(lengths.tolist()):
         enc[b, n:] = 99.0  # poison the padding
-    _assert_matches_oracle(enc, lengths)
+    _assert_matches_oracle(enc, lengths, fn_name=fn_name)
 
 
-def test_zero_length_batch_is_a_no_op() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_zero_length_batch_is_a_no_op(fn_name: str) -> None:
     # @spec PORT-PERF-001
     predictor, joint = _nets()
     enc = torch.randn(2, 4, ENC)
     with torch.no_grad():
-        ids, lens, state = rnnt.decode_compact_active(
+        ids, lens, state = getattr(rnnt, fn_name)(
             enc, torch.tensor([0, 0]), predictor, joint, _state(2)
         )
     assert lens.tolist() == [0, 0]
@@ -172,11 +187,13 @@ def test_zero_length_batch_is_a_no_op() -> None:
     assert not bool(state.h.any()) and not bool(state.c.any())
 
 
-def test_carried_state_continues_across_calls() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_carried_state_continues_across_calls(fn_name: str) -> None:
     # @spec PORT-DEC-001
-    # Two chunks through compact-active == one concatenated chunk
-    # through the oracle (state carries, no SOS re-injection).
+    # Two chunks through the production decode == one concatenated
+    # chunk through the oracle (state carries, no SOS re-injection).
     predictor, joint = _nets(9)
+    decode = getattr(rnnt, fn_name)
     torch.manual_seed(13)
     a = torch.randn(1, 4, ENC)
     b = torch.randn(1, 3, ENC)
@@ -184,10 +201,10 @@ def test_carried_state_continues_across_calls() -> None:
         whole, _ = rnnt.greedy_decode_batch(
             torch.cat([a, b], dim=1), predictor, joint, _state(1)
         )
-        ids1, lens1, mid = rnnt.decode_compact_active(
+        ids1, lens1, mid = decode(
             a, torch.tensor([4]), predictor, joint, _state(1)
         )
-        ids2, lens2, _ = rnnt.decode_compact_active(
+        ids2, lens2, _ = decode(
             b, torch.tensor([3]), predictor, joint, mid
         )
     streamed = (
@@ -197,7 +214,8 @@ def test_carried_state_continues_across_calls() -> None:
     assert streamed == whole[0]
 
 
-def test_cap_saturated_burst_matches() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_cap_saturated_burst_matches(fn_name: str) -> None:
     # @spec PORT-DEC-008
     # A quiet joint bias can drive long per-frame emissions; the
     # ten-symbol cap path must match the oracle exactly.
@@ -211,7 +229,7 @@ def test_cap_saturated_burst_matches() -> None:
     with torch.no_grad():
         joint2.joint_net[1].bias[:VOCAB] += 3.0
         expected, _ = _oracle_rows(predictor2, joint2, enc, lengths)
-        ids, lens, _ = rnnt.decode_compact_active(
+        ids, lens, _ = getattr(rnnt, fn_name)(
             enc, lengths, predictor, joint, _state(2)
         )
     for b, burst in enumerate(expected):
@@ -219,7 +237,8 @@ def test_cap_saturated_burst_matches() -> None:
         assert ids[b, : int(lens[b])].tolist() == burst
 
 
-def test_mixed_carried_state_rows_match_the_oracle() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_mixed_carried_state_rows_match_the_oracle(fn_name: str) -> None:
     # @spec PORT-DEC-001 / PORT-DEC-008
     # Rows arriving with DISTINCT nonzero h/c/last_label (mid-session
     # resumes) must each evolve exactly as their own single-row run.
@@ -233,7 +252,7 @@ def test_mixed_carried_state_rows_match_the_oracle() -> None:
         last_label=torch.tensor([1, 7, VOCAB]),
     )
     with torch.no_grad():
-        ids, lens, state = rnnt.decode_compact_active(
+        ids, lens, state = getattr(rnnt, fn_name)(
             enc, lengths, predictor, joint, carried
         )
         for b in range(3):
@@ -253,7 +272,10 @@ def test_mixed_carried_state_rows_match_the_oracle() -> None:
             assert int(state.last_label[b]) == int(out.last_label[0])
 
 
-def test_zero_length_carried_row_state_is_bit_identical() -> None:
+@pytest.mark.parametrize("fn_name", DECODE_FN_NAMES)
+def test_zero_length_carried_row_state_is_bit_identical(
+    fn_name: str,
+) -> None:
     # @spec PORT-PERF-001
     # A zero-length row alongside active peers: its carried state must
     # come back BIT-identical (no masked-arithmetic residue).
@@ -266,7 +288,7 @@ def test_zero_length_carried_row_state_is_bit_identical() -> None:
         last_label=torch.tensor([3, 9]),
     )
     with torch.no_grad():
-        _, lens, state = rnnt.decode_compact_active(
+        _, lens, state = getattr(rnnt, fn_name)(
             enc, torch.tensor([4, 0]), predictor, joint, carried
         )
     assert int(lens[1]) == 0
@@ -281,6 +303,9 @@ def test_zero_length_carried_row_state_is_bit_identical() -> None:
 
 def test_out_of_range_lengths_are_rejected() -> None:
     # @spec PORT-DEC-008
+    # The eager compact loop raises ValueError from its host check; the
+    # sync-free dense loop surfaces the same defect as a device-side
+    # assertion (RuntimeError on the CPU tier, PORT-ADV-004).
     predictor, joint = _nets()
     enc = torch.randn(2, 4, ENC)
     for bad in ([-1, 2], [2, 5]):
@@ -288,6 +313,42 @@ def test_out_of_range_lengths_are_rejected() -> None:
             rnnt.decode_compact_active(
                 enc, torch.tensor(bad), predictor, joint, _state(2)
             )
+        with pytest.raises(RuntimeError, match="enc_lengths"):
+            rnnt.decode_dense_masked(
+                enc, torch.tensor(bad), predictor, joint, _state(2)
+            )
+
+
+def test_dense_and_compact_agree() -> None:
+    # @spec PORT-DEC-008
+    # The two production variants on identical inputs: labels, lengths,
+    # and padding EXACT; LSTM state at the cross-shape ulp bound.
+    predictor, joint = _nets(19)
+    torch.manual_seed(20)
+    enc = torch.randn(4, 6, ENC)
+    lengths = torch.tensor([6, 0, 3, 5])
+    carried = rnnt.DecodeState(
+        h=torch.randn(2, 4, PRED) * 0.2,
+        c=torch.randn(2, 4, PRED) * 0.2,
+        last_label=torch.tensor([1, 7, VOCAB, 4]),
+    )
+    with torch.no_grad():
+        ids_c, lens_c, st_c = rnnt.decode_compact_active(
+            enc, lengths, predictor, joint,
+            rnnt.DecodeState(
+                h=carried.h.clone(),
+                c=carried.c.clone(),
+                last_label=carried.last_label.clone(),
+            ),
+        )
+        ids_d, lens_d, st_d = rnnt.decode_dense_masked(
+            enc, lengths, predictor, joint, carried
+        )
+    assert lens_c.tolist() == lens_d.tolist()
+    assert ids_c.tolist() == ids_d.tolist()
+    assert st_c.last_label.tolist() == st_d.last_label.tolist()
+    torch.testing.assert_close(st_c.h, st_d.h, rtol=0, atol=1e-6)
+    torch.testing.assert_close(st_c.c, st_d.c, rtol=0, atol=1e-6)
 
 
 def test_manual_lstm_initializes_its_parameters() -> None:

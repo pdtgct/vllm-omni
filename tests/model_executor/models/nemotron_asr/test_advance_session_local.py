@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Exercised advance_session coverage (PORT-ADV-001), locally.
+"""Exercised advance_session coverage (PORT-ADV-001/004), locally.
 
 The transition's whole dependency closure is torch-only (featurizer,
 masks, encoder, lid, manifests, frontend, rnnt_cell, rnnt, advance) —
 loaded by file path under a stubbed package chain, the CANONICAL
-transition executes on macOS. This is the seam the review found
-uncovered: the local tier was green without ever running
-``advance_session`` end-to-end.
+transition executes on macOS. Length-aware contract: one
+profile+geometry bucket carries mixed session-first / continuing /
+final / zero-frame rows with per-row logical lengths; protocol-invalid
+rows are masked no-ops reported in ``AdvanceResult.row_valid``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
 import torch
 
 _PKG = (
@@ -67,6 +67,11 @@ WINDOW = 8
 VOCAB = 12
 CHUNK = 17_920  # 1120 ms cadence (geometry id 4, lookahead 13)
 GEOMETRY_1120 = 4
+LOOKAHEAD = 13
+CADENCE = 8 * (LOOKAHEAD + 1)  # 112
+PAD_FRAMES = CADENCE + 7  # the bucket bound (design §Exact Bounded
+# Frontend); mel width = MEL_TAIL_FRAMES + PAD_FRAMES
+MEL_WIDTH = frontend.MEL_TAIL_FRAMES + PAD_FRAMES
 RAW_TAIL = 1_953
 
 
@@ -120,6 +125,31 @@ def _fresh_state(batch: int) -> Any:
     )
 
 
+def _stack_states(states: list[Any]) -> Any:
+    return advance.SessionStateBatch(
+        raw_tail=torch.cat([s.raw_tail for s in states]),
+        mel_tail=torch.cat([s.mel_tail for s in states]),
+        frontend_counters=torch.cat(
+            [s.frontend_counters for s in states]
+        ),
+        channel=[
+            torch.cat([s.channel[i] for s in states])
+            for i in range(N_LAYERS)
+        ],
+        window_valid=[
+            torch.cat([s.window_valid[i] for s in states])
+            for i in range(N_LAYERS)
+        ],
+        time=[
+            torch.cat([s.time[i] for s in states])
+            for i in range(N_LAYERS)
+        ],
+        h=torch.cat([s.h for s in states]),
+        c=torch.cat([s.c for s in states]),
+        last_label=torch.cat([s.last_label for s in states]),
+    )
+
+
 def _chunk(
     samples: torch.Tensor,
     *,
@@ -145,28 +175,42 @@ def _chunk(
     )
 
 
+def _advance(core: Any, batch: Any, state: Any, **kw: Any) -> Any:
+    return advance.advance_session(
+        core, batch, state, geometry=GEOMETRY_1120, **kw
+    )
+
+
 def test_session_first_chunk_advances_and_captures() -> None:
     # @spec PORT-ADV-001
     # The canonical transition, exercised: session-first 1120 ms chunk
     # commits B_1 = 105 mel frames, runs encoder/LID/decode, advances
     # every counter, and (capture ON) stages the three named tensors
-    # with exact lengths.
+    # at the bucket's fixed padded widths with exact logical lengths.
     core = _core()
     state = _fresh_state(1)
     torch.manual_seed(21)
     samples = torch.randn(1, CHUNK) * 0.1
-    result = advance.advance_session(
-        core, _chunk(samples, seq=0), state, capture=True
-    )
+    result = _advance(core, _chunk(samples, seq=0), state, capture=True)
     ctr = state.frontend_counters[0]
     b1 = frontend.cadence_boundary(1, lookahead=13)
     assert int(ctr[frontend.CTR_COMMITTED_MEL_FRAMES]) == b1 == 105
     assert int(ctr[frontend.CTR_ENCODED_MEL_FRAMES]) == b1
     assert int(ctr[frontend.CTR_EXPECTED_CHUNK_SEQUENCE]) == 1
+    assert result.row_valid.tolist() == [True]
     caps = result.captures
     assert caps is not None
-    assert caps.frontend_mel.shape == (1, FEAT, b1)  # no prefix, first
-    assert int(caps.encoder_lengths[0]) == caps.encoder_raw.shape[1]
+    # Fixed bucket width; logical length = 105 (no prefix, first).
+    assert caps.frontend_mel.shape == (1, FEAT, MEL_WIDTH)
+    assert int(caps.mel_lengths[0]) == b1
+    expected_f = int(
+        core.encoder.pre_encode.output_lengths(torch.tensor([b1]))[0]
+    )
+    assert int(caps.encoder_lengths[0]) == expected_f
+    assert caps.encoder_raw.shape[1] >= expected_f
+    # Padded capture columns are exactly zero.
+    assert not bool(caps.frontend_mel[0, :, b1:].any())
+    assert not bool(caps.encoder_raw[0, expected_f:].any())
     assert result.token_ids.shape[0] == 1
     # The encoder window advanced: valid length grew and is mirrored
     # across every layer's slot.
@@ -182,7 +226,7 @@ def test_capture_off_returns_none() -> None:
     state = _fresh_state(1)
     torch.manual_seed(22)
     samples = torch.randn(1, CHUNK) * 0.1
-    result = advance.advance_session(core, _chunk(samples, seq=0), state)
+    result = _advance(core, _chunk(samples, seq=0), state)
     assert result.captures is None
     assert result.token_ids.shape[0] == 1
 
@@ -195,10 +239,8 @@ def test_continuing_chunk_prepends_the_prefix_and_drops() -> None:
     state = _fresh_state(1)
     torch.manual_seed(23)
     samples = torch.randn(1, 2 * CHUNK) * 0.1
-    advance.advance_session(
-        core, _chunk(samples[:, :CHUNK], seq=0), state
-    )
-    result = advance.advance_session(
+    _advance(core, _chunk(samples[:, :CHUNK], seq=0), state)
+    result = _advance(
         core, _chunk(samples[:, CHUNK:], seq=1), state, capture=True
     )
     b2 = frontend.cadence_boundary(2, lookahead=13)
@@ -207,37 +249,89 @@ def test_continuing_chunk_prepends_the_prefix_and_drops() -> None:
     ) == b2
     caps = result.captures
     assert caps is not None
-    # Prefix (9) + the C = 112 new frames.
-    assert caps.frontend_mel.shape[2] == frontend.MEL_TAIL_FRAMES + 112
+    # Fixed width; logical length = prefix (9) + C = 121.
+    assert caps.frontend_mel.shape[2] == MEL_WIDTH
+    assert int(caps.mel_lengths[0]) == frontend.MEL_TAIL_FRAMES + CADENCE
 
 
-def test_wrong_sequence_is_rejected_before_mutation() -> None:
-    # @spec PORT-ADV-001
+def test_wrong_sequence_row_is_masked_and_reported() -> None:
+    # @spec PORT-ADV-004
+    # A protocol-invalid row (wrong chunk sequence) in a two-row
+    # bucket: that row mutates nothing and returns a zero-length
+    # burst; row_valid reports it; the sibling valid row advances
+    # exactly as its single-row run.
     core = _core()
+    torch.manual_seed(24)
+    samples = torch.randn(2, CHUNK) * 0.1
+    state = _fresh_state(2)
+    before = {
+        "counters": state.frontend_counters[1].clone(),
+        "h": state.h[1].clone(),
+        "channel": state.channel[0][1].clone(),
+    }
+    batch = _chunk(samples, seq=0)
+    batch.chunk_sequence[1] = 3  # wrong: expected 0
+    result = _advance(core, batch, state, capture=True)
+    assert result.row_valid.tolist() == [True, False]
+    assert int(result.token_lengths[1]) == 0
+    torch.testing.assert_close(
+        state.frontend_counters[1], before["counters"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(state.h[1], before["h"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        state.channel[0][1], before["channel"], rtol=0, atol=0
+    )
+    # The valid row matches its single-row run.
+    state1 = _fresh_state(1)
+    r1 = _advance(
+        core, _chunk(samples[:1], seq=0), state1, capture=True
+    )
+    assert int(result.token_lengths[0]) == int(r1.token_lengths[0])
+    torch.testing.assert_close(
+        state.frontend_counters[0:1],
+        state1.frontend_counters,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state.h[0:1], state1.h, rtol=0, atol=1e-6
+    )
+
+
+def test_geometry_mismatch_row_is_masked() -> None:
+    # @spec PORT-ADV-004
+    # An envelope geometry different from the bucket geometry is a
+    # per-row protocol violation: masked no-op, reported.
+    core = _core()
+    torch.manual_seed(27)
+    samples = torch.randn(1, CHUNK) * 0.1
     state = _fresh_state(1)
     before = state.frontend_counters.clone()
-    torch.manual_seed(24)
-    samples = torch.randn(1, CHUNK) * 0.1
-    with pytest.raises(ValueError, match="sequence"):
-        advance.advance_session(core, _chunk(samples, seq=3), state)
+    batch = _chunk(samples, seq=0)
+    batch.geometry_id[0] = 2  # bucket is GEOMETRY_1120 = 4
+    result = _advance(core, batch, state)
+    assert result.row_valid.tolist() == [False]
+    assert int(result.token_lengths[0]) == 0
     torch.testing.assert_close(
         state.frontend_counters, before, rtol=0, atol=0
     )
 
 
-def test_zero_frame_final_skips_model_work_and_stages_captures() -> None:
+def test_zero_frame_final_leaves_state_and_stages_captures() -> None:
     # @spec PORT-ADV-001 / PORT-HOOK-001
-    # A final tail whose short residual is dropped: no encoder/LID/
-    # decode work, state untouched beyond finalization, and (capture
-    # ON) all three named tensors present at zero valid length.
+    # A final tail whose short residual is dropped rides the uniform
+    # masked path: encoder/predictor state untouched, zero-length
+    # burst, finalization marked, and (capture ON) all three named
+    # tensors present at zero logical length.
     core = _core()
     state = _fresh_state(1)
     torch.manual_seed(25)
     samples = torch.randn(1, CHUNK) * 0.1
-    advance.advance_session(core, _chunk(samples, seq=0), state)
+    _advance(core, _chunk(samples, seq=0), state)
     h_before = state.h.clone()
     window_before = state.channel[0].clone()
-    result = advance.advance_session(
+    valid_before = state.window_valid[0].clone()
+    result = _advance(
         core,
         _chunk(torch.zeros(1, 0), seq=1, final=True),
         state,
@@ -246,16 +340,21 @@ def test_zero_frame_final_skips_model_work_and_stages_captures() -> None:
     assert int(
         state.frontend_counters[0, frontend.CTR_FINALIZED]
     ) == 1
+    assert result.row_valid.tolist() == [True]
     torch.testing.assert_close(state.h, h_before, rtol=0, atol=0)
     torch.testing.assert_close(
         state.channel[0], window_before, rtol=0, atol=0
     )
+    torch.testing.assert_close(
+        state.window_valid[0], valid_before, rtol=0, atol=0
+    )
     assert int(result.token_lengths[0]) == 0
     caps = result.captures
     assert caps is not None
-    assert caps.frontend_mel.shape[2] == 0
     assert int(caps.mel_lengths[0]) == 0
     assert int(caps.encoder_lengths[0]) == 0
+    assert not bool(caps.frontend_mel.any())
+    assert not bool(caps.encoder_raw.any())
 
 
 def test_mixed_prompts_condition_row_wise() -> None:
@@ -268,7 +367,7 @@ def test_mixed_prompts_condition_row_wise() -> None:
     samples = torch.randn(1, CHUNK) * 0.1
     two = samples.repeat(2, 1)
     state2 = _fresh_state(2)
-    result2 = advance.advance_session(
+    result2 = _advance(
         core, _chunk(two, seq=0, prompts=[0, 2]), state2, capture=True
     )
     caps2 = result2.captures
@@ -280,7 +379,7 @@ def test_mixed_prompts_condition_row_wise() -> None:
     )
     for row, prompt in ((0, 0), (1, 2)):
         state1 = _fresh_state(1)
-        r1 = advance.advance_session(
+        r1 = _advance(
             core, _chunk(samples, seq=0, prompts=[prompt]), state1,
             capture=True,
         )
@@ -295,3 +394,134 @@ def test_mixed_prompts_condition_row_wise() -> None:
         assert int(result2.token_lengths[row]) == int(
             r1.token_lengths[0]
         )
+
+
+def test_mixed_phase_bucket_rows_match_single_rows() -> None:
+    # @spec PORT-ADV-004
+    # THE length-aware transition differential: session-first,
+    # continuing, committable-final, and zero-frame-final rows advance
+    # in ONE bucket call, each equal to its own single-row run —
+    # counters exact, states and captures at the provisional
+    # cross-shape bound, token bursts identical.
+    core = _core()
+    torch.manual_seed(31)
+    signals = [
+        torch.randn(2 * CHUNK) * s for s in (0.1, 0.2, 0.15, 0.25)
+    ]
+
+    # Phases: 0 session-first; 1 continuing; 2 final with a
+    # committable 69-frame residual; 3 zero-sample final (7-frame
+    # residual DROPPED — zero model work inside the mixed bucket).
+    second_widths = [CHUNK, CHUNK, 10_000, 0]
+    finals = [False, False, True, True]
+    seqs = [0, 1, 1, 1]
+
+    singles: list[Any] = []
+    results1: list[Any] = []
+    for row in range(4):
+        s1 = _fresh_state(1)
+        if row != 0:
+            _advance(
+                core,
+                _chunk(signals[row][:CHUNK].unsqueeze(0), seq=0),
+                s1,
+            )
+        singles.append(s1)
+    stateN = _stack_states(singles)
+
+    samples = torch.zeros(4, CHUNK)
+    valid = torch.zeros(4, dtype=torch.long)
+    for row in range(4):
+        w = second_widths[row]
+        samples[row, :w] = signals[row][CHUNK : CHUNK + w]
+        valid[row] = w
+    batchN = advance.ChunkBatch(
+        samples=samples,
+        valid_samples=valid,
+        geometry_id=torch.full((4,), GEOMETRY_1120, dtype=torch.long),
+        final_tail=torch.tensor(finals),
+        prompt_index=torch.tensor([0, 2, 1, 0], dtype=torch.long),
+        chunk_sequence=torch.tensor(seqs, dtype=torch.long),
+    )
+    resultN = _advance(core, batchN, stateN, capture=True)
+    assert resultN.row_valid.tolist() == [True] * 4
+
+    for row in range(4):
+        s1 = singles[row]
+        w = second_widths[row]
+        batch1 = advance.ChunkBatch(
+            samples=samples[row : row + 1],
+            valid_samples=valid[row : row + 1],
+            geometry_id=torch.tensor([GEOMETRY_1120]),
+            final_tail=torch.tensor([finals[row]]),
+            prompt_index=batchN.prompt_index[row : row + 1],
+            chunk_sequence=torch.tensor([seqs[row]], dtype=torch.long),
+        )
+        r1 = _advance(core, batch1, s1, capture=True)
+        results1.append(r1)
+        # Token bursts identical.
+        nb = int(resultN.token_lengths[row])
+        assert nb == int(r1.token_lengths[0]), f"row {row}"
+        assert (
+            resultN.token_ids[row, :nb].tolist()
+            == r1.token_ids[0, :nb].tolist()
+        ), f"row {row}"
+        # Frontend counters exact.
+        torch.testing.assert_close(
+            stateN.frontend_counters[row : row + 1],
+            s1.frontend_counters,
+            rtol=0,
+            atol=0,
+        )
+        # Encoder caches, conv tails, window_valid, predictor state.
+        for layer in range(N_LAYERS):
+            torch.testing.assert_close(
+                stateN.channel[layer][row : row + 1],
+                s1.channel[layer],
+                rtol=0,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                stateN.time[layer][row : row + 1],
+                s1.time[layer],
+                rtol=0,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                stateN.window_valid[layer][row : row + 1],
+                s1.window_valid[layer],
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(
+            stateN.h[row : row + 1], s1.h, rtol=0, atol=1e-6
+        )
+        torch.testing.assert_close(
+            stateN.c[row : row + 1], s1.c, rtol=0, atol=1e-6
+        )
+        # Captures: logical lengths equal; valid regions at the bound.
+        capsN, caps1 = resultN.captures, r1.captures
+        assert capsN is not None and caps1 is not None
+        assert int(capsN.mel_lengths[row]) == int(caps1.mel_lengths[0])
+        assert int(capsN.encoder_lengths[row]) == int(
+            caps1.encoder_lengths[0]
+        )
+        ml = int(capsN.mel_lengths[row])
+        el = int(capsN.encoder_lengths[row])
+        torch.testing.assert_close(
+            capsN.frontend_mel[row, :, :ml],
+            caps1.frontend_mel[0, :, :ml],
+            rtol=0,
+            atol=2e-6,
+        )
+        torch.testing.assert_close(
+            capsN.encoder_conditioned[row, :el],
+            caps1.encoder_conditioned[0, :el],
+            rtol=0,
+            atol=1e-5,
+        )
+    # Zero-frame final row: untouched model state, finalized.
+    assert int(
+        stateN.frontend_counters[3, frontend.CTR_FINALIZED]
+    ) == 1
+    assert int(resultN.token_lengths[3]) == 0

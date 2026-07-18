@@ -113,3 +113,161 @@ def test_weight_names_follow_nemo_layout():
     # convolution_bias false).
     assert "layers.0.self_attn.linear_q.bias" not in names
     assert "layers.0.conv.pointwise_conv1.bias" not in names
+
+
+# ---- length-aware streaming step (PORT-ADV-004 / PORT-PERF-001) ----
+
+from vllm_omni.model_executor.models.nemotron_asr.encoder import (  # noqa: E402
+    StreamingCaches,
+    stream_step,
+)
+
+
+def _caches(batch: int, enc: FastConformerEncoder) -> StreamingCaches:
+    return StreamingCaches(
+        n_layers=len(enc.layers),
+        batch=batch,
+        d_model=32,
+        left_context=enc.att_context[0],
+        conv_kernel=5,
+        device=torch.device("cpu"),
+    )
+
+
+def _clone_caches(c: StreamingCaches) -> tuple:
+    return (c.channel.clone(), c.time.clone(), c.valid.clone())
+
+
+def test_stream_step_mixed_lengths_match_single_rows():
+    # @spec PORT-ADV-004
+    # THE length-aware encoder differential: rows with different valid
+    # mel widths and different pre-encode drops advance in ONE padded
+    # call; each row's valid output, advanced window, conv tail, and
+    # window_valid must match its own exact-width single-row run.
+    enc = _tiny(att_context=(8, 1))
+    torch.manual_seed(51)
+    n_mels, width = 16, 41
+    mel = torch.randn(3, n_mels, width) * 0.5
+    # Per-row valid mel widths and drops: row 0 full-width continuing
+    # (drop 2), row 1 shorter continuing (drop 2), row 2 session-first
+    # (drop 0, width 24).
+    mel_lens = torch.tensor([41, 33, 24])
+    offsets = torch.tensor([2, 2, 0])
+    for b, n in enumerate(mel_lens.tolist()):
+        mel[b, :, n:] = 77.0  # poison the padding
+    out_lens = enc.pre_encode.output_lengths(mel_lens) - offsets
+    out_width = int(enc.pre_encode.output_lengths(
+        torch.tensor([width])
+    )[0])
+
+    caches3 = _caches(3, enc)
+    # Distinct carried windows/tails per row (mid-session resumes).
+    torch.manual_seed(52)
+    caches3.channel.normal_(0.0, 0.2)
+    caches3.time.normal_(0.0, 0.2)
+    caches3.valid = torch.tensor([8, 3, 0])
+    singles = []
+    for b in range(3):
+        c1 = _caches(1, enc)
+        c1.channel.copy_(caches3.channel[:, b : b + 1])
+        c1.time.copy_(caches3.time[:, b : b + 1])
+        c1.valid = caches3.valid[b : b + 1].clone()
+        singles.append(c1)
+
+    with torch.no_grad():
+        out3 = stream_step(
+            enc, mel, caches3,
+            out_offsets=offsets,
+            out_lengths=out_lens,
+            out_width=out_width,
+        )
+    assert out3.shape[1] == out_width
+    for b in range(3):
+        c1 = singles[b]
+        with torch.no_grad():
+            out1 = stream_step(
+                enc,
+                mel[b : b + 1, :, : int(mel_lens[b])],
+                c1,
+                out_offsets=offsets[b : b + 1],
+                out_lengths=out_lens[b : b + 1],
+                out_width=int(out_lens[b]),
+            )
+        f = int(out_lens[b])
+        torch.testing.assert_close(
+            out3[b, :f], out1[0, :f], rtol=0, atol=1e-5
+        )
+        # Padded output frames are exactly zero.
+        torch.testing.assert_close(
+            out3[b, f:],
+            torch.zeros(out_width - f, 32),
+            rtol=0,
+            atol=0,
+        )
+        # Caches advanced by the row's LOGICAL length only.
+        torch.testing.assert_close(
+            caches3.channel[:, b], c1.channel[:, 0], rtol=0, atol=1e-5
+        )
+        torch.testing.assert_close(
+            caches3.time[:, b], c1.time[:, 0], rtol=0, atol=1e-5
+        )
+        assert int(caches3.valid[b]) == int(c1.valid[0])
+
+
+def test_stream_step_zero_length_row_is_a_masked_no_op():
+    # @spec PORT-ADV-004
+    # A zero-valid row beside an active one: output all-zero, window,
+    # conv tail, and window_valid BIT-identical (no advancement).
+    enc = _tiny(att_context=(8, 1))
+    torch.manual_seed(53)
+    mel = torch.randn(2, 16, 25) * 0.5
+    caches = _caches(2, enc)
+    caches.channel.normal_(0.0, 0.2)
+    caches.time.normal_(0.0, 0.2)
+    caches.valid = torch.tensor([5, 5])
+    before = _clone_caches(caches)
+    out_width = int(
+        enc.pre_encode.output_lengths(torch.tensor([25]))[0]
+    ) - 2
+    with torch.no_grad():
+        out = stream_step(
+            enc, mel, caches,
+            out_offsets=torch.tensor([2, 2]),
+            out_lengths=torch.tensor([out_width, 0]),
+            out_width=out_width,
+        )
+    torch.testing.assert_close(
+        out[1], torch.zeros_like(out[1]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        caches.channel[:, 1], before[0][:, 1], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        caches.time[:, 1], before[1][:, 1], rtol=0, atol=0
+    )
+    assert int(caches.valid[1]) == int(before[2][1])
+    # The active row DID advance.
+    assert int(caches.valid[0]) == min(5 + out_width, 8)
+
+
+def test_stream_step_window_valid_saturates_per_row():
+    # @spec PORT-ADV-004
+    # window_valid accumulates each row's logical length and clamps at
+    # the window capacity independently per row.
+    enc = _tiny(att_context=(8, 1))
+    torch.manual_seed(54)
+    mel = torch.randn(2, 16, 41) * 0.5
+    caches = _caches(2, enc)
+    caches.valid = torch.tensor([7, 2])
+    out_width = int(
+        enc.pre_encode.output_lengths(torch.tensor([41]))[0]
+    )
+    lens = torch.tensor([out_width, 3])
+    with torch.no_grad():
+        stream_step(
+            enc, mel, caches,
+            out_offsets=torch.tensor([0, 0]),
+            out_lengths=lens,
+            out_width=out_width,
+        )
+    assert caches.valid.tolist() == [8, 5]
