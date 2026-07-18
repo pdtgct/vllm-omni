@@ -49,6 +49,19 @@ class ManualLSTM(nn.Module):
                 f"bias_hh_l{layer}",
                 nn.Parameter(torch.empty(4 * hidden_size)),
             )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """``nn.LSTM``'s init: U(-1/sqrt(hidden), 1/sqrt(hidden)).
+
+        ``torch.empty`` alone left UNINITIALIZED memory: the loaded
+        checkpoint overwrites every parameter in production, but
+        random-fixture tests decoded through allocator garbage —
+        run-to-run NaN/tie flapping (the 2026-07-17 pod flappers).
+        """
+        stdv = 1.0 / (self.hidden_size**0.5)
+        for param in self.parameters():
+            nn.init.uniform_(param, -stdv, stdv)
 
     def step(
         self,

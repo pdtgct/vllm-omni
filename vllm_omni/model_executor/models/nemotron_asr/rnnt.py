@@ -215,6 +215,93 @@ def greedy_decode_batch(
     return emitted, DecodeState(h=h, c=c, last_label=last_label)
 
 
+def decode_compact_active(
+    enc_frames: torch.Tensor,
+    enc_lengths: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    state: DecodeState,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> tuple[torch.Tensor, torch.Tensor, DecodeState]:
+    """Length-aware compact-active greedy decode (PORT-PERF-001).
+
+    The tensorized production loop ``greedy_decode_batch`` is the
+    differential oracle for: fixed outer frame/symbol trips (no
+    host-side early exit), GPU masks for semantic activity — a row is
+    active at frame ``t`` only while ``t < enc_lengths[row]`` (padded
+    frames never decode) and, within a frame, only while its previous
+    trip emitted — with tensor-indexed compaction so joint/predictor
+    work runs on active rows only, and index_put/index-copy state
+    commits. No ``.item()``, ``.tolist()``, Python label lists, or
+    host booleans; the one eager-mode concession is ``nonzero``'s
+    implicit shape materialization (the compact-vs-dense profile
+    decides whether that stays, per the review gate).
+
+    Args:
+        enc_frames: ``(B, T_pad, enc_hidden)`` conditioned frames.
+        enc_lengths: ``(B,)`` long valid frame counts (rows may be
+            padded to ``T_pad``).
+        predictor: The prediction network.
+        joint: The joint network.
+        state: Stacked decode state (NOT mutated; the advanced state
+            is returned).
+        max_symbols: Per-frame emission cap (checkpoint value 10).
+
+    Returns:
+        ``token_ids`` ``(B, T_pad * max_symbols)`` int32 padded,
+        ``token_lengths`` ``(B,)`` int32, and the advanced state.
+    """
+    batch, t_pad, _ = enc_frames.shape
+    device = enc_frames.device
+    blank = predictor.blank_id
+    h = state.h.clone()
+    c = state.c.clone()
+    last_label = state.last_label.clone()
+    token_ids = torch.zeros(
+        batch, t_pad * max_symbols, dtype=torch.int32, device=device
+    )
+    token_lengths = torch.zeros(
+        batch, dtype=torch.long, device=device
+    )
+    pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
+    for t in range(t_pad):
+        frame = enc_frames[:, t]
+        active = t < enc_lengths
+        for _ in range(max_symbols):
+            rows = active.nonzero(as_tuple=True)[0]
+            logits = joint.logits(
+                frame.index_select(0, rows),
+                pred_out.index_select(0, rows),
+            )
+            labels = logits.argmax(dim=-1)
+            emit = labels != blank
+            erows = rows[emit]
+            elabels = labels[emit]
+            token_ids[erows, token_lengths[erows]] = elabels.to(
+                torch.int32
+            )
+            token_lengths[erows] += 1
+            last_label[erows] = elabels
+            # Commit the state that produced this pred_out, emitters
+            # only; blank never advances the predictor.
+            h[:, erows] = pred_h[:, erows]
+            c[:, erows] = pred_c[:, erows]
+            new_out, (new_h, new_c) = predictor.step(
+                last_label[erows], (h[:, erows], c[:, erows])
+            )
+            pred_out[erows] = new_out
+            pred_h[:, erows] = new_h
+            pred_c[:, erows] = new_c
+            active = torch.zeros_like(active)
+            active[erows] = True
+    return (
+        token_ids,
+        token_lengths.to(torch.int32),
+        DecodeState(h=h, c=c, last_label=last_label),
+    )
+
+
 # ---- engine-tier decode seams (α3 tests-first; PORT-DEC-002/003/007/008) -----
 
 #: Slot indices in the replay-queue page's SEVEN-slot session book

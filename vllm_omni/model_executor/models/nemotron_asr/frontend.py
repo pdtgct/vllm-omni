@@ -21,10 +21,13 @@ pad. Pre-emphasis continuity costs one extra retained sample
 (``y[t] = x[t] - p*x[t-1]``); an absent sample (index < 0) is zero,
 which also reproduces ``y[0] = x[0]``.
 
-Batching: rows are grouped by identical segment length and frame
-count, so the expensive STFT/mel/log ops run batched per group; only
-index assembly loops per row (the design's no-per-session-loop rule
-targets the tensor ops).
+Batching: within a geometry+phase bucket every row commits the
+same frame count per regular chunk (8L+1 first, C continuing), so
+frame geometry is per-call constant and only absolute stream offsets
+vary per row — the whole update runs as batched tensor ops with two
+shape-determining host syncs per call (PORT-PERF-001). Heterogeneous
+frame counts raise (a TEMPORARY transition assertion; the
+length-aware path carries per-row counts).
 
 The frontend counters live in the ``(B, 8)`` int64 tensor whose slot
 names/order are pinned by ``manifests.FRONTEND_COUNTER_FIELDS``; the
@@ -68,41 +71,44 @@ def final_frames(n_samples: int, *, n_fft: int, hop: int) -> int:
     return (n_samples + 2 * (n_fft // 2) - n_fft) // hop
 
 
-def _gather_absolute(
+def _gather_rows(
+    idx: torch.Tensor,
     *,
-    start: int,
-    length: int,
     raw_tail: torch.Tensor,
-    tail_origin: int,
-    tail_length: int,
-    new_samples: torch.Tensor,
-    new_origin: int,
-    valid_limit: int,
+    tail_origin: torch.Tensor,
+    tail_length: torch.Tensor,
+    samples: torch.Tensor,
+    valid_samples: torch.Tensor,
+    new_origin: torch.Tensor,
+    valid_limit: torch.Tensor,
 ) -> torch.Tensor:
-    """Samples ``[start, start+length)`` in absolute stream indices.
-
-    Sourced from the retained tail (``[tail_origin, tail_origin +
-    tail_length)``), the new samples (``[new_origin, new_origin +
-    len)``), and zeros for indices below 0 or at/after
-    ``valid_limit`` (the whole-signal mask + constant-pad semantics).
+    """Batched absolute-index sample gather: ``out[b, j]`` is stream
+    sample ``idx[b, j]``, sourced from the retained tail or the new
+    samples, zero below 0 or at/past ``valid_limit[b]`` (the
+    whole-signal mask + constant-pad semantics). The two sources are
+    disjoint by construction (tail < new_origin <= new). Pure tensor
+    ops — no per-row host work (PORT-PERF-001).
     """
-    out = torch.zeros(
-        length, dtype=raw_tail.dtype, device=raw_tail.device
-    )
-    idx = torch.arange(start, start + length, device=raw_tail.device)
+    legal = (idx >= 0) & (idx < valid_limit.unsqueeze(1))
+    out = torch.zeros_like(idx, dtype=raw_tail.dtype)
+    tail_pos = idx - tail_origin.unsqueeze(1)
     in_tail = (
-        (idx >= tail_origin) & (idx < tail_origin + tail_length)
-        & (idx < valid_limit) & (idx >= 0)
+        legal & (tail_pos >= 0) & (tail_pos < tail_length.unsqueeze(1))
     )
-    if bool(in_tail.any()):
-        out[in_tail] = raw_tail[idx[in_tail] - tail_origin]
-    n_new = int(new_samples.shape[0])
+    if raw_tail.shape[1] > 0:
+        gathered = raw_tail.gather(
+            1, tail_pos.clamp(0, raw_tail.shape[1] - 1)
+        )
+        out = torch.where(in_tail, gathered, out)
+    new_pos = idx - new_origin.unsqueeze(1)
     in_new = (
-        (idx >= new_origin) & (idx < new_origin + n_new)
-        & (idx < valid_limit) & (idx >= 0)
+        legal & (new_pos >= 0) & (new_pos < valid_samples.unsqueeze(1))
     )
-    if bool(in_new.any()):
-        out[in_new] = new_samples[idx[in_new] - new_origin]
+    if samples.shape[1] > 0:
+        gathered = samples.gather(
+            1, new_pos.clamp(0, samples.shape[1] - 1)
+        )
+        out = torch.where(in_new, gathered, out)
     return out
 
 
@@ -161,9 +167,11 @@ def advance_frontend(
         counters: ``(B, 8)`` int64 counters, updated in place.
 
     Returns:
-        Per-row newly committed mel frames (``(n_mels, frames_i)``
-        each; possibly zero-width) and the ``(B,)`` long new-frame
-        counts.
+        The newly committed mel frames as ONE ``(B, n_mels, n_new)``
+        tensor (possibly zero-width) and the ``(B,)`` long new-frame
+        counts. Fully tensorized: exactly two shape-determining host
+        syncs per call (the uniform frame count and the retention
+        width), never per-row host work (PORT-PERF-001).
 
     Raises:
         ValueError: on a chunk after finalization (protocol error), a
@@ -180,100 +188,92 @@ def advance_frontend(
     batch = samples.shape[0]
     capacity = raw_tail.shape[1]
 
-    plans: list[dict[str, int]] = []
-    for b in range(batch):
-        if int(counters[b, CTR_FINALIZED]):
-            raise ValueError(
-                f"row {b}: chunk after finalization (a finalized "
-                "session accepts no further audio)"
-            )
-        total_before = int(counters[b, CTR_TOTAL_VALID_SAMPLES])
-        committed = int(counters[b, CTR_COMMITTED_MEL_FRAMES])
-        n_valid = int(valid_samples[b])
-        total = total_before + n_valid
-        stable = stable_frames(total, n_fft=n_fft, hop=hop)
-        if bool(final_tail[b]):
-            # Final residual rule (design §Exact Bounded Frontend):
-            # commit the remaining valid frames as a partial chunk
-            # only when at least EIGHT new mel frames remain past the
-            # committed (encoder) boundary; a shorter remainder is
-            # DROPPED — finalization still marks atomically either
-            # way.
-            n_final = final_frames(total, n_fft=n_fft, hop=hop)
-            target = n_final if n_final - committed >= 8 else committed
-        else:
-            target = int(target_frames[b])
-            if target < committed:
-                raise ValueError(
-                    f"row {b}: cadence target {target} is below the "
-                    f"committed boundary {committed}"
-                )
-            if stable < target:
-                raise ValueError(
-                    f"row {b}: only {stable} stable mel frames for "
-                    f"cadence target {target} (design margin "
-                    "violated)"
-                )
-        n_new = target - committed
+    device = counters.device
+    valid_samples = valid_samples.to(device=device, dtype=torch.long)
+    is_final = final_tail.to(device=device, dtype=torch.bool)
+    target_frames = target_frames.to(device=device, dtype=torch.long)
+
+    # Snapshot every counter read: the column writes below mutate
+    # the underlying storage, and basic-slice reads are VIEWS.
+    finalized = counters[:, CTR_FINALIZED].clone()
+    tail_origin0 = counters[:, CTR_RAW_TAIL_ORIGIN].clone()
+    tail_length0 = counters[:, CTR_RAW_TAIL_LENGTH].clone()
+    if bool((finalized > 0).any()):
+        row = int((finalized > 0).long().argmax())
+        raise ValueError(
+            f"row {row}: chunk after finalization (a finalized "
+            "session accepts no further audio)"
+        )
+    total_before = counters[:, CTR_TOTAL_VALID_SAMPLES].clone()
+    committed = counters[:, CTR_COMMITTED_MEL_FRAMES].clone()
+    total = total_before + valid_samples
+    stable = torch.clamp((total - half) // hop + 1, min=0)
+    # Final residual rule (design §Exact Bounded Frontend): commit the
+    # remaining valid frames only when at least EIGHT new mel frames
+    # lie past the committed (encoder) boundary; a shorter remainder
+    # is DROPPED — finalization still marks atomically either way.
+    n_final = total // hop  # == final_frames(total)
+    final_target = torch.where(
+        n_final - committed >= 8, n_final, committed
+    )
+    regular = ~is_final
+    bad = regular & (target_frames < committed)
+    if bool(bad.any()):
+        row = int(bad.long().argmax())
+        raise ValueError(
+            f"row {row}: cadence target {int(target_frames[row])} is "
+            f"below the committed boundary {int(committed[row])}"
+        )
+    bad = regular & (stable < target_frames)
+    if bool(bad.any()):
+        row = int(bad.long().argmax())
+        raise ValueError(
+            f"row {row}: only {int(stable[row])} stable mel frames "
+            f"for cadence target {int(target_frames[row])} (design "
+            "margin violated)"
+        )
+    target = torch.where(is_final, final_target, target_frames)
+    n_new_t = target - committed
+    if bool((n_new_t != n_new_t[0]).any()):
+        # TEMPORARY transition assertion — the length-aware path
+        # carries per-row frame counts instead (PORT-PERF-001).
+        raise ValueError(
+            f"heterogeneous new-frame counts in one call: "
+            f"{n_new_t.tolist()} (temporary transition assertion)"
+        )
+    # ONE shape-determining host sync per call (never per row).
+    n_new = int(n_new_t[0])
+    counts = torch.full((batch,), n_new, dtype=torch.long, device=device)
+    n_mels = featurizer.fb.shape[0]
+
+    if n_new > 0:
         # Segment covering frames [committed, target): preemphasized
         # samples [committed*hop - half, (target-1)*hop + half), plus
         # one leading raw sample for pre-emphasis continuity.
         seg_start = committed * hop - half
-        seg_len = (n_new - 1) * hop + n_fft if n_new else 0
-        plans.append({
-            "total_before": total_before,
-            "committed": committed,
-            "total": total,
-            "target": target,
-            "n_new": n_new,
-            "seg_start": seg_start,
-            "seg_len": seg_len,
-        })
-
-    counts = torch.zeros(batch, dtype=torch.long)
-    out: list[torch.Tensor] = [
-        torch.zeros(
-            featurizer.fb.shape[0], 0, device=featurizer.fb.device
+        seg_len = (n_new - 1) * hop + n_fft
+        idx = (seg_start - 1).unsqueeze(1) + torch.arange(
+            seg_len + 1, device=device
+        ).unsqueeze(0)
+        x = _gather_rows(
+            idx,
+            raw_tail=raw_tail,
+            tail_origin=tail_origin0,
+            tail_length=tail_length0,
+            samples=samples,
+            valid_samples=valid_samples,
+            new_origin=total_before,
+            valid_limit=total,
         )
-        for _ in range(batch)
-    ]
-
-    # Group rows with identical segment geometry: one batched
-    # preemphasis + STFT + mel + log per group.
-    groups: dict[tuple[int, int], list[int]] = {}
-    for b, plan in enumerate(plans):
-        if plan["n_new"]:
-            groups.setdefault(
-                (plan["seg_len"], plan["n_new"]), []
-            ).append(b)
-
-    for (seg_len, n_new), rows in groups.items():
-        segs = []
-        for b in rows:
-            plan = plans[b]
-            segs.append(_gather_absolute(
-                start=plan["seg_start"] - 1,
-                length=seg_len + 1,
-                raw_tail=raw_tail[b],
-                tail_origin=int(counters[b, CTR_RAW_TAIL_ORIGIN]),
-                tail_length=int(counters[b, CTR_RAW_TAIL_LENGTH]),
-                new_samples=samples[b, : int(valid_samples[b])],
-                new_origin=plan["total_before"],
-                valid_limit=plan["total"],
-            ))
-        x = torch.stack(segs)
         # Masked pre-emphasis: y[t] = x[t] - p*x[t-1]; the leading
-        # extra sample supplies x[t-1] across the segment boundary, and
-        # positions at/after each row's valid limit arrived as zeros
-        # from the gather (the whole-signal mask).
+        # extra sample supplies x[t-1] across the segment boundary.
         y = x[:, 1:] - preemph * x[:, :-1]
         # Zero re-mask: y at absolute positions >= the row's valid
         # limit must be exactly 0 (not -p*x[limit-1]).
-        for j, b in enumerate(rows):
-            plan = plans[b]
-            rel_limit = plan["total"] - plan["seg_start"]
-            if rel_limit < seg_len:
-                y[j, max(rel_limit, 0):] = 0.0
+        abs_pos = seg_start.unsqueeze(1) + torch.arange(
+            seg_len, device=device
+        ).unsqueeze(0)
+        y = torch.where(abs_pos < total.unsqueeze(1), y, y.new_zeros(()))
         spec = torch.stft(
             y,
             n_fft=n_fft,
@@ -286,51 +286,65 @@ def advance_frontend(
         magnitude = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1))
         power = magnitude.pow(2.0)
         mel = torch.matmul(featurizer.fb, power)
-        logmel = torch.log(mel + featurizer.log_zero_guard)
-        for j, b in enumerate(rows):
-            out[b] = logmel[j, :, :n_new]
-            counts[b] = n_new
+        new_frames = torch.log(mel + featurizer.log_zero_guard)[
+            :, :, :n_new
+        ]
+        keep = min(MEL_TAIL_FRAMES, n_new)
+        mel_tail.copy_(torch.cat(
+            [mel_tail[:, :, keep:], new_frames[:, :, n_new - keep:]],
+            dim=2,
+        ))
+    else:
+        new_frames = torch.zeros(batch, n_mels, 0, device=device)
 
-    # Commit state: counters, mel tail, raw tail.
-    for b, plan in enumerate(plans):
-        total, target = plan["total"], plan["target"]
-        is_final = bool(final_tail[b])
-        if plan["n_new"]:
-            keep = min(MEL_TAIL_FRAMES, plan["n_new"])
-            mel_tail[b] = torch.roll(mel_tail[b], -keep, dims=1)
-            mel_tail[b, :, MEL_TAIL_FRAMES - keep:] = (
-                out[b][:, plan["n_new"] - keep:]
-            )
-        counters[b, CTR_TOTAL_VALID_SAMPLES] = total
-        counters[b, CTR_COMMITTED_MEL_FRAMES] = target
-        counters[b, CTR_MEL_TAIL_LENGTH] = min(
-            MEL_TAIL_FRAMES, target
+    counters[:, CTR_TOTAL_VALID_SAMPLES] = total
+    counters[:, CTR_COMMITTED_MEL_FRAMES] = target
+    counters[:, CTR_MEL_TAIL_LENGTH] = torch.clamp(
+        target, max=MEL_TAIL_FRAMES
+    )
+
+    # Raw-tail retention: nonfinal rows retain from one sample before
+    # the next frame's window; final rows clear.
+    keep_from = torch.clamp(target * hop - half - 1, min=0)
+    keep_len = torch.clamp(total - keep_from, min=0)
+    bad = regular & (keep_len > capacity)
+    if bool(bad.any()):
+        row = int(bad.long().argmax())
+        raise ValueError(
+            f"row {row}: raw-tail overflow ({int(keep_len[row])} > "
+            f"{capacity}) — the derived bound was violated"
         )
-        if is_final:
-            counters[b, CTR_FINALIZED] = 1
-            counters[b, CTR_RAW_TAIL_ORIGIN] = total
-            counters[b, CTR_RAW_TAIL_LENGTH] = 0
-        else:
-            # Retain from one sample before the next frame's window.
-            keep_from = max(target * hop - half - 1, 0)
-            keep_len = total - keep_from
-            if keep_len > capacity:
-                raise ValueError(
-                    f"row {b}: raw-tail overflow ({keep_len} > "
-                    f"{capacity}) — the derived bound was violated"
-                )
-            if keep_len > 0:
-                raw_tail[b, :keep_len] = _gather_absolute(
-                    start=keep_from,
-                    length=keep_len,
-                    raw_tail=raw_tail[b].clone(),
-                    tail_origin=int(counters[b, CTR_RAW_TAIL_ORIGIN]),
-                    tail_length=int(counters[b, CTR_RAW_TAIL_LENGTH]),
-                    new_samples=samples[b, : int(valid_samples[b])],
-                    new_origin=plan["total_before"],
-                    valid_limit=total,
-                )
-            counters[b, CTR_RAW_TAIL_ORIGIN] = keep_from
-            counters[b, CTR_RAW_TAIL_LENGTH] = max(keep_len, 0)
-
-    return out, counts
+    retain_len = torch.where(regular, keep_len, keep_len.new_zeros(()))
+    # The SECOND (and last) shape-determining host sync per call.
+    k_max = int(retain_len.max()) if batch else 0
+    if k_max > 0:
+        kidx = keep_from.unsqueeze(1) + torch.arange(
+            k_max, device=device
+        ).unsqueeze(0)
+        kept = _gather_rows(
+            kidx,
+            raw_tail=raw_tail.clone(),
+            tail_origin=tail_origin0,
+            tail_length=tail_length0,
+            samples=samples,
+            valid_samples=valid_samples,
+            new_origin=total_before,
+            valid_limit=total,
+        )
+        write = regular.unsqueeze(1) & (
+            torch.arange(k_max, device=device).unsqueeze(0)
+            < keep_len.unsqueeze(1)
+        )
+        raw_tail[:, :k_max] = torch.where(
+            write, kept, raw_tail[:, :k_max]
+        )
+    counters[:, CTR_RAW_TAIL_ORIGIN] = torch.where(
+        is_final, total, keep_from
+    )
+    counters[:, CTR_RAW_TAIL_LENGTH] = torch.where(
+        is_final, keep_len.new_zeros(()), keep_len
+    )
+    counters[:, CTR_FINALIZED] = torch.where(
+        is_final, finalized.new_ones(()), finalized
+    )
+    return new_frames, counts

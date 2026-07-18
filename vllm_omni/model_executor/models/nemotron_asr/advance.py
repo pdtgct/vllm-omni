@@ -328,7 +328,8 @@ def advance_session(
             next state.
 
     Returns:
-        Per-row nonblank bursts and named captures.
+        The GPU-resident :class:`AdvanceResult` (padded token
+        tensors + prepared captures).
 
     Raises:
         ValueError: on a control-field violation (non-integer value,
@@ -351,7 +352,7 @@ def advance_session(
     )
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
         DecodeState,
-        greedy_decode_batch,
+        decode_compact_active,
     )
 
     n_rows = batch.samples.shape[0]
@@ -481,8 +482,14 @@ def advance_session(
             c=state.c.transpose(0, 1).contiguous(),
             last_label=state.last_label,
         )
-        bursts, decode = greedy_decode_batch(
-            conditioned, core.predictor, core.joint, decode
+        # Per-row valid encoder lengths: uniform under the temporary
+        # homogeneity assertion; the length-aware encoder transition
+        # makes these genuinely per-row.
+        enc_lengths = torch.full(
+            (n_rows,), enc.shape[1], dtype=torch.long, device=device
+        )
+        token_ids, token_lengths, decode = decode_compact_active(
+            conditioned, enc_lengths, core.predictor, core.joint, decode
         )
     state.h.copy_(decode.h.transpose(0, 1))
     state.c.copy_(decode.c.transpose(0, 1))
@@ -492,24 +499,7 @@ def advance_session(
             state.frontend_counters[b, CTR_COMMITTED_MEL_FRAMES]
         )
 
-    # Boundary conversion to the GPU-resident result; the interior
-    # loop tensorizes in the compact-active slice (PORT-PERF-001).
-    max_len = max((len(b) for b in bursts), default=0)
-    token_ids = torch.zeros(
-        n_rows, max_len, dtype=torch.int32, device=device
-    )
-    token_lengths = torch.zeros(
-        n_rows, dtype=torch.int32, device=device
-    )
-    for b, burst in enumerate(bursts):
-        token_lengths[b] = len(burst)
-        if burst:
-            token_ids[b, : len(burst)] = torch.tensor(
-                burst, dtype=torch.int32, device=device
-            )
-    lengths = torch.full(
-        (n_rows,), enc.shape[1], dtype=torch.long, device=device
-    )
+    lengths = enc_lengths
     return AdvanceResult(
         token_ids=token_ids,
         token_lengths=token_lengths,
