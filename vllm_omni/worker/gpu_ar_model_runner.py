@@ -1224,6 +1224,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
             )
 
+        # Let a streaming-state model stage its host row-plan context —
+        # the FINAL row order joined to per-request scheduler authority
+        # (CPU token ids, state blocks, scheduled multimodal inputs) —
+        # which its forward then consumes exactly once. Purely
+        # host-side; models without the hook are unaffected.
+        prepare_row_plan_context = getattr(self.model, "prepare_row_plan_context", None)
+        if callable(prepare_row_plan_context):
+            prepare_row_plan_context(
+                req_ids=req_ids[:num_reqs],
+                token_ids_cpu=self.input_batch.token_ids_cpu[:num_reqs],
+                num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
+                requests=self.requests,
+                scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+            )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.

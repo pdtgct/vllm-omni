@@ -1526,9 +1526,12 @@ def test_run_forward_step_is_removed_and_advance_model_rows_is_wired() -> None:
     assert "advance_model_rows" in model_src
 
 
-@pytest.mark.xfail(strict=True, reason="P5-1 split lands in Phase 6")
 def test_forward_routes_through_advance_model_rows() -> None:
     # @spec PORT-INT-003
+    # Flipped from xfail at Task 5: forward now routes through the
+    # shared transaction. forward_step.py itself survives as the
+    # regression oracle until the Task-7 parity gate deletes it (the
+    # companion naming-lock test above stays xfail until then).
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
     assert "advance_model_rows(" in model_src
     assert "run_forward_step(" not in model_src

@@ -28,6 +28,18 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     model runners for text generation stages (e.g., thinker stages).
     """
 
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        # A streaming-state model warms its resident commit-scatter
+        # specializations here — after cache allocation, before any
+        # session is admitted — and fails startup on a specialization
+        # that cannot compile, execute, and synchronize. Models without
+        # the hook are unaffected.
+        warmup_resident_state = getattr(self.model_runner.model, "warmup_resident_state", None)
+        if callable(warmup_resident_state):
+            warmup_resident_state()
+        return result
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):

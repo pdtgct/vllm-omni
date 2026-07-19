@@ -13,12 +13,25 @@ values are produced by the conversion publisher
 
 from transformers import PretrainedConfig
 
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    ENVELOPE_HEADER_FIELDS,
+    RAW_SAMPLES_PER_CHUNK,
+)
+
 #: The architecture string — the single source of truth shared by the
 #: registry, the pipeline, the publisher, and ``config.json``'s
 #: ``architectures[0]``. Imported, never re-spelled.
 ARCHITECTURE = "Nemotron3_5AsrForRNNT"
 
 MODEL_TYPE = "nemotron_asr"
+
+#: The raw chunk-envelope carrier width: header slots plus the largest
+#: admitted raw cadence (1120 ms at 16 kHz) — DERIVED from the
+#: manifests, never a copied constant (PORT-INT-004; the retired mel
+#: default 15,617 is superseded by this envelope value, 17,926).
+_CARRIER_WIDTH = len(ENVELOPE_HEADER_FIELDS) + max(
+    RAW_SAMPLES_PER_CHUNK.values()
+)
 
 
 class NemotronASRConfig(PretrainedConfig):
@@ -38,9 +51,12 @@ class NemotronASRConfig(PretrainedConfig):
         *,
         vocab_size: int = 13090,
         num_asr_labels: int = 13087,
-        hidden_size: int = 15617,
+        hidden_size: int = _CARRIER_WIDTH,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
+        decode_dispatch_arm: str | None = None,
+        decode_dispatch_table: str | None = None,
+        performance_gated: bool = False,
         d_model: int = 1024,
         conv_kernel: int = 9,
         att_context_left: int = 56,

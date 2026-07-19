@@ -25,8 +25,22 @@ import torch
 from torch import nn
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
+from vllm_omni.model_executor.models.nemotron_asr.advance import (
+    ENVELOPE_HEADER_SLOTS,
+    DecodeRequest,
+    DecodeResolver,
+    EmissionAdapter,
+    ResolvedDecode,
+    make_mrv1_adapter,
+)
+from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
+    BoundedCommitSink,
+)
 from vllm_omni.model_executor.models.nemotron_asr.convert import (
     LID_REQUIRED_PATTERN,
+)
+from vllm_omni.model_executor.models.nemotron_asr.decode_dispatch import (
+    SYNC_FREE_ARMS,
 )
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     FastConformerEncoder,
@@ -39,7 +53,14 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
     resolve_prompt_index,
 )
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    CADENCES,
     FRONTEND_CONSTANTS,
+)
+from vllm_omni.model_executor.models.nemotron_asr.plan import (
+    ObservedRow,
+    PlanContextSlot,
+    SessionRegistry,
+    prepare_plan_context,
 )
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
@@ -277,6 +298,82 @@ __all__ = [
 ]
 
 
+def build_decode_resolver(hf_config: Any) -> DecodeResolver:
+    """Startup decode-dispatch resolution (PORT-DEC-008: no default).
+
+    The SERVED config must declare exactly one of:
+
+    - ``decode_dispatch_arm``: an explicitly configured arm for the
+      bring-up/correctness lane. The resolver still enforces the two
+      unconditional safety overrides (graph coverage forces
+      ``dense-graphed``; more than one ready decode bucket forces the
+      sync-free eager arm) — a declared arm is a preference, never a
+      license to serialize a busy multi-bucket engine.
+    - ``decode_dispatch_table``: a measured, validated table artifact.
+      Loading it requires the runtime-fingerprint tooling owned by the
+      deferred A100 work packet; until that lands this path fails
+      closed rather than validating against a fabricated fingerprint.
+
+    Raises:
+        ValueError: neither or both declared, an unknown arm, or the
+            not-yet-supported table path.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_compact_active,
+        decode_dense_masked,
+    )
+
+    arm = getattr(hf_config, "decode_dispatch_arm", None)
+    table_path = getattr(hf_config, "decode_dispatch_table", None)
+    if arm and table_path:
+        raise ValueError(
+            "declare decode_dispatch_arm OR decode_dispatch_table, "
+            "not both"
+        )
+    if not arm and not table_path:
+        raise ValueError(
+            "the served config must declare decode_dispatch_arm or "
+            "decode_dispatch_table — decode dispatch is never a "
+            "hardcoded default (PORT-DEC-008)"
+        )
+    if table_path:
+        raise ValueError(
+            "decode_dispatch_table loading requires the deferred A100 "
+            "work packet's runtime-fingerprint tooling; declare "
+            "decode_dispatch_arm for the bring-up lane"
+        )
+    arms = {
+        "dense-eager": decode_dense_masked,
+        "dense-graphed": decode_dense_masked,
+        "compact-eager": decode_compact_active,
+    }
+    if arm not in arms:
+        raise ValueError(
+            f"unknown decode_dispatch_arm {arm!r} "
+            f"(known: {sorted(arms)})"
+        )
+
+    def resolve(request: DecodeRequest) -> ResolvedDecode:
+        if request.graph_covers_decode:
+            return ResolvedDecode(
+                arm="dense-graphed",
+                decode_fn=arms["dense-graphed"],
+                override_reason="graph-covers-decode",
+            )
+        if (
+            request.ready_decode_buckets > 1
+            and arm not in SYNC_FREE_ARMS
+        ):
+            return ResolvedDecode(
+                arm="dense-eager",
+                decode_fn=arms["dense-eager"],
+                override_reason="multi-bucket-serialization-guard",
+            )
+        return ResolvedDecode(arm=arm, decode_fn=arms[arm])
+
+    return resolve
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     NemotronASRMultiModalProcessor,
     info=NemotronASRProcessingInfo,
@@ -365,8 +462,28 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             p for k, p in paired if k == "frontend_counter"
         )
         # The pre-encode overlap dropped from non-first chunks
-        # (drop_extra); session-first chunks use 0 (run_forward_step).
+        # (drop_extra); session-first chunks use 0 (the retained legacy
+        # run_forward_step path until the Task-7 parity gate deletes it).
         self._drop_extra = 2
+        # ---- Task-5 seams (design §Phase-6c transaction seams) ----
+        # Session identity authority + the consume-once hook↔forward
+        # handoff, the MRV1 adapter, and the startup-resolved decode
+        # dispatch. The composite commit sink is constructed lazily at
+        # the first step because pinned staging needs the compute
+        # device, which binds after construction.
+        self._registry = SessionRegistry()
+        self._plan_slot = PlanContextSlot()
+        self._plan_step = 0
+        self._emission_adapter: EmissionAdapter = make_mrv1_adapter(
+            hidden_size=hf_config.hidden_size,
+            park_id=hf_config.eos_token_id,
+            blank_id=self.core.blank_id,
+        )
+        self._decode_resolver = build_decode_resolver(hf_config)
+        self._max_num_seqs = int(
+            vllm_config.scheduler_config.max_num_seqs
+        )
+        self._commit_sink: BoundedCommitSink | None = None
 
     def _build_state_pages(
         self, n_layers: int, cfg: Any, policy: PrecisionPolicy
@@ -507,46 +624,195 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         ):
             yield update
 
-    def embed_multimodal(self, **kwargs: Any) -> Any:
-        """Stateless mel front-end → one carrier row per chunk (BU-c1).
+    def prepare_row_plan_context(
+        self,
+        *,
+        req_ids: Any,
+        token_ids_cpu: Any,
+        num_computed_tokens_cpu: Any,
+        num_scheduled_tokens: Any,
+        requests: Any,
+        scheduled_encoder_inputs: Any,
+    ) -> None:
+        """The typed runner hook (design §Phase-6c transaction seams).
 
-        Runs the featurizer on each chunk's audio and packs the mel
-        into a single ``inputs_embeds`` row (``pack_audio_carrier``,
-        slot 0 = frame count). MUST be pure — the engine content-hash-
-        caches this output, so identical chunks must produce identical
-        carriers (PORT-INT-003). The mm_kwargs key/shape is the
-        processor's contract (BU-c2), pod-verified/adapted.
+        Called by the fork AR runner immediately before ``forward``
+        with the FINAL host row order. Observes each row's scheduled
+        CPU token, per-request state block, and — for rows whose new
+        CHUNK envelope is scheduled this step — the envelope's CPU
+        header, then stages the consume-once :class:`PlanContext` that
+        ``forward`` combines with the attention metadata. All reads
+        here are host-side; no device work happens in the hook.
         """
-        from vllm_omni.model_executor.models.nemotron_asr.forward_ops import (
-            pack_audio_carrier,
+        import time
+
+        rows: list[ObservedRow] = []
+        for i, req_id in enumerate(req_ids):
+            if int(num_scheduled_tokens[i]) != 1:
+                raise ValueError(
+                    f"request {req_id!r} scheduled "
+                    f"{int(num_scheduled_tokens[i])} tokens — every "
+                    "streaming model row is single-token"
+                )
+            computed = int(num_computed_tokens_cpu[i])
+            token = int(token_ids_cpu[i, computed])
+            state = requests[req_id]
+            block_groups = state.block_ids
+            if len(block_groups) != 1 or len(block_groups[0]) != 1:
+                raise ValueError(
+                    f"request {req_id!r} holds block groups "
+                    f"{block_groups!r} — the uniform state group "
+                    "allocates exactly one block per resident session "
+                    "(PORT-STATE-002)"
+                )
+            header: tuple[float, ...] | None = None
+            scheduled = scheduled_encoder_inputs.get(req_id)
+            if scheduled:
+                if len(scheduled) != 1:
+                    raise ValueError(
+                        f"request {req_id!r} scheduled "
+                        f"{len(scheduled)} envelopes in one step"
+                    )
+                feature = state.mm_features[scheduled[0]]
+                item = feature.data
+                if item is None:
+                    raise ValueError(
+                        f"request {req_id!r} scheduled an envelope "
+                        "with no kwargs payload"
+                    )
+                payload = item["audio"].data
+                env = (
+                    payload
+                    if isinstance(payload, torch.Tensor)
+                    else torch.as_tensor(payload)
+                )
+                if env.device.type != "cpu":
+                    raise ValueError(
+                        "envelope payload must be host-resident at "
+                        "the hook"
+                    )
+                env = env.reshape(-1)
+                if int(env.shape[0]) < ENVELOPE_HEADER_SLOTS:
+                    raise ValueError(
+                        f"request {req_id!r} envelope is smaller than "
+                        "its header"
+                    )
+                header = tuple(
+                    float(v)
+                    for v in env[:ENVELOPE_HEADER_SLOTS].tolist()
+                )
+            rows.append(
+                ObservedRow(
+                    request_id=str(req_id),
+                    block_id=int(block_groups[0][0]),
+                    scheduled_token_id=token,
+                    has_prior_state=computed > 0,
+                    envelope_header=header,
+                )
+            )
+        self._plan_step += 1
+        context = prepare_plan_context(
+            self._registry,
+            rows,
+            resident_request_ids=tuple(str(r) for r in requests),
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            num_prompts=int(self.core.lid.num_prompts),
+            num_geometries=len(CADENCES),
+            now_ns=time.monotonic_ns(),
+            step=self._plan_step,
+        )
+        self._plan_slot.stage(context)
+
+    def warmup_resident_state(self) -> None:
+        """Warm every commit-scatter specialization before admission.
+
+        The Task-5 startup caller (the fork worker's
+        ``compile_or_warm_up_model`` override) invokes this once after
+        the resident pools are allocated and bound; startup fails if
+        any specialization does not compile, execute, and synchronize
+        (PORT-ADV-003 as amended). A CPU/loader environment has no
+        Triton specializations to warm and returns immediately.
+        """
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            warmup_advance_model_rows_scatter,
         )
 
+        if not self._window_pages[0].kv_cache:
+            raise ValueError(
+                "resident pools are not bound — warmup runs after "
+                "cache allocation, before admission"
+            )
+        if self._window_pages[0].kv_cache[0].device.type != "cuda":
+            return
+        warmup_advance_model_rows_scatter(
+            channel_pools=[pg.kv_cache[0] for pg in self._window_pages],
+            time_pools=[pg.kv_cache[0] for pg in self._conv_pages],
+            len_pools=[pg.kv_cache[1] for pg in self._window_pages],
+            h_pool=self._lstm_page.kv_cache[0],
+            c_pool=self._lstm_page.kv_cache[1],
+            queue_pool=self._replay_page.kv_cache[0],
+            book_pool=self._replay_page.kv_cache[1],
+            frontend_raw_pool=self._frontend_buffer_page.kv_cache[0],
+            frontend_mel_pool=self._frontend_buffer_page.kv_cache[1],
+            frontend_counter_pool=self._frontend_counter_page.kv_cache[0],
+        )
+
+    def _ensure_commit_sink(
+        self, device: torch.device
+    ) -> BoundedCommitSink:
+        """The serving composite sink, constructed at first use (the
+        pinned status staging needs the bound compute device)."""
+        if self._commit_sink is None:
+            self._commit_sink = BoundedCommitSink(
+                self._registry,
+                max_rows=self._max_num_seqs,
+                device=device,
+            )
+        return self._commit_sink
+
+    def embed_multimodal(self, **kwargs: Any) -> Any:
+        """Envelope pass-through → one carrier row per chunk (Task 5).
+
+        The serving tier mints the complete raw envelope (versioned
+        header + raw PCM, ``streaming.mint_envelope``); this seam only
+        pads it to the configuration-derived carrier width and moves it
+        to the compute device. NO featurization happens here — the
+        stateful mel frontend runs inside ``advance_session``
+        (PORT-INT-003/PORT-REGIME-001; the packed-mel carrier is
+        retired). MUST stay pure: identical envelopes produce identical
+        carriers. Header semantics are validated host-side by the plan
+        provider and on device by the transaction, not here.
+        """
         audios = kwargs.get("audio")
         if audios is None:
             raise ValueError("embed_multimodal expects an 'audio' item")
-        # Raw-audio mm fields ride as np arrays, which the batched-field
-        # reducer leaves on CPU (it only h2d-moves torch tensors); move to
-        # the model device so the featurizer's on-device window/fb match.
         device = next(self.parameters()).device
+        hidden = int(self.config.hidden_size)
         rows = []
         for chunk in audios:
-            wav = (
+            env = (
                 chunk
                 if isinstance(chunk, torch.Tensor)
                 else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
             )
-            wav = wav.to(device=device, dtype=torch.float32).reshape(1, -1)
-            mel, _ = self.core.featurizer(
-                wav, torch.tensor([wav.shape[-1]], device=wav.device)
-            )
-            rows.append(
-                pack_audio_carrier(mel[0], hidden_size=self.config.hidden_size)
-            )
+            env = env.reshape(-1).to(dtype=torch.float32)
+            n = int(env.shape[0])
+            if n < ENVELOPE_HEADER_SLOTS:
+                raise ValueError(
+                    f"envelope carries {n} values — smaller than its "
+                    f"{ENVELOPE_HEADER_SLOTS}-slot header"
+                )
+            if n > hidden:
+                raise ValueError(
+                    f"envelope carries {n} values — wider than the "
+                    f"configured carrier width {hidden}"
+                )
+            row = torch.zeros(hidden, dtype=torch.float32)
+            row[:n] = env
+            rows.append(row.to(device))
         # SupportsMultiModal contract (sanity_check_mm_encoder_outputs): a
         # sequence of one 2D (num_tokens, hidden_size) tensor PER audio
         # item — each chunk is a single carrier token, so (1, hidden_size).
-        # The runner caches these per item and slices them in
-        # _gather_mm_embeddings.
         return [row.unsqueeze(0) for row in rows]
 
     def embed_input_ids(
@@ -592,17 +858,25 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     ) -> torch.Tensor:
         """Chunk-ingest or replay step; hidden rows carry decisions.
 
-        Thin wrapper (D-BUc-1): reads the bound page pools and per-row
-        ``state_indices`` from ``get_forward_context()`` and calls
-        ``run_forward_step`` (the pure pipeline, loader-tested in BU-c1).
-        Pod-verified/adapted (BU-c2): the exact metadata field access and
-        the ``_p``/``_d`` handling are confirmed against the real
-        ``ShortConvAttentionMetadata`` on the engine.
+        Thin wrapper (design §Phase-6c transaction seams): consumes the
+        runner hook's staged :class:`PlanContext`, combines it with the
+        attention metadata's host row counts into the transaction's
+        ``RowPlan``, and invokes shared ``advance_model_rows``
+        (PORT-INT-003) over the bound page pools with the model's
+        emission adapter, startup-resolved decode dispatch, and the
+        serving composite commit sink. The metadata field access
+        (``ShortConvAttentionMetadata`` for the uniform page group) is
+        the BU-c2 pod-verified seam; its host counts are the engine
+        authority the plan's CPU columns are validated against.
         """
         from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-        from vllm_omni.model_executor.models.nemotron_asr.forward_step import (
-            run_forward_step,
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            advance_model_rows,
+        )
+        from vllm_omni.model_executor.models.nemotron_asr.plan import (
+            build_row_plan,
         )
 
         assert inputs_embeds is not None and input_ids is not None
@@ -614,30 +888,24 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 dtype=inputs_embeds.dtype, device=inputs_embeds.device,
             )
         # All five page kinds share one uniform group → one metadata
-        # object (ShortConvAttentionMetadata; Any off-engine). The batch
-        # is ordered decodes-then-prefills (short_conv splits
-        # [num_decode_tokens, num_prefill_tokens]); every row is a single
-        # token (replay id, or a chunk placeholder — the first chunk of a
-        # session prefills, later chunks decode), so the per-row page
-        # index is decode indices then prefill indices concatenated,
-        # aligned to ``input_ids``.
+        # object; the batch is decode-then-prefill ordered (BU-c2).
         meta = md[self._window_pages[0].prefix]
-        parts = [
-            t
-            for t in (
-                meta.state_indices_tensor_d,
-                meta.state_indices_tensor_p,
-            )
-            if t is not None and t.numel()
-        ]
-        state_indices = (
-            torch.cat(parts)
-            if parts
-            else input_ids.new_zeros(0)
+        context = self._plan_slot.consume()
+        num_pool_blocks = int(self._window_pages[0].kv_cache[0].shape[0])
+        plan = build_row_plan(
+            context,
+            num_decodes=int(meta.num_decodes),
+            num_prefills=int(meta.num_prefills),
+            null_block_id=int(NULL_BLOCK_ID),
+            num_pool_blocks=num_pool_blocks,
         )
-
-        return run_forward_step(
-            self.core, input_ids, inputs_embeds,
+        return advance_model_rows(
+            self.core,
+            # The runner's raw id buffer is int32; the transaction's
+            # row-id contract is int64 (PORT-STATE-007 posture).
+            input_ids.long(),
+            inputs_embeds,
+            plan,
             channel_pools=[pg.kv_cache[0] for pg in self._window_pages],
             time_pools=[pg.kv_cache[0] for pg in self._conv_pages],
             len_pools=[pg.kv_cache[1] for pg in self._window_pages],
@@ -645,11 +913,16 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             c_pool=self._lstm_page.kv_cache[1],
             queue_pool=self._replay_page.kv_cache[0],
             book_pool=self._replay_page.kv_cache[1],
-            state_indices=state_indices,
-            placeholder_id=self.config.audio_chunk_token_id,
-            park_id=self.config.eos_token_id,
-            feat=_N_MELS,
-            drop_extra=self._drop_extra,
+            frontend_raw_pool=self._frontend_buffer_page.kv_cache[0],
+            frontend_mel_pool=self._frontend_buffer_page.kv_cache[1],
+            frontend_counter_pool=self._frontend_counter_page.kv_cache[0],
+            adapter=self._emission_adapter,
+            decode_resolver=self._decode_resolver,
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            park_id=int(self.config.eos_token_id),
+            commit_sink=self._ensure_commit_sink(inputs_embeds.device),
+            capture=False,
+            graph_covers_decode=False,
         )
 
     def compute_logits(
