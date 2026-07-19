@@ -231,6 +231,7 @@ def _plan(
     chunk: list[bool] | None = None,
     geometries: list[int] | None = None,
     generations: list[int] | None = None,
+    execution_tier: int = 0,
 ) -> Any:
     decodes = decodes or []
     prefills = prefills or []
@@ -246,9 +247,9 @@ def _plan(
         has_initial = [False] * len(prefills)
     if live is None:
         live = list(range(1, num_pool_blocks))
-    if prompts is None:
-        prompts = [0] * len(prefills)
     n_real = num_decodes + len(prefills)
+    if prompts is None:
+        prompts = [0] * n_real  # ADMITTED prompt authority, every row
     if chunk is None:
         chunk = [False] * num_decodes + [True] * len(prefills)
     if geometries is None:
@@ -268,6 +269,8 @@ def _plan(
         prompt_index=torch.tensor(prompts, dtype=torch.long),
         is_chunk=torch.tensor(chunk, dtype=torch.bool),
         admission_generation=torch.tensor(generations, dtype=torch.long),
+        request_ids=tuple(f"req-{i}" for i in range(n_real)),
+        execution_tier=execution_tier,
     )
 
 
@@ -326,9 +329,13 @@ class _Reservation:
 
     def publish(self, records: Any) -> None:
         self._sink.published.append(list(records))
+        self._sink.log.append("publish")
+        if self._sink.on_publish is not None:
+            self._sink.on_publish()
 
     def cancel(self) -> None:
         self._sink.cancels += 1
+        self._sink.log.append("cancel")
 
 
 class _RecorderSink:
@@ -336,21 +343,42 @@ class _RecorderSink:
         self.plans: list[Any] = []
         self.published: list[list[Any]] = []
         self.cancels = 0
+        self.log: list[str] = []
+        self.on_publish: Any = None
         self._fail = fail_reserve
 
     def reserve(self, plan: Any) -> _Reservation:
         self.plans.append(plan)
+        self.log.append("reserve_capture")
         if self._fail:
             raise RuntimeError("capture sink at capacity")
         return _Reservation(self)
 
 
-class _StatusRecorder:
-    def __init__(self) -> None:
-        self.staged: list[torch.Tensor] = []
+class _StatusTicket:
+    def __init__(self, sink: _StatusRecorder) -> None:
+        self._sink = sink
 
     def stage(self, row_status: torch.Tensor) -> None:
-        self.staged.append(row_status.clone())
+        self._sink.staged.append(row_status.clone())
+        self._sink.log.append("stage")
+
+
+class _StatusRecorder:
+    """Request-aware ticket sink: reserve pre-commit, stage no-fail."""
+
+    def __init__(self, *, fail_reserve: bool = False) -> None:
+        self.reserved: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
+        self.staged: list[torch.Tensor] = []
+        self.log: list[str] = []
+        self._fail = fail_reserve
+
+    def reserve(self, request_ids: Any, generations: Any) -> _StatusTicket:
+        self.reserved.append((tuple(request_ids), tuple(generations)))
+        self.log.append("reserve_status")
+        if self._fail:
+            raise RuntimeError("status sink at capacity")
+        return _StatusTicket(self)
 
 
 def _call(
@@ -654,6 +682,23 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
     assert emitted[-1] == PARK_ID
     assert int(book[1, _BOOK["pending_echo"]]) == 0
 
+    # An INVALID CONTINUING chunk (wrong sequence) on the now-parked
+    # session leaves every page of its block bit-identical.
+    parked = _clone_pools(pools)
+    wrong_seq = _envelope(
+        samples, final=True, seq=5, geometry=GEOM_FINAL
+    ).unsqueeze(0)
+    status = _StatusRecorder()
+    out = _call(
+        core, pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), wrong_seq,
+        _plan(decodes=[1], chunk=[True], geometries=[GEOM_FINAL]),
+        status_sink=status,
+    )
+    assert _decision(out) == [PARK_ID]
+    _assert_pools_equal(pools, parked)
+    assert int(status.staged[0][0]) != 0
+
 
 def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
     # Two CHUNK rows at different geometries plus one replay row in a
@@ -777,9 +822,11 @@ def test_capture_records_publish_after_commit_with_identity() -> None:
     assert sink.cancels == 0
 
 
-def test_adapter_failure_after_reserve_cancels_reservation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_adapter_failure_precedes_reservation_entirely() -> None:
+    # The corrected state machine (PORT-ADV-003 as amended) runs the
+    # adapter and every other fallible operation BEFORE reservation:
+    # an adapter failure therefore never creates a reservation to
+    # leak — nothing reserved, nothing published, pools untouched.
     core = _tiny_core()
     pools = _fresh_pools()
     before = _clone_pools(pools)
@@ -792,7 +839,7 @@ def test_adapter_failure_after_reserve_cancels_reservation(
     sink = _RecorderSink()
 
     def _bad_adapter(*_args: Any) -> Any:
-        raise RuntimeError("adapter blew up after reservation")
+        raise RuntimeError("adapter blew up")
 
     with pytest.raises(RuntimeError):
         _call(
@@ -801,7 +848,8 @@ def test_adapter_failure_after_reserve_cancels_reservation(
             carrier, plan, _bad_adapter, capture_sink=sink,
         )
     _assert_pools_equal(pools, before)
-    assert sink.cancels == 1
+    assert sink.plans == []
+    assert sink.cancels == 0
     assert sink.published == []
 
 
@@ -824,9 +872,12 @@ def test_no_capture_sink_stages_nothing() -> None:
 # ---- envelope validation --------------------------------------------------
 
 
-def test_bad_envelope_version_masks_the_row() -> None:
+def test_bad_envelope_on_a_fresh_row_scatters_nothing() -> None:
+    # PORT-ADV-004 as amended: a failed row — fresh initialization
+    # included — leaves EVERY resident page bit-identical. Sentinel
+    # pools prove the fresh init did not leak.
     core = _tiny_core()
-    pools = _fresh_pools()
+    pools = _sentinel_pools()
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
@@ -842,13 +893,7 @@ def test_bad_envelope_version_masks_the_row() -> None:
     )
     assert _decision(out) == [PARK_ID]
     assert int(status.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
-    # The fresh book init IS committed (metadata-driven), but no
-    # frontend/encoder/decode state advanced.
-    torch.testing.assert_close(
-        pools["frontend_counter_pool"][1],
-        before["frontend_counter_pool"][1],
-        rtol=0, atol=0,
-    )
+    _assert_pools_equal(pools, before)
 
 
 def test_regular_chunk_with_wrong_cadence_length_masks() -> None:
@@ -869,8 +914,47 @@ def test_regular_chunk_with_wrong_cadence_length_masks() -> None:
     assert int(status.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
 
 
-def test_out_of_dictionary_prompt_masks() -> None:
+def test_wrong_but_valid_prompt_masks_and_admission_conditions() -> None:
+    # PORT-LID-003 as amended: the envelope prompt is only a device
+    # cross-check. Row 0's carrier agrees with its admitted prompt (2)
+    # and computes; row 1's carrier stamps a DIFFERENT valid prompt
+    # (2) against admitted 1 — masked with PROMPT_MISMATCH, never a
+    # silently accepted substitute.
     core = _tiny_core()  # num_prompts == 4
+    pools = _fresh_pools(num_blocks=4)
+    torch.manual_seed(5)
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    ok_row = _envelope(
+        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
+    )
+    bad_row = _envelope(
+        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
+    )
+    plan = _plan(
+        prefills=[1, 2],
+        num_pool_blocks=4,
+        geometries=[GEOM_FINAL, GEOM_FINAL],
+        prompts=[2, 1],  # admitted authority per row
+    )
+    status = _StatusRecorder()
+    out = _call(
+        core, pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
+        torch.stack([ok_row, bad_row]), plan, status_sink=status,
+    )
+    decisions = _decision(out)
+    assert decisions[0] != PARK_ID  # admitted==stamped: computed
+    assert decisions[1] == PARK_ID  # valid-but-different: masked
+    assert int(status.staged[0][0]) == 0
+    assert (
+        int(status.staged[0][1]) & advance.ROW_STATUS_PROMPT_MISMATCH
+    )
+
+
+def test_out_of_dictionary_carrier_prompt_masks() -> None:
+    # A carrier prompt outside the dictionary disagrees with the
+    # (host-validated) admitted authority by construction.
+    core = _tiny_core()
     pools = _fresh_pools()
     torch.manual_seed(5)
     carrier = _envelope(
@@ -884,7 +968,221 @@ def test_out_of_dictionary_prompt_masks() -> None:
         carrier.unsqueeze(0), plan, status_sink=status,
     )
     assert _decision(out) == [PARK_ID]
-    assert int(status.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
+    assert (
+        int(status.staged[0][0]) & advance.ROW_STATUS_PROMPT_MISMATCH
+    )
+
+
+# ---- correction-pass hardening pins ---------------------------------------
+
+
+def test_second_bucket_failure_leaves_pools_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failure in bucket 2 AFTER bucket 1 computed is still a
+    # whole-call failure before any scatter: scratch-first means the
+    # first bucket's results never reached the pools.
+    real = advance.advance_session
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("second bucket exploded")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(advance, "advance_session", flaky)
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    reg = _envelope(
+        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        geometry=GEOM_REG,
+    )
+    fin = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    )
+    plan = _plan(
+        prefills=[1, 2], num_pool_blocks=4,
+        geometries=[GEOM_REG, GEOM_FINAL],
+    )
+    with pytest.raises(RuntimeError):
+        _call(
+            core, pools,
+            torch.tensor(
+                [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
+            ),
+            torch.stack([reg, fin]), plan,
+        )
+    assert calls["n"] == 2
+    _assert_pools_equal(pools, before)
+
+
+def test_status_reserve_failure_cancels_capture_reservation() -> None:
+    # The composite reservation: a status-sink reservation failure
+    # after a successful capture reservation cancels the capture
+    # reservation and fails pre-commit.
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
+    cap_sink = _RecorderSink()
+    bad_status = _StatusRecorder(fail_reserve=True)
+    with pytest.raises(RuntimeError):
+        _call(
+            core, pools,
+            torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+            carrier, plan,
+            capture_sink=cap_sink, status_sink=bad_status,
+        )
+    _assert_pools_equal(pools, before)
+    assert cap_sink.cancels == 1
+    assert cap_sink.published == []
+
+
+def test_status_ticket_is_request_aware_and_staged_once() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    plan = _plan(decodes=[1], generations=[9])
+    status = _StatusRecorder()
+    _call(
+        core, pools,
+        torch.tensor([3], dtype=torch.long),
+        torch.zeros(1, CARRIER_HIDDEN), plan,
+        status_sink=status,
+    )
+    assert status.reserved == [(("req-0",), (9,))]
+    assert len(status.staged) == 1
+
+
+@pytest.mark.parametrize(
+    "corruption", ["negative_head", "oversized_length", "bad_last_label"]
+)
+def test_corrupt_book_masks_safely(corruption: str) -> None:
+    # PORT-ADV-004 as amended: book-invariant violations are sanitized
+    # to safe substitutes (no gather fault, no embedding fault), the
+    # row masks with BOOK_INVARIANT, and its pages stay bit-identical.
+    core = _tiny_core()
+    pools = _fresh_pools()
+    book = pools["book_pool"]
+    if corruption == "negative_head":
+        _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+        book[1, _BOOK["queue_head"]] = -3
+        ids = [3]
+        chunk = [False]
+        embeds = torch.zeros(1, CARRIER_HIDDEN)
+    elif corruption == "oversized_length":
+        _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+        book[1, _BOOK["queue_length"]] = CAP + 10
+        ids = [3]
+        chunk = [False]
+        embeds = torch.zeros(1, CARRIER_HIDDEN)
+    else:  # bad_last_label on a CHUNK row: must not reach the embed
+        book[1, _BOOK["last_label"]] = 500  # >> vocab
+        ids = [PLACEHOLDER_ID]
+        chunk = [True]
+        torch.manual_seed(5)
+        embeds = _envelope(
+            torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0
+        ).unsqueeze(0)
+    before = _clone_pools(pools)
+    plan = _plan(decodes=[1], chunk=chunk)
+    status = _StatusRecorder()
+    out = _call(
+        core, pools,
+        torch.tensor(ids, dtype=torch.long), embeds, plan,
+        status_sink=status,
+    )
+    assert _decision(out) == [PARK_ID]
+    _assert_pools_equal(pools, before)
+    assert (
+        int(status.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    )
+
+
+def test_burst_overflow_is_rejected_not_truncated() -> None:
+    # A decode returning more labels than the queue holds is a port
+    # defect: the row masks with BURST_OVERFLOW and nothing scatters —
+    # the queue never sees a truncated burst.
+    def _overflowing_decode(
+        frames: Any, lengths: Any, predictor: Any, joint: Any, state: Any
+    ) -> Any:
+        b = frames.shape[0]
+        ids = torch.ones(b, CAP + 8, dtype=torch.int32)
+        lens = torch.full((b,), CAP + 1, dtype=torch.int32)
+        return ids, lens, state
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
+    status = _StatusRecorder()
+    out = _call(
+        core, pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        resolver=_fixed_resolver(_overflowing_decode),
+        status_sink=status,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert (
+        int(status.staged[0][0]) & advance.ROW_STATUS_BURST_OVERFLOW
+    )
+    torch.testing.assert_close(
+        pools["queue_pool"], before["queue_pool"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        pools["book_pool"], before["book_pool"], rtol=0, atol=0
+    )
+
+
+def test_publication_observes_commit_and_stage_first() -> None:
+    # Ordering proof: capture reserve → status reserve → (scatters) →
+    # stage → publish, and at publish time the resident book already
+    # holds the committed value.
+    core = _tiny_core()
+    pools = _fresh_pools()
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
+    shared: list[str] = []
+    cap_sink = _RecorderSink()
+    status = _StatusRecorder()
+    cap_sink.log = shared
+    status.log = shared
+    seen_at_publish: dict[str, int] = {}
+
+    def snapshot() -> None:
+        seen_at_publish["head"] = int(
+            pools["book_pool"][1, _BOOK["queue_head"]]
+        )
+
+    cap_sink.on_publish = snapshot
+    _call(
+        core, pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        capture_sink=cap_sink, status_sink=status,
+    )
+    assert shared == [
+        "reserve_capture", "reserve_status", "stage", "publish",
+    ]
+    # The CHUNK committed head=1 (first label emitted) BEFORE publish.
+    assert seen_at_publish["head"] == 1
 
 
 # ---- the MRV1 adapter as a pure tensor transform --------------------------

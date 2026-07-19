@@ -46,6 +46,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ENVELOPE_HEADER_SLOTS,
     ENVELOPE_VERSION,
     ROW_STATUS_ECHO_MISMATCH,
+    ROW_STATUS_PROMPT_MISMATCH,
     ROW_STATUS_QUEUE_NOT_DRAINED,
     AdvanceResult,
     CapturePlan,
@@ -303,12 +304,14 @@ def _plan(
     chunk: list[bool] | None = None,
     geometries: list[int] | None = None,
     generations: list[int] | None = None,
+    execution_tier: int = 0,
 ) -> RowPlan:
     """Build a RowPlan the way the plan provider would: decode indices
     as a ``(rows, K)`` tensor (real rows first, graph padding after),
-    prefill indices flat, freshness/liveness/roles/geometry from HOST
-    authority (scheduler metadata + the session registry) — CPU
-    tensors throughout (design §Phase-6c transaction seams)."""
+    prefill indices flat, freshness/liveness/roles/geometry/prompt/
+    identity from HOST authority (scheduler metadata + the session
+    registry) — CPU tensors throughout (design §Phase-6c transaction
+    seams)."""
     decodes = decodes or []
     prefills = prefills or []
     num_decodes = len(decodes)
@@ -323,9 +326,9 @@ def _plan(
         has_initial = [False] * len(prefills)
     if live is None:
         live = list(range(1, num_pool_blocks))
-    if prompts is None:
-        prompts = [0] * len(prefills)
     n_real = num_decodes + len(prefills)
+    if prompts is None:
+        prompts = [0] * n_real  # ADMITTED prompt authority, every row
     if chunk is None:
         # Default host roles: decode rows replay, prefill rows are
         # session-first CHUNKs.
@@ -347,6 +350,8 @@ def _plan(
         prompt_index=torch.tensor(prompts, dtype=torch.long),
         is_chunk=torch.tensor(chunk, dtype=torch.bool),
         admission_generation=torch.tensor(generations, dtype=torch.long),
+        request_ids=tuple(f"req-{i}" for i in range(n_real)),
+        execution_tier=execution_tier,
     )
 
 
@@ -436,14 +441,30 @@ class _RecorderSink:
         return _Reservation(self)
 
 
-class _StatusRecorder:
-    """Records each staged row-status tensor (must be exactly one)."""
-
-    def __init__(self) -> None:
-        self.staged: list[torch.Tensor] = []
+class _StatusTicket:
+    def __init__(self, sink: "_StatusRecorder") -> None:
+        self._sink = sink
 
     def stage(self, row_status: torch.Tensor) -> None:
-        self.staged.append(row_status.clone())
+        self._sink.staged.append(row_status.clone())
+
+
+class _StatusRecorder:
+    """Request-aware ticket sink: reserve pre-commit, stage no-fail
+    post-commit (exactly once)."""
+
+    def __init__(self, *, fail_reserve: bool = False) -> None:
+        self.reserved: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
+        self.staged: list[torch.Tensor] = []
+        self._fail = fail_reserve
+
+    def reserve(
+        self, request_ids: Any, generations: Any
+    ) -> _StatusTicket:
+        self.reserved.append((tuple(request_ids), tuple(generations)))
+        if self._fail:
+            raise RuntimeError("status sink at capacity")
+        return _StatusTicket(self)
 
 
 def _call(
@@ -1097,6 +1118,7 @@ def test_capture_publishes_prepared_records_after_commit() -> None:
     assert sink.plans[0].payload_bytes > 0
     assert len(sink.published) == 1 and len(sink.published[0]) == 1
     record = sink.published[0][0]
+    assert record.request_id == "req-0"
     assert record.block_id == 1
     assert int(record.mel_length) == FINAL_SAMPLES // 160
     assert record.frontend_mel.shape[0] == FEAT
@@ -1121,6 +1143,113 @@ def test_no_capture_sink_means_no_capture_work() -> None:
         capture_sink=None,
     )
     assert out.shape == (1, CARRIER_HIDDEN)
+
+
+# ---- correction-pass hardening pins (mirrored from the local twin) --------
+
+
+def test_second_bucket_failure_leaves_pools_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-STATE-008 / PORT-ADV-003 (as amended)
+    # A failure in bucket 2 AFTER bucket 1 computed is a whole-call
+    # failure before any scatter (scratch-first).
+    real = advance_mod.advance_session
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("second bucket exploded")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(advance_mod, "advance_session", flaky)
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    reg = _envelope(
+        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        geometry=GEOM_REG,
+    )
+    fin = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    )
+    plan = _plan(
+        prefills=[1, 2], num_pool_blocks=4,
+        geometries=[GEOM_REG, GEOM_FINAL],
+    )
+    with pytest.raises(RuntimeError):
+        _call(
+            core, pools,
+            torch.tensor(
+                [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
+            ),
+            torch.stack([reg, fin]), plan,
+        )
+    assert calls["n"] == 2
+    _assert_pools_equal(pools, before)
+
+
+def test_status_reserve_failure_cancels_capture_reservation() -> None:
+    # @spec PORT-ADV-003 / PORT-HOOK-001 (as amended): the composite
+    # reservation — a status reservation failure after a successful
+    # capture reservation cancels it and fails pre-commit.
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
+    cap_sink = _RecorderSink()
+    with pytest.raises(RuntimeError):
+        _call(
+            core, pools,
+            torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+            carrier, plan,
+            capture_sink=cap_sink,
+            status_sink=_StatusRecorder(fail_reserve=True),
+        )
+    _assert_pools_equal(pools, before)
+    assert cap_sink.cancels == 1
+    assert cap_sink.published == []
+
+
+def test_wrong_but_valid_prompt_masks_and_admission_conditions() -> None:
+    # @spec PORT-LID-003 (as amended): the envelope prompt is only a
+    # device cross-check; a valid-but-different stamped prompt masks
+    # the row instead of silently changing model output.
+    core = _tiny_core()  # num_prompts == 4
+    pools = _fresh_pools(num_blocks=4)
+    torch.manual_seed(5)
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    ok_row = _envelope(
+        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
+    )
+    bad_row = _envelope(
+        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
+    )
+    plan = _plan(
+        prefills=[1, 2],
+        num_pool_blocks=4,
+        geometries=[GEOM_FINAL, GEOM_FINAL],
+        prompts=[2, 1],  # admitted authority per row
+    )
+    status = _StatusRecorder()
+    out = _call(
+        core, pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
+        torch.stack([ok_row, bad_row]), plan, status_sink=status,
+    )
+    decisions = read_decision_carrier(out).tolist()
+    assert decisions[0] != PARK_ID
+    assert decisions[1] == PARK_ID
+    assert int(status.staged[0][0]) == 0
+    assert int(status.staged[0][1]) & ROW_STATUS_PROMPT_MISMATCH
 
 
 # ---- PORT-ADV-001 / MRV1 emission: burst-then-park ------------------------
