@@ -107,6 +107,10 @@ MODS = _load_chain()
 rnnt = MODS["rnnt"]
 manifests = MODS["manifests"]
 
+#: Artifact schema revision — bumped whenever report structure or
+#: semantics change; the generator admits known schemas only.
+PROBE_SCHEMA = "p6b-decode-profile-v3"
+
 #: Production decode dims (nemotron_asr.py NemotronASRCore defaults;
 #: vocab = num_asr_labels, blank = index vocab). Asserted against the
 #: model config below where that module is importable.
@@ -222,13 +226,19 @@ def _probe_revision() -> dict[str, Any]:
              "--exclude-standard"],
             capture_output=True, text=True, timeout=10,
         ).stdout.strip()
+        untracked_paths = (
+            untracked.splitlines() if untracked else []
+        )
         return {
             "fork_commit": rev,
             "dirty_tree": bool(tracked),
             "dirty_paths": tracked.splitlines()[:20],
-            "untracked_files": (
-                len(untracked.splitlines()) if untracked else 0
-            ),
+            # EVERY untracked path, so the artifact itself is
+            # auditable (a count alone cannot prove all of them were
+            # benign); the generator allowlists the narrow lock-file
+            # class and fails on anything else.
+            "untracked_files": len(untracked_paths),
+            "untracked_paths": untracked_paths[:200],
         }
     except Exception:
         return {"fork_commit": None, "dirty_tree": None}
@@ -704,9 +714,21 @@ def main() -> None:
                     flush=True,
                 )
 
+    lane_definitions = {
+        "fp32": "all decode modules fp32",
+        "bf16-joint": (
+            "joint BF16; predictor + recurrent state fp32 "
+            "(PORT-PREC-001/005 seam)"
+        ),
+    }
     report: dict[str, Any] = {
         "probe": "p6b_decode_profile",
         "fingerprint": {
+            "probe_schema": PROBE_SCHEMA,
+            "decode_algo_revision": rnnt.DECODE_ALGO_REVISION,
+            "lane_definitions_digest": manifests.manifest_hash(
+                {"lanes": lane_definitions}
+            ),
             "device": device,
             "device_name": (
                 torch.cuda.get_device_name(0)

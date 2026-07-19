@@ -80,13 +80,20 @@ def _cell(
 def _report(cells: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "probe": "p6b_decode_profile",
+        "execution_ok": True,
         "fingerprint": {
+            "probe_schema": "p6b-decode-profile-v3",
+            "decode_algo_revision": "decode-algo-v1",
+            "lane_definitions_digest": "sha256:lanes",
             "device_name": "NVIDIA L4",
             "driver": "580.126.20",
             "torch": "2.11.0+cu130",
+            "tf32_matmul": False,
             "model_shape_digest": "sha256:abc",
             "fork_commit": "deadbeef",
             "dirty_tree": False,
+            "config_asserted": True,
+            "untracked_paths": ["abc123model-download.lock"],
         },
         "dcp": {
             "version": "dcp-v1",
@@ -102,11 +109,6 @@ def _report(cells: list[dict[str, Any]]) -> dict[str, Any]:
                 "mismatch_cells": 0,
                 "performance_qualified": True,
                 "dispatch_eligible": True,
-            },
-            "bf16-joint": {
-                "mismatch_cells": 3,
-                "performance_qualified": False,
-                "dispatch_eligible": False,
             },
         },
         "generator_eligible_lanes": ["fp32"],
@@ -337,3 +339,147 @@ def test_generation_is_deterministic() -> None:
         copy.deepcopy(_two_tier_report())
     )
     assert a.entries == b.entries
+
+
+# ---- fail-closed admission (PR #96 review round) -----------------------------
+
+
+def test_execution_not_ok_is_rejected() -> None:
+    report = _two_tier_report()
+    report["execution_ok"] = False
+    with pytest.raises(ValueError, match="execution_ok"):
+        generate_dispatch_table(report)
+    del report["execution_ok"]
+    with pytest.raises(ValueError, match="execution_ok"):
+        generate_dispatch_table(report)
+
+
+def test_declared_lane_contradicting_lane_results_is_rejected() -> None:
+    report = _two_tier_report()
+    report["lane_results"]["fp32"]["dispatch_eligible"] = False
+    with pytest.raises(ValueError, match="disagrees"):
+        generate_dispatch_table(report)
+
+
+def test_dirty_tree_none_is_rejected() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["dirty_tree"] = None
+    with pytest.raises(ValueError, match="dirty"):
+        generate_dispatch_table(report)
+
+
+def test_unknown_dcp_version_is_rejected() -> None:
+    report = _two_tier_report()
+    report["dcp"]["version"] = "dcp-v999"
+    with pytest.raises(ValueError, match="dcp version"):
+        generate_dispatch_table(report)
+
+
+def test_unasserted_config_is_rejected() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["config_asserted"] = False
+    with pytest.raises(ValueError, match="config"):
+        generate_dispatch_table(report)
+
+
+def test_unknown_probe_schema_is_rejected() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["probe_schema"] = "p6b-decode-profile-v99"
+    with pytest.raises(ValueError, match="schema"):
+        generate_dispatch_table(report)
+
+
+def test_untracked_outside_lock_class_is_rejected() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["untracked_paths"] = [
+        "abc.lock", "sitecustomize.py",
+    ]
+    with pytest.raises(ValueError, match="untracked"):
+        generate_dispatch_table(report)
+    report["fingerprint"]["untracked_paths"] = None
+    with pytest.raises(ValueError, match="untracked"):
+        generate_dispatch_table(report)
+
+
+def test_unknown_arm_is_rejected() -> None:
+    report = _two_tier_report()
+    report["cells"][0]["arm"] = "dense-fused"
+    with pytest.raises(ValueError, match="unknown arm"):
+        generate_dispatch_table(report)
+
+
+def test_duplicate_cell_is_rejected() -> None:
+    report = _two_tier_report()
+    report["cells"].append(dict(report["cells"][0]))
+    with pytest.raises(ValueError, match="duplicate"):
+        generate_dispatch_table(report)
+
+
+def test_missing_dense_row_is_rejected_strict() -> None:
+    report = _two_tier_report()
+    report["cells"] = [
+        c for c in report["cells"]
+        if not (c["batch"] == 8 and c["arm"] == "dense-eager")
+    ]
+    with pytest.raises(ValueError, match="dense-eager"):
+        generate_dispatch_table(report)
+
+
+def test_non_finite_latency_is_rejected() -> None:
+    report = _two_tier_report()
+    report["cells"][0]["latency_us"] = float("nan")
+    with pytest.raises(ValueError, match="latency"):
+        generate_dispatch_table(report)
+
+
+def test_lane_results_mismatch_count_is_cross_checked() -> None:
+    report = _two_tier_report()
+    report["lane_results"]["fp32"]["mismatch_cells"] = 2
+    # Declared 2 mismatches but cells carry none — and eligibility
+    # derivation already refuses a lane with mismatches.
+    with pytest.raises(ValueError):
+        generate_dispatch_table(report)
+
+
+def test_analysis_mode_is_labeled_and_never_deployable() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["dirty_tree"] = True  # hygiene defect
+    table = generate_dispatch_table(report, admission="analysis")
+    assert table.analysis_only is True
+    with pytest.raises(FingerprintMismatchError, match="analysis"):
+        table.validate_runtime(
+            dict(table.fingerprint), performance_gated=True,
+        )
+    # Round trip preserves the label.
+    from_json = DispatchTable.from_json(table.to_json())
+    assert from_json.analysis_only is True
+
+
+def test_identity_covers_math_mode_lane_and_algorithm() -> None:
+    table = generate_dispatch_table(_two_tier_report())
+    for key, changed in (
+        ("tf32_matmul", True),
+        ("lane_definitions_digest", "sha256:other"),
+        ("decode_algo_revision", "decode-algo-v2"),
+        ("probe_schema", "p6b-decode-profile-v4"),
+    ):
+        runtime = dict(table.fingerprint)
+        runtime[key] = changed
+        assert key in table.validate_runtime(
+            runtime, performance_gated=False,
+        )
+        with pytest.raises(FingerprintMismatchError):
+            table.validate_runtime(runtime, performance_gated=True)
+
+
+def test_unmeasured_tier_fallback_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    table = generate_dispatch_table(_two_tier_report())
+    with caplog.at_level("WARNING"):
+        table.select(
+            "1120ms", 516, lane="fp32", graph_covers_decode=False,
+        )
+    assert any(
+        "unmeasured tier" in rec.message for rec in caplog.records
+    )

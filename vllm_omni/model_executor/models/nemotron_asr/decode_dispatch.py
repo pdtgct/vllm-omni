@@ -33,8 +33,13 @@ profile+geometry bucket at batch-composition time.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+import math
+import re
+from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 #: The recorded hysteresis margin (decisions/decode-dispatch-regime.md
 #: r3: chosen 2026-07-18, validated by independent profile runs before
@@ -43,10 +48,27 @@ HYSTERESIS_PCT = 25.0
 
 #: Arms whose valid path issues no host/device synchronization.
 SYNC_FREE_ARMS = ("dense-eager", "dense-graphed")
+_KNOWN_ARMS = frozenset(
+    ("dense-eager", "dense-graphed", "compact-eager")
+)
 
-#: Fingerprint keys a runtime must match for a table to be valid.
+#: Admission allowlists — strict generation fails closed on anything
+#: outside them.
+SUPPORTED_DCP_VERSIONS = ("dcp-v1",)
+SUPPORTED_PROBE_SCHEMAS = ("p6b-decode-profile-v3",)
+#: The one benign untracked class on a measurement checkout:
+#: root-level model-download lock files (round 7's audit).
+_UNTRACKED_ALLOWED = re.compile(r"^[^/]+\.lock$")
+
+#: Fingerprint keys a runtime must match for a table to be valid —
+#: the full normative identity: device, driver, torch, model shape,
+#: decode-algorithm revision (never the fork commit — an unrelated
+#: commit must not invalidate a table), probe schema, lane
+#: definitions, math mode, and the calibration-policy version.
 _FINGERPRINT_KEYS = (
     "device_name", "driver", "torch", "model_shape_digest",
+    "decode_algo_revision", "probe_schema",
+    "lane_definitions_digest", "tf32_matmul",
 )
 
 
@@ -70,6 +92,10 @@ class DispatchTable:
     hysteresis_pct: float
     policy_version: str
     lanes: tuple[str, ...]
+    #: True when generated under admission="analysis" (comparison and
+    #: review use only): such a table NEVER validates for a
+    #: performance-gated runtime.
+    analysis_only: bool = field(default=False)
 
     def select(
         self,
@@ -113,11 +139,24 @@ class DispatchTable:
         if low_arm != high_arm:
             # Crossover-gap rule: bracketing tiers disagree — take
             # the sync-free arm of the pair.
+            logger.warning(
+                "decode dispatch: unmeasured tier %d for %s/%s with "
+                "disagreeing brackets (%d=%s, %d=%s) — selecting the "
+                "sync-free arm",
+                batch, geometry, lane, lower, low_arm, upper,
+                high_arm,
+            )
             return (
                 low_arm if low_arm in SYNC_FREE_ARMS else high_arm
             )
         nearest = (
             lower if (batch - lower) <= (upper - batch) else upper
+        )
+        logger.warning(
+            "decode dispatch: unmeasured tier %d for %s/%s — "
+            "resolving to nearest measured tier %d (%s)",
+            batch, geometry, lane, nearest,
+            self.entries[(geometry, nearest, lane)],
         )
         return self.entries[(geometry, nearest, lane)]
 
@@ -137,6 +176,11 @@ class DispatchTable:
             FingerprintMismatchError: any mismatch while
                 ``performance_gated`` — the table fails closed.
         """
+        if self.analysis_only and performance_gated:
+            raise FingerprintMismatchError(
+                "analysis-only table (admission='analysis') can "
+                "never serve a performance-gated runtime"
+            )
         mismatched = [
             key
             for key in _FINGERPRINT_KEYS
@@ -165,6 +209,7 @@ class DispatchTable:
             "hysteresis_pct": self.hysteresis_pct,
             "policy_version": self.policy_version,
             "lanes": list(self.lanes),
+            "analysis_only": self.analysis_only,
         })
 
     @classmethod
@@ -180,6 +225,7 @@ class DispatchTable:
             hysteresis_pct=float(raw["hysteresis_pct"]),
             policy_version=raw["policy_version"],
             lanes=tuple(raw["lanes"]),
+            analysis_only=bool(raw.get("analysis_only", False)),
         )
 
 
@@ -187,23 +233,98 @@ def _latency(cell: dict[str, Any]) -> float:
     return float(cell["latency_us"])
 
 
+def _admit_strict(
+    report: dict[str, Any], fingerprint: dict[str, Any]
+) -> None:
+    """Fail-closed artifact admission: every gate must POSITIVELY
+    hold (absent or None never passes)."""
+    if report.get("execution_ok") is not True:
+        raise ValueError(
+            "artifact does not record execution_ok=True — the sweep "
+            "may not have completed"
+        )
+    if fingerprint.get("dirty_tree") is not False:
+        raise ValueError(
+            "artifact does not record a clean tree (dirty_tree must "
+            "be exactly False) — evidence identity is not "
+            "reproducible"
+        )
+    if fingerprint.get("config_asserted") is not True:
+        raise ValueError(
+            "artifact dims were not asserted against the model "
+            "config (config_asserted must be True)"
+        )
+    schema = fingerprint.get("probe_schema")
+    if schema not in SUPPORTED_PROBE_SCHEMAS:
+        raise ValueError(
+            f"unsupported probe schema {schema!r} "
+            f"(supported: {SUPPORTED_PROBE_SCHEMAS})"
+        )
+    untracked = fingerprint.get("untracked_paths")
+    if untracked is None:
+        raise ValueError(
+            "artifact records no untracked_paths — untracked state "
+            "is unauditable"
+        )
+    offending = [
+        p for p in untracked if not _UNTRACKED_ALLOWED.match(p)
+    ]
+    if offending:
+        raise ValueError(
+            "untracked files outside the allowlisted root lock-file "
+            f"class on the measurement checkout: {offending[:5]}"
+        )
+
+
+def _eligible_lanes(
+    report: dict[str, Any], *, strict: bool
+) -> tuple[str, ...]:
+    """Lanes are DERIVED from lane_results, never trusted from the
+    declared list; strict admission requires the two to agree."""
+    lane_results = report["lane_results"]
+    derived = tuple(sorted(
+        lane
+        for lane, res in lane_results.items()
+        if res.get("dispatch_eligible") is True
+        and res.get("performance_qualified") is True
+        and res.get("mismatch_cells") == 0
+    ))
+    declared = tuple(sorted(report["generator_eligible_lanes"]))
+    if strict and derived != declared:
+        raise ValueError(
+            f"generator_eligible_lanes {declared} disagrees with "
+            f"lane_results derivation {derived}"
+        )
+    return derived
+
+
 def generate_dispatch_table(
     report: dict[str, Any],
     *,
     hysteresis_pct: float = HYSTERESIS_PCT,
+    admission: str = "strict",
 ) -> DispatchTable:
     """Compute the dispatch table from a profile artifact.
 
     Args:
-        report: a ``p6b_decode_profile`` report (probe r6+ schema:
-            per-lane qualification and per-cell policy realization).
+        report: a ``p6b_decode_profile`` report (probe r8+ schema).
         hysteresis_pct: the recorded sync-free preference margin.
+        admission: ``"strict"`` (default) applies the fail-closed
+            gates; ``"analysis"`` bypasses ONLY the artifact-hygiene
+            gates for comparison/review work and marks the table
+            ``analysis_only`` — such a table never validates for a
+            performance-gated runtime.
 
     Raises:
-        ValueError: pre-lane-schema artifact (no ``lane_results`` /
-            ``generator_eligible_lanes``), a dirty-tree artifact, or
-            a missing dcp declaration — all fail generation outright.
+        ValueError: schema, hygiene, consistency, or structural
+            defects — generation fails closed on all of them.
     """
+    if admission not in ("strict", "analysis"):
+        raise ValueError(f"unknown admission mode {admission!r}")
+    strict = admission == "strict"
+    for required in ("fingerprint", "cells", "dcp"):
+        if required not in report:
+            raise ValueError(f"artifact missing {required!r}")
     if (
         "lane_results" not in report
         or "generator_eligible_lanes" not in report
@@ -214,38 +335,74 @@ def generate_dispatch_table(
             "not generator input"
         )
     fingerprint = dict(report["fingerprint"])
-    if fingerprint.get("dirty_tree"):
+    dcp = report["dcp"]
+    if dcp.get("version") not in SUPPORTED_DCP_VERSIONS:
         raise ValueError(
-            "artifact was produced from a dirty tree — evidence "
-            "identity is not reproducible"
+            f"unsupported dcp version {dcp.get('version')!r} "
+            f"(supported: {SUPPORTED_DCP_VERSIONS})"
         )
-    dcp = report.get("dcp")
-    if not dcp:
-        raise ValueError("artifact carries no dcp declaration")
+    if strict:
+        _admit_strict(report, fingerprint)
+    lanes = _eligible_lanes(report, strict=strict)
     selective_activities = tuple(dcp["selective_activities"])
-    lanes = tuple(report["generator_eligible_lanes"])
 
     by_key: dict[
         tuple[str, int, str], dict[str, dict[str, Any]]
     ] = {}
+    mismatch_recount: dict[str, int] = {}
+    seen: set[tuple[str, int, str, str, str]] = set()
     for cell in report["cells"]:
-        lane = cell["precision"]
+        lane = str(cell["precision"])
+        arm = str(cell["arm"])
+        if arm not in _KNOWN_ARMS:
+            raise ValueError(f"unknown arm {arm!r} in artifact")
+        latency = float(cell["latency_us"])
+        if not math.isfinite(latency) or latency <= 0.0:
+            raise ValueError(
+                f"non-finite/non-positive latency in cell "
+                f"{cell['geometry']}/{cell['batch']}/{lane}/{arm}"
+            )
+        if not cell.get("tokens_match", True):
+            mismatch_recount[lane] = (
+                mismatch_recount.get(lane, 0) + 1
+            )
+        ident = (
+            str(cell["geometry"]), int(cell["batch"]), lane, arm,
+            str(cell["activity"]),
+        )
+        if ident in seen:
+            raise ValueError(f"duplicate cell {ident}")
+        seen.add(ident)
         if lane not in lanes:
             continue
-        key = (cell["geometry"], int(cell["batch"]), lane)
+        key = (str(cell["geometry"]), int(cell["batch"]), lane)
         arms = by_key.setdefault(key, {})
-        arm = cell["arm"]
         if arm == "compact-eager":
             # Keep every activity row; selection reads dcp levels.
             arms[f"compact:{cell['activity']}"] = cell
         else:
             arms.setdefault(arm, cell)
+    if strict:
+        for lane, res in report["lane_results"].items():
+            if mismatch_recount.get(lane, 0) != res.get(
+                "mismatch_cells"
+            ):
+                raise ValueError(
+                    f"lane_results mismatch_cells for {lane!r} "
+                    f"({res.get('mismatch_cells')}) disagrees with "
+                    f"the cells ({mismatch_recount.get(lane, 0)})"
+                )
 
     entries: dict[tuple[str, int, str], str] = {}
     factor = 1.0 - hysteresis_pct / 100.0
     for key, arms in by_key.items():
         dense = arms.get("dense-eager")
         if dense is None:
+            if strict:
+                raise ValueError(
+                    f"measured group {key} has no dense-eager row — "
+                    "artifact is structurally incomplete"
+                )
             continue
         dense_lat = _latency(dense)
         compact_wins = True
@@ -269,4 +426,5 @@ def generate_dispatch_table(
         hysteresis_pct=hysteresis_pct,
         policy_version=str(dcp["version"]),
         lanes=lanes,
+        analysis_only=not strict,
     )

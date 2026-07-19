@@ -29,6 +29,11 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt_cell import (
 
 MAX_SYMBOLS_PER_STEP = 10
 
+#: Bumped whenever either decode candidate's ALGORITHM changes —
+#: dispatch tables bind to this, not to a fork commit (an unrelated
+#: commit must not invalidate a table; an algorithm change must).
+DECODE_ALGO_REVISION = "decode-algo-v1"
+
 
 @dataclass
 class DecodeState:
