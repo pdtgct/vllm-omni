@@ -27,9 +27,6 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 _DEFAULT_CHUNK_SAMPLES = 8960
 #: Minted carrier placeholder id fallback (config's audio_chunk_token_id).
 _DEFAULT_PLACEHOLDER_ID = 13089
-#: 8 mel frames * 160-sample hop: the shortest tail worth decoding.
-_MIN_TAIL_SAMPLES = 1280
-
 #: Geometry ids follow manifests.CADENCES order; the admitted geometry
 #: is derived from the session's chunk width — an unknown width fails
 #: closed (PORT-SESS-002: geometry is admission-selected, never
@@ -80,8 +77,8 @@ async def buffer_stream(
     park token id for chunk N appears on ``input_stream``
     (buffer-until-drained, PORT-SESS-001 — defense in depth over core's
     park-time queue consumption); applies the NeMo tail rules on
-    finalize (PORT-SESS-003: partial tails as-is, sub-8-mel-frame
-    remainders dropped, never zero-padded).
+    finalize (PORT-SESS-003: exactly one actual-residual final-tail,
+    including an explicit zero-sample transaction; never zero-padded).
     """
     chunk_samples = getattr(
         model_config, "nemotron_chunk_samples", _DEFAULT_CHUNK_SAMPLES
@@ -139,7 +136,10 @@ async def buffer_stream(
                 await hold_until_park()
             yield prompt(chunk, final_tail=False)
             yielded = True
-    if buffer.shape[0] >= _MIN_TAIL_SAMPLES:
-        if yielded:
-            await hold_until_park()
-        yield prompt(buffer, final_tail=True)
+    # Finalization is an explicit protocol transaction even when the
+    # residual is shorter than the frontend's minimum commit or is
+    # exactly zero. The frontend owns the zero-frame decision; the
+    # session transition still needs the final marker (PORT-SESS-003).
+    if yielded:
+        await hold_until_park()
+    yield prompt(buffer, final_tail=True)

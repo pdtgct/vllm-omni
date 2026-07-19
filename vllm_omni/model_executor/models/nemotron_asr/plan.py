@@ -27,10 +27,10 @@ Authority boundaries, stated exactly:
   against the plan authority by the transaction's row-status bits, so
   host/device drift masks rows instead of corrupting sessions.
 
-Registry prompt/expectation updates are deliberately OPTIMISTIC: a row
-that later fails on device terminates its session at the status
-readback, so host state that ran ahead of a failed commit only
-accelerates masking — it can never resurrect a dead session.
+Registry mutations are atomic per hook call. Prompt transitions remain
+provisional until the transaction's status is consumed at the normal
+scheduling boundary: a failed row clears the proposal and preserves
+the prior admitted prompt, while a clean row publishes it.
 
 Torch + stdlib only (CPU tensors): the whole module runs under the
 macOS loader chain and is differentially tested locally.
@@ -39,7 +39,7 @@ macOS loader chain and is differentially tested locally.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -104,6 +104,29 @@ class _Session:
     generation: int
     geometry_id: int
     prompt_index: int
+    pending_prompt_index: int | None = None
+
+
+def reject_unsupported_outer_graph_mode(compilation_config: object) -> None:
+    """Fail startup when the outer runner would capture full decode.
+
+    Phase 6c owns an eager transaction whose row plan and commit sink are
+    host-step state. Piecewise graphs may cover lower operators, but the
+    runner must not capture/replay the whole model ``forward`` until an
+    exact padded-plan and replay-safe handoff exist (PORT-ADV-003).
+    """
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if mode is None:
+        return
+    decode_mode = getattr(mode, "decode_mode", None)
+    runtime = decode_mode() if callable(decode_mode) else mode
+    name = getattr(runtime, "name", str(runtime)).upper()
+    if name == "FULL":
+        raise ValueError(
+            "Nemotron ASR rejects full CUDA graph decode until the runner "
+            "provides exact padded RowPlan and commit-handoff replay semantics; "
+            "use cudagraph_mode=NONE or PIECEWISE"
+        )
 
 
 def _header_int(header: tuple[float, ...], slot: int, name: str) -> int:
@@ -135,7 +158,7 @@ class SessionRegistry:
     def __len__(self) -> int:
         return len(self._sessions)
 
-    def prune(self, resident_request_ids: Sequence[str]) -> None:
+    def prune(self, resident_request_ids: Collection[str]) -> None:
         """Drop sessions whose request is no longer worker-resident."""
         keep = set(resident_request_ids)
         for req_id in [r for r in self._sessions if r not in keep]:
@@ -181,6 +204,27 @@ class SessionRegistry:
             self.validate_lease(bindings)
         except ValueError:
             return False
+        return True
+
+    def resolve_status(
+        self,
+        *,
+        request_id: str,
+        admission_generation: int,
+        clean: bool,
+    ) -> bool:
+        """Resolve one staged prompt proposal at status consumption.
+
+        Returns ``False`` for a stale request/generation report instead
+        of raising: this runs after resident commit at the scheduling
+        boundary, where ABA drift is a recorded fatal fact.
+        """
+        session = self._sessions.get(request_id)
+        if session is None or session.generation != admission_generation:
+            return False
+        if clean and session.pending_prompt_index is not None:
+            session.prompt_index = session.pending_prompt_index
+        session.pending_prompt_index = None
         return True
 
     def _parse_chunk_header(
@@ -240,6 +284,7 @@ class SessionRegistry:
         num_prompts: int,
         num_geometries: int,
         now_ns: int,
+        resident_request_ids: Sequence[str] | None = None,
     ) -> tuple[PreparedRowBinding, ...]:
         """Mint one binding per observed row, atomically per step.
 
@@ -252,6 +297,43 @@ class SessionRegistry:
         """
         if now_ns <= 0:
             raise ValueError("now_ns must be a positive monotonic stamp")
+        # Two-phase delta commit: validate the complete row set against
+        # a filtered registry view, staging only newly admitted sessions
+        # and prompt proposals. No resident map is cloned on the hot path.
+        keep = (
+            None
+            if resident_request_ids is None
+            else set(resident_request_ids)
+        )
+        if keep is not None:
+            missing = {
+                row.request_id for row in rows if row.request_id not in keep
+            }
+            if missing:
+                raise ValueError(
+                    "scheduled rows absent from worker-resident authority: "
+                    f"{sorted(missing)}"
+                )
+        new_sessions: dict[str, _Session] = {}
+        new_blocks: dict[int, str] = {}
+        prompt_updates: dict[str, int | None] = {}
+        staged_generation = self._generation
+
+        def visible_session(request_id: str) -> _Session | None:
+            if request_id in new_sessions:
+                return new_sessions[request_id]
+            if keep is not None and request_id not in keep:
+                return None
+            return self._sessions.get(request_id)
+
+        def visible_block_owner(block_id: int) -> str | None:
+            if block_id in new_blocks:
+                return new_blocks[block_id]
+            owner = self._blocks.get(block_id)
+            if owner is not None and (keep is None or owner in keep):
+                return owner
+            return None
+
         seen: set[str] = set()
         bindings: list[PreparedRowBinding] = []
         for row in rows:
@@ -267,7 +349,7 @@ class SessionRegistry:
                     f"non-CHUNK row {row.request_id!r} carries a "
                     "scheduled envelope"
                 )
-            session = self._sessions.get(row.request_id)
+            session = visible_session(row.request_id)
             if is_chunk and not row.has_prior_state:
                 if session is not None:
                     raise ValueError(
@@ -275,7 +357,7 @@ class SessionRegistry:
                         "still registered — resident sessions are never "
                         "recomputed (PORT-STATE-005)"
                     )
-                owner = self._blocks.get(row.block_id)
+                owner = visible_block_owner(row.block_id)
                 if owner is not None:
                     raise ValueError(
                         f"block {row.block_id} is already owned by "
@@ -286,15 +368,15 @@ class SessionRegistry:
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
                 )
-                self._generation += 1
+                staged_generation += 1
                 session = _Session(
                     block_id=row.block_id,
-                    generation=self._generation,
+                    generation=staged_generation,
                     geometry_id=geometry,
                     prompt_index=prompt,
                 )
-                self._sessions[row.request_id] = session
-                self._blocks[row.block_id] = row.request_id
+                new_sessions[row.request_id] = session
+                new_blocks[row.block_id] = row.request_id
                 bindings.append(
                     PreparedRowBinding(
                         request_id=row.request_id,
@@ -321,6 +403,11 @@ class SessionRegistry:
                     f"{session.block_id} to {row.block_id} — resident "
                     "state never migrates outside park serialization"
                 )
+            if session.pending_prompt_index is not None:
+                raise ValueError(
+                    f"request {row.request_id!r} has a prompt status "
+                    "pending from the previous CHUNK"
+                )
             if is_chunk:
                 _, prompt = self._parse_chunk_header(
                     row,
@@ -328,10 +415,11 @@ class SessionRegistry:
                     num_geometries=num_geometries,
                 )
                 prior = session.prompt_index
-                # Optimistic host update: the transaction commits the
-                # new prompt only for a clean row, and a failed row
-                # terminates the session at the status readback.
-                session.prompt_index = prompt
+                # Provisional only: resolve_status publishes it after a
+                # clean transaction status, or clears it on failure.
+                prompt_updates[row.request_id] = (
+                    prompt if prompt != prior else None
+                )
                 bindings.append(
                     PreparedRowBinding(
                         request_id=row.request_id,
@@ -359,6 +447,13 @@ class SessionRegistry:
                     ready_deadline_ns=0,
                 )
             )
+        if keep is not None:
+            self.prune(keep)
+        self._sessions.update(new_sessions)
+        self._blocks.update(new_blocks)
+        for request_id, pending_prompt in prompt_updates.items():
+            self._sessions[request_id].pending_prompt_index = pending_prompt
+        self._generation = staged_generation
         return tuple(bindings)
 
 
@@ -374,13 +469,13 @@ def prepare_plan_context(
     step: int,
 ) -> PlanContext:
     """One hook invocation: prune, mint bindings, build the columns."""
-    registry.prune(resident_request_ids)
     bindings = registry.bind_rows(
         rows,
         placeholder_id=placeholder_id,
         num_prompts=num_prompts,
         num_geometries=num_geometries,
         now_ns=now_ns,
+        resident_request_ids=resident_request_ids,
     )
     return PlanContext(
         step=step,

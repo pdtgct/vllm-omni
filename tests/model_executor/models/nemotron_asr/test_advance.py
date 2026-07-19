@@ -437,9 +437,9 @@ class _CommitTicket:
     def __init__(self, sink: "_CommitRecorder") -> None:
         self._sink = sink
 
-    def stage(self, row_status: torch.Tensor, records: Any) -> None:
+    def stage(self, row_status: torch.Tensor) -> None:
         self._sink.staged.append(row_status.clone())
-        candidates = list(records)
+        candidates = list(self._sink.plans[-1].records)
         self._sink.published.append([r for r in candidates if int(row_status[r.row]) == 0])
 
     def cancel(self) -> None:

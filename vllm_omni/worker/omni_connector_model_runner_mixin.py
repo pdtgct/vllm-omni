@@ -1526,8 +1526,20 @@ class OmniConnectorModelRunnerMixin:
         Full payloads remain owned by the Model Runner local cache for all
         paths.
         """
+        model_status: dict[str, int] = {}
+        model_failed_req_ids: set[str] = set()
+        collect_status = getattr(
+            getattr(self, "model", None),
+            "collect_commit_status",
+            None,
+        )
+        if callable(collect_status):
+            model_status, model_failed_req_ids = collect_status()
         if not hasattr(self, "_lock"):
-            return OmniConnectorOutput()
+            return OmniConnectorOutput(
+                model_status=model_status,
+                model_failed_req_ids=model_failed_req_ids,
+            )
 
         tp_group = self._get_local_tp_group()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
@@ -1576,6 +1588,8 @@ class OmniConnectorModelRunnerMixin:
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            model_status=model_status,
+            model_failed_req_ids=model_failed_req_ids,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1599,6 +1613,8 @@ class OmniConnectorModelRunnerMixin:
             or output.kv_sent_req_ids
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
+            or output.model_status
+            or output.model_failed_req_ids
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:

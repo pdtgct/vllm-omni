@@ -59,6 +59,30 @@ class OmniSchedulerMixin:
         """
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        failed_model_ids = (
+            set(getattr(connector_output, "model_failed_req_ids", set()))
+            if connector_output
+            else set()
+        )
+        requests = getattr(self, "requests", {})
+        present_failed_ids = {
+            request_id
+            for request_id in failed_model_ids
+            if request_id in requests
+        }
+        if present_failed_ids:
+            statuses = getattr(connector_output, "model_status", {})
+            logger.warning(
+                "Finishing %d request(s) after model transaction status: %s",
+                len(present_failed_ids),
+                {
+                    request_id: statuses.get(request_id)
+                    for request_id in sorted(present_failed_ids)
+                },
+            )
+            getattr(self, "finish_requests")(
+                present_failed_ids, RequestStatus.FINISHED_ERROR
+            )
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return

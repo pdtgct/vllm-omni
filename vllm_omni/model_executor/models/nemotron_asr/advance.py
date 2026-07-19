@@ -497,8 +497,8 @@ def make_table_resolver(
     into a dense lookup, with one aggregate log line per geometry
     instead of per-lookup warnings. The returned resolver then:
 
-    - forces ``dense-graphed`` whenever the invocation's engine graph
-      covers decode (compact is capture-ineligible by construction);
+    - fails closed whenever the outer invocation's engine graph covers
+      decode, until the runner provides exact padded row authority;
     - forces the sync-free eager arm whenever more than one decode
       bucket is ready in the iteration (the multi-bucket override),
       recording ``override_reason`` for telemetry;
@@ -576,10 +576,9 @@ def make_table_resolver(
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
-            return ResolvedDecode(
-                arm="dense-graphed",
-                decode_fn=arms["dense-graphed"],
-                override_reason="graph-covers-decode",
+            raise ValueError(
+                "graph-covered decode requires exact padded runner "
+                "authority; the Phase 6c resolver is eager-only"
             )
         batch = min(max(request.execution_batch_size, 1), max_batch)
         arm = compiled_t[request.geometry][batch]
@@ -640,11 +639,13 @@ class CommitPlan:
     revalidates/pins their registry lease through ``stage``/``cancel``;
     carrying only request ids and generations would not prevent row swaps.
     ``capture`` is ``None`` when capture is disabled, so the measured path
-    prepares no capture-only state.
+    prepares no capture-only state. Candidate records are frozen into this
+    PRE-COMMIT plan; ``stage`` therefore performs no container allocation.
     """
 
     bindings: tuple[PreparedRowBinding, ...]
     capture: CapturePlan | None
+    records: tuple[CaptureRecord, ...] = ()
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -667,11 +668,7 @@ class CommitReservation(Protocol):
     ``cancel`` is idempotent and releases the whole reservation.
     """
 
-    def stage(
-        self,
-        row_status: torch.Tensor,
-        records: Sequence[CaptureRecord],
-    ) -> None: ...
+    def stage(self, row_status: torch.Tensor) -> None: ...
 
     def cancel(self) -> None: ...
 
@@ -2577,14 +2574,16 @@ def advance_model_rows(
         capture_plan: CapturePlan | None = CapturePlan(rows=len(records), payload_bytes=payload_bytes)
     else:
         capture_plan = None
+    prepared_records = tuple(records)
     reservation: CommitReservation | None = None
     cancel_reservation: Callable[[], None] | None = None
-    stage_reservation: Callable[[torch.Tensor, Sequence[CaptureRecord]], None] | None = None
+    stage_reservation: Callable[[torch.Tensor], None] | None = None
     if commit_sink is not None:
         reservation = commit_sink.reserve(
             CommitPlan(
                 bindings=plan.bindings,
                 capture=capture_plan,
+                records=prepared_records,
             )
         )
         cancel_candidate = getattr(reservation, "cancel", None)
@@ -2611,5 +2610,5 @@ def advance_model_rows(
         raise
     # ---- ONE no-fail combined stage through the reserved ticket ----
     if stage_reservation is not None:
-        stage_reservation(status, records)
+        stage_reservation(status)
     return projection_rows

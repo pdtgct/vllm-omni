@@ -1268,6 +1268,22 @@ class TestRankAwareKVRouting(unittest.TestCase):
 
 
 class TestAttachOmniConnectorOutput(unittest.TestCase):
+    def test_get_output_drains_model_commit_status_without_connectors(self):
+        host = MixinHost()
+        calls = []
+        host.model = SimpleNamespace(
+            collect_commit_status=lambda: (
+                calls.append("collect") or {"bad": 512, "ok": 0},
+                {"bad"},
+            )
+        )
+
+        output = host.get_omni_connector_output()
+
+        self.assertEqual(calls, ["collect"])
+        self.assertEqual(output.model_status, {"bad": 512, "ok": 0})
+        self.assertEqual(output.model_failed_req_ids, {"bad"})
+
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
         from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
 

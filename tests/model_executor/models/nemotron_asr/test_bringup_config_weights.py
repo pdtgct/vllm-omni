@@ -70,13 +70,20 @@ def test_architecture_constant_and_model_type():
 
 def test_config_carries_the_bringup_fields():
     cfg = NemotronASRConfig(
-        vocab_size=13089, hidden_size=15488, eos_token_id=13087
+        vocab_size=13089,
+        hidden_size=15488,
+        eos_token_id=13087,
+        decode_dispatch_arm="dense-eager",
+        performance_gated=True,
     )
     assert cfg.model_type == MODEL_TYPE
     assert cfg.vocab_size == 13089
     assert cfg.hidden_size == 15488  # the mm-carrier width, not d_model
     assert cfg.d_model == 1024
     assert cfg.eos_token_id == 13087
+    assert cfg.decode_dispatch_arm == "dense-eager"
+    assert cfg.decode_dispatch_table is None
+    assert cfg.performance_gated is True
     assert cfg.torch_dtype in ("float32", torch.float32)
 
 
@@ -99,11 +106,30 @@ def test_config_roundtrips_through_from_dict():
     # to_dict both do) must not collide with an explicit arg. This is
     # exactly the AutoConfig.from_pretrained path for a real
     # checkpoint's config.json.
-    d = NemotronASRConfig(vocab_size=13090, eos_token_id=13088).to_dict()
+    d = NemotronASRConfig(
+        vocab_size=13090,
+        eos_token_id=13088,
+        decode_dispatch_table="decode-dispatch.json",
+        performance_gated=True,
+    ).to_dict()
     assert d["architectures"] == [ARCHITECTURE]
     rebuilt = NemotronASRConfig.from_dict(d)
     assert rebuilt.vocab_size == 13090
     assert rebuilt.architectures == [ARCHITECTURE]
+    assert rebuilt.decode_dispatch_arm is None
+    assert rebuilt.decode_dispatch_table == "decode-dispatch.json"
+    assert rebuilt.performance_gated is True
+
+
+def test_declared_dense_graphed_arm_is_not_an_eager_binding():
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        build_decode_resolver,
+    )
+
+    with pytest.raises(ValueError, match="unknown decode_dispatch_arm"):
+        build_decode_resolver(
+            NemotronASRConfig(decode_dispatch_arm="dense-graphed")
+        )
 
 
 def test_num_asr_labels_survives_construction():
@@ -231,6 +257,7 @@ def _duck_vllm_config(cfg: NemotronASRConfig) -> SimpleNamespace:
         model_config=SimpleNamespace(hf_config=cfg, dtype=torch.float32),
         compilation_config=SimpleNamespace(static_forward_context={}),
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
     )
 
 
@@ -239,7 +266,9 @@ def test_init_sets_num_logits_from_config_vocab_size():
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig(vocab_size=13089)
+    cfg = NemotronASRConfig(
+        vocab_size=13089, decode_dispatch_arm="dense-eager"
+    )
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     assert model.num_logits == 13089
 
@@ -249,7 +278,7 @@ def test_init_registers_all_state_pages():
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig()
+    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
     ctx: dict = {}
     vc = _duck_vllm_config(cfg)
     vc.compilation_config.static_forward_context = ctx
@@ -264,7 +293,7 @@ def test_load_weights_missing_prompt_kernel_is_fatal():
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig()
+    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     weights_without_lid = [
         (n, t)
@@ -280,7 +309,7 @@ def test_load_weights_rejects_unexpected_name():
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig()
+    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     with pytest.raises((ValueError, KeyError)):
         model.load_weights(iter([("not.a.real.tensor", torch.zeros(4))]))

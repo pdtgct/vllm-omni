@@ -332,8 +332,8 @@ class _CommitTicket:
     def __init__(self, sink: _CommitRecorder) -> None:
         self._sink = sink
 
-    def stage(self, row_status: torch.Tensor, records: Any) -> None:
-        candidates = list(records)
+    def stage(self, row_status: torch.Tensor) -> None:
+        candidates = list(self._sink.plans[-1].records)
         self._sink.staged.append(row_status.clone())
         self._sink.records.append(candidates)
         self._sink.published.append([r for r in candidates if int(row_status[r.row]) == 0])
@@ -1186,7 +1186,7 @@ def test_ticket_methods_are_bound_exactly_once_before_commit() -> None:
         def stage(self) -> Any:
             self.stage_lookups += 1
 
-            def bound(_status: torch.Tensor, _records: Any) -> None:
+            def bound(_status: torch.Tensor) -> None:
                 self.stages += 1
 
             return bound
@@ -2922,18 +2922,17 @@ def test_table_resolver_bracket_disagreement_takes_sync_free() -> None:
     assert got.arm == "dense-eager"
 
 
-def test_table_resolver_graph_coverage_forces_dense_graphed() -> None:
+def test_table_resolver_graph_coverage_fails_closed() -> None:
     resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
-    got = resolver(
-        advance.DecodeRequest(
-            geometry=0,
-            execution_batch_size=512,
-            graph_covers_decode=True,
-            ready_decode_buckets=1,
+    with pytest.raises(ValueError, match="exact padded runner"):
+        resolver(
+            advance.DecodeRequest(
+                geometry=0,
+                execution_batch_size=512,
+                graph_covers_decode=True,
+                ready_decode_buckets=1,
+            )
         )
-    )
-    assert got.arm == "dense-graphed"
-    assert got.override_reason == "graph-covers-decode"
 
 
 def test_table_resolver_multi_bucket_forces_sync_free() -> None:

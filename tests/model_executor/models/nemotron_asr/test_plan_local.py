@@ -172,6 +172,61 @@ def test_duplicate_request_in_one_step_rejected() -> None:
         _bind(registry, [_row("a", 3), _row("a", 3)])
 
 
+def test_bind_rows_is_atomic_when_a_later_row_is_invalid() -> None:
+    registry = plan_mod.SessionRegistry()
+    with pytest.raises(ValueError, match="already owned"):
+        _bind(
+            registry,
+            [
+                _row("a", 3, chunk=True, prior=False),
+                _row("b", 3, chunk=True, prior=False),
+            ],
+        )
+    assert len(registry) == 0
+    assert registry.live_block_ids() == []
+    [binding] = _bind(
+        registry, [_row("c", 4, chunk=True, prior=False)]
+    )
+    assert binding.admission_generation == 1
+
+
+def test_prepare_context_rolls_back_prune_when_binding_fails() -> None:
+    registry = plan_mod.SessionRegistry()
+    _bind(registry, [_row("a", 3, chunk=True, prior=False)])
+    _bind(registry, [_row("b", 4, chunk=True, prior=False)])
+    with pytest.raises(ValueError, match="already owned"):
+        plan_mod.prepare_plan_context(
+            registry,
+            [
+                _row("c", 5, chunk=True, prior=False),
+                _row("d", 5, chunk=True, prior=False),
+            ],
+            resident_request_ids=["a", "c", "d"],
+            placeholder_id=PLACEHOLDER_ID,
+            num_prompts=NUM_PROMPTS,
+            num_geometries=NUM_GEOMETRIES,
+            now_ns=NOW_NS,
+            step=2,
+        )
+    assert registry.live_block_ids() == [3, 4]
+
+
+def test_prepare_context_rejects_rows_missing_from_resident_authority() -> None:
+    registry = plan_mod.SessionRegistry()
+    with pytest.raises(ValueError, match="absent from worker-resident"):
+        plan_mod.prepare_plan_context(
+            registry,
+            [_row("a", 3, chunk=True, prior=False)],
+            resident_request_ids=[],
+            placeholder_id=PLACEHOLDER_ID,
+            num_prompts=NUM_PROMPTS,
+            num_geometries=NUM_GEOMETRIES,
+            now_ns=NOW_NS,
+            step=1,
+        )
+    assert len(registry) == 0
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -215,6 +270,13 @@ def test_prompt_transition_flags_exactly_on_change() -> None:
     assert changed.allow_prompt_transition
     assert changed.prior_prompt_index == 0
     assert changed.prompt_index == 2
+    with pytest.raises(ValueError, match="status.*pending"):
+        _bind(registry, [_row("a", 3)])
+    registry.resolve_status(
+        request_id="a",
+        admission_generation=changed.admission_generation,
+        clean=True,
+    )
     # REPLAY continuation carries the persisted (new) prompt, never a
     # retroactive selection, and can never authorize a transition.
     [replay] = _bind(registry, [_row("a", 3)])
@@ -222,6 +284,50 @@ def test_prompt_transition_flags_exactly_on_change() -> None:
     assert not replay.allow_prompt_transition
     assert replay.prompt_index == 2 and replay.prior_prompt_index == 2
     assert replay.ready_deadline_ns == 0
+
+
+def test_failed_prompt_transition_preserves_prior_prompt() -> None:
+    registry = plan_mod.SessionRegistry()
+    _bind(registry, [_row("a", 3, chunk=True, prior=False)])
+    [changed] = _bind(
+        registry,
+        [_row("a", 3, chunk=True, header=_header(prompt=2, seq=1))],
+    )
+    registry.resolve_status(
+        request_id="a",
+        admission_generation=changed.admission_generation,
+        clean=False,
+    )
+    [replay] = _bind(registry, [_row("a", 3)])
+    assert replay.prompt_index == 0
+    assert replay.prior_prompt_index == 0
+
+
+def test_outer_full_decode_graph_mode_is_rejected() -> None:
+    class _RuntimeMode:
+        name = "FULL"
+
+    class _ConfiguredMode:
+        def decode_mode(self) -> _RuntimeMode:
+            return _RuntimeMode()
+
+    with pytest.raises(ValueError, match="full CUDA graph"):
+        plan_mod.reject_unsupported_outer_graph_mode(
+            type("Compilation", (), {"cudagraph_mode": _ConfiguredMode()})()
+        )
+
+
+def test_outer_none_and_piecewise_graph_modes_are_accepted() -> None:
+    for name in ("NONE", "PIECEWISE"):
+        runtime = type("Runtime", (), {"name": name})()
+        configured = type(
+            "Configured",
+            (),
+            {"decode_mode": lambda self, value=runtime: value},
+        )()
+        plan_mod.reject_unsupported_outer_graph_mode(
+            type("Compilation", (), {"cudagraph_mode": configured})()
+        )
 
 
 def test_prune_releases_sessions_and_blocks() -> None:
@@ -363,7 +469,7 @@ def test_sink_reserve_stage_collect_roundtrip() -> None:
     registry, sink, commit_plan = _sink_and_plan()
     ticket = sink.reserve(commit_plan)
     status = torch.tensor([0], dtype=torch.int32)
-    ticket.stage(status, [])
+    ticket.stage(status)
     reports, committed, lease_ok = sink.collect()
     assert [r.request_id for r in reports] == ["a"]
     assert reports[0].row_status == 0
@@ -384,26 +490,31 @@ def test_sink_exposes_only_status_clean_records() -> None:
         registry, max_rows=4, max_capture_rows=4,
         max_capture_bytes=1 << 20,
     )
+    records = [
+        _record("a", 3, 1, row=0),
+        _record("b", 4, 2, row=1),
+    ]
     commit_plan = advance.CommitPlan(
         bindings=tuple(bindings),
-        capture=advance.CapturePlan(rows=2, payload_bytes=64),
+        capture=advance.CapturePlan(
+            rows=2, payload_bytes=_payload_bytes(records)
+        ),
+        records=tuple(records),
     )
-    records = [
-        _record("a", 3, 1),
-        _record("b", 4, 2),
-    ]
     ticket = sink.reserve(commit_plan)
-    ticket.stage(torch.tensor([512, 0], dtype=torch.int32), records)
+    ticket.stage(torch.tensor([512, 0], dtype=torch.int32))
     reports, committed, lease_ok = sink.collect()
     assert [r.row_status for r in reports] == [512, 0]
     assert [r.request_id for r in committed] == ["b"]
     assert lease_ok
 
 
-def _record(req: str, block: int, generation: int) -> Any:
+def _record(
+    req: str, block: int, generation: int, *, row: int = 0
+) -> Any:
     scalar = torch.zeros((), dtype=torch.int64)
     return advance.CaptureRecord(
-        row=0,
+        row=row,
         request_id=req,
         block_id=block,
         admission_generation=generation,
@@ -416,6 +527,23 @@ def _record(req: str, block: int, generation: int) -> Any:
         encoder_raw=torch.zeros(1, 2),
         encoder_conditioned=torch.zeros(1, 2),
         encoder_length=scalar,
+    )
+
+
+def _payload_bytes(records: list[Any]) -> int:
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for record in records
+        for tensor in (
+            record.chunk_sequence,
+            record.prompt_index,
+            record.row_status,
+            record.frontend_mel,
+            record.mel_length,
+            record.encoder_raw,
+            record.encoder_conditioned,
+            record.encoder_length,
+        )
     )
 
 
@@ -459,13 +587,37 @@ def test_sink_reserve_validates_lease_and_bounds() -> None:
         )
 
 
+def test_sink_reserve_rejects_capture_identity_drift() -> None:
+    registry = plan_mod.SessionRegistry()
+    [binding] = _bind(
+        registry, [_row("a", 3, chunk=True, prior=False)]
+    )
+    sink = commit_sink_mod.BoundedCommitSink(
+        registry,
+        max_rows=2,
+        max_capture_rows=2,
+        max_capture_bytes=1 << 20,
+    )
+    bad = _record("other", 3, binding.admission_generation)
+    with pytest.raises(ValueError, match="capture record identity"):
+        sink.reserve(
+            advance.CommitPlan(
+                bindings=(binding,),
+                capture=advance.CapturePlan(
+                    rows=1, payload_bytes=_payload_bytes([bad])
+                ),
+                records=(bad,),
+            )
+        )
+
+
 def test_sink_stage_records_lease_break_without_raising() -> None:
     # Nothing may fail after resident state committed: a lease broken
     # between reserve and stage is RECORDED, never raised.
     registry, sink, commit_plan = _sink_and_plan()
     ticket = sink.reserve(commit_plan)
     registry.prune([])  # simulate a lease break inside the window
-    ticket.stage(torch.tensor([0], dtype=torch.int32), [])
+    ticket.stage(torch.tensor([0], dtype=torch.int32))
     _, _, lease_ok = sink.collect()
     assert not lease_ok
 
@@ -475,3 +627,41 @@ def test_sink_collect_without_stage_raises() -> None:
     sink.reserve(commit_plan)
     with pytest.raises(ValueError, match="no staged commit"):
         sink.collect()
+
+
+def test_geometry_only_status_preserves_session_and_prompt() -> None:
+    registry = plan_mod.SessionRegistry()
+    _bind(registry, [_row("a", 3, chunk=True, prior=False)])
+    [changed] = _bind(
+        registry,
+        [_row("a", 3, chunk=True, header=_header(prompt=2, seq=1))],
+    )
+    sink = commit_sink_mod.BoundedCommitSink(registry, max_rows=2)
+    ticket = sink.reserve(
+        advance.CommitPlan(bindings=(changed,), capture=None)
+    )
+    ticket.stage(torch.tensor([1], dtype=torch.int32))
+    reports, _, lease_ok = sink.collect()
+
+    statuses, failed = commit_sink_mod.resolve_status_reports(
+        registry, reports, lease_ok=lease_ok
+    )
+
+    assert statuses == {"a": 1}
+    assert failed == set()
+    [replay] = _bind(registry, [_row("a", 3)])
+    assert replay.prompt_index == 0
+
+
+def test_nonrecoverable_status_is_terminal() -> None:
+    registry, sink, commit_plan = _sink_and_plan()
+    ticket = sink.reserve(commit_plan)
+    ticket.stage(torch.tensor([512], dtype=torch.int32))
+    reports, _, lease_ok = sink.collect()
+
+    statuses, failed = commit_sink_mod.resolve_status_reports(
+        registry, reports, lease_ok=lease_ok
+    )
+
+    assert statuses == {"a": 512}
+    assert failed == {"a"}

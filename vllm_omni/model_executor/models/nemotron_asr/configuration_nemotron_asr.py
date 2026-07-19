@@ -80,6 +80,13 @@ class NemotronASRConfig(PretrainedConfig):
         self.num_asr_labels = num_asr_labels
         self.hidden_size = hidden_size
         self.audio_chunk_token_id = audio_chunk_token_id
+        # Startup decode policy is part of the served artifact, not a
+        # process-local default. Preserve all three fields through HF
+        # serialization so build_decode_resolver sees the declaration
+        # authored by the publisher (PORT-WGT-004 / PORT-DEC-008).
+        self.decode_dispatch_arm = decode_dispatch_arm
+        self.decode_dispatch_table = decode_dispatch_table
+        self.performance_gated = performance_gated
         self.d_model = d_model
         self.conv_kernel = conv_kernel
         self.att_context_left = att_context_left

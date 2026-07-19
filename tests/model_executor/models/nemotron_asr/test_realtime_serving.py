@@ -14,18 +14,52 @@ allocator halves live in test_omni_serving_binding.py (pod tier).
 """
 
 import asyncio
+import importlib.util
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
-    verify_replay_echo,
-    write_decision_carrier,
+_PKG = (
+    Path(__file__).resolve().parents[4]
+    / "vllm_omni/model_executor/models/nemotron_asr"
 )
-from vllm_omni.model_executor.models.nemotron_asr.streaming import (
-    buffer_stream,
-)
+_BASE = "vllm_omni.model_executor.models.nemotron_asr"
+
+
+def _load_chain() -> dict[str, Any]:
+    for name in (
+        "vllm_omni",
+        "vllm_omni.model_executor",
+        "vllm_omni.model_executor.models",
+        _BASE,
+    ):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    loaded: dict[str, Any] = {}
+    for mod in (
+        "precision", "masks", "featurizer", "encoder", "lid",
+        "manifests", "frontend", "rnnt_cell", "rnnt", "streaming",
+    ):
+        spec = importlib.util.spec_from_file_location(
+            f"{_BASE}.{mod}", _PKG / f"{mod}.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[f"{_BASE}.{mod}"] = module
+        spec.loader.exec_module(module)
+        loaded[mod] = module
+    return loaded
+
+
+_MODULES = _load_chain()
+verify_replay_echo = _MODULES["rnnt"].verify_replay_echo
+write_decision_carrier = _MODULES["rnnt"].write_decision_carrier
+buffer_stream = _MODULES["streaming"].buffer_stream
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,9 +67,12 @@ PARK_ID = 13089  # placeholder eos in these tests; real value from config
 
 
 def _run(coro):
-    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        coro
-    )
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
 
 
 async def _collect_yields(chunks_of_samples, park_after_each=True):
@@ -69,25 +106,44 @@ async def _collect_yields(chunks_of_samples, park_after_each=True):
 
 def test_one_yield_per_chunk_at_the_admitted_config():
     # 560 ms chunks at 16 kHz = 8960 samples per chunk: feeding exactly
-    # three chunks' worth of audio yields exactly three prompts —
-    # never a fourth from padding (PORT-SESS-003's never-zero-pad).
+    # three chunks' worth of audio yields three cadence CHUNKs plus the
+    # explicit zero-sample final-tail transaction (PORT-SESS-003).
     yields = _run(_collect_yields([8960, 8960, 8960]))
-    assert len(yields) == 3
+    assert len(yields) == 4
+    tail = yields[-1]["multi_modal_data"]["audio"]
+    assert tail[1] == 0
+    assert tail[3] == 1
+    assert tail[5] == 3
 
 
 def test_ragged_appends_rechunk_to_the_admitted_size():
     # The wire cadence is the client's; the yield cadence is the
-    # admitted chunk's. 2 × 13440 samples = exactly 3 × 8960.
+    # admitted chunk's. 2 × 13440 samples = 3 × 8960 plus the explicit
+    # zero-sample final-tail transaction.
     yields = _run(_collect_yields([13440, 13440]))
-    assert len(yields) == 3
+    assert len(yields) == 4
 
 
 def test_subchunk_tail_is_processed_as_is_never_padded():
     # Finalize with a 4480-sample residual (half a chunk): the tail
-    # yields as-is (partial tails processed, PORT-SESS-003); a
-    # sub-8-mel-frame remainder (under 1280 samples) is dropped.
+    # yields as-is. Even a sub-8-mel-frame residual is represented by
+    # an explicit final-tail transaction; the frontend may commit zero
+    # frames while finalization still advances atomically.
     assert len(_run(_collect_yields([8960, 4480]))) == 2
-    assert len(_run(_collect_yields([8960, 1279]))) == 1
+    yields = _run(_collect_yields([8960, 1279]))
+    assert len(yields) == 2
+    tail = yields[-1]["multi_modal_data"]["audio"]
+    assert tail[1] == 1279
+    assert tail[3] == 1
+
+
+def test_zero_audio_still_emits_one_final_tail_transaction():
+    yields = _run(_collect_yields([]))
+    assert len(yields) == 1
+    envelope = yields[0]["multi_modal_data"]["audio"]
+    assert envelope[1] == 0
+    assert envelope[3] == 1
+    assert envelope.shape[0] == 6
 
 
 def test_next_chunk_holds_until_park_echo():

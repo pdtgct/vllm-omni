@@ -28,6 +28,9 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     CommitPlan,
     PreparedRowBinding,
 )
+from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+    ROW_STATUS_GEOMETRY,
+)
 from vllm_omni.model_executor.models.nemotron_asr.plan import (
     SessionRegistry,
 )
@@ -42,6 +45,35 @@ class SessionStatusReport:
     row_status: int
 
 
+def resolve_status_reports(
+    registry: SessionRegistry,
+    reports: Sequence[SessionStatusReport],
+    *,
+    lease_ok: bool,
+) -> tuple[dict[str, int], set[str]]:
+    """Resolve registry proposals and classify terminal sessions.
+
+    A geometry-only mismatch is the PORT-SESS-002 recoverable tier.
+    Every other nonzero status, or any request/generation lease drift,
+    is terminal and must reach the scheduler.
+    """
+    statuses: dict[str, int] = {}
+    failed: set[str] = set()
+    for report in reports:
+        status = report.row_status if lease_ok else -1
+        current = registry.resolve_status(
+            request_id=report.request_id,
+            admission_generation=report.admission_generation,
+            clean=status == 0,
+        )
+        if not current:
+            status = -1
+        statuses[report.request_id] = status
+        if status not in (0, ROW_STATUS_GEOMETRY):
+            failed.add(report.request_id)
+    return statuses, failed
+
+
 class CommitTicket:
     """One reserved composite status/capture slot (CommitReservation).
 
@@ -49,8 +81,8 @@ class CommitTicket:
     the device status into the sink's preallocated host slot
     (non-blocking), records the completion event, revalidates the
     registry lease as a RECORDED FACT (never a raise — nothing may
-    fail after resident state committed), and stores the prepared
-    candidate records. ``cancel`` is idempotent.
+    fail after resident state committed). Candidate records were
+    frozen into the pre-commit plan. ``cancel`` is idempotent.
     """
 
     def __init__(self, sink: BoundedCommitSink, plan: CommitPlan) -> None:
@@ -58,15 +90,11 @@ class CommitTicket:
         self._plan = plan
         self._done = False
 
-    def stage(
-        self,
-        row_status: torch.Tensor,
-        records: Sequence[CaptureRecord],
-    ) -> None:
+    def stage(self, row_status: torch.Tensor) -> None:
         if self._done:
             return
         self._done = True
-        self._sink._stage(self._plan, row_status, list(records))
+        self._sink._stage(self._plan, row_status)
 
     def cancel(self) -> None:
         if self._done:
@@ -109,7 +137,7 @@ class BoundedCommitSink:
         )
         self._reserved: CommitPlan | None = None
         self._staged: CommitPlan | None = None
-        self._staged_records: list[CaptureRecord] = []
+        self._staged_records: tuple[CaptureRecord, ...] = ()
         self._staged_lease_ok = False
 
     def reserve(self, plan: CommitPlan) -> CommitTicket:
@@ -139,6 +167,54 @@ class BoundedCommitSink:
                     f"{plan.capture.payload_bytes} capture bytes exceed "
                     f"the sink bound {self._max_capture_bytes}"
                 )
+            if plan.capture.rows != len(plan.records):
+                raise ValueError(
+                    "capture plan row count does not match its frozen "
+                    "candidate records"
+                )
+        elif plan.records:
+            raise ValueError(
+                "capture-disabled commit plan carries candidate records"
+            )
+        prior_row = -1
+        for record in plan.records:
+            if not isinstance(record, CaptureRecord):
+                raise ValueError("commit plan capture records are malformed")
+            if record.row <= prior_row or not 0 <= record.row < rows:
+                raise ValueError(
+                    "capture records must have unique increasing plan rows"
+                )
+            binding = plan.bindings[record.row]
+            if (
+                record.request_id != binding.request_id
+                or record.block_id != binding.block_id
+                or record.admission_generation
+                != binding.admission_generation
+                or record.geometry != binding.geometry_id
+            ):
+                raise ValueError(
+                    "capture record identity disagrees with its prepared binding"
+                )
+            prior_row = record.row
+        if plan.capture is not None:
+            actual_payload_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for record in plan.records
+                for tensor in (
+                    record.chunk_sequence,
+                    record.prompt_index,
+                    record.row_status,
+                    record.frontend_mel,
+                    record.mel_length,
+                    record.encoder_raw,
+                    record.encoder_conditioned,
+                    record.encoder_length,
+                )
+            )
+            if plan.capture.payload_bytes != actual_payload_bytes:
+                raise ValueError(
+                    "capture plan payload bytes do not match its frozen records"
+                )
         # Pin the lease: every binding must be CURRENT in the registry.
         self._registry.validate_lease(plan.bindings)
         self._reserved = plan
@@ -148,7 +224,6 @@ class BoundedCommitSink:
         self,
         plan: CommitPlan,
         row_status: torch.Tensor,
-        records: list[CaptureRecord],
     ) -> None:
         rows = len(plan.bindings)
         self._status_host[:rows].copy_(row_status, non_blocking=True)
@@ -159,14 +234,14 @@ class BoundedCommitSink:
         self._staged_lease_ok = self._registry.lease_is_current(
             plan.bindings
         )
-        self._staged_records = records
+        self._staged_records = plan.records
         self._staged = plan
         self._reserved = None
 
     def _release(self) -> None:
         self._reserved = None
         self._staged = None
-        self._staged_records = []
+        self._staged_records = ()
         self._staged_lease_ok = False
 
     @property

@@ -88,8 +88,14 @@ def publish(
     *,
     tokenizer_dir: Path | None,
     reference_vocab_size: int | None,
+    decode_dispatch_arm: str,
 ) -> dict:
     """Convert + author + write the served checkpoint. Returns the config."""
+    if decode_dispatch_arm not in {"dense-eager", "compact-eager"}:
+        raise ValueError(
+            "decode_dispatch_arm must name a currently executable eager "
+            "arm; dense-graphed is not a graph binding"
+        )
     raw = load_file(str(nemo_state))
     converted, report = convert_state_dict(raw, NEMO_RULES)
 
@@ -112,6 +118,8 @@ def publish(
         hidden_size=cfg_dict["hidden_size"],
         eos_token_id=cfg_dict["eos_token_id"],
         audio_chunk_token_id=cfg_dict["audio_chunk_token_id"],
+        decode_dispatch_arm=decode_dispatch_arm,
+        performance_gated=False,
     )
 
     # Author and validate EVERYTHING before touching the filesystem
@@ -156,6 +164,7 @@ def publish(
         "audio_chunk_token_id": cfg_dict["audio_chunk_token_id"],
         "hidden_size": cfg_dict["hidden_size"],
         "architectures": cfg_dict["architectures"],
+        "decode_dispatch_arm": decode_dispatch_arm,
         "tensors_consumed": len(report.consumed),
         "out_dir": str(out_dir),
         "checkpoint_profile_id": profile["id"],
@@ -188,12 +197,19 @@ def main() -> None:
         help="cross-check against .nemo meta.json / model card; "
         "hard-fails on disagreement with the derived V.",
     )
+    ap.add_argument(
+        "--decode-dispatch-arm",
+        choices=("dense-eager", "compact-eager"),
+        required=True,
+        help="explicit executable bring-up arm authored into config.json",
+    )
     args = ap.parse_args()
     summary = publish(
         args.nemo_state,
         args.out,
         tokenizer_dir=args.tokenizer_dir,
         reference_vocab_size=args.reference_vocab_size,
+        decode_dispatch_arm=args.decode_dispatch_arm,
     )
     print(json.dumps(summary, indent=2))
 

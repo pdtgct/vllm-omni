@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
+    resolve_status_reports,
 )
 from vllm_omni.model_executor.models.nemotron_asr.convert import (
     LID_REQUIRED_PATTERN,
@@ -61,6 +62,7 @@ from vllm_omni.model_executor.models.nemotron_asr.plan import (
     PlanContextSlot,
     SessionRegistry,
     prepare_plan_context,
+    reject_unsupported_outer_graph_mode,
 )
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
@@ -303,12 +305,12 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
 
     The SERVED config must declare exactly one of:
 
-    - ``decode_dispatch_arm``: an explicitly configured arm for the
-      bring-up/correctness lane. The resolver still enforces the two
-      unconditional safety overrides (graph coverage forces
-      ``dense-graphed``; more than one ready decode bucket forces the
-      sync-free eager arm) — a declared arm is a preference, never a
-      license to serialize a busy multi-bucket engine.
+    - ``decode_dispatch_arm``: an explicitly configured eager arm for
+      the bring-up/correctness lane. More than one ready decode bucket
+      still forces the sync-free eager arm — a declared arm is a
+      preference, never a license to serialize a busy engine. A
+      ``dense-graphed`` declaration is rejected until an actual graph
+      binding exists.
     - ``decode_dispatch_table``: a measured, validated table artifact.
       Loading it requires the runtime-fingerprint tooling owned by the
       deferred A100 work packet; until that lands this path fails
@@ -344,7 +346,6 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
         )
     arms = {
         "dense-eager": decode_dense_masked,
-        "dense-graphed": decode_dense_masked,
         "compact-eager": decode_compact_active,
     }
     if arm not in arms:
@@ -355,10 +356,9 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
-            return ResolvedDecode(
-                arm="dense-graphed",
-                decode_fn=arms["dense-graphed"],
-                override_reason="graph-covers-decode",
+            raise ValueError(
+                "graph-covered decode requires an exact padded runner "
+                "binding; Phase 6c is eager-only"
             )
         if (
             request.ready_decode_buckets > 1
@@ -420,6 +420,10 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         """
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
+        reject_unsupported_outer_graph_mode(
+            getattr(vllm_config, "compilation_config", None)
+        )
+        decode_resolver = build_decode_resolver(hf_config)
         self.config = hf_config
         # The engine samples over the full logit width (labels + minted
         # park/placeholder specials); the core decodes over V labels.
@@ -479,7 +483,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
-        self._decode_resolver = build_decode_resolver(hf_config)
+        self._decode_resolver = decode_resolver
         self._max_num_seqs = int(
             vllm_config.scheduler_config.max_num_seqs
         )
@@ -646,6 +650,11 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         """
         import time
 
+        if self._commit_sink is not None and self._commit_sink.has_staged:
+            raise RuntimeError(
+                "previous model transaction status was not consumed at "
+                "the runner output boundary"
+            )
         rows: list[ObservedRow] = []
         for i, req_id in enumerate(req_ids):
             if int(num_scheduled_tokens[i]) != 1:
@@ -769,6 +778,24 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 device=device,
             )
         return self._commit_sink
+
+    def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+        """Drain one staged transaction at the scheduling boundary.
+
+        This is the sole legal host synchronization for row status. It
+        resolves provisional registry prompt state by request/generation,
+        returns every observed status for diagnostics, and separately
+        identifies sessions the scheduler must finish. A geometry-only
+        carrier mismatch is recoverable (PORT-SESS-002); every other bit
+        and any lease/ABA mismatch is terminal.
+        """
+        sink = self._commit_sink
+        if sink is None or not sink.has_staged:
+            return {}, set()
+        reports, _records, lease_ok = sink.collect()
+        return resolve_status_reports(
+            self._registry, reports, lease_ok=lease_ok
+        )
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         """Envelope pass-through → one carrier row per chunk (Task 5).
