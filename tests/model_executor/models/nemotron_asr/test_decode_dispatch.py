@@ -666,6 +666,72 @@ def test_from_json_fails_closed() -> None:
         DispatchTable.from_json(_json.dumps(broken))
 
 
+def test_validation_reports_admitted_at_primary_level() -> None:
+    # A strict table may not launder its validation through
+    # analysis-mode admission: an execution_ok=False or dirty-tree
+    # "validation run" must reject, not count.
+    report = _two_tier_report()
+    bad = _validation_copy(report)
+    bad["execution_ok"] = False
+    with pytest.raises(ValueError, match="execution_ok"):
+        generate_dispatch_table(
+            report, validation_reports=[bad],
+        )
+    bad = _validation_copy(report)
+    bad["fingerprint"]["dirty_tree"] = True
+    with pytest.raises(ValueError, match="dirty"):
+        generate_dispatch_table(
+            report, validation_reports=[bad],
+        )
+
+
+def test_loader_enforces_qualified_hysteresis() -> None:
+    import json as _json
+
+    report = _two_tier_report()
+    table = generate_dispatch_table(
+        report, validation_reports=[_validation_copy(report)],
+    )
+    edited = _json.loads(table.to_json())
+    edited["hysteresis_pct"] = 5.0
+    with pytest.raises(ValueError, match="qualified"):
+        DispatchTable.from_json(_json.dumps(edited))
+    # Analysis tables may carry exploratory margins and still load —
+    # they can never deploy anyway.
+    analysis = generate_dispatch_table(
+        _two_tier_report(), hysteresis_pct=5.0,
+        admission="analysis",
+    )
+    loaded = DispatchTable.from_json(analysis.to_json())
+    assert loaded.analysis_only
+
+
+def test_performance_gate_enforces_qualified_hysteresis() -> None:
+    # Defense in depth: a programmatically constructed table with an
+    # unqualified margin never passes the gate, even without a
+    # from_json round trip.
+    report = _two_tier_report()
+    table = generate_dispatch_table(
+        report, validation_reports=[_validation_copy(report)],
+    )
+    tampered = DispatchTable(
+        entries=table.entries,
+        fingerprint=table.fingerprint,
+        hysteresis_pct=5.0,
+        policy_version=table.policy_version,
+        lanes=table.lanes,
+        analysis_only=False,
+        validation_runs=table.validation_runs,
+        cross_run_forced=table.cross_run_forced,
+        source_report_digest=table.source_report_digest,
+        validation_report_digests=table.validation_report_digests,
+    )
+    with pytest.raises(FingerprintMismatchError, match="qualified"):
+        tampered.validate_runtime(
+            dict(table.fingerprint), performance_gated=True,
+        )
+
+
 def test_untracked_count_mismatch_is_rejected() -> None:
     report = _two_tier_report()
     report["fingerprint"]["untracked_files"] = 3

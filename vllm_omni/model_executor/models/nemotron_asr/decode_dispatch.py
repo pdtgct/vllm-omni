@@ -234,6 +234,16 @@ class DispatchTable:
                 "comparable independent run(s) with bound report "
                 f"digests (this table: {self.validation_runs})"
             )
+        if performance_gated and (
+            self.hysteresis_pct
+            != QUALIFIED_HYSTERESIS.get(self.policy_version)
+        ):
+            # Defense in depth for programmatically constructed
+            # tables that never round-tripped through from_json.
+            raise FingerprintMismatchError(
+                f"hysteresis {self.hysteresis_pct}% is not the "
+                f"qualified margin for {self.policy_version}"
+            )
         mismatched = [
             key
             for key in _FINGERPRINT_KEYS
@@ -304,6 +314,15 @@ class DispatchTable:
             raise ValueError(
                 f"unsupported policy_version "
                 f"{raw['policy_version']!r}"
+            )
+        if not raw["analysis_only"] and float(
+            raw["hysteresis_pct"]
+        ) != QUALIFIED_HYSTERESIS[raw["policy_version"]]:
+            raise ValueError(
+                f"deployable table carries hysteresis "
+                f"{raw['hysteresis_pct']}%, not the qualified "
+                f"margin for {raw['policy_version']} — an edited "
+                "table cannot load"
             )
         for key_id in _FINGERPRINT_KEYS:
             if key_id not in raw["fingerprint"]:
@@ -603,10 +622,15 @@ def generate_dispatch_table(
                     "validation reports must be UNIQUE independent "
                     "runs (duplicate digest)"
                 )
+            # Validation reports are admitted at the SAME level as
+            # the primary: a strict table may not launder its
+            # validation through analysis-mode admission (an
+            # execution_ok=False or dirty-tree "validation run"
+            # would count otherwise).
             other = generate_dispatch_table(
                 other_report,
                 hysteresis_pct=hysteresis_pct,
-                admission="analysis",
+                admission=admission,
             )
             # Comparability: the full identity projection AND the
             # policy contents must match — counting an incomparable
