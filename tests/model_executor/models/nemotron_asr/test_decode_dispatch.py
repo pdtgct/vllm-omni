@@ -93,6 +93,7 @@ def _report(cells: list[dict[str, Any]]) -> dict[str, Any]:
             "fork_commit": "deadbeef",
             "dirty_tree": False,
             "config_asserted": True,
+            "untracked_files": 1,
             "untracked_paths": ["abc123model-download.lock"],
         },
         "dcp": {
@@ -495,16 +496,165 @@ def test_cross_run_disagreement_forces_sync_free() -> None:
     assert loaded.cross_run_forced == table.cross_run_forced
 
 
+def _validation_copy(report: dict[str, Any]) -> dict[str, Any]:
+    """A comparable-but-distinct independent run: identical identity
+    and selections, one latency perturbed inside its margin."""
+    other = copy.deepcopy(report)
+    other["cells"][0]["latency_us"] += 1.0
+    return other
+
+
 def test_cross_run_agreement_changes_nothing() -> None:
     report = _two_tier_report()
     table = generate_dispatch_table(
         report,
-        validation_reports=[copy.deepcopy(report)],
+        validation_reports=[_validation_copy(report)],
     )
     unvalidated = generate_dispatch_table(_two_tier_report())
     assert table.entries == unvalidated.entries
     assert table.validation_runs == 1
     assert table.cross_run_forced == ()
+    assert len(table.validation_report_digests) == 1
+    assert (
+        table.source_report_digest
+        not in table.validation_report_digests
+    )
+
+
+# ---- cross-run gate + loader hardening (PR #96 round 2) ----------------------
+
+
+def test_performance_gate_requires_validation() -> None:
+    # A strict-but-unvalidated table never serves a performance-gated
+    # runtime; a validated one does.
+    table = generate_dispatch_table(_two_tier_report())
+    with pytest.raises(FingerprintMismatchError, match="validat"):
+        table.validate_runtime(
+            dict(table.fingerprint), performance_gated=True,
+        )
+    report = _two_tier_report()
+    validated = generate_dispatch_table(
+        report, validation_reports=[_validation_copy(report)],
+    )
+    assert validated.validate_runtime(
+        dict(validated.fingerprint), performance_gated=True,
+    ) == []
+
+
+def test_duplicate_validation_report_is_rejected() -> None:
+    report = _two_tier_report()
+    with pytest.raises(ValueError, match="UNIQUE"):
+        generate_dispatch_table(
+            report, validation_reports=[copy.deepcopy(report)],
+        )
+    other = _validation_copy(report)
+    with pytest.raises(ValueError, match="UNIQUE"):
+        generate_dispatch_table(
+            report,
+            validation_reports=[other, copy.deepcopy(other)],
+        )
+
+
+def test_incomparable_validation_report_is_rejected() -> None:
+    report = _two_tier_report()
+    empty: dict[str, Any] = {}
+    with pytest.raises(ValueError):
+        generate_dispatch_table(
+            report, validation_reports=[empty],
+        )
+    relabeled = _validation_copy(report)
+    relabeled["fingerprint"]["device_name"] = (
+        "NVIDIA A100 80GB PCIe"
+    )
+    with pytest.raises(ValueError, match="not comparable"):
+        generate_dispatch_table(
+            report, validation_reports=[relabeled],
+        )
+    other_algo = _validation_copy(report)
+    other_algo["fingerprint"]["decode_algo_revision"] = (
+        "decode-algo-v2"
+    )
+    with pytest.raises(ValueError, match="not comparable"):
+        generate_dispatch_table(
+            report, validation_reports=[other_algo],
+        )
+
+
+def test_validation_key_coverage_must_match() -> None:
+    report = _two_tier_report()
+    partial = _validation_copy(report)
+    partial["cells"] = [
+        c for c in partial["cells"] if c["batch"] != 1024
+    ]
+    with pytest.raises(ValueError, match="key set"):
+        generate_dispatch_table(
+            report, validation_reports=[partial],
+        )
+
+
+def test_mutated_dcp_contents_are_rejected() -> None:
+    report = _two_tier_report()
+    report["dcp"]["selective_activities"] = ()
+    with pytest.raises(ValueError, match="canonical"):
+        generate_dispatch_table(report)
+
+
+def test_unqualified_hysteresis_is_rejected_strict() -> None:
+    with pytest.raises(ValueError, match="qualified"):
+        generate_dispatch_table(
+            _two_tier_report(), hysteresis_pct=5.0,
+        )
+    # Analysis mode may explore other margins.
+    table = generate_dispatch_table(
+        _two_tier_report(), hysteresis_pct=5.0,
+        admission="analysis",
+    )
+    assert table.analysis_only
+
+
+def test_from_json_fails_closed() -> None:
+    import json as _json
+
+    table = generate_dispatch_table(_two_tier_report())
+    raw = _json.loads(table.to_json())
+    # Missing qualification field.
+    broken = dict(raw)
+    del broken["analysis_only"]
+    with pytest.raises(ValueError, match="missing"):
+        DispatchTable.from_json(_json.dumps(broken))
+    # Unsupported schema.
+    broken = dict(raw)
+    broken["schema"] = "nemotron-dispatch-table-v1"
+    with pytest.raises(ValueError, match="schema"):
+        DispatchTable.from_json(_json.dumps(broken))
+    # Unsupported policy version.
+    broken = dict(raw)
+    broken["policy_version"] = "dcp-v999"
+    with pytest.raises(ValueError, match="policy_version"):
+        DispatchTable.from_json(_json.dumps(broken))
+    # Unknown arm.
+    broken = _json.loads(table.to_json())
+    key = next(iter(broken["entries"]))
+    broken["entries"][key] = "dense-fused"
+    with pytest.raises(ValueError, match="unknown arm"):
+        DispatchTable.from_json(_json.dumps(broken))
+    # Inconsistent validation metadata.
+    broken = _json.loads(table.to_json())
+    broken["validation_runs"] = 2
+    with pytest.raises(ValueError, match="disagrees"):
+        DispatchTable.from_json(_json.dumps(broken))
+    # Fingerprint missing an identity key.
+    broken = _json.loads(table.to_json())
+    del broken["fingerprint"]["tf32_matmul"]
+    with pytest.raises(ValueError, match="identity"):
+        DispatchTable.from_json(_json.dumps(broken))
+
+
+def test_untracked_count_mismatch_is_rejected() -> None:
+    report = _two_tier_report()
+    report["fingerprint"]["untracked_files"] = 3
+    with pytest.raises(ValueError, match="count disagrees"):
+        generate_dispatch_table(report)
 
 
 def test_unmeasured_tier_fallback_warns(

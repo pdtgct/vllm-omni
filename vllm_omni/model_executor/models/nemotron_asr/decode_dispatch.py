@@ -32,6 +32,7 @@ profile+geometry bucket at batch-composition time.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -56,6 +57,29 @@ _KNOWN_ARMS = frozenset(
 #: outside them.
 SUPPORTED_DCP_VERSIONS = ("dcp-v1",)
 SUPPORTED_PROBE_SCHEMAS = ("p6b-decode-profile-v3",)
+#: Serialized-table schema; loading fails closed on anything else.
+TABLE_SCHEMA = "nemotron-dispatch-table-v2"
+#: The canonical CONTENTS each policy version binds — a mutated
+#: declaration under a known version name is rejected (the version
+#: string alone binds nothing).
+CANONICAL_DCP: dict[str, dict[str, Any]] = {
+    "dcp-v1": {
+        "version": "dcp-v1",
+        "targets": {"silence": 0.3, "speech": 3.0},
+        "tolerance": {
+            "silence": [0.0, 1.0], "speech": [1.5, 4.5],
+        },
+        "selective_activities": ["silence", "speech"],
+    },
+}
+#: The qualified hysteresis per policy version
+#: (decisions/decode-dispatch-regime.md r3) — strict generation
+#: accepts no other value.
+QUALIFIED_HYSTERESIS: dict[str, float] = {"dcp-v1": 25.0}
+#: Minimum comparable independent runs a table must carry to serve a
+#: performance-gated runtime (the record's "validated by an
+#: independent profile run").
+MIN_VALIDATION_RUNS = 1
 #: The one benign untracked class on a measurement checkout:
 #: root-level model-download lock files (round 7's audit).
 _UNTRACKED_ALLOWED = re.compile(r"^[^/]+\.lock$")
@@ -97,10 +121,14 @@ class DispatchTable:
     #: performance-gated runtime.
     analysis_only: bool = field(default=False)
     #: Independent runs whose tables were compared during generation
-    #: (0 = unvalidated) and the entries cross-run disagreement forced
-    #: to the sync-free arm.
+    #: (0 = unvalidated — such a table never serves a
+    #: performance-gated runtime) and the entries cross-run
+    #: disagreement forced to the sync-free arm.
     validation_runs: int = field(default=0)
     cross_run_forced: tuple[str, ...] = field(default=())
+    #: Canonical digests binding the table to its exact inputs.
+    source_report_digest: str = field(default="")
+    validation_report_digests: tuple[str, ...] = field(default=())
 
     def select(
         self,
@@ -186,6 +214,18 @@ class DispatchTable:
                 "analysis-only table (admission='analysis') can "
                 "never serve a performance-gated runtime"
             )
+        if performance_gated and (
+            self.validation_runs < MIN_VALIDATION_RUNS
+            or len(self.validation_report_digests)
+            != self.validation_runs
+            or not self.source_report_digest
+        ):
+            raise FingerprintMismatchError(
+                "performance-gated deployment requires a table "
+                f"cross-validated by >= {MIN_VALIDATION_RUNS} "
+                "comparable independent run(s) with bound report "
+                f"digests (this table: {self.validation_runs})"
+            )
         mismatched = [
             key
             for key in _FINGERPRINT_KEYS
@@ -206,6 +246,7 @@ class DispatchTable:
     def to_json(self) -> str:
         """Serialize (entry keys flatten to 'geometry|tier|lane')."""
         return json.dumps({
+            "schema": TABLE_SCHEMA,
             "entries": {
                 f"{g}|{t}|{lane}": arm
                 for (g, t, lane), arm in sorted(self.entries.items())
@@ -217,31 +258,126 @@ class DispatchTable:
             "analysis_only": self.analysis_only,
             "validation_runs": self.validation_runs,
             "cross_run_forced": list(self.cross_run_forced),
+            "source_report_digest": self.source_report_digest,
+            "validation_report_digests": list(
+                self.validation_report_digests
+            ),
         })
 
     @classmethod
     def from_json(cls, blob: str) -> DispatchTable:
+        """Load a serialized table, FAIL-CLOSED: every qualification
+        field must be explicitly present and internally consistent —
+        a legacy or hand-edited table never becomes deployable by
+        defaulting.
+
+        Raises:
+            ValueError: unsupported schema, missing fields, unknown
+                arms/policy, or inconsistent validation metadata.
+        """
         raw = json.loads(blob)
+        if raw.get("schema") != TABLE_SCHEMA:
+            raise ValueError(
+                f"unsupported table schema {raw.get('schema')!r} "
+                f"(expected {TABLE_SCHEMA!r})"
+            )
+        required = (
+            "entries", "fingerprint", "hysteresis_pct",
+            "policy_version", "lanes", "analysis_only",
+            "validation_runs", "cross_run_forced",
+            "source_report_digest", "validation_report_digests",
+        )
+        missing = [k for k in required if k not in raw]
+        if missing:
+            raise ValueError(
+                f"table is missing required fields: {missing}"
+            )
+        if raw["policy_version"] not in SUPPORTED_DCP_VERSIONS:
+            raise ValueError(
+                f"unsupported policy_version "
+                f"{raw['policy_version']!r}"
+            )
+        for key_id in _FINGERPRINT_KEYS:
+            if key_id not in raw["fingerprint"]:
+                raise ValueError(
+                    f"table fingerprint missing identity key "
+                    f"{key_id!r}"
+                )
+        if len(raw["validation_report_digests"]) != int(
+            raw["validation_runs"]
+        ):
+            raise ValueError(
+                "validation_report_digests count disagrees with "
+                "validation_runs"
+            )
         entries: dict[tuple[str, int, str], str] = {}
         for key, arm in raw["entries"].items():
+            if arm not in _KNOWN_ARMS:
+                raise ValueError(f"unknown arm {arm!r} in table")
             geometry, tier, lane = key.split("|")
             entries[(geometry, int(tier), lane)] = arm
+        if not raw["lanes"]:
+            raise ValueError("table declares no lanes")
         return cls(
             entries=entries,
             fingerprint=raw["fingerprint"],
             hysteresis_pct=float(raw["hysteresis_pct"]),
             policy_version=raw["policy_version"],
             lanes=tuple(raw["lanes"]),
-            analysis_only=bool(raw.get("analysis_only", False)),
-            validation_runs=int(raw.get("validation_runs", 0)),
-            cross_run_forced=tuple(
-                raw.get("cross_run_forced", ())
+            analysis_only=bool(raw["analysis_only"]),
+            validation_runs=int(raw["validation_runs"]),
+            cross_run_forced=tuple(raw["cross_run_forced"]),
+            source_report_digest=str(raw["source_report_digest"]),
+            validation_report_digests=tuple(
+                raw["validation_report_digests"]
             ),
         )
 
 
 def _latency(cell: dict[str, Any]) -> float:
     return float(cell["latency_us"])
+
+
+def _report_digest(report: dict[str, Any]) -> str:
+    """Canonical sha256 of a whole report (tuples serialize as
+    lists, so in-memory and JSON-loaded forms digest identically)."""
+    blob = json.dumps(
+        report, sort_keys=True, separators=(",", ":")
+    )
+    return "sha256:" + hashlib.sha256(
+        blob.encode("utf-8")
+    ).hexdigest()
+
+
+def _dcp_canonical(dcp: dict[str, Any]) -> str:
+    """The policy declaration minus prose, canonically serialized."""
+    return json.dumps(
+        {
+            k: v for k, v in dcp.items() if k != "fallback_rule"
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _admit_dcp(dcp: dict[str, Any]) -> str:
+    """The version string binds its canonical CONTENTS, not just its
+    name — a mutated declaration under a known version rejects."""
+    version = dcp.get("version")
+    if version not in SUPPORTED_DCP_VERSIONS:
+        raise ValueError(
+            f"unsupported dcp version {version!r} "
+            f"(supported: {SUPPORTED_DCP_VERSIONS})"
+        )
+    if _dcp_canonical(dcp) != _dcp_canonical(
+        CANONICAL_DCP[version]
+    ):
+        raise ValueError(
+            f"dcp declaration does not match the canonical "
+            f"{version} contents — a mutated policy under a known "
+            "version name is rejected"
+        )
+    return str(version)
 
 
 def _admit_strict(
@@ -276,6 +412,11 @@ def _admit_strict(
         raise ValueError(
             "artifact records no untracked_paths — untracked state "
             "is unauditable"
+        )
+    if fingerprint.get("untracked_files") != len(untracked):
+        raise ValueError(
+            "untracked_files count disagrees with untracked_paths — "
+            "the inventory may be truncated and cannot be audited"
         )
     offending = [
         p for p in untracked if not _UNTRACKED_ALLOWED.match(p)
@@ -355,13 +496,15 @@ def generate_dispatch_table(
         )
     fingerprint = dict(report["fingerprint"])
     dcp = report["dcp"]
-    if dcp.get("version") not in SUPPORTED_DCP_VERSIONS:
-        raise ValueError(
-            f"unsupported dcp version {dcp.get('version')!r} "
-            f"(supported: {SUPPORTED_DCP_VERSIONS})"
-        )
+    dcp_version = _admit_dcp(dcp)
     if strict:
         _admit_strict(report, fingerprint)
+        qualified = QUALIFIED_HYSTERESIS[dcp_version]
+        if hysteresis_pct != qualified:
+            raise ValueError(
+                f"hysteresis {hysteresis_pct}% is not the qualified "
+                f"margin for {dcp_version} ({qualified}%)"
+            )
     lanes = _eligible_lanes(report, strict=strict)
     selective_activities = tuple(dcp["selective_activities"])
 
@@ -439,19 +582,54 @@ def generate_dispatch_table(
             "compact-eager" if compact_wins else "dense-eager"
         )
 
+    source_digest = _report_digest(report)
     forced: list[str] = []
-    n_validation = 0
+    validation_digests: list[str] = []
     if validation_reports:
-        n_validation = len(validation_reports)
         for other_report in validation_reports:
+            digest = _report_digest(other_report)
+            if digest == source_digest or digest in (
+                validation_digests
+            ):
+                raise ValueError(
+                    "validation reports must be UNIQUE independent "
+                    "runs (duplicate digest)"
+                )
             other = generate_dispatch_table(
                 other_report,
                 hysteresis_pct=hysteresis_pct,
                 admission="analysis",
             )
+            # Comparability: the full identity projection AND the
+            # policy contents must match — counting an incomparable
+            # run would launder the validation requirement.
+            other_fp = other_report["fingerprint"]
+            incomparable = [
+                k for k in _FINGERPRINT_KEYS
+                if other_fp.get(k) != fingerprint.get(k)
+            ]
+            if incomparable:
+                raise ValueError(
+                    "validation report is not comparable — identity "
+                    f"differs on {incomparable}"
+                )
+            if _dcp_canonical(
+                other_report["dcp"]
+            ) != _dcp_canonical(dcp):
+                raise ValueError(
+                    "validation report carries a different dcp "
+                    "declaration"
+                )
+            if set(other.entries) != set(entries):
+                raise ValueError(
+                    "validation report does not cover the same "
+                    "(geometry, tier, lane) key set — coverage "
+                    "gaps cannot be silently skipped"
+                )
+            validation_digests.append(digest)
             for key, arm in list(entries.items()):
-                other_arm = other.entries.get(key)
-                if other_arm is not None and other_arm != arm:
+                other_arm = other.entries[key]
+                if other_arm != arm:
                     if arm not in SYNC_FREE_ARMS:
                         entries[key] = "dense-eager"
                     forced.append("|".join(map(str, key)))
@@ -464,9 +642,11 @@ def generate_dispatch_table(
         entries=entries,
         fingerprint=fingerprint,
         hysteresis_pct=hysteresis_pct,
-        policy_version=str(dcp["version"]),
+        policy_version=dcp_version,
         lanes=lanes,
         analysis_only=not strict,
-        validation_runs=n_validation,
+        validation_runs=len(validation_digests),
         cross_run_forced=tuple(sorted(set(forced))),
+        source_report_digest=source_digest,
+        validation_report_digests=tuple(validation_digests),
     )

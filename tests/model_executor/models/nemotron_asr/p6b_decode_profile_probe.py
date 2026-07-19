@@ -233,12 +233,14 @@ def _probe_revision() -> dict[str, Any]:
             "fork_commit": rev,
             "dirty_tree": bool(tracked),
             "dirty_paths": tracked.splitlines()[:20],
-            # EVERY untracked path, so the artifact itself is
-            # auditable (a count alone cannot prove all of them were
-            # benign); the generator allowlists the narrow lock-file
-            # class and fails on anything else.
+            # EVERY untracked path, uncapped, so the artifact itself
+            # is auditable (a count alone cannot prove all of them
+            # were benign, and a truncated list would let file N+1
+            # escape auditing — admission cross-checks the count
+            # against the list length); the generator allowlists the
+            # narrow lock-file class and fails on anything else.
             "untracked_files": len(untracked_paths),
-            "untracked_paths": untracked_paths[:200],
+            "untracked_paths": untracked_paths,
         }
     except Exception:
         return {"fork_commit": None, "dirty_tree": None}
