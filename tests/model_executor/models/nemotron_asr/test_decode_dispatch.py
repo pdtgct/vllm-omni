@@ -472,6 +472,41 @@ def test_identity_covers_math_mode_lane_and_algorithm() -> None:
             table.validate_runtime(runtime, performance_gated=True)
 
 
+def test_cross_run_disagreement_forces_sync_free() -> None:
+    report = _two_tier_report()
+    other = copy.deepcopy(report)
+    # The independent run flips the large tier: compact's speech win
+    # evaporates there.
+    for cell in other["cells"]:
+        if (
+            cell["batch"] == 1024
+            and cell["arm"] == "compact-eager"
+        ):
+            cell["latency_us"] = 900_000
+    table = generate_dispatch_table(
+        report, validation_reports=[other]
+    )
+    assert table.validation_runs == 1
+    assert table.entries[("1120ms", 1024, "fp32")] == "dense-eager"
+    assert "1120ms|1024|fp32" in table.cross_run_forced
+    # Serialization preserves the validation record.
+    loaded = DispatchTable.from_json(table.to_json())
+    assert loaded.validation_runs == 1
+    assert loaded.cross_run_forced == table.cross_run_forced
+
+
+def test_cross_run_agreement_changes_nothing() -> None:
+    report = _two_tier_report()
+    table = generate_dispatch_table(
+        report,
+        validation_reports=[copy.deepcopy(report)],
+    )
+    unvalidated = generate_dispatch_table(_two_tier_report())
+    assert table.entries == unvalidated.entries
+    assert table.validation_runs == 1
+    assert table.cross_run_forced == ()
+
+
 def test_unmeasured_tier_fallback_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

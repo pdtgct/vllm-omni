@@ -96,6 +96,11 @@ class DispatchTable:
     #: review use only): such a table NEVER validates for a
     #: performance-gated runtime.
     analysis_only: bool = field(default=False)
+    #: Independent runs whose tables were compared during generation
+    #: (0 = unvalidated) and the entries cross-run disagreement forced
+    #: to the sync-free arm.
+    validation_runs: int = field(default=0)
+    cross_run_forced: tuple[str, ...] = field(default=())
 
     def select(
         self,
@@ -210,6 +215,8 @@ class DispatchTable:
             "policy_version": self.policy_version,
             "lanes": list(self.lanes),
             "analysis_only": self.analysis_only,
+            "validation_runs": self.validation_runs,
+            "cross_run_forced": list(self.cross_run_forced),
         })
 
     @classmethod
@@ -226,6 +233,10 @@ class DispatchTable:
             policy_version=raw["policy_version"],
             lanes=tuple(raw["lanes"]),
             analysis_only=bool(raw.get("analysis_only", False)),
+            validation_runs=int(raw.get("validation_runs", 0)),
+            cross_run_forced=tuple(
+                raw.get("cross_run_forced", ())
+            ),
         )
 
 
@@ -303,6 +314,7 @@ def generate_dispatch_table(
     *,
     hysteresis_pct: float = HYSTERESIS_PCT,
     admission: str = "strict",
+    validation_reports: list[dict[str, Any]] | None = None,
 ) -> DispatchTable:
     """Compute the dispatch table from a profile artifact.
 
@@ -314,6 +326,13 @@ def generate_dispatch_table(
             gates for comparison/review work and marks the table
             ``analysis_only`` — such a table never validates for a
             performance-gated runtime.
+        validation_reports: independent-run artifacts (admitted in
+            analysis mode) whose computed selections CROSS-VALIDATE
+            this one: any entry that disagrees across runs is forced
+            to the sync-free arm and recorded — selection stability
+            under re-measurement is enforced, not hoped (the round-8
+            arc caught a discrete calibration-realization flip at a
+            B=1 edge cell this way).
 
     Raises:
         ValueError: schema, hygiene, consistency, or structural
@@ -420,6 +439,27 @@ def generate_dispatch_table(
             "compact-eager" if compact_wins else "dense-eager"
         )
 
+    forced: list[str] = []
+    n_validation = 0
+    if validation_reports:
+        n_validation = len(validation_reports)
+        for other_report in validation_reports:
+            other = generate_dispatch_table(
+                other_report,
+                hysteresis_pct=hysteresis_pct,
+                admission="analysis",
+            )
+            for key, arm in list(entries.items()):
+                other_arm = other.entries.get(key)
+                if other_arm is not None and other_arm != arm:
+                    if arm not in SYNC_FREE_ARMS:
+                        entries[key] = "dense-eager"
+                    forced.append("|".join(map(str, key)))
+                    logger.warning(
+                        "decode dispatch: cross-run disagreement at "
+                        "%s (%s vs %s) — forcing the sync-free arm",
+                        key, arm, other_arm,
+                    )
     return DispatchTable(
         entries=entries,
         fingerprint=fingerprint,
@@ -427,4 +467,6 @@ def generate_dispatch_table(
         policy_version=str(dcp["version"]),
         lanes=lanes,
         analysis_only=not strict,
+        validation_runs=n_validation,
+        cross_run_forced=tuple(sorted(set(forced))),
     )
