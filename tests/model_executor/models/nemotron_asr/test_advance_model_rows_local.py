@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,10 +27,7 @@ from typing import Any
 import pytest
 import torch
 
-_PKG = (
-    Path(__file__).resolve().parents[4]
-    / "vllm_omni/model_executor/models/nemotron_asr"
-)
+_PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/nemotron_asr"
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
@@ -44,13 +42,20 @@ def _load_chain() -> dict[str, Any]:
             sys.modules[name] = types.ModuleType(name)
     loaded: dict[str, Any] = {}
     for mod in (
-        "precision", "masks", "featurizer", "encoder", "lid",
-        "manifests", "frontend", "rnnt_cell", "rnnt",
-        "decode_dispatch", "advance",
+        "precision",
+        "masks",
+        "featurizer",
+        "encoder",
+        "lid",
+        "manifests",
+        "frontend",
+        "rnnt_cell",
+        "rnnt",
+        "decode_dispatch",
+        "state_scatter",
+        "advance",
     ):
-        spec = importlib.util.spec_from_file_location(
-            f"{_BASE}.{mod}", _PKG / f"{mod}.py"
-        )
+        spec = importlib.util.spec_from_file_location(f"{_BASE}.{mod}", _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[f"{_BASE}.{mod}"] = module
@@ -87,9 +92,7 @@ GEOM_FINAL = 2
 FINAL_SAMPLES = 3_840
 
 _BOOK = {name: i for i, (name, _) in enumerate(manifests.BOOK_FIELDS)}
-_CTR = {
-    name: i for i, name in enumerate(manifests.FRONTEND_COUNTER_FIELDS)
-}
+_CTR = {name: i for i, name in enumerate(manifests.FRONTEND_COUNTER_FIELDS)}
 BOOK_WIDTH = len(manifests.BOOK_FIELDS)
 CTR_WIDTH = len(manifests.FRONTEND_COUNTER_FIELDS)
 
@@ -105,21 +108,24 @@ def _tiny_core(seed: int = 7) -> Any:
     # labels, the drain-order discriminator.
     torch.manual_seed(seed)
     encoder = mods["encoder"].FastConformerEncoder(
-        feat_in=FEAT, d_model=D_MODEL, d_ff=64, n_layers=N_LAYERS,
-        n_heads=4, conv_kernel=KERNEL, subsampling_channels=16,
+        feat_in=FEAT,
+        d_model=D_MODEL,
+        d_ff=64,
+        n_layers=N_LAYERS,
+        n_heads=4,
+        conv_kernel=KERNEL,
+        subsampling_channels=16,
         att_context=(WINDOW, 1),
     )
     encoder.eval()
     return SimpleNamespace(
         encoder=encoder,
-        lid=mods["lid"].PromptConditioner(
-            enc_hidden=D_MODEL, num_prompts=4
-        ),
-        predictor=rnnt.Predictor(
-            vocab_size=VOCAB, pred_hidden=16, pred_rnn_layers=2
-        ),
+        lid=mods["lid"].PromptConditioner(enc_hidden=D_MODEL, num_prompts=4),
+        predictor=rnnt.Predictor(vocab_size=VOCAB, pred_hidden=16, pred_rnn_layers=2),
         joint=rnnt.Joint(
-            enc_hidden=D_MODEL, pred_hidden=16, joint_hidden=16,
+            enc_hidden=D_MODEL,
+            pred_hidden=16,
+            joint_hidden=16,
             vocab_size=VOCAB,
         ),
         featurizer=mods["featurizer"].MelFeaturizer(
@@ -130,60 +136,43 @@ def _tiny_core(seed: int = 7) -> Any:
     )
 
 
-def _reference_burst(
-    core: Any, samples: torch.Tensor, prompt_index: int
-) -> list[int]:
+def _reference_burst(core: Any, samples: torch.Tensor, prompt_index: int) -> list[int]:
     """The labels a session-first final-tail chunk should emit, via
     the golden whole-signal path."""
     with torch.no_grad():
-        mel, mel_len = core.featurizer(
-            samples.unsqueeze(0), torch.tensor([samples.shape[0]])
-        )
+        mel, mel_len = core.featurizer(samples.unsqueeze(0), torch.tensor([samples.shape[0]]))
         mel = mel[:, :, : int(mel_len[0])]
         caches = mods["encoder"].StreamingCaches(
-            n_layers=N_LAYERS, batch=1, d_model=D_MODEL,
-            left_context=WINDOW, conv_kernel=KERNEL,
+            n_layers=N_LAYERS,
+            batch=1,
+            d_model=D_MODEL,
+            left_context=WINDOW,
+            conv_kernel=KERNEL,
             device=torch.device("cpu"),
         )
-        enc = mods["encoder"].stream_step(
-            core.encoder, mel, caches, drop_extra=0
-        )
+        enc = mods["encoder"].stream_step(core.encoder, mel, caches, drop_extra=0)
         conditioned = core.lid(enc, prompt_index=prompt_index)
         state = rnnt.DecodeState(
             h=torch.zeros(2, 1, 16),
             c=torch.zeros(2, 1, 16),
             last_label=torch.full((1,), core.blank_id),
         )
-        labels, _ = rnnt.greedy_decode_batch(
-            conditioned, core.predictor, core.joint, state
-        )
+        labels, _ = rnnt.greedy_decode_batch(conditioned, core.predictor, core.joint, state)
     return list(labels[0])
 
 
 def _fresh_pools(num_blocks: int = 3) -> Pools:
     return {
-        "channel_pools": [
-            torch.zeros(num_blocks, WINDOW, D_MODEL)
-            for _ in range(N_LAYERS)
-        ],
-        "time_pools": [
-            torch.zeros(num_blocks, D_MODEL, KERNEL - 1)
-            for _ in range(N_LAYERS)
-        ],
-        "len_pools": [
-            torch.zeros(num_blocks, 1) for _ in range(N_LAYERS)
-        ],
+        "channel_pools": [torch.zeros(num_blocks, WINDOW, D_MODEL) for _ in range(N_LAYERS)],
+        "time_pools": [torch.zeros(num_blocks, D_MODEL, KERNEL - 1) for _ in range(N_LAYERS)],
+        "len_pools": [torch.zeros(num_blocks, 1, dtype=torch.int32) for _ in range(N_LAYERS)],
         "h_pool": torch.zeros(num_blocks, 2, 16),
         "c_pool": torch.zeros(num_blocks, 2, 16),
         "queue_pool": torch.zeros(num_blocks, CAP, dtype=torch.int32),
-        "book_pool": torch.zeros(
-            num_blocks, BOOK_WIDTH, dtype=torch.int32
-        ),
+        "book_pool": torch.zeros(num_blocks, BOOK_WIDTH, dtype=torch.int32),
         "frontend_raw_pool": torch.zeros(num_blocks, RAW_TAIL),
         "frontend_mel_pool": torch.zeros(num_blocks, FEAT, 9),
-        "frontend_counter_pool": torch.zeros(
-            num_blocks, CTR_WIDTH, dtype=torch.int64
-        ),
+        "frontend_counter_pool": torch.zeros(num_blocks, CTR_WIDTH, dtype=torch.int64),
     }
 
 
@@ -194,17 +183,12 @@ def _sentinel_pools(num_blocks: int = 3, value: float = 12345.0) -> Pools:
             for t in val:
                 t.fill_(value)
         else:
-            val.fill_(
-                int(value) if not val.dtype.is_floating_point else value
-            )
+            val.fill_(int(value) if not val.dtype.is_floating_point else value)
     return pools
 
 
 def _clone_pools(pools: Pools) -> Pools:
-    return {
-        k: [t.clone() for t in v] if isinstance(v, list) else v.clone()
-        for k, v in pools.items()
-    }
+    return {k: [t.clone() for t in v] if isinstance(v, list) else v.clone() for k, v in pools.items()}
 
 
 def _assert_pools_equal(a: Pools, b: Pools) -> None:
@@ -231,17 +215,17 @@ def _plan(
     chunk: list[bool] | None = None,
     geometries: list[int] | None = None,
     generations: list[int] | None = None,
+    deadlines: list[int] | None = None,
+    request_ids: tuple[str, ...] | None = None,
+    prior_prompts: list[int] | None = None,
+    allow_prompt_transitions: list[bool] | None = None,
     execution_tier: int = 0,
 ) -> Any:
     decodes = decodes or []
     prefills = prefills or []
     num_decodes = len(decodes)
-    padded = decodes + [padding_value] * (
-        (pad_decodes_to or num_decodes) - num_decodes
-    )
-    d = torch.tensor(
-        [[i] * decode_columns for i in padded], dtype=torch.long
-    ).reshape(len(padded), decode_columns)
+    padded = decodes + [padding_value] * ((pad_decodes_to or num_decodes) - num_decodes)
+    d = torch.tensor([[i] * decode_columns for i in padded], dtype=torch.long).reshape(len(padded), decode_columns)
     p = torch.tensor(prefills, dtype=torch.long)
     if has_initial is None:
         has_initial = [False] * len(prefills)
@@ -256,6 +240,29 @@ def _plan(
         geometries = [GEOM_REG] * n_real
     if generations is None:
         generations = [0] * n_real
+    if deadlines is None:
+        deadlines = [i + 1 if chunk[i] else 0 for i in range(n_real)]
+    if request_ids is None:
+        request_ids = tuple(f"req-{i}" for i in range(n_real))
+    if prior_prompts is None:
+        prior_prompts = list(prompts)
+    if allow_prompt_transitions is None:
+        allow_prompt_transitions = [False] * n_real
+    blocks = [*decodes, *prefills]
+    bindings = tuple(
+        advance.PreparedRowBinding(
+            request_id=request_ids[row],
+            block_id=blocks[row],
+            admission_generation=generations[row],
+            geometry_id=geometries[row],
+            prompt_index=prompts[row],
+            prior_prompt_index=prior_prompts[row],
+            allow_prompt_transition=allow_prompt_transitions[row],
+            is_chunk=chunk[row],
+            ready_deadline_ns=deadlines[row],
+        )
+        for row in range(n_real)
+    )
     return advance.RowPlan(
         state_indices_d=d,
         num_decodes=num_decodes,
@@ -269,8 +276,10 @@ def _plan(
         prompt_index=torch.tensor(prompts, dtype=torch.long),
         is_chunk=torch.tensor(chunk, dtype=torch.bool),
         admission_generation=torch.tensor(generations, dtype=torch.long),
-        request_ids=tuple(f"req-{i}" for i in range(n_real)),
+        ready_deadline_ns=torch.tensor(deadlines, dtype=torch.long),
+        request_ids=request_ids,
         execution_tier=execution_tier,
+        bindings=bindings,
     )
 
 
@@ -292,9 +301,7 @@ def _envelope(
     row[advance.ENV_FINAL_TAIL] = 1.0 if final else 0.0
     row[advance.ENV_PROMPT_INDEX] = prompt
     row[advance.ENV_CHUNK_SEQUENCE] = seq
-    row[advance.ENVELOPE_HEADER_SLOTS : advance.ENVELOPE_HEADER_SLOTS + n] = (
-        samples
-    )
+    row[advance.ENVELOPE_HEADER_SLOTS : advance.ENVELOPE_HEADER_SLOTS + n] = samples
     return row
 
 
@@ -318,67 +325,44 @@ class _RecordingResolver:
 
     def __call__(self, request: Any) -> Any:
         self.requests.append(request)
-        return advance.ResolvedDecode(
-            arm="dense-eager", decode_fn=self._fn
-        )
+        return advance.ResolvedDecode(arm="dense-eager", decode_fn=self._fn)
 
 
-class _Reservation:
-    def __init__(self, sink: _RecorderSink) -> None:
+class _CommitTicket:
+    def __init__(self, sink: _CommitRecorder) -> None:
         self._sink = sink
 
-    def publish(self, records: Any) -> None:
-        self._sink.published.append(list(records))
-        self._sink.log.append("publish")
-        if self._sink.on_publish is not None:
-            self._sink.on_publish()
+    def stage(self, row_status: torch.Tensor, records: Any) -> None:
+        candidates = list(records)
+        self._sink.staged.append(row_status.clone())
+        self._sink.records.append(candidates)
+        self._sink.published.append([r for r in candidates if int(row_status[r.row]) == 0])
+        self._sink.log.append("stage")
+        if self._sink.on_stage is not None:
+            self._sink.on_stage()
 
     def cancel(self) -> None:
         self._sink.cancels += 1
         self._sink.log.append("cancel")
 
 
-class _RecorderSink:
+class _CommitRecorder:
     def __init__(self, *, fail_reserve: bool = False) -> None:
         self.plans: list[Any] = []
+        self.staged: list[torch.Tensor] = []
+        self.records: list[list[Any]] = []
         self.published: list[list[Any]] = []
         self.cancels = 0
         self.log: list[str] = []
-        self.on_publish: Any = None
+        self.on_stage: Any = None
         self._fail = fail_reserve
 
-    def reserve(self, plan: Any) -> _Reservation:
+    def reserve(self, plan: Any) -> _CommitTicket:
         self.plans.append(plan)
-        self.log.append("reserve_capture")
+        self.log.append("reserve")
         if self._fail:
-            raise RuntimeError("capture sink at capacity")
-        return _Reservation(self)
-
-
-class _StatusTicket:
-    def __init__(self, sink: _StatusRecorder) -> None:
-        self._sink = sink
-
-    def stage(self, row_status: torch.Tensor) -> None:
-        self._sink.staged.append(row_status.clone())
-        self._sink.log.append("stage")
-
-
-class _StatusRecorder:
-    """Request-aware ticket sink: reserve pre-commit, stage no-fail."""
-
-    def __init__(self, *, fail_reserve: bool = False) -> None:
-        self.reserved: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
-        self.staged: list[torch.Tensor] = []
-        self.log: list[str] = []
-        self._fail = fail_reserve
-
-    def reserve(self, request_ids: Any, generations: Any) -> _StatusTicket:
-        self.reserved.append((tuple(request_ids), tuple(generations)))
-        self.log.append("reserve_status")
-        if self._fail:
-            raise RuntimeError("status sink at capacity")
-        return _StatusTicket(self)
+            raise RuntimeError("commit sink at capacity")
+        return _CommitTicket(self)
 
 
 def _call(
@@ -390,23 +374,27 @@ def _call(
     adapter: Any = None,
     *,
     resolver: Any = None,
-    capture_sink: Any = None,
-    status_sink: Any = None,
+    commit_sink: Any = None,
+    capture: bool = False,
     graph_covers_decode: bool = False,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = advance.make_mrv1_adapter(
-            hidden_size=CARRIER_HIDDEN, park_id=PARK_ID,
+            hidden_size=CARRIER_HIDDEN,
+            park_id=PARK_ID,
             blank_id=core.blank_id,
         )
     out: torch.Tensor = advance.advance_model_rows(
-        core, input_ids, inputs_embeds, plan,
+        core,
+        input_ids,
+        inputs_embeds,
+        plan,
         adapter=adapter,
-        decode_resolver=(
-            resolver if resolver is not None else _fixed_resolver()
-        ),
-        placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
-        capture_sink=capture_sink, status_sink=status_sink,
+        decode_resolver=(resolver if resolver is not None else _fixed_resolver()),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        commit_sink=commit_sink,
+        capture=capture,
         graph_covers_decode=graph_covers_decode,
         **pools,
     )
@@ -431,7 +419,7 @@ def _set_replay_book(
         qp[block, i] = label
     book[block, _BOOK["queue_head"]] = head
     book[block, _BOOK["queue_length"]] = len(queue)
-    book[block, _BOOK["last_label"]] = expected
+    book[block, _BOOK["last_label"]] = queue[-1]
     book[block, _BOOK["pending_echo"]] = 1
     book[block, _BOOK["expected_label"]] = expected
 
@@ -473,9 +461,7 @@ def test_structural_defects_fail_whole_call_before_any_read(
         plan = _plan(decodes=[1, NULL_INDEX], num_pool_blocks=5)
         ids, embeds = [PARK_ID, PARK_ID], torch.zeros(2, CARRIER_HIDDEN)
     elif name == "out_of_range":
-        plan = _plan(
-            decodes=[1, 99], num_pool_blocks=5, live=[1, 2, 99]
-        )
+        plan = _plan(decodes=[1, 99], num_pool_blocks=5, live=[1, 2, 99])
         ids, embeds = [PARK_ID, PARK_ID], torch.zeros(2, CARRIER_HIDDEN)
     elif name == "non_live":
         plan = _plan(decodes=[2], num_pool_blocks=5, live=[1, 3])
@@ -489,14 +475,20 @@ def test_structural_defects_fail_whole_call_before_any_read(
         ids, embeds = [PARK_ID, PARK_ID], torch.zeros(2, CARRIER_HIDDEN)
     else:  # live_padding
         plan = _plan(
-            decodes=[1], num_pool_blocks=5, pad_decodes_to=2,
+            decodes=[1],
+            num_pool_blocks=5,
+            pad_decodes_to=2,
             padding_value=2,
         )
         ids, embeds = [PARK_ID], torch.zeros(1, CARRIER_HIDDEN)
     with pytest.raises(ValueError):
         _call(
-            core, pools, torch.tensor(ids, dtype=torch.long), embeds,
-            plan, _refuse_adapter,
+            core,
+            pools,
+            torch.tensor(ids, dtype=torch.long),
+            embeds,
+            plan,
+            _refuse_adapter,
         )
     _assert_pools_equal(pools, before)
 
@@ -508,11 +500,200 @@ def test_missing_resolver_fails_before_state_reads() -> None:
     plan = _plan(decodes=[1])
     with pytest.raises(ValueError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PARK_ID], dtype=torch.long),
-            torch.zeros(1, CARRIER_HIDDEN), plan, _refuse_adapter,
+            torch.zeros(1, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
             resolver=False,
         )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-003, PORT-STATE-007
+@pytest.mark.parametrize(
+    ("plan", "input_ids", "hidden"),
+    [
+        (_plan(prefills=[1]), [PLACEHOLDER_ID], advance.ENVELOPE_HEADER_SLOTS + REG_SAMPLES - 1),
+        (_plan(decodes=[1]), [PARK_ID], 0),
+    ],
+)
+def test_carrier_width_fails_before_resolver_or_resident_read(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: Any,
+    input_ids: list[int],
+    hidden: int,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    events: list[str] = []
+
+    def forbid_gather(*_args: Any, **_kwargs: Any) -> Any:
+        events.append("read")
+        raise AssertionError("resident gather must not run")
+
+    def resolver(_request: Any) -> Any:
+        events.append("resolve")
+        raise AssertionError("resolver must not run")
+
+    monkeypatch.setattr(advance, "_gather_initialized_rows", forbid_gather)
+    with pytest.raises(ValueError, match="carrier width"):
+        _call(
+            core,
+            pools,
+            torch.tensor(input_ids),
+            torch.zeros(len(input_ids), hidden),
+            plan,
+            _refuse_adapter,
+            resolver=resolver,
+        )
+    assert events == []
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-STATE-007
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("geometry_id", torch.zeros(1, dtype=torch.int32)),
+        ("geometry_id", torch.empty(1, dtype=torch.long, device="meta")),
+        ("prompt_index", torch.zeros(1, 1, dtype=torch.long)),
+        ("is_chunk", torch.ones(1, dtype=torch.long)),
+        ("admission_generation", torch.tensor([-1], dtype=torch.long)),
+        ("ready_deadline_ns", torch.tensor([0], dtype=torch.long)),
+    ],
+)
+def test_row_plan_authority_fails_closed_before_reads(field: str, value: torch.Tensor) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    plan = replace(_plan(prefills=[1]), **{field: value})
+    with pytest.raises(ValueError):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-STATE-007, PORT-HOOK-001
+@pytest.mark.parametrize("request_ids", [("",), ("same", "same")])
+def test_request_identity_is_nonempty_and_unique(request_ids: tuple[str, ...]) -> None:
+    rows = len(request_ids)
+    plan = _plan(
+        prefills=list(range(1, rows + 1)),
+        num_pool_blocks=rows + 2,
+        request_ids=request_ids,
+    )
+    pools = _sentinel_pools(num_blocks=rows + 2)
+    before = _clone_pools(pools)
+    with pytest.raises(ValueError):
+        _call(
+            _tiny_core(),
+            pools,
+            torch.full((rows,), PLACEHOLDER_ID),
+            torch.zeros(rows, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-STATE-007, PORT-HOOK-001
+@pytest.mark.parametrize("drift", ["request_swap", "generation_aba", "bool_block"])
+def test_atomic_row_binding_rejects_identity_or_control_drift(
+    drift: str,
+) -> None:
+    plan = _plan(decodes=[1, 2], num_pool_blocks=4)
+    if drift == "request_swap":
+        plan = replace(plan, request_ids=("req-1", "req-0"))
+    elif drift == "generation_aba":
+        plan = replace(
+            plan,
+            admission_generation=torch.tensor([1, 0], dtype=torch.long),
+        )
+    else:
+        plan = replace(
+            plan,
+            bindings=(
+                replace(plan.bindings[0], block_id=True),
+                plan.bindings[1],
+            ),
+        )
+    pools = _sentinel_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    with pytest.raises(ValueError, match="binding"):
+        _call(
+            _tiny_core(),
+            pools,
+            torch.full((2,), PARK_ID),
+            torch.zeros(2, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-LID-003, PORT-STATE-007
+def test_fresh_binding_cannot_authorize_prompt_transition() -> None:
+    plan = _plan(
+        prefills=[1],
+        prompts=[1],
+        prior_prompts=[0],
+        allow_prompt_transitions=[True],
+    )
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    with pytest.raises(ValueError, match="fresh admission"):
+        _call(
+            _tiny_core(),
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-DEC-008, PORT-STATE-007
+def test_graph_covered_call_rejects_before_resolver_or_resident_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    events: list[str] = []
+    original = torch.Tensor.index_select
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        events.append("read")
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+
+    def resolver(_request: Any) -> Any:
+        events.append("resolve")
+        return advance.ResolvedDecode("dense-graphed", rnnt.decode_dense_masked)
+
+    with pytest.raises(ValueError, match="graph-covered"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            _plan(prefills=[1], execution_tier=1),
+            _refuse_adapter,
+            resolver=resolver,
+            graph_covers_decode=True,
+        )
+    assert events == []
     _assert_pools_equal(pools, before)
 
 
@@ -522,9 +703,11 @@ def test_legal_graph_padding_replays_normally() -> None:
     _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
     plan = _plan(decodes=[1], pad_decodes_to=2, padding_value=NULL_INDEX)
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([3], dtype=torch.long),
-        torch.zeros(1, CARRIER_HIDDEN), plan,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
     )
     assert out.shape == (1, CARRIER_HIDDEN)
     assert _decision(out) == [5]
@@ -539,9 +722,7 @@ def test_fresh_rows_ignore_recycled_poison() -> None:
     core = _tiny_core()
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     ids = torch.tensor([PLACEHOLDER_ID], dtype=torch.long)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
     clean = _fresh_pools()
@@ -559,23 +740,21 @@ def test_corrupt_echo_is_row_local_and_reported() -> None:
     _set_replay_book(pools, 2, queue=[4, 6], head=1, expected=4)
     before = _clone_pools(pools)
     plan = _plan(decodes=[1, 2])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([3, 8], dtype=torch.long),
-        torch.zeros(2, CARRIER_HIDDEN), plan,
-        status_sink=status,
+        torch.zeros(2, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [5, PARK_ID]
     # The healthy peer advanced...
     assert int(pools["book_pool"][1, _BOOK["queue_head"]]) == 2
     # ...the corrupted row is bit-identical.
-    torch.testing.assert_close(
-        pools["book_pool"][2], before["book_pool"][2], rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        pools["queue_pool"][2], before["queue_pool"][2], rtol=0, atol=0
-    )
+    torch.testing.assert_close(pools["book_pool"][2], before["book_pool"][2], rtol=0, atol=0)
+    torch.testing.assert_close(pools["queue_pool"][2], before["queue_pool"][2], rtol=0, atol=0)
     assert len(status.staged) == 1
     assert int(status.staged[0][0]) == 0
     assert int(status.staged[0][1]) & advance.ROW_STATUS_ECHO_MISMATCH
@@ -588,9 +767,11 @@ def test_absurd_echo_id_is_safe_and_masked() -> None:
     before = _clone_pools(pools)
     plan = _plan(decodes=[1])
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([10**6], dtype=torch.long),
-        torch.zeros(1, CARRIER_HIDDEN), plan,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
     )
     assert _decision(out) == [PARK_ID]
     _assert_pools_equal(pools, before)
@@ -602,21 +783,20 @@ def test_chunk_on_undrained_queue_masks_and_reports() -> None:
     _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
     before = _clone_pools(pools)
     torch.manual_seed(5)
-    carrier = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0
-    ).unsqueeze(0)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
     plan = _plan(decodes=[1], chunk=[True])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        status_sink=status,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
     _assert_pools_equal(pools, before)
-    assert (
-        int(status.staged[0][0]) & advance.ROW_STATUS_QUEUE_NOT_DRAINED
-    )
+    assert int(status.staged[0][0]) & advance.ROW_STATUS_QUEUE_NOT_DRAINED
 
 
 def test_flush_parks_only_when_drained_and_finalized() -> None:
@@ -624,20 +804,21 @@ def test_flush_parks_only_when_drained_and_finalized() -> None:
     pools = _fresh_pools()
     _set_drained_book(pools, 1, blank=core.blank_id)
     pools["frontend_counter_pool"][1, _CTR["finalized"]] = 1
+    pools["frontend_counter_pool"][1, _CTR["expected_chunk_sequence"]] = 1
     _set_drained_book(pools, 2, blank=core.blank_id)  # NOT finalized
     plan = _plan(decodes=[1, 2])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PARK_ID, PARK_ID], dtype=torch.long),
-        torch.zeros(2, CARRIER_HIDDEN), plan,
-        status_sink=status,
+        torch.zeros(2, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID, PARK_ID]
     assert int(status.staged[0][0]) == 0
-    assert (
-        int(status.staged[0][1]) & advance.ROW_STATUS_SESSION_PROTOCOL
-    )
+    assert int(status.staged[0][1]) & advance.ROW_STATUS_SESSION_PROTOCOL
 
 
 # ---- the full MRV1 arc ----------------------------------------------------
@@ -652,12 +833,13 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
 
     pools = _fresh_pools()
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
     )
     emitted = [_decision(out)[0]]
     book = pools["book_pool"]
@@ -672,9 +854,11 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
         if emitted[-1] == PARK_ID:
             break
         out = _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([emitted[-1]], dtype=torch.long),
-            torch.zeros(1, CARRIER_HIDDEN), decode_plan,
+            torch.zeros(1, CARRIER_HIDDEN),
+            decode_plan,
         )
         emitted.append(_decision(out)[0])
 
@@ -685,15 +869,15 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
     # An INVALID CONTINUING chunk (wrong sequence) on the now-parked
     # session leaves every page of its block bit-identical.
     parked = _clone_pools(pools)
-    wrong_seq = _envelope(
-        samples, final=True, seq=5, geometry=GEOM_FINAL
-    ).unsqueeze(0)
-    status = _StatusRecorder()
+    wrong_seq = _envelope(samples, final=True, seq=5, geometry=GEOM_FINAL).unsqueeze(0)
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), wrong_seq,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        wrong_seq,
         _plan(decodes=[1], chunk=[True], geometries=[GEOM_FINAL]),
-        status_sink=status,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
     _assert_pools_equal(pools, parked)
@@ -717,21 +901,24 @@ def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
     )
     torch.manual_seed(5)
     reg = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
         geometry=GEOM_REG,
     )
     fin = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     )
-    input_ids = torch.tensor(
-        [7, PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
-    )
+    input_ids = torch.tensor([7, PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long)
     embeds = torch.stack([torch.zeros(CARRIER_HIDDEN), reg, fin])
     out = _call(core, pools, input_ids, embeds, plan, resolver=resolver)
     assert len(resolver.requests) == 2
     assert {r.geometry for r in resolver.requests} == {
-        GEOM_REG, GEOM_FINAL,
+        GEOM_REG,
+        GEOM_FINAL,
     }
     assert all(r.ready_decode_buckets == 2 for r in resolver.requests)
     assert all(r.execution_batch_size == 1 for r in resolver.requests)
@@ -739,6 +926,139 @@ def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
     assert decisions[0] == 9  # the replay row advanced its queue
     assert decisions[2] != PARK_ID  # the final chunk burst emitted
     assert int(pools["book_pool"][3, _BOOK["queue_head"]]) == 2
+
+
+# @spec PORT-ADV-003, PORT-PERF-001
+def test_deadline_orders_all_resolutions_before_resident_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    events: list[str] = []
+    original = torch.Tensor.index_select
+    pool_ptrs = {
+        tensor.data_ptr() for value in pools.values() for tensor in (value if isinstance(value, list) else [value])
+    }
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        if tensor.data_ptr() in pool_ptrs:
+            events.append("read")
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+
+    class Resolver:
+        def __call__(self, request: Any) -> Any:
+            events.append(f"resolve-{request.geometry}")
+            return advance.ResolvedDecode("dense-eager", rnnt.decode_dense_masked)
+
+    torch.manual_seed(5)
+    reg = _envelope(
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
+        geometry=GEOM_REG,
+    )
+    fin = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
+        geometry=GEOM_FINAL,
+    )
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+        torch.stack([reg, fin]),
+        _plan(
+            prefills=[1, 2],
+            num_pool_blocks=4,
+            geometries=[GEOM_REG, GEOM_FINAL],
+            deadlines=[200, 100],
+        ),
+        resolver=Resolver(),
+    )
+    assert events[:2] == [f"resolve-{GEOM_FINAL}", f"resolve-{GEOM_REG}"]
+    assert "read" not in events[:2]
+
+
+# @spec PORT-ADV-003, PORT-DEC-008
+def test_later_resolver_failure_precedes_every_resident_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    reads = {"count": 0}
+    original = torch.Tensor.index_select
+    pool_ptrs = {
+        tensor.data_ptr() for value in pools.values() for tensor in (value if isinstance(value, list) else [value])
+    }
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        if tensor.data_ptr() in pool_ptrs:
+            reads["count"] += 1
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+    calls = {"count": 0}
+
+    def resolver(_request: Any) -> Any:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("second resolver failed")
+        return advance.ResolvedDecode("dense-eager", rnnt.decode_dense_masked)
+
+    plan = _plan(
+        prefills=[1, 2],
+        num_pool_blocks=4,
+        geometries=[GEOM_REG, GEOM_FINAL],
+        deadlines=[200, 100],
+    )
+    with pytest.raises(RuntimeError, match="second resolver"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+            torch.zeros(2, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
+            resolver=resolver,
+        )
+    assert calls["count"] == 2
+    assert reads["count"] == 0
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-STATE-003
+def test_fresh_rows_are_absent_from_every_resident_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools(num_blocks=4, value=3.14)
+    fresh_block = 2
+    read_blocks: list[int] = []
+    original = torch.Tensor.index_select
+    pool_ptrs = {
+        tensor.data_ptr() for value in pools.values() for tensor in (value if isinstance(value, list) else [value])
+    }
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        if tensor.data_ptr() in pool_ptrs and dim == 0:
+            read_blocks.extend(int(x) for x in index.tolist())
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[fresh_block], num_pool_blocks=4),
+    )
+    assert fresh_block not in read_blocks
 
 
 def test_bucket_compute_failure_leaves_pools_untouched(
@@ -752,15 +1072,15 @@ def test_bucket_compute_failure_leaves_pools_untouched(
     pools = _fresh_pools()
     before = _clone_pools(pools)
     torch.manual_seed(5)
-    carrier = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0
-    ).unsqueeze(0)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
     plan = _plan(prefills=[1])
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-            carrier, plan,
+            carrier,
+            plan,
         )
     _assert_pools_equal(pools, before)
 
@@ -774,19 +1094,297 @@ def test_capture_reservation_failure_is_pre_commit_fatal() -> None:
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    sink = _RecorderSink(fail_reserve=True)
+    sink = _CommitRecorder(fail_reserve=True)
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-            carrier, plan, capture_sink=sink,
+            carrier,
+            plan,
+            commit_sink=sink,
+            capture=True,
         )
     _assert_pools_equal(pools, before)
     assert sink.published == []
+
+
+# @spec PORT-HOOK-001, PORT-STATE-008
+@pytest.mark.parametrize("ticket", [None, object()])
+def test_malformed_commit_ticket_is_precommit_fatal(ticket: object) -> None:
+    class BadSink:
+        def reserve(self, plan: Any) -> object:
+            del plan
+            return ticket
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="reservation"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            commit_sink=BadSink(),
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-HOOK-001, PORT-STATE-008
+def test_ticket_without_stage_is_cancelled_precommit() -> None:
+    class CancelOnly:
+        def __init__(self) -> None:
+            self.cancels = 0
+
+        def cancel(self) -> None:
+            self.cancels += 1
+
+    ticket = CancelOnly()
+
+    class BadSink:
+        def reserve(self, plan: Any) -> CancelOnly:
+            del plan
+            return ticket
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="without stage"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            commit_sink=BadSink(),
+        )
+    assert ticket.cancels == 1
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-003, PORT-HOOK-001, PORT-STATE-008
+def test_ticket_methods_are_bound_exactly_once_before_commit() -> None:
+    class DynamicTicket:
+        def __init__(self) -> None:
+            self.stage_lookups = 0
+            self.cancel_lookups = 0
+            self.stages = 0
+
+        @property
+        def stage(self) -> Any:
+            self.stage_lookups += 1
+
+            def bound(_status: torch.Tensor, _records: Any) -> None:
+                self.stages += 1
+
+            return bound
+
+        @property
+        def cancel(self) -> Any:
+            self.cancel_lookups += 1
+
+            def bound() -> None:
+                return None
+
+            return bound
+
+    ticket = DynamicTicket()
+
+    class Sink:
+        def reserve(self, plan: Any) -> DynamicTicket:
+            del plan
+            return ticket
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        commit_sink=Sink(),
+    )
+    assert ticket.cancel_lookups == 1
+    assert ticket.stage_lookups == 1
+    assert ticket.stages == 1
+
+
+# @spec PORT-ADV-003, PORT-HOOK-001, PORT-STATE-008
+def test_ticket_stage_binding_failure_cancels_reservation() -> None:
+    class RaisingStageTicket:
+        def __init__(self) -> None:
+            self.cancel_lookups = 0
+            self.stage_lookups = 0
+            self.cancels = 0
+
+        @property
+        def cancel(self) -> Any:
+            self.cancel_lookups += 1
+
+            def bound() -> None:
+                self.cancels += 1
+
+            return bound
+
+        @property
+        def stage(self) -> Any:
+            self.stage_lookups += 1
+            raise RuntimeError("stage binding failed")
+
+    ticket = RaisingStageTicket()
+
+    class Sink:
+        def reserve(self, plan: Any) -> RaisingStageTicket:
+            del plan
+            return ticket
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(RuntimeError, match="stage binding failed"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            commit_sink=Sink(),
+        )
+    assert ticket.cancel_lookups == 1
+    assert ticket.stage_lookups == 1
+    assert ticket.cancels == 1
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-HOOK-001, PORT-STATE-008
+def test_capture_shape_mismatch_is_precommit_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = advance.advance_session
+
+    def malformed(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        assert result.captures is not None
+        captures = replace(
+            result.captures,
+            frontend_mel=result.captures.frontend_mel[:, :, :-1],
+        )
+        return replace(result, captures=captures)
+
+    monkeypatch.setattr(advance, "advance_session", malformed)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    with pytest.raises(ValueError, match="frontend capture"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            commit_sink=sink,
+            capture=True,
+        )
+    assert sink.plans == []
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-HOOK-001, PORT-STATE-008
+def test_capture_length_predicate_is_row_tier_without_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = advance.advance_session
+
+    def malformed(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        assert result.captures is not None
+        captures = replace(
+            result.captures,
+            mel_lengths=torch.full_like(
+                result.captures.mel_lengths,
+                result.captures.frontend_mel.shape[2] + 1,
+            ),
+        )
+        return replace(result, captures=captures)
+
+    monkeypatch.setattr(advance, "advance_session", malformed)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        commit_sink=sink,
+        capture=True,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    assert sink.published == [[]]
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-HOOK-001, PORT-STATE-008
+def test_capture_in_range_wrong_length_is_row_tier_without_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = advance.advance_session
+
+    def malformed(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        assert result.captures is not None
+        captures = replace(
+            result.captures,
+            mel_lengths=torch.zeros_like(result.captures.mel_lengths),
+            encoder_lengths=torch.zeros_like(result.captures.encoder_lengths),
+        )
+        return replace(result, captures=captures)
+
+    monkeypatch.setattr(advance, "advance_session", malformed)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        commit_sink=sink,
+        capture=True,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    assert sink.published == [[]]
+    _assert_pools_equal(pools, before)
 
 
 def test_capture_records_publish_after_commit_with_identity() -> None:
@@ -794,21 +1392,25 @@ def test_capture_records_publish_after_commit_with_identity() -> None:
     pools = _fresh_pools()
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
-    plan = _plan(
-        prefills=[1], geometries=[GEOM_FINAL], generations=[41]
-    )
-    sink = _RecorderSink()
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL], generations=[41])
+    sink = _CommitRecorder()
     _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        capture_sink=sink,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=sink,
+        capture=True,
     )
     assert len(sink.plans) == 1
-    assert sink.plans[0].rows == 1
-    assert sink.plans[0].payload_bytes > 0
+    assert sink.plans[0].capture.rows == 1
+    assert sink.plans[0].capture.payload_bytes > 0
     [records] = sink.published
     [record] = records
     assert record.row == 0
@@ -822,6 +1424,50 @@ def test_capture_records_publish_after_commit_with_identity() -> None:
     assert sink.cancels == 0
 
 
+# @spec PORT-HOOK-001, PORT-STATE-008
+def test_composite_stage_exposes_only_status_clean_capture_records() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    torch.manual_seed(5)
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    rows = torch.stack(
+        [
+            _envelope(
+                samples,
+                final=True,
+                seq=0,
+                geometry=GEOM_FINAL,
+                prompt=0,
+            ),
+            _envelope(
+                samples,
+                final=True,
+                seq=0,
+                geometry=GEOM_FINAL,
+                prompt=2,
+            ),
+        ]
+    )
+    sink = _CommitRecorder()
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+        rows,
+        _plan(
+            prefills=[1, 2],
+            num_pool_blocks=4,
+            geometries=[GEOM_FINAL, GEOM_FINAL],
+            prompts=[0, 1],
+        ),
+        commit_sink=sink,
+        capture=True,
+    )
+    assert len(sink.records[0]) == 2
+    assert [record.row for record in sink.published[0]] == [0]
+    assert int(sink.staged[0][1]) & advance.ROW_STATUS_PROMPT_MISMATCH
+
+
 def test_adapter_failure_precedes_reservation_entirely() -> None:
     # The corrected state machine (PORT-ADV-003 as amended) runs the
     # adapter and every other fallible operation BEFORE reservation:
@@ -832,20 +1478,27 @@ def test_adapter_failure_precedes_reservation_entirely() -> None:
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    sink = _RecorderSink()
+    sink = _CommitRecorder()
 
     def _bad_adapter(*_args: Any) -> Any:
         raise RuntimeError("adapter blew up")
 
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-            carrier, plan, _bad_adapter, capture_sink=sink,
+            carrier,
+            plan,
+            _bad_adapter,
+            commit_sink=sink,
+            capture=True,
         )
     _assert_pools_equal(pools, before)
     assert sink.plans == []
@@ -858,13 +1511,18 @@ def test_no_capture_sink_stages_nothing() -> None:
     pools = _fresh_pools()
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
     )
     assert out.shape == (1, CARRIER_HIDDEN)
 
@@ -880,16 +1538,17 @@ def test_bad_envelope_on_a_fresh_row_scatters_nothing() -> None:
     pools = _sentinel_pools()
     before = _clone_pools(pools)
     torch.manual_seed(5)
-    carrier = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0
-    )
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0)
     carrier[advance.ENV_VERSION] = 99.0
     plan = _plan(prefills=[1])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-        carrier.unsqueeze(0), plan, status_sink=status,
+        carrier.unsqueeze(0),
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
     assert int(status.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
@@ -900,15 +1559,16 @@ def test_regular_chunk_with_wrong_cadence_length_masks() -> None:
     core = _tiny_core()
     pools = _fresh_pools()
     torch.manual_seed(5)
-    carrier = _envelope(
-        torch.randn(REG_SAMPLES - 160) * 0.01, final=False, seq=0
-    )
+    carrier = _envelope(torch.randn(REG_SAMPLES - 160) * 0.01, final=False, seq=0)
     plan = _plan(prefills=[1])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-        carrier.unsqueeze(0), plan, status_sink=status,
+        carrier.unsqueeze(0),
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
     assert int(status.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
@@ -924,31 +1584,28 @@ def test_wrong_but_valid_prompt_masks_and_admission_conditions() -> None:
     pools = _fresh_pools(num_blocks=4)
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    ok_row = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
-    )
-    bad_row = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
-    )
+    ok_row = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2)
+    bad_row = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2)
     plan = _plan(
         prefills=[1, 2],
         num_pool_blocks=4,
         geometries=[GEOM_FINAL, GEOM_FINAL],
         prompts=[2, 1],  # admitted authority per row
     )
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
-        torch.stack([ok_row, bad_row]), plan, status_sink=status,
+        torch.stack([ok_row, bad_row]),
+        plan,
+        commit_sink=status,
     )
     decisions = _decision(out)
     assert decisions[0] != PARK_ID  # admitted==stamped: computed
     assert decisions[1] == PARK_ID  # valid-but-different: masked
     assert int(status.staged[0][0]) == 0
-    assert (
-        int(status.staged[0][1]) & advance.ROW_STATUS_PROMPT_MISMATCH
-    )
+    assert int(status.staged[0][1]) & advance.ROW_STATUS_PROMPT_MISMATCH
 
 
 def test_out_of_dictionary_carrier_prompt_masks() -> None:
@@ -957,20 +1614,19 @@ def test_out_of_dictionary_carrier_prompt_masks() -> None:
     core = _tiny_core()
     pools = _fresh_pools()
     torch.manual_seed(5)
-    carrier = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0, prompt=7
-    )
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0, prompt=7)
     plan = _plan(prefills=[1])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-        carrier.unsqueeze(0), plan, status_sink=status,
+        carrier.unsqueeze(0),
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
-    assert (
-        int(status.staged[0][0]) & advance.ROW_STATUS_PROMPT_MISMATCH
-    )
+    assert int(status.staged[0][0]) & advance.ROW_STATUS_PROMPT_MISMATCH
 
 
 # ---- correction-pass hardening pins ---------------------------------------
@@ -997,54 +1653,62 @@ def test_second_bucket_failure_leaves_pools_untouched(
     before = _clone_pools(pools)
     torch.manual_seed(5)
     reg = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
         geometry=GEOM_REG,
     )
     fin = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     )
     plan = _plan(
-        prefills=[1, 2], num_pool_blocks=4,
+        prefills=[1, 2],
+        num_pool_blocks=4,
         geometries=[GEOM_REG, GEOM_FINAL],
     )
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
-            torch.tensor(
-                [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
-            ),
-            torch.stack([reg, fin]), plan,
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
+            torch.stack([reg, fin]),
+            plan,
         )
     assert calls["n"] == 2
     _assert_pools_equal(pools, before)
 
 
-def test_status_reserve_failure_cancels_capture_reservation() -> None:
-    # The composite reservation: a status-sink reservation failure
-    # after a successful capture reservation cancels the capture
-    # reservation and fails pre-commit.
+def test_composite_reservation_failure_is_pre_commit_fatal() -> None:
+    # Status and capture capacity are admitted by one atomic reserve;
+    # a failure creates no ticket and leaves every resident page exact.
     core = _tiny_core()
     pools = _fresh_pools()
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    cap_sink = _RecorderSink()
-    bad_status = _StatusRecorder(fail_reserve=True)
+    sink = _CommitRecorder(fail_reserve=True)
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-            carrier, plan,
-            capture_sink=cap_sink, status_sink=bad_status,
+            carrier,
+            plan,
+            commit_sink=sink,
+            capture=True,
         )
     _assert_pools_equal(pools, before)
-    assert cap_sink.cancels == 1
-    assert cap_sink.published == []
+    assert sink.cancels == 0
+    assert sink.published == []
 
 
 def test_status_ticket_is_request_aware_and_staged_once() -> None:
@@ -1052,20 +1716,21 @@ def test_status_ticket_is_request_aware_and_staged_once() -> None:
     pools = _fresh_pools()
     _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
     plan = _plan(decodes=[1], generations=[9])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([3], dtype=torch.long),
-        torch.zeros(1, CARRIER_HIDDEN), plan,
-        status_sink=status,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
     )
-    assert status.reserved == [(("req-0",), (9,))]
+    assert status.plans[0].request_ids == ("req-0",)
+    assert status.plans[0].generations == (9,)
     assert len(status.staged) == 1
 
 
-@pytest.mark.parametrize(
-    "corruption", ["negative_head", "oversized_length", "bad_last_label"]
-)
+@pytest.mark.parametrize("corruption", ["negative_head", "oversized_length", "bad_last_label"])
 def test_corrupt_book_masks_safely(corruption: str) -> None:
     # PORT-ADV-004 as amended: book-invariant violations are sanitized
     # to safe substitutes (no gather fault, no embedding fault), the
@@ -1090,31 +1755,845 @@ def test_corrupt_book_masks_safely(corruption: str) -> None:
         ids = [PLACEHOLDER_ID]
         chunk = [True]
         torch.manual_seed(5)
-        embeds = _envelope(
-            torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0
-        ).unsqueeze(0)
+        embeds = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
     before = _clone_pools(pools)
     plan = _plan(decodes=[1], chunk=chunk)
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
-        torch.tensor(ids, dtype=torch.long), embeds, plan,
-        status_sink=status,
+        core,
+        pools,
+        torch.tensor(ids, dtype=torch.long),
+        embeds,
+        plan,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
     _assert_pools_equal(pools, before)
-    assert (
-        int(status.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    assert int(status.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_nonnegative_corrupt_replay_counters_mask_without_store() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    counters = pools["frontend_counter_pool"]
+    counters[1, _CTR["total_valid_samples"]] = 100
+    # origin + retained length must equal total for every persisted row.
+    counters[1, _CTR["raw_tail_origin"]] = 0
+    counters[1, _CTR["raw_tail_length"]] = 0
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([3]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
     )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_replay_counter_sequence_must_match_geometry_cadence() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    pools["frontend_counter_pool"][1, _CTR["expected_chunk_sequence"]] = 7
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([3]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-FEAT-002, PORT-STATE-008
+def test_nonfinal_raw_retention_must_match_committed_boundary() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    counters = pools["frontend_counter_pool"]
+    counters[1, _CTR["total_valid_samples"]] = REG_SAMPLES
+    counters[1, _CTR["committed_mel_frames"]] = 1
+    counters[1, _CTR["encoded_mel_frames"]] = 1
+    counters[1, _CTR["mel_tail_length"]] = 1
+    counters[1, _CTR["expected_chunk_sequence"]] = 1
+    # Still sums to total, but does not begin at the exact next-window
+    # retention origin (zero for the first 80-ms cadence).
+    counters[1, _CTR["raw_tail_origin"]] = 100
+    counters[1, _CTR["raw_tail_length"]] = REG_SAMPLES - 100
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([3]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-FEAT-002, PORT-STATE-008
+def test_final_tail_must_account_for_exact_valid_sample_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = advance.advance_session
+
+    def undercount(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        state = args[2]
+        counters = state.frontend_counters
+        plausible_total = 3_200
+        plausible_frames = plausible_total // 160
+        counters[:, _CTR["total_valid_samples"]] = plausible_total
+        counters[:, _CTR["committed_mel_frames"]] = plausible_frames
+        counters[:, _CTR["encoded_mel_frames"]] = plausible_frames
+        counters[:, _CTR["raw_tail_origin"]] = plausible_total
+        counters[:, _CTR["raw_tail_length"]] = 0
+        counters[:, _CTR["mel_tail_length"]] = 9
+        counters[:, _CTR["expected_chunk_sequence"]] = 1
+        counters[:, _CTR["finalized"]] = 1
+        return result
+
+    monkeypatch.setattr(advance, "advance_session", undercount)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_finalized_counter_cannot_commit_frames_beyond_audio() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    counters = pools["frontend_counter_pool"]
+    counters[1, _CTR["committed_mel_frames"]] = 100
+    counters[1, _CTR["encoded_mel_frames"]] = 100
+    counters[1, _CTR["mel_tail_length"]] = 9
+    counters[1, _CTR["finalized"]] = 1
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PARK_ID]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_finalized_counter_sequence_must_bound_final_residual() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    counters = pools["frontend_counter_pool"]
+    counters[1, _CTR["expected_chunk_sequence"]] = 7
+    counters[1, _CTR["finalized"]] = 1
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PARK_ID]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-LID-001, PORT-LID-003, PORT-STATE-008
+def test_authorized_prompt_transition_commits_on_new_chunk() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    book = pools["book_pool"]
+    book[1, _BOOK["last_label"]] = core.blank_id
+    book[1, _BOOK["geometry"]] = GEOM_REG
+    book[1, _BOOK["prompt"]] = 2
+    torch.manual_seed(5)
+    samples = torch.randn(REG_SAMPLES) * 0.01
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        _envelope(samples, final=False, seq=0, prompt=1).unsqueeze(0),
+        _plan(
+            decodes=[1],
+            chunk=[True],
+            prompts=[1],
+            prior_prompts=[2],
+            allow_prompt_transitions=[True],
+        ),
+        commit_sink=sink,
+    )
+    assert int(sink.staged[0][0]) == 0
+    assert int(pools["book_pool"][1, _BOOK["prompt"]]) == 1
+    assert _decision(out)[0] != PARK_ID
+
+
+# @spec PORT-LID-003, PORT-STATE-008
+def test_replay_persisted_prompt_drift_masks_only_that_row() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    _set_replay_book(pools, 2, queue=[3, 5], head=1, expected=3)
+    pools["book_pool"][1, _BOOK["prompt"]] = 2
+    pools["book_pool"][2, _BOOK["prompt"]] = 1
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([3, 3]),
+        torch.zeros(2, CARRIER_HIDDEN),
+        _plan(
+            decodes=[1, 2],
+            chunk=[False, False],
+            prompts=[1, 1],
+            num_pool_blocks=4,
+        ),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID, 5]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_IDENTITY
+    for value, old in zip(pools.values(), before.values(), strict=True):
+        values = value if isinstance(value, list) else [value]
+        olds = old if isinstance(old, list) else [old]
+        for tensor, original in zip(values, olds, strict=True):
+            torch.testing.assert_close(tensor[1], original[1], rtol=0, atol=0)
+
+
+# @spec PORT-ADV-004
+@pytest.mark.parametrize(
+    ("lengths", "tokens"),
+    [
+        ([-1, 1], [[1], [2]]),
+        ([2, 1], [[1], [2]]),
+        ([1, 1], [[-1], [2]]),
+        ([1, 1], [[VOCAB], [2]]),
+    ],
+)
+def test_malformed_decode_content_masks_only_affected_row(lengths: list[int], tokens: list[list[int]]) -> None:
+    def malformed(frames: Any, enc_lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
+        del frames, enc_lengths, predictor, joint
+        token_tensor = torch.tensor(tokens, dtype=torch.int32)
+        length_tensor = torch.tensor(lengths, dtype=torch.int32)
+        next_label = state.last_label.clone()
+        for row, length in enumerate(lengths):
+            if 0 < length <= len(tokens[row]):
+                next_label[row] = tokens[row][length - 1]
+        return (
+            token_tensor,
+            length_tensor,
+            replace(state, last_label=next_label.contiguous()),
+        )
+
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    samples = torch.randn(REG_SAMPLES) * 0.01
+    rows = torch.stack(
+        [
+            _envelope(samples, final=False, seq=0),
+            _envelope(samples, final=False, seq=0),
+        ]
+    )
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+        rows,
+        _plan(prefills=[1, 2], num_pool_blocks=4),
+        resolver=_fixed_resolver(malformed),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID, 2]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    for value, old in zip(pools.values(), before.values(), strict=True):
+        values = value if isinstance(value, list) else [value]
+        olds = old if isinstance(old, list) else [old]
+        for tensor, original in zip(values, olds, strict=True):
+            torch.testing.assert_close(tensor[1], original[1], rtol=0, atol=0)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_malformed_decode_next_state_structure_is_precommit_fatal() -> None:
+    def malformed(frames: Any, enc_lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
+        del frames, enc_lengths, predictor, joint
+        bad = rnnt.DecodeState(
+            h=state.h[:, :, :-1],
+            c=state.c,
+            last_label=state.last_label,
+        )
+        return (
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            bad,
+        )
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="next-state h"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            resolver=_fixed_resolver(malformed),
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_invalid_decode_next_label_masks_only_affected_row() -> None:
+    def malformed(frames: Any, enc_lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
+        del frames, enc_lengths, predictor, joint
+        bad = rnnt.DecodeState(
+            h=state.h,
+            c=state.c,
+            last_label=torch.tensor([VOCAB + 1, 2], dtype=torch.long),
+        )
+        return (
+            torch.tensor([[1], [2]], dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            bad,
+        )
+
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    samples = torch.randn(REG_SAMPLES) * 0.01
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+        torch.stack(
+            [
+                _envelope(samples, final=False, seq=0),
+                _envelope(samples, final=False, seq=0),
+            ]
+        ),
+        _plan(prefills=[1, 2], num_pool_blocks=4),
+        resolver=_fixed_resolver(malformed),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID, 2]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    assert int(sink.staged[0][1]) == 0
+    for value, old in zip(pools.values(), before.values(), strict=True):
+        values = value if isinstance(value, list) else [value]
+        olds = old if isinstance(old, list) else [old]
+        for tensor, original in zip(values, olds, strict=True):
+            torch.testing.assert_close(tensor[1], original[1], rtol=0, atol=0)
+
+
+# @spec PORT-ADV-004
+def test_transition_validation_preserves_incoming_status_bits() -> None:
+    incoming = torch.tensor([advance.ROW_STATUS_ENVELOPE], dtype=torch.int32)
+    result = advance.AdvanceResult(
+        token_ids=torch.zeros(1, 1, dtype=torch.int32),
+        token_lengths=torch.zeros(1, dtype=torch.int32),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    checked = advance._validated_result(
+        result,
+        incoming=incoming,
+        blank_id=VOCAB,
+        queue_capacity=CAP,
+        geometry_bound=CAP,
+        capture=False,
+    )
+    assert int(checked.row_status[0]) & advance.ROW_STATUS_ENVELOPE
+    assert int(checked.row_status[0]) & advance.ROW_STATUS_DECODE_INVARIANT
+
+
+# @spec PORT-ADV-004, PORT-HOOK-001
+def test_adapter_validation_preserves_incoming_status_bits() -> None:
+    real = advance.make_mrv1_adapter(
+        hidden_size=CARRIER_HIDDEN,
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+    )
+
+    def dropping(result: Any, context: Any) -> Any:
+        projection = real(result, context)
+        return replace(
+            projection,
+            row_status=torch.zeros_like(projection.row_status),
+        )
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    carrier[0, advance.ENV_VERSION] = 99
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        adapter=dropping,
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_ENVELOPE
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-003, PORT-ADV-004, PORT-STATE-008
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "nan",
+        "fractional",
+        "out_of_range",
+        "tail_garbage",
+        "echo_disagreement",
+        "coherent_substitution",
+    ],
+)
+def test_malformed_adapter_decision_masks_without_store(corruption: str) -> None:
+    real = advance.make_mrv1_adapter(
+        hidden_size=CARRIER_HIDDEN,
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+    )
+
+    def malformed(result: Any, context: Any) -> Any:
+        projection = real(result, context)
+        rows = projection.rows.clone()
+        book = projection.book.clone()
+        if corruption == "nan":
+            rows[0, 0] = torch.nan
+        elif corruption == "fractional":
+            rows[0, 0] = 1.5
+        elif corruption == "out_of_range":
+            rows[0, 0] = VOCAB
+        elif corruption == "tail_garbage":
+            rows[0, 1] = 1
+        elif corruption == "echo_disagreement":
+            rows[0, 0] = 1
+            book[0, _BOOK["pending_echo"]] = 1
+            book[0, _BOOK["expected_label"]] = 2
+        else:
+            rows[0, 0] = 1
+            queue = projection.queue.clone()
+            queue[0].zero_()
+            queue[0, 0] = 1
+            book[0, _BOOK["queue_head"]] = 1
+            book[0, _BOOK["queue_length"]] = 1
+            book[0, _BOOK["pending_echo"]] = 1
+            book[0, _BOOK["expected_label"]] = 1
+            return replace(projection, rows=rows, queue=queue, book=book)
+        return replace(projection, rows=rows, book=book)
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        adapter=malformed,
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-003, PORT-ADV-004, PORT-STATE-008
+@pytest.mark.parametrize("corruption", ["clear_status", "flush_book", "replay_queue"])
+def test_adapter_cannot_mutate_transaction_authority_in_place(
+    corruption: str,
+) -> None:
+    real = advance.make_mrv1_adapter(
+        hidden_size=CARRIER_HIDDEN,
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+    )
+
+    def mutating(result: Any, context: Any) -> Any:
+        if corruption == "clear_status":
+            context.row_status.zero_()
+        elif corruption == "flush_book":
+            context.book[0, _BOOK["last_label"]] = 1
+        else:
+            context.queue[0, 1] = 6
+        return real(result, context)
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    if corruption == "clear_status":
+        torch.manual_seed(5)
+        embeds = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+        embeds[0, advance.ENV_VERSION] = 99
+        ids = torch.tensor([PLACEHOLDER_ID])
+        plan = _plan(prefills=[1])
+    elif corruption == "flush_book":
+        _set_drained_book(pools, 1, blank=core.blank_id)
+        counters = pools["frontend_counter_pool"]
+        counters[1, _CTR["finalized"]] = 1
+        counters[1, _CTR["expected_chunk_sequence"]] = 1
+        embeds = torch.zeros(1, CARRIER_HIDDEN)
+        ids = torch.tensor([PARK_ID])
+        plan = _plan(decodes=[1])
+    else:
+        _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+        embeds = torch.zeros(1, CARRIER_HIDDEN)
+        ids = torch.tensor([3])
+        plan = _plan(decodes=[1])
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        ids,
+        embeds,
+        plan,
+        adapter=mutating,
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) != 0
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004
+def test_decode_validation_ignores_padding_beyond_active_length() -> None:
+    result = advance.AdvanceResult(
+        token_ids=torch.tensor([[3, VOCAB, -1]], dtype=torch.int32),
+        token_lengths=torch.tensor([1], dtype=torch.int32),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    checked = advance._validated_result(
+        result,
+        incoming=torch.zeros(1, dtype=torch.int32),
+        blank_id=VOCAB,
+        queue_capacity=CAP,
+        geometry_bound=CAP,
+        capture=False,
+    )
+    assert int(checked.row_status[0]) == 0
+    assert int(checked.token_lengths[0]) == 1
+
+
+# @spec PORT-ADV-004
+def test_malformed_advance_result_structure_is_precommit_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = advance.advance_session
+
+    def malformed(*args: Any, **kwargs: Any) -> Any:
+        result = real(*args, **kwargs)
+        return replace(result, token_ids=result.token_ids.long())
+
+    monkeypatch.setattr(advance, "advance_session", malformed)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="token_ids"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            _refuse_adapter,
+        )
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-001, PORT-ADV-004, PORT-STATE-008
+@pytest.mark.parametrize(
+    "corruption",
+    ["last_label", "zero_emission_state", "zero_emission_inplace"],
+)
+def test_decode_state_must_match_emission_semantics(corruption: str) -> None:
+    def malformed_decode(
+        frames: torch.Tensor,
+        lengths: torch.Tensor,
+        predictor: Any,
+        joint: Any,
+        state: Any,
+    ) -> Any:
+        token_ids, token_lengths, next_state = rnnt.decode_dense_masked(
+            frames,
+            lengths,
+            predictor,
+            joint,
+            state,
+        )
+        if corruption == "last_label":
+            assert bool((token_lengths > 0).all())
+            wrong = (next_state.last_label + 1) % VOCAB
+            next_state = replace(next_state, last_label=wrong.contiguous())
+        elif corruption == "zero_emission_state":
+            token_lengths = torch.zeros_like(token_lengths)
+            next_state = replace(
+                next_state,
+                h=(state.h + 1).contiguous(),
+                c=(state.c + 1).contiguous(),
+                last_label=state.last_label.clone(),
+            )
+        else:
+            token_lengths = torch.zeros_like(token_lengths)
+            state.h.add_(1)
+            state.c.add_(1)
+            next_state = state
+        return token_ids, token_lengths, next_state
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        resolver=_fixed_resolver(malformed_decode),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_armed_blank_expected_label_is_a_book_invariant() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(
+        pools,
+        1,
+        queue=[3, 5],
+        head=1,
+        expected=core.blank_id,
+    )
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([core.blank_id]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-DEC-007, PORT-STATE-008
+@pytest.mark.parametrize(
+    "corruption",
+    ["pending_at_zero", "wrong_expected", "wrong_last", "undrained_unarmed"],
+)
+def test_replay_book_cross_relations_are_reachable(corruption: str) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
+    book = pools["book_pool"]
+    if corruption == "pending_at_zero":
+        book[1, _BOOK["queue_head"]] = 0
+    elif corruption == "wrong_expected":
+        book[1, _BOOK["expected_label"]] = 4
+    elif corruption == "wrong_last":
+        book[1, _BOOK["last_label"]] = 4
+    else:
+        book[1, _BOOK["pending_echo"]] = 0
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([3]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-007, PORT-STATE-008
+@pytest.mark.parametrize("corruption", ["negative_head", "armed_blank"])
+def test_adapter_proposed_book_defect_masks_without_store(
+    corruption: str,
+) -> None:
+    real = advance.make_mrv1_adapter(
+        hidden_size=CARRIER_HIDDEN,
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+    )
+
+    def malformed(result: Any, context: Any) -> Any:
+        projection = real(result, context)
+        book = projection.book.clone()
+        if corruption == "negative_head":
+            book[0, _BOOK["queue_head"]] = -1
+        else:
+            book[0, _BOOK["pending_echo"]] = 1
+            book[0, _BOOK["expected_label"]] = VOCAB
+        return replace(projection, book=book)
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        adapter=malformed,
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def test_all_scatter_descriptors_validate_before_first_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    validations = {"count": 0}
+    writes = {"count": 0}
+    real_validate = advance.validate_masked_page_scatter
+
+    def fail_late(*args: Any) -> None:
+        validations["count"] += 1
+        if validations["count"] == 2:
+            raise ValueError("malformed later scatter descriptor")
+        real_validate(*args)
+
+    def observe_write(*_args: Any) -> None:
+        writes["count"] += 1
+
+    monkeypatch.setattr(advance, "validate_masked_page_scatter", fail_late)
+    monkeypatch.setattr(advance, "masked_page_scatter_", observe_write)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="later scatter"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+        )
+    assert validations["count"] == 2
+    assert writes["count"] == 0
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-ADV-003, PORT-HOOK-001
+def test_commit_failure_cancels_composite_ticket_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    sink = _CommitRecorder()
+
+    def fail_commit(*_args: Any) -> None:
+        raise RuntimeError("scatter launch failed")
+
+    monkeypatch.setattr(advance, "masked_page_scatter_", fail_commit)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(RuntimeError, match="scatter launch"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            carrier,
+            _plan(prefills=[1]),
+            commit_sink=sink,
+        )
+    assert sink.log == ["reserve", "cancel"]
+    assert sink.cancels == 1
+    assert sink.staged == []
 
 
 def test_burst_overflow_is_rejected_not_truncated() -> None:
     # A decode returning more labels than the queue holds is a port
     # defect: the row masks with BURST_OVERFLOW and nothing scatters —
     # the queue never sees a truncated burst.
-    def _overflowing_decode(
-        frames: Any, lengths: Any, predictor: Any, joint: Any, state: Any
-    ) -> Any:
+    def _overflowing_decode(frames: Any, lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
         b = frames.shape[0]
         ids = torch.ones(b, CAP + 8, dtype=torch.int32)
         lens = torch.full((b,), CAP + 1, dtype=torch.int32)
@@ -1125,64 +2604,60 @@ def test_burst_overflow_is_rejected_not_truncated() -> None:
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
         resolver=_fixed_resolver(_overflowing_decode),
-        status_sink=status,
+        commit_sink=status,
     )
     assert _decision(out) == [PARK_ID]
-    assert (
-        int(status.staged[0][0]) & advance.ROW_STATUS_BURST_OVERFLOW
-    )
-    torch.testing.assert_close(
-        pools["queue_pool"], before["queue_pool"], rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        pools["book_pool"], before["book_pool"], rtol=0, atol=0
-    )
+    assert int(status.staged[0][0]) & advance.ROW_STATUS_BURST_OVERFLOW
+    torch.testing.assert_close(pools["queue_pool"], before["queue_pool"], rtol=0, atol=0)
+    torch.testing.assert_close(pools["book_pool"], before["book_pool"], rtol=0, atol=0)
 
 
-def test_publication_observes_commit_and_stage_first() -> None:
-    # Ordering proof: capture reserve → status reserve → (scatters) →
-    # stage → publish, and at publish time the resident book already
-    # holds the committed value.
+def test_composite_stage_observes_commit() -> None:
+    # Ordering proof: one reserve → scatters → one combined stage; at
+    # stage time the resident book already holds the committed value.
     core = _tiny_core()
     pools = _fresh_pools()
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    shared: list[str] = []
-    cap_sink = _RecorderSink()
-    status = _StatusRecorder()
-    cap_sink.log = shared
-    status.log = shared
-    seen_at_publish: dict[str, int] = {}
+    sink = _CommitRecorder()
+    seen_at_stage: dict[str, int] = {}
 
     def snapshot() -> None:
-        seen_at_publish["head"] = int(
-            pools["book_pool"][1, _BOOK["queue_head"]]
-        )
+        seen_at_stage["head"] = int(pools["book_pool"][1, _BOOK["queue_head"]])
 
-    cap_sink.on_publish = snapshot
+    sink.on_stage = snapshot
     _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        capture_sink=cap_sink, status_sink=status,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=sink,
+        capture=True,
     )
-    assert shared == [
-        "reserve_capture", "reserve_status", "stage", "publish",
-    ]
-    # The CHUNK committed head=1 (first label emitted) BEFORE publish.
-    assert seen_at_publish["head"] == 1
+    assert sink.log == ["reserve", "stage"]
+    # The CHUNK committed head=1 before the combined no-fail stage.
+    assert seen_at_stage["head"] == 1
 
 
 # ---- the MRV1 adapter as a pure tensor transform --------------------------
@@ -1196,6 +2671,7 @@ def _context(
     queue: torch.Tensor,
     book: torch.Tensor,
     row_status: list[int] | None = None,
+    prompt_index: list[int] | None = None,
 ) -> Any:
     n = len(roles)
     return advance.EmissionContext(
@@ -1204,16 +2680,13 @@ def _context(
         chunk_rows=torch.tensor(chunk_rows, dtype=torch.long),
         queue=queue,
         book=book,
-        row_status=torch.tensor(
-            row_status or [0] * n, dtype=torch.int32
-        ),
+        prompt_index=torch.tensor(prompt_index or [0] * n, dtype=torch.long),
+        row_status=torch.tensor(row_status or [0] * n, dtype=torch.int32),
     )
 
 
 def _adapter() -> Any:
-    return advance.make_mrv1_adapter(
-        hidden_size=64, park_id=PARK_ID, blank_id=VOCAB
-    )
+    return advance.make_mrv1_adapter(hidden_size=64, park_id=PARK_ID, blank_id=VOCAB)
 
 
 def test_adapter_chunk_burst_first_label_and_armed_echo() -> None:
@@ -1223,7 +2696,8 @@ def test_adapter_chunk_burst_first_label_and_armed_echo() -> None:
         token_lengths=torch.tensor([2], dtype=torch.int32),
     )
     ctx = _context(
-        roles=[advance.ROLE_CHUNK], input_ids=[PLACEHOLDER_ID],
+        roles=[advance.ROLE_CHUNK],
+        input_ids=[PLACEHOLDER_ID],
         chunk_rows=[0],
         queue=torch.zeros(1, CAP, dtype=torch.int32),
         book=torch.zeros(1, BOOK_WIDTH, dtype=torch.int32),
@@ -1246,7 +2720,8 @@ def test_adapter_zero_burst_parks_without_echo() -> None:
         token_lengths=torch.zeros(1, dtype=torch.int32),
     )
     ctx = _context(
-        roles=[advance.ROLE_CHUNK], input_ids=[PLACEHOLDER_ID],
+        roles=[advance.ROLE_CHUNK],
+        input_ids=[PLACEHOLDER_ID],
         chunk_rows=[0],
         queue=torch.zeros(1, CAP, dtype=torch.int32),
         book=torch.zeros(1, BOOK_WIDTH, dtype=torch.int32),
@@ -1267,8 +2742,11 @@ def test_adapter_masked_chunk_keeps_scratch_and_parks() -> None:
     book[0, _BOOK["last_label"]] = 3
     queue = torch.zeros(1, CAP, dtype=torch.int32)
     ctx = _context(
-        roles=[advance.ROLE_CHUNK], input_ids=[PLACEHOLDER_ID],
-        chunk_rows=[0], queue=queue, book=book,
+        roles=[advance.ROLE_CHUNK],
+        input_ids=[PLACEHOLDER_ID],
+        chunk_rows=[0],
+        queue=queue,
+        book=book,
         row_status=[advance.ROW_STATUS_ENVELOPE],
     )
     proj = adapter(result, ctx)
@@ -1287,8 +2765,11 @@ def test_adapter_replay_emits_next_and_advances_head() -> None:
     book[0, _BOOK["pending_echo"]] = 1
     book[0, _BOOK["expected_label"]] = 4
     ctx = _context(
-        roles=[advance.ROLE_REPLAY], input_ids=[4], chunk_rows=[],
-        queue=queue, book=book,
+        roles=[advance.ROLE_REPLAY],
+        input_ids=[4],
+        chunk_rows=[],
+        queue=queue,
+        book=book,
     )
     proj = adapter(
         advance.AdvanceResult(
@@ -1313,8 +2794,11 @@ def test_adapter_drained_replay_parks_and_clears_echo() -> None:
     book[0, _BOOK["pending_echo"]] = 1
     book[0, _BOOK["expected_label"]] = 6
     ctx = _context(
-        roles=[advance.ROLE_REPLAY], input_ids=[6], chunk_rows=[],
-        queue=queue, book=book,
+        roles=[advance.ROLE_REPLAY],
+        input_ids=[6],
+        chunk_rows=[],
+        queue=queue,
+        book=book,
     )
     proj = adapter(
         advance.AdvanceResult(
@@ -1336,7 +2820,8 @@ def test_adapter_queue_saturation_full_capacity_burst() -> None:
         token_lengths=torch.tensor([CAP], dtype=torch.int32),
     )
     ctx = _context(
-        roles=[advance.ROLE_CHUNK], input_ids=[PLACEHOLDER_ID],
+        roles=[advance.ROLE_CHUNK],
+        input_ids=[PLACEHOLDER_ID],
         chunk_rows=[0],
         queue=torch.zeros(1, CAP, dtype=torch.int32),
         book=torch.zeros(1, BOOK_WIDTH, dtype=torch.int32),
@@ -1366,11 +2851,15 @@ def test_adapter_mixed_roles_keep_row_order() -> None:
     )
     ctx = _context(
         roles=[
-            advance.ROLE_CHUNK, advance.ROLE_REPLAY,
-            advance.ROLE_FLUSH, advance.ROLE_REPLAY,
+            advance.ROLE_CHUNK,
+            advance.ROLE_REPLAY,
+            advance.ROLE_FLUSH,
+            advance.ROLE_REPLAY,
         ],
         input_ids=[PLACEHOLDER_ID, 7, PARK_ID, 11],
-        chunk_rows=[0], queue=queue, book=book,
+        chunk_rows=[0],
+        queue=queue,
+        book=book,
     )
     proj = adapter(result, ctx)
     assert proj.rows[:, 0].long().tolist() == [5, 9, PARK_ID, PARK_ID]
@@ -1405,44 +2894,42 @@ def _arms() -> dict[str, Any]:
 
 def test_table_resolver_matches_select_semantics() -> None:
     table = _table()
-    resolver = advance.make_table_resolver(
-        table, lane="fp32", arms=_arms(), max_batch=1024
-    )
+    resolver = advance.make_table_resolver(table, lane="fp32", arms=_arms(), max_batch=1024)
     for batch in (1, 8, 33, 64, 100, 512, 700, 1024):
         got = resolver(
             advance.DecodeRequest(
-                geometry=0, execution_batch_size=batch,
-                graph_covers_decode=False, ready_decode_buckets=1,
+                geometry=0,
+                execution_batch_size=batch,
+                graph_covers_decode=False,
+                ready_decode_buckets=1,
             )
         )
-        want = table.select(
-            "80ms", batch, lane="fp32", graph_covers_decode=False
-        )
+        want = table.select("80ms", batch, lane="fp32", graph_covers_decode=False)
         assert got.arm == want, f"batch {batch}: {got.arm} != {want}"
 
 
 def test_table_resolver_bracket_disagreement_takes_sync_free() -> None:
-    resolver = advance.make_table_resolver(
-        _table(), lane="fp32", arms=_arms(), max_batch=1024
-    )
+    resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
     # 64 (dense) and 512 (compact) bracket 200: sync-free wins.
     got = resolver(
         advance.DecodeRequest(
-            geometry=0, execution_batch_size=200,
-            graph_covers_decode=False, ready_decode_buckets=1,
+            geometry=0,
+            execution_batch_size=200,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
         )
     )
     assert got.arm == "dense-eager"
 
 
 def test_table_resolver_graph_coverage_forces_dense_graphed() -> None:
-    resolver = advance.make_table_resolver(
-        _table(), lane="fp32", arms=_arms(), max_batch=1024
-    )
+    resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
     got = resolver(
         advance.DecodeRequest(
-            geometry=0, execution_batch_size=512,
-            graph_covers_decode=True, ready_decode_buckets=1,
+            geometry=0,
+            execution_batch_size=512,
+            graph_covers_decode=True,
+            ready_decode_buckets=1,
         )
     )
     assert got.arm == "dense-graphed"
@@ -1450,20 +2937,22 @@ def test_table_resolver_graph_coverage_forces_dense_graphed() -> None:
 
 
 def test_table_resolver_multi_bucket_forces_sync_free() -> None:
-    resolver = advance.make_table_resolver(
-        _table(), lane="fp32", arms=_arms(), max_batch=1024
-    )
+    resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
     single = resolver(
         advance.DecodeRequest(
-            geometry=0, execution_batch_size=512,
-            graph_covers_decode=False, ready_decode_buckets=1,
+            geometry=0,
+            execution_batch_size=512,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
         )
     )
     assert single.arm == "compact-eager"
     multi = resolver(
         advance.DecodeRequest(
-            geometry=0, execution_batch_size=512,
-            graph_covers_decode=False, ready_decode_buckets=2,
+            geometry=0,
+            execution_batch_size=512,
+            graph_covers_decode=False,
+            ready_decode_buckets=2,
         )
     )
     assert multi.arm == "dense-eager"
@@ -1472,9 +2961,7 @@ def test_table_resolver_multi_bucket_forces_sync_free() -> None:
 
 def test_table_resolver_missing_geometry_fails_at_startup() -> None:
     table = _table()
-    entries = {
-        k: v for k, v in table.entries.items() if k[0] != "320ms"
-    }
+    entries = {k: v for k, v in table.entries.items() if k[0] != "320ms"}
     broken = decode_dispatch.DispatchTable(
         entries=entries,
         fingerprint={},
@@ -1483,15 +2970,11 @@ def test_table_resolver_missing_geometry_fails_at_startup() -> None:
         lanes=("fp32",),
     )
     with pytest.raises(KeyError):
-        advance.make_table_resolver(
-            broken, lane="fp32", arms=_arms(), max_batch=64
-        )
+        advance.make_table_resolver(broken, lane="fp32", arms=_arms(), max_batch=64)
 
 
 def test_table_resolver_unbound_arm_fails_at_startup() -> None:
     arms = _arms()
     del arms["compact-eager"]
     with pytest.raises(KeyError):
-        advance.make_table_resolver(
-            _table(), lane="fp32", arms=arms, max_batch=1024
-        )
+        advance.make_table_resolver(_table(), lane="fp32", arms=arms, max_batch=1024)

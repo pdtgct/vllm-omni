@@ -45,15 +45,16 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ENV_VERSION,
     ENVELOPE_HEADER_SLOTS,
     ENVELOPE_VERSION,
+    ROW_STATUS_BOOK_IDENTITY,
     ROW_STATUS_ECHO_MISMATCH,
     ROW_STATUS_PROMPT_MISMATCH,
     ROW_STATUS_QUEUE_NOT_DRAINED,
     AdvanceResult,
-    CapturePlan,
     ChunkBatch,
     DecodeRequest,
     EmissionAdapter,
     PreparedCaptures,
+    PreparedRowBinding,
     ResolvedDecode,
     RowPlan,
     SessionStateBatch,
@@ -147,23 +148,30 @@ def _tiny_core(seed: int = 7) -> Any:
 
     torch.manual_seed(seed)
     encoder = FastConformerEncoder(
-        feat_in=FEAT, d_model=D_MODEL, d_ff=64, n_layers=N_LAYERS,
-        n_heads=4, conv_kernel=KERNEL, subsampling_channels=16,
+        feat_in=FEAT,
+        d_model=D_MODEL,
+        d_ff=64,
+        n_layers=N_LAYERS,
+        n_heads=4,
+        conv_kernel=KERNEL,
+        subsampling_channels=16,
         att_context=(WINDOW, 1),
     )
     encoder.eval()
     predictor = Predictor(vocab_size=VOCAB, pred_hidden=16, pred_rnn_layers=2)
-    joint = Joint(
-        enc_hidden=D_MODEL, pred_hidden=16, joint_hidden=16, vocab_size=VOCAB
-    )
+    joint = Joint(enc_hidden=D_MODEL, pred_hidden=16, joint_hidden=16, vocab_size=VOCAB)
     lid = PromptConditioner(enc_hidden=D_MODEL, num_prompts=4)
     featurizer = MelFeaturizer(
         filterbank=torch.rand(FEAT, 257) * 0.01,
         window=torch.hann_window(400),
     )
     return SimpleNamespace(
-        encoder=encoder, lid=lid, predictor=predictor, joint=joint,
-        featurizer=featurizer, blank_id=VOCAB,
+        encoder=encoder,
+        lid=lid,
+        predictor=predictor,
+        joint=joint,
+        featurizer=featurizer,
+        blank_id=VOCAB,
     )
 
 
@@ -172,16 +180,12 @@ def _whole_signal_mel(core: Any, samples: torch.Tensor) -> torch.Tensor:
     (a final-tail chunk applies ordinary centered-STFT boundary rules,
     identical to the whole-utterance featurizer)."""
     with torch.no_grad():
-        mel, mel_len = core.featurizer(
-            samples.unsqueeze(0), torch.tensor([samples.shape[0]])
-        )
+        mel, mel_len = core.featurizer(samples.unsqueeze(0), torch.tensor([samples.shape[0]]))
     trimmed: torch.Tensor = mel[:, :, : int(mel_len[0])]
     return trimmed
 
 
-def _reference_burst(
-    core: Any, samples: torch.Tensor, prompt_index: int
-) -> list[int]:
+def _reference_burst(core: Any, samples: torch.Tensor, prompt_index: int) -> list[int]:
     """The labels a session-first final-tail chunk should emit, via the
     golden whole-signal path."""
     from vllm_omni.model_executor.models.nemotron_asr.encoder import (
@@ -195,8 +199,12 @@ def _reference_burst(
 
     mel = _whole_signal_mel(core, samples)
     caches = StreamingCaches(
-        n_layers=N_LAYERS, batch=1, d_model=D_MODEL, left_context=WINDOW,
-        conv_kernel=KERNEL, device=torch.device("cpu"),
+        n_layers=N_LAYERS,
+        batch=1,
+        d_model=D_MODEL,
+        left_context=WINDOW,
+        conv_kernel=KERNEL,
+        device=torch.device("cpu"),
     )
     with torch.no_grad():
         enc = stream_step(core.encoder, mel, caches, drop_extra=0)
@@ -206,9 +214,7 @@ def _reference_burst(
             c=torch.zeros(2, 1, 16),
             last_label=torch.full((1,), core.blank_id),
         )
-        labels, _ = greedy_decode_batch(
-            conditioned, core.predictor, core.joint, state
-        )
+        labels, _ = greedy_decode_batch(conditioned, core.predictor, core.joint, state)
     return labels[0]
 
 
@@ -222,8 +228,12 @@ def _reference_encoder_frames(core: Any, samples: torch.Tensor) -> int:
 
     mel = _whole_signal_mel(core, samples)
     caches = StreamingCaches(
-        n_layers=N_LAYERS, batch=1, d_model=D_MODEL, left_context=WINDOW,
-        conv_kernel=KERNEL, device=torch.device("cpu"),
+        n_layers=N_LAYERS,
+        batch=1,
+        d_model=D_MODEL,
+        left_context=WINDOW,
+        conv_kernel=KERNEL,
+        device=torch.device("cpu"),
     )
     with torch.no_grad():
         enc = stream_step(core.encoder, mel, caches, drop_extra=0)
@@ -234,25 +244,16 @@ def _fresh_pools(num_blocks: int = 3) -> Pools:
     # Block 0 is the reserved null block: allocated like every pool row
     # but never a live session page.
     return {
-        "channel_pools": [
-            torch.zeros(num_blocks, WINDOW, D_MODEL) for _ in range(N_LAYERS)
-        ],
-        "time_pools": [
-            torch.zeros(num_blocks, D_MODEL, KERNEL - 1)
-            for _ in range(N_LAYERS)
-        ],
-        "len_pools": [
-            torch.zeros(num_blocks, 1) for _ in range(N_LAYERS)
-        ],
+        "channel_pools": [torch.zeros(num_blocks, WINDOW, D_MODEL) for _ in range(N_LAYERS)],
+        "time_pools": [torch.zeros(num_blocks, D_MODEL, KERNEL - 1) for _ in range(N_LAYERS)],
+        "len_pools": [torch.zeros(num_blocks, 1, dtype=torch.int32) for _ in range(N_LAYERS)],
         "h_pool": torch.zeros(num_blocks, 2, 16),
         "c_pool": torch.zeros(num_blocks, 2, 16),
         "queue_pool": torch.zeros(num_blocks, CAP, dtype=torch.int32),
         "book_pool": torch.zeros(num_blocks, BOOK_WIDTH, dtype=torch.int32),
         "frontend_raw_pool": torch.zeros(num_blocks, RAW_TAIL),
         "frontend_mel_pool": torch.zeros(num_blocks, FEAT, 9),
-        "frontend_counter_pool": torch.zeros(
-            num_blocks, CTR_WIDTH, dtype=torch.int64
-        ),
+        "frontend_counter_pool": torch.zeros(num_blocks, CTR_WIDTH, dtype=torch.int64),
     }
 
 
@@ -267,17 +268,12 @@ def _sentinel_pools(num_blocks: int = 3, value: float = 12345.0) -> Pools:
             for t in val:
                 t.fill_(value)
         else:
-            val.fill_(
-                int(value) if not val.dtype.is_floating_point else value
-            )
+            val.fill_(int(value) if not val.dtype.is_floating_point else value)
     return pools
 
 
 def _clone_pools(pools: Pools) -> Pools:
-    return {
-        k: [t.clone() for t in v] if isinstance(v, list) else v.clone()
-        for k, v in pools.items()
-    }
+    return {k: [t.clone() for t in v] if isinstance(v, list) else v.clone() for k, v in pools.items()}
 
 
 def _assert_pools_equal(a: Pools, b: Pools) -> None:
@@ -304,6 +300,9 @@ def _plan(
     chunk: list[bool] | None = None,
     geometries: list[int] | None = None,
     generations: list[int] | None = None,
+    deadlines: list[int] | None = None,
+    prior_prompts: list[int] | None = None,
+    allow_prompt_transitions: list[bool] | None = None,
     execution_tier: int = 0,
 ) -> RowPlan:
     """Build a RowPlan the way the plan provider would: decode indices
@@ -315,12 +314,8 @@ def _plan(
     decodes = decodes or []
     prefills = prefills or []
     num_decodes = len(decodes)
-    padded = decodes + [padding_value] * (
-        (pad_decodes_to or num_decodes) - num_decodes
-    )
-    d = torch.tensor(
-        [[i] * decode_columns for i in padded], dtype=torch.long
-    ).reshape(len(padded), decode_columns)
+    padded = decodes + [padding_value] * ((pad_decodes_to or num_decodes) - num_decodes)
+    d = torch.tensor([[i] * decode_columns for i in padded], dtype=torch.long).reshape(len(padded), decode_columns)
     p = torch.tensor(prefills, dtype=torch.long)
     if has_initial is None:
         has_initial = [False] * len(prefills)
@@ -337,6 +332,28 @@ def _plan(
         geometries = [GEOM_REG] * n_real
     if generations is None:
         generations = [0] * n_real
+    if deadlines is None:
+        deadlines = [i + 1 if chunk[i] else 0 for i in range(n_real)]
+    request_ids = tuple(f"req-{i}" for i in range(n_real))
+    if prior_prompts is None:
+        prior_prompts = list(prompts)
+    if allow_prompt_transitions is None:
+        allow_prompt_transitions = [False] * n_real
+    blocks = [*decodes, *prefills]
+    bindings = tuple(
+        PreparedRowBinding(
+            request_id=request_ids[row],
+            block_id=blocks[row],
+            admission_generation=generations[row],
+            geometry_id=geometries[row],
+            prompt_index=prompts[row],
+            prior_prompt_index=prior_prompts[row],
+            allow_prompt_transition=allow_prompt_transitions[row],
+            is_chunk=chunk[row],
+            ready_deadline_ns=deadlines[row],
+        )
+        for row in range(n_real)
+    )
     return RowPlan(
         state_indices_d=d,
         num_decodes=num_decodes,
@@ -350,8 +367,10 @@ def _plan(
         prompt_index=torch.tensor(prompts, dtype=torch.long),
         is_chunk=torch.tensor(chunk, dtype=torch.bool),
         admission_generation=torch.tensor(generations, dtype=torch.long),
-        request_ids=tuple(f"req-{i}" for i in range(n_real)),
+        ready_deadline_ns=torch.tensor(deadlines, dtype=torch.long),
+        request_ids=request_ids,
         execution_tier=execution_tier,
+        bindings=bindings,
     )
 
 
@@ -414,57 +433,34 @@ class _RecordingResolver:
         return ResolvedDecode(arm="dense-eager", decode_fn=self._fn)
 
 
-class _Reservation:
-    def __init__(self, sink: "_RecorderSink") -> None:
+class _CommitTicket:
+    def __init__(self, sink: "_CommitRecorder") -> None:
         self._sink = sink
 
-    def publish(self, records: Any) -> None:
-        self._sink.published.append(list(records))
+    def stage(self, row_status: torch.Tensor, records: Any) -> None:
+        self._sink.staged.append(row_status.clone())
+        candidates = list(records)
+        self._sink.published.append([r for r in candidates if int(row_status[r.row]) == 0])
 
     def cancel(self) -> None:
         self._sink.cancels += 1
 
 
-class _RecorderSink:
-    """A bounded-sink test double recording reserve/publish/cancel."""
+class _CommitRecorder:
+    """Composite status/capture reservation test double."""
 
     def __init__(self, *, fail_reserve: bool = False) -> None:
-        self.plans: list[CapturePlan] = []
+        self.plans: list[Any] = []
+        self.staged: list[torch.Tensor] = []
         self.published: list[list[Any]] = []
         self.cancels = 0
         self._fail = fail_reserve
 
-    def reserve(self, plan: CapturePlan) -> _Reservation:
+    def reserve(self, plan: Any) -> _CommitTicket:
         self.plans.append(plan)
         if self._fail:
-            raise RuntimeError("capture sink at capacity")
-        return _Reservation(self)
-
-
-class _StatusTicket:
-    def __init__(self, sink: "_StatusRecorder") -> None:
-        self._sink = sink
-
-    def stage(self, row_status: torch.Tensor) -> None:
-        self._sink.staged.append(row_status.clone())
-
-
-class _StatusRecorder:
-    """Request-aware ticket sink: reserve pre-commit, stage no-fail
-    post-commit (exactly once)."""
-
-    def __init__(self, *, fail_reserve: bool = False) -> None:
-        self.reserved: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
-        self.staged: list[torch.Tensor] = []
-        self._fail = fail_reserve
-
-    def reserve(
-        self, request_ids: Any, generations: Any
-    ) -> _StatusTicket:
-        self.reserved.append((tuple(request_ids), tuple(generations)))
-        if self._fail:
-            raise RuntimeError("status sink at capacity")
-        return _StatusTicket(self)
+            raise RuntimeError("commit sink at capacity")
+        return _CommitTicket(self)
 
 
 def _call(
@@ -476,21 +472,27 @@ def _call(
     adapter: EmissionAdapter | None = None,
     *,
     resolver: Any = None,
-    capture_sink: Any = None,
-    status_sink: Any = None,
+    commit_sink: Any = None,
+    capture: bool = False,
     graph_covers_decode: bool = False,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = make_mrv1_adapter(
-            hidden_size=CARRIER_HIDDEN, park_id=PARK_ID,
+            hidden_size=CARRIER_HIDDEN,
+            park_id=PARK_ID,
             blank_id=core.blank_id,
         )
     return advance_model_rows(
-        core, input_ids, inputs_embeds, plan,
+        core,
+        input_ids,
+        inputs_embeds,
+        plan,
         adapter=adapter,
         decode_resolver=resolver if resolver is not None else _fixed_resolver(),
-        placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
-        capture_sink=capture_sink, status_sink=status_sink,
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        commit_sink=commit_sink,
+        capture=capture,
         graph_covers_decode=graph_covers_decode,
         **pools,
     )
@@ -515,7 +517,7 @@ def _set_replay_book(
         qp[block, i] = label
     book[block, _BOOK["queue_head"]] = head
     book[block, _BOOK["queue_length"]] = len(queue)
-    book[block, _BOOK["last_label"]] = expected
+    book[block, _BOOK["last_label"]] = queue[-1]
     book[block, _BOOK["pending_echo"]] = 1
     book[block, _BOOK["expected_label"]] = expected
 
@@ -650,9 +652,12 @@ def test_advance_model_rows_requires_a_resolver_before_state_reads() -> None:
     plan = _plan(decodes=[1])
     with pytest.raises(ValueError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PARK_ID], dtype=torch.long),
-            torch.zeros(1, CARRIER_HIDDEN), plan, _refuse_adapter,
+            torch.zeros(1, CARRIER_HIDDEN),
+            plan,
+            _refuse_adapter,
             resolver=False,  # explicit non-callable sentinel
         )
     _assert_pools_equal(pools, before)
@@ -668,11 +673,32 @@ def test_advance_model_rows_accepts_legal_graph_padding() -> None:
     _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
     plan = _plan(decodes=[1], pad_decodes_to=2, padding_value=NULL_INDEX)
     input_ids = torch.tensor([3], dtype=torch.long)  # the correct echo
-    out = _call(
-        core, pools, input_ids, torch.zeros(1, CARRIER_HIDDEN), plan
-    )
+    out = _call(core, pools, input_ids, torch.zeros(1, CARRIER_HIDDEN), plan)
     assert out.shape == (1, CARRIER_HIDDEN)
     assert int(read_decision_carrier(out)[0]) == 5  # next queued label
+
+
+def test_graph_covered_outer_call_rejects_before_resolution() -> None:
+    # @spec PORT-DEC-008 — legal padding metadata does not imply that
+    # the outer transaction has exact execution padding; graph-covered
+    # invocation remains fail-closed until that separate slice lands.
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    resolver = _RecordingResolver()
+    with pytest.raises(ValueError, match="graph-covered"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            _plan(prefills=[1], execution_tier=1),
+            _refuse_adapter,
+            resolver=resolver,
+            graph_covers_decode=True,
+        )
+    assert resolver.requests == []
+    _assert_pools_equal(pools, before)
 
 
 # ---- PORT-ADV-003: decode-then-prefill composition ------------------------
@@ -703,19 +729,17 @@ def test_composition_orders_decode_rows_before_prefill_rows(
     pools = _fresh_pools()
     pools["h_pool"][2].fill_(0.5)  # the resumed session's signature
     pools["book_pool"][2, _BOOK["last_label"]] = core.blank_id
-    pools["frontend_counter_pool"][
-        2, _CTR["expected_chunk_sequence"]
-    ] = 3
+    pools["frontend_counter_pool"][2, _CTR["expected_chunk_sequence"]] = 3
     plan = _plan(decodes=[2], prefills=[1], chunk=[True, True])
     torch.manual_seed(5)
     samples = torch.randn(REG_SAMPLES) * 0.01
-    embeds = torch.stack([
-        _envelope(samples, final=False, seq=3),
-        _envelope(samples, final=False, seq=0),
-    ])
-    input_ids = torch.tensor(
-        [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
+    embeds = torch.stack(
+        [
+            _envelope(samples, final=False, seq=3),
+            _envelope(samples, final=False, seq=0),
+        ]
     )
+    input_ids = torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long)
     _call(core, pools, input_ids, embeds, plan)
     assert torch.all(seen["h"][0] == 0.5)  # decode row first
     assert torch.count_nonzero(seen["h"][1]) == 0  # fresh prefill after
@@ -729,8 +753,8 @@ def test_mixed_geometries_bucket_and_resolve_per_geometry(
     # Two CHUNK rows at different admitted geometries: one
     # advance_session call per geometry bucket, each with its own
     # geometry kwarg and membership; the resolver is invoked exactly
-    # once per bucket with ready_decode_buckets == 2, and the padded
-    # execution tier equals each bucket's row count.
+    # once per bucket with ready_decode_buckets == 2. Deadlines oppose
+    # manifest order, proving final geometry resolves/executes first.
     calls: list[dict[str, Any]] = []
 
     def _recorder(
@@ -739,10 +763,12 @@ def test_mixed_geometries_bucket_and_resolve_per_geometry(
         _state: SessionStateBatch,
         **kw: Any,
     ) -> AdvanceResult:
-        calls.append({
-            "rows": batch.samples.shape[0],
-            "geometry": kw.get("geometry"),
-        })
+        calls.append(
+            {
+                "rows": batch.samples.shape[0],
+                "geometry": kw.get("geometry"),
+            }
+        )
         return _empty_result(batch.samples.shape[0])
 
     monkeypatch.setattr(advance_mod, "advance_session", _recorder)
@@ -753,27 +779,34 @@ def test_mixed_geometries_bucket_and_resolve_per_geometry(
         prefills=[1, 2],
         num_pool_blocks=4,
         geometries=[GEOM_REG, GEOM_FINAL],
+        deadlines=[200, 100],
     )
     torch.manual_seed(5)
     reg = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
         geometry=GEOM_REG,
     )
     fin = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     )
-    input_ids = torch.tensor(
-        [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
-    )
+    input_ids = torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long)
     _call(
-        core, pools, input_ids, torch.stack([reg, fin]), plan,
+        core,
+        pools,
+        input_ids,
+        torch.stack([reg, fin]),
+        plan,
         resolver=resolver,
     )
-    assert sorted(c["geometry"] for c in calls) == [GEOM_REG, GEOM_FINAL]
+    assert [c["geometry"] for c in calls] == [GEOM_FINAL, GEOM_REG]
     assert all(c["rows"] == 1 for c in calls)
     assert len(resolver.requests) == 2  # exactly once per bucket
-    assert {r.geometry for r in resolver.requests} == {GEOM_REG, GEOM_FINAL}
+    assert [r.geometry for r in resolver.requests] == [GEOM_FINAL, GEOM_REG]
     assert all(r.ready_decode_buckets == 2 for r in resolver.requests)
     assert all(r.execution_batch_size == 1 for r in resolver.requests)
 
@@ -796,9 +829,11 @@ def test_replay_only_batch_never_calls_advance_session(
     _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3)
     plan = _plan(decodes=[1])
     _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([3], dtype=torch.long),  # the correct echo
-        torch.zeros(1, CARRIER_HIDDEN), plan,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
     )
 
 
@@ -818,11 +853,14 @@ def test_flush_only_batch_never_calls_advance_session(
     # token.
     _set_drained_book(pools, 1, blank=core.blank_id)
     pools["frontend_counter_pool"][1, _CTR["finalized"]] = 1
+    pools["frontend_counter_pool"][1, _CTR["expected_chunk_sequence"]] = 1
     plan = _plan(decodes=[1])
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PARK_ID], dtype=torch.long),
-        torch.zeros(1, CARRIER_HIDDEN), plan,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
     )
     assert int(read_decision_carrier(out)[0]) == PARK_ID
 
@@ -848,10 +886,12 @@ def test_mixed_batch_calls_advance_session_with_only_chunk_rows(
     _set_replay_book(pools, 2, queue=[7], head=1, expected=7)  # REPLAY
     torch.manual_seed(5)
     samples = torch.randn(REG_SAMPLES) * 0.01
-    embeds = torch.stack([
-        torch.zeros(CARRIER_HIDDEN),
-        _envelope(samples, final=False, seq=0),
-    ])
+    embeds = torch.stack(
+        [
+            torch.zeros(CARRIER_HIDDEN),
+            _envelope(samples, final=False, seq=0),
+        ]
+    )
     input_ids = torch.tensor([7, PLACEHOLDER_ID], dtype=torch.long)
     plan = _plan(decodes=[2], prefills=[1])
     _call(core, pools, input_ids, embeds, plan)
@@ -881,17 +921,19 @@ def test_advance_session_result_contract() -> None:
         mel_tail=torch.zeros(1, FEAT, 9),
         frontend_counters=torch.zeros(1, CTR_WIDTH, dtype=torch.int64),
         channel=[torch.zeros(1, WINDOW, D_MODEL) for _ in range(N_LAYERS)],
-        window_valid=[
-            torch.zeros(1, 1, dtype=torch.int32) for _ in range(N_LAYERS)
-        ],
+        window_valid=[torch.zeros(1, 1, dtype=torch.int32) for _ in range(N_LAYERS)],
         time=[torch.zeros(1, D_MODEL, KERNEL - 1) for _ in range(N_LAYERS)],
         h=torch.zeros(1, 2, 16),
         c=torch.zeros(1, 2, 16),
         last_label=torch.full((1,), core.blank_id, dtype=torch.long),
     )
     result = advance_session(
-        core, batch, state,
-        geometry=GEOM_FINAL, decode_fn=decode_dense_masked, capture=True,
+        core,
+        batch,
+        state,
+        geometry=GEOM_FINAL,
+        decode_fn=decode_dense_masked,
+        capture=True,
     )
     assert isinstance(result, AdvanceResult)
     # GPU-resident result: padded token_ids + per-row lengths + the
@@ -934,22 +976,16 @@ def test_fresh_session_rows_ignore_a_recycled_blocks_poison() -> None:
     core = _tiny_core()
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     input_ids = torch.tensor([PLACEHOLDER_ID], dtype=torch.long)
-    plan = _plan(
-        prefills=[1], has_initial=[False], geometries=[GEOM_FINAL]
-    )
+    plan = _plan(prefills=[1], has_initial=[False], geometries=[GEOM_FINAL])
 
     clean = _fresh_pools()
     out_clean = _call(core, clean, input_ids, carrier, plan)
 
     dirty = _sentinel_pools(value=3.14)  # poison EVERYTHING, book incl.
     out_dirty = _call(core, dirty, input_ids, carrier, plan)
-    torch.testing.assert_close(
-        read_decision_carrier(out_dirty), read_decision_carrier(out_clean)
-    )
+    torch.testing.assert_close(read_decision_carrier(out_dirty), read_decision_carrier(out_clean))
 
 
 def test_corrupted_echo_masks_only_that_row_and_peers_advance() -> None:
@@ -966,12 +1002,14 @@ def test_corrupted_echo_masks_only_that_row_and_peers_advance() -> None:
     _set_replay_book(pools, 2, queue=[4, 6], head=1, expected=4)
     before = _clone_pools(pools)
     plan = _plan(decodes=[1, 2])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([3, 8], dtype=torch.long),  # row 1: wrong echo
-        torch.zeros(2, CARRIER_HIDDEN), plan,
-        status_sink=status,
+        torch.zeros(2, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
     )
     # Row 0 advanced: next queued label emitted, head past it.
     assert int(read_decision_carrier(out)[0]) == 5
@@ -979,12 +1017,8 @@ def test_corrupted_echo_masks_only_that_row_and_peers_advance() -> None:
     assert int(pools["book_pool"][1, _BOOK["expected_label"]]) == 5
     # Row 1 masked: park only, book/queue bit-identical.
     assert int(read_decision_carrier(out)[1]) == PARK_ID
-    torch.testing.assert_close(
-        pools["book_pool"][2], before["book_pool"][2], rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        pools["queue_pool"][2], before["queue_pool"][2], rtol=0, atol=0
-    )
+    torch.testing.assert_close(pools["book_pool"][2], before["book_pool"][2], rtol=0, atol=0)
+    torch.testing.assert_close(pools["queue_pool"][2], before["queue_pool"][2], rtol=0, atol=0)
     # Exactly one staged status: row 0 clean, row 1 flagged.
     assert len(status.staged) == 1
     staged = status.staged[0]
@@ -1002,9 +1036,11 @@ def test_absurd_echo_id_cannot_reach_unsafe_indexing() -> None:
     before = _clone_pools(pools)
     plan = _plan(decodes=[1])
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([10**6], dtype=torch.long),
-        torch.zeros(1, CARRIER_HIDDEN), plan,
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
     )
     assert int(read_decision_carrier(out)[0]) == PARK_ID
     _assert_pools_equal(pools, before)
@@ -1023,11 +1059,14 @@ def test_chunk_on_undrained_queue_is_masked_and_reported() -> None:
     samples = torch.randn(REG_SAMPLES) * 0.01
     carrier = _envelope(samples, final=False, seq=0).unsqueeze(0)
     plan = _plan(decodes=[1], chunk=[True])
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        status_sink=status,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=status,
     )
     assert int(read_decision_carrier(out)[0]) == PARK_ID
     _assert_pools_equal(pools, before)
@@ -1059,8 +1098,11 @@ def test_resident_pools_unchanged_when_bucket_compute_fails(
     plan = _plan(prefills=[1])
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
-            torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+            carrier,
+            plan,
         )
     _assert_pools_equal(pools, before)
 
@@ -1077,16 +1119,18 @@ def test_capture_reservation_failure_is_pre_commit_fatal() -> None:
     before = _clone_pools(pools)
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    sink = _RecorderSink(fail_reserve=True)
+    sink = _CommitRecorder(fail_reserve=True)
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
-            torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-            capture_sink=sink,
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+            carrier,
+            plan,
+            commit_sink=sink,
+            capture=True,
         )
     _assert_pools_equal(pools, before)
     assert sink.published == []
@@ -1103,19 +1147,21 @@ def test_capture_publishes_prepared_records_after_commit() -> None:
     pools = _fresh_pools()
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    sink = _RecorderSink()
+    sink = _CommitRecorder()
     _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        capture_sink=sink,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=sink,
+        capture=True,
     )
     assert len(sink.plans) == 1
-    assert sink.plans[0].rows == 1
-    assert sink.plans[0].payload_bytes > 0
+    assert sink.plans[0].capture.rows == 1
+    assert sink.plans[0].capture.payload_bytes > 0
     assert len(sink.published) == 1 and len(sink.published[0]) == 1
     record = sink.published[0][0]
     assert record.request_id == "req-0"
@@ -1125,22 +1171,23 @@ def test_capture_publishes_prepared_records_after_commit() -> None:
     assert sink.cancels == 0
 
 
-def test_no_capture_sink_means_no_capture_work() -> None:
-    # @spec PORT-HOOK-001 — capture_sink=None disables capture
+def test_capture_off_means_no_capture_work() -> None:
+    # @spec PORT-HOOK-001 — capture=False disables capture
     # creation entirely; the sink recorder proves no reserve/publish
     # by never existing, and the call still succeeds.
     core = _tiny_core()
     pools = _fresh_pools()
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
-        capture_sink=None,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        commit_sink=None,
     )
     assert out.shape == (1, CARRIER_HIDDEN)
 
@@ -1169,53 +1216,61 @@ def test_second_bucket_failure_leaves_pools_untouched(
     before = _clone_pools(pools)
     torch.manual_seed(5)
     reg = _envelope(
-        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0,
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
         geometry=GEOM_REG,
     )
     fin = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     )
     plan = _plan(
-        prefills=[1, 2], num_pool_blocks=4,
+        prefills=[1, 2],
+        num_pool_blocks=4,
         geometries=[GEOM_REG, GEOM_FINAL],
     )
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
-            torch.tensor(
-                [PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long
-            ),
-            torch.stack([reg, fin]), plan,
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
+            torch.stack([reg, fin]),
+            plan,
         )
     assert calls["n"] == 2
     _assert_pools_equal(pools, before)
 
 
-def test_status_reserve_failure_cancels_capture_reservation() -> None:
-    # @spec PORT-ADV-003 / PORT-HOOK-001 (as amended): the composite
-    # reservation — a status reservation failure after a successful
-    # capture reservation cancels it and fails pre-commit.
+def test_composite_reserve_failure_is_precommit_fatal() -> None:
+    # @spec PORT-ADV-003 / PORT-HOOK-001: atomic reserve failure
+    # creates no ticket and leaves all resident state untouched.
     core = _tiny_core()
     pools = _fresh_pools()
     before = _clone_pools(pools)
     torch.manual_seed(5)
     carrier = _envelope(
-        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0,
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
         geometry=GEOM_FINAL,
     ).unsqueeze(0)
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    cap_sink = _RecorderSink()
+    cap_sink = _CommitRecorder(fail_reserve=True)
     with pytest.raises(RuntimeError):
         _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
-            carrier, plan,
-            capture_sink=cap_sink,
-            status_sink=_StatusRecorder(fail_reserve=True),
+            carrier,
+            plan,
+            commit_sink=cap_sink,
+            capture=True,
         )
     _assert_pools_equal(pools, before)
-    assert cap_sink.cancels == 1
+    assert cap_sink.cancels == 0
     assert cap_sink.published == []
 
 
@@ -1227,29 +1282,71 @@ def test_wrong_but_valid_prompt_masks_and_admission_conditions() -> None:
     pools = _fresh_pools(num_blocks=4)
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
-    ok_row = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
-    )
-    bad_row = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2
-    )
+    ok_row = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2)
+    bad_row = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=2)
     plan = _plan(
         prefills=[1, 2],
         num_pool_blocks=4,
         geometries=[GEOM_FINAL, GEOM_FINAL],
         prompts=[2, 1],  # admitted authority per row
     )
-    status = _StatusRecorder()
+    status = _CommitRecorder()
     out = _call(
-        core, pools,
+        core,
+        pools,
         torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
-        torch.stack([ok_row, bad_row]), plan, status_sink=status,
+        torch.stack([ok_row, bad_row]),
+        plan,
+        commit_sink=status,
     )
     decisions = read_decision_carrier(out).tolist()
     assert decisions[0] != PARK_ID
     assert decisions[1] == PARK_ID
     assert int(status.staged[0][0]) == 0
     assert int(status.staged[0][1]) & ROW_STATUS_PROMPT_MISMATCH
+
+
+def test_persisted_prompt_mismatch_masks_only_that_row() -> None:
+    # @spec PORT-LID-003 / PORT-STATE-008: the session book must agree
+    # with the CPU registry authority before conditioning or commit.
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    for block, prompt in ((1, 2), (2, 1)):
+        pools["book_pool"][block, _BOOK["last_label"]] = core.blank_id
+        pools["book_pool"][block, _BOOK["geometry"]] = GEOM_REG
+        pools["book_pool"][block, _BOOK["prompt"]] = prompt
+    before = _clone_pools(pools)
+    torch.manual_seed(5)
+    samples = torch.randn(REG_SAMPLES) * 0.01
+    rows = torch.stack(
+        [
+            _envelope(samples, final=False, seq=0, prompt=1),
+            _envelope(samples, final=False, seq=0, prompt=1),
+        ]
+    )
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID]),
+        rows,
+        _plan(
+            decodes=[1, 2],
+            chunk=[True, True],
+            prompts=[1, 1],
+            num_pool_blocks=4,
+        ),
+        commit_sink=sink,
+    )
+    decisions = read_decision_carrier(out).tolist()
+    assert decisions[0] == PARK_ID
+    assert decisions[1] != PARK_ID
+    assert int(sink.staged[0][0]) & ROW_STATUS_BOOK_IDENTITY
+    for value, old in zip(pools.values(), before.values(), strict=True):
+        values = value if isinstance(value, list) else [value]
+        olds = old if isinstance(old, list) else [old]
+        for tensor, original in zip(values, olds, strict=True):
+            torch.testing.assert_close(tensor[1], original[1], rtol=0, atol=0)
 
 
 # ---- PORT-ADV-001 / MRV1 emission: burst-then-park ------------------------
@@ -1271,12 +1368,13 @@ def test_advance_model_rows_emits_the_burst_then_parks() -> None:
 
     pools = _fresh_pools()
     plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
-    carrier = _envelope(
-        samples, final=True, seq=0, geometry=GEOM_FINAL
-    ).unsqueeze(0)
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
     out = _call(
-        core, pools,
-        torch.tensor([PLACEHOLDER_ID], dtype=torch.long), carrier, plan,
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
     )
     emitted = [int(read_decision_carrier(out)[0])]
     book = pools["book_pool"]
@@ -1291,9 +1389,11 @@ def test_advance_model_rows_emits_the_burst_then_parks() -> None:
         if emitted[-1] == PARK_ID:
             break
         out = _call(
-            core, pools,
+            core,
+            pools,
             torch.tensor([emitted[-1]], dtype=torch.long),
-            torch.zeros(1, CARRIER_HIDDEN), decode_plan,
+            torch.zeros(1, CARRIER_HIDDEN),
+            decode_plan,
         )
         emitted.append(int(read_decision_carrier(out)[0]))
 
@@ -1323,27 +1423,38 @@ def test_persist_across_session_park_by_kind() -> None:
     )
 
     window = WindowCachePage(
-        prefix="encoder.layers.0.window", window=WINDOW, d_model=D_MODEL,
+        prefix="encoder.layers.0.window",
+        window=WINDOW,
+        d_model=D_MODEL,
         policy=FP32_BRINGUP,
     )
     conv = ConvCachePage(
-        prefix="encoder.layers.0.conv", d_model=D_MODEL, kernel=KERNEL,
+        prefix="encoder.layers.0.conv",
+        d_model=D_MODEL,
+        kernel=KERNEL,
         policy=FP32_BRINGUP,
     )
     lstm = LSTMStatePage(
-        prefix="predictor.layers.0.lstm_state", pred_rnn_layers=2,
-        pred_hidden=16, policy=FP32_BRINGUP,
+        prefix="predictor.layers.0.lstm_state",
+        pred_rnn_layers=2,
+        pred_hidden=16,
+        policy=FP32_BRINGUP,
     )
     replay = ReplayQueuePage(
-        prefix="decode.layers.0.replay", max_symbols_per_step=10,
-        max_frames_per_chunk=4, policy=FP32_BRINGUP,
+        prefix="decode.layers.0.replay",
+        max_symbols_per_step=10,
+        max_frames_per_chunk=4,
+        policy=FP32_BRINGUP,
     )
     frontend = FrontendBufferPage(
-        prefix="frontend.layers.0.buffers", raw_tail=RAW_TAIL,
-        n_mels=FEAT, policy=FP32_BRINGUP,
+        prefix="frontend.layers.0.buffers",
+        raw_tail=RAW_TAIL,
+        n_mels=FEAT,
+        policy=FP32_BRINGUP,
     )
     counters = FrontendCounterPage(
-        prefix="frontend.layers.0.counters", policy=FP32_BRINGUP,
+        prefix="frontend.layers.0.counters",
+        policy=FP32_BRINGUP,
     )
     assert window.persist_across_session_park is True
     assert conv.persist_across_session_park is True
@@ -1368,8 +1479,7 @@ def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
     needed = ENVELOPE_HEADER_SLOTS + max(RAW_SAMPLES_PER_CHUNK.values())
     assert needed == 17_926
     assert NemotronASRConfig().hidden_size >= needed, (
-        f"hidden_size must cover the raw chunk envelope: need {needed}, "
-        f"config has {NemotronASRConfig().hidden_size}"
+        f"hidden_size must cover the raw chunk envelope: need {needed}, config has {NemotronASRConfig().hidden_size}"
     )
 
 
@@ -1386,9 +1496,7 @@ def test_embed_input_ids_canonical_merge_places_carriers_and_zeros() -> None:
     input_ids = torch.tensor([500, 7, 501, 0], dtype=torch.long)
     is_mm = torch.tensor([True, False, True, False])
     mm = torch.stack([torch.full((hidden,), 1.0), torch.full((hidden,), 2.0)])
-    out = model.embed_input_ids(
-        input_ids, multimodal_embeddings=mm, is_multimodal=is_mm
-    )
+    out = model.embed_input_ids(input_ids, multimodal_embeddings=mm, is_multimodal=is_mm)
     assert out.shape == (4, hidden)
     assert torch.all(out[0] == 1.0) and torch.all(out[2] == 2.0)
     assert torch.count_nonzero(out[1]) == 0
@@ -1397,14 +1505,10 @@ def test_embed_input_ids_canonical_merge_places_carriers_and_zeros() -> None:
 
 # ---- PORT-REGIME-001 / PORT-INT-003: naming-lock source pins --------------
 
-_NEMOTRON_ASR_DIR = Path(__file__).resolve().parents[4] / (
-    "vllm_omni/model_executor/models/nemotron_asr"
-)
+_NEMOTRON_ASR_DIR = Path(__file__).resolve().parents[4] / ("vllm_omni/model_executor/models/nemotron_asr")
 
 
-@pytest.mark.xfail(
-    strict=True, reason="P5-1 split lands in Phase 6"
-)
+@pytest.mark.xfail(strict=True, reason="P5-1 split lands in Phase 6")
 def test_run_forward_step_is_removed_and_advance_model_rows_is_wired() -> None:
     # @spec PORT-REGIME-001
     # A source-level pin (Path.read_text — no imports needed): once the
@@ -1416,17 +1520,13 @@ def test_run_forward_step_is_removed_and_advance_model_rows_is_wired() -> None:
     # P5-1), so an absent file also satisfies "no longer defines
     # run_forward_step" — this must not FileNotFoundError forever.
     forward_step_path = _NEMOTRON_ASR_DIR / "forward_step.py"
-    forward_step_src = (
-        forward_step_path.read_text() if forward_step_path.exists() else ""
-    )
+    forward_step_src = forward_step_path.read_text() if forward_step_path.exists() else ""
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
     assert "def run_forward_step" not in forward_step_src
     assert "advance_model_rows" in model_src
 
 
-@pytest.mark.xfail(
-    strict=True, reason="P5-1 split lands in Phase 6"
-)
+@pytest.mark.xfail(strict=True, reason="P5-1 split lands in Phase 6")
 def test_forward_routes_through_advance_model_rows() -> None:
     # @spec PORT-INT-003
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()

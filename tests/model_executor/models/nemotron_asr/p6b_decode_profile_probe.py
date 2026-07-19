@@ -90,7 +90,8 @@ def _load_chain() -> dict[str, Any]:
     loaded: dict[str, Any] = {}
     for mod in (
         "precision", "masks", "featurizer", "encoder", "lid",
-        "manifests", "frontend", "rnnt_cell", "rnnt", "advance",
+        "manifests", "frontend", "rnnt_cell", "rnnt",
+        "state_scatter", "advance",
     ):
         spec = importlib.util.spec_from_file_location(
             f"{_BASE}.{mod}", _PKG / f"{mod}.py"

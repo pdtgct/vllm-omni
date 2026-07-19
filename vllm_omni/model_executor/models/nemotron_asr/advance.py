@@ -45,6 +45,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
+    _execute_masked_page_scatter_ as masked_page_scatter_,
+)
+from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
+    validate_masked_page_scatter,
+    warmup_masked_page_scatter,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -193,8 +201,8 @@ class AdvanceResult:
     status bitmask (PORT-ADV-004; bit names are
     ``frontend.ROW_STATUS_*``, 0 == committed clean). A row with any
     bit set mutated no state and its burst is zero-length; the
-    transaction consumes this tensor through its existing
-    asynchronous output readback at the commit boundary, mapping
+    transaction stages this tensor through its reserved asynchronous
+    output handoff and the scheduler consumes it at its next boundary, mapping
     protocol bits to PORT-STATE-008's row tier and invariant bits to
     port-defect escalation — never a raise or device assertion from
     inside the transition.
@@ -218,6 +226,31 @@ class AdvanceResult:
         if self.row_status is None:
             return None
         return self.row_status == 0
+
+
+@dataclass(frozen=True)
+class PreparedRowBinding:
+    """One atomically prepared request-to-execution authority row.
+
+    Task 5's runner-hook provider mints this immutable snapshot only after
+    joining the request id to the session registry and current scheduler
+    controls.  :class:`RowPlan` retains vector columns for efficient CPU and
+    device operations; structural preflight requires those columns and the
+    attention-metadata block composition to reproduce this binding exactly.
+    That catches row swaps, generation-column drift, and control-vector drift
+    before any resident read. It does not prove registry currency; Task 5's
+    consume-once registry lease supplies that live ABA check.
+    """
+
+    request_id: str
+    block_id: int
+    admission_generation: int
+    geometry_id: int
+    prompt_index: int
+    prior_prompt_index: int
+    allow_prompt_transition: bool
+    is_chunk: bool
+    ready_deadline_ns: int
 
 
 @dataclass(frozen=True)
@@ -266,9 +299,21 @@ class RowPlan:
     record's block-reuse/ABA guard.
     ``request_ids``: ordered request identities per real row — the
     status handoff's and capture records' provenance authority.
+    ``ready_deadline_ns``: ``(num_decodes + num_prefills,)`` long,
+    the scheduler's absolute ready deadline for each selected CHUNK;
+    non-CHUNK rows carry zero. Buckets execute by their earliest
+    selected-row deadline, never enum/geometry order.
     ``execution_tier``: the engine's padded decode execution tier
     under a graph-covered profile; 0 for eager profiles, where the
     live bucket size IS the execution size (PORT-DEC-008 as amended).
+    ``bindings``: one immutable :class:`PreparedRowBinding` per real
+    row, minted atomically by the provider from registry + scheduler
+    authority. Preflight requires the composed block and every parallel
+    control column to reproduce it exactly; neither an ordered request-id
+    tuple nor live-set membership alone establishes row identity. Its
+    prior-prompt snapshot and explicit transition authorization let the
+    first newly minted CHUNK after a valid locale update replace the old
+    persisted prompt; REPLAY/FLUSH can never authorize that transition.
 
     All plan tensors are HOST-side (CPU) scheduler/registry authority:
     structural preflight validates them without any device
@@ -288,8 +333,10 @@ class RowPlan:
     prompt_index: torch.Tensor
     is_chunk: torch.Tensor
     admission_generation: torch.Tensor
+    ready_deadline_ns: torch.Tensor
     request_ids: tuple[str, ...]
     execution_tier: int
+    bindings: tuple[PreparedRowBinding, ...]
 
 
 @dataclass
@@ -305,7 +352,8 @@ class EmissionContext:
     ``(B,)`` long positions of the CHUNK rows within the N-row batch
     (merged-result row ``j`` is call row ``chunk_rows[j]``); ``queue``
     ``(N, cap)`` / ``book`` ``(N, 7)``: gathered emission scratch;
-    ``row_status``: ``(N,)`` int32 — the transaction-composed FINAL
+    ``prompt_index``: ``(N,)`` int64, the row-authoritative prompt
+    snapshot to persist on a clean CHUNK. ``row_status``: ``(N,)`` int32 — the transaction-composed FINAL
     per-row status (transition bits already folded in for CHUNK
     rows). The adapter trusts it and never recomputes protocol logic:
     any nonzero row emits park and keeps its scratch untouched.
@@ -316,6 +364,7 @@ class EmissionContext:
     chunk_rows: torch.Tensor
     queue: torch.Tensor
     book: torch.Tensor
+    prompt_index: torch.Tensor
     row_status: torch.Tensor
 
 
@@ -326,12 +375,15 @@ class EmissionProjection:
 
     ``rows``: ``(N, H)`` runner output (e.g. MRV1 decision carriers);
     ``queue`` / ``book``: the updated scratch, same shapes as the
-    context's.
+    context's. ``row_status`` is the adapter's final status view; it
+    must preserve every incoming bit and cover any proposed-book
+    invariant it detects before choosing a non-park row.
     """
 
     rows: torch.Tensor
     queue: torch.Tensor
     book: torch.Tensor
+    row_status: torch.Tensor
 
 
 #: A model-local emission adapter: projects a committed
@@ -339,9 +391,7 @@ class EmissionProjection:
 #: :class:`EmissionProjection`. Selection happens once at model init
 #: (runner-mode configuration); the transaction owns every resident
 #: scatter.
-EmissionAdapter = Callable[
-    ["AdvanceResult", "EmissionContext"], "EmissionProjection"
-]
+EmissionAdapter = Callable[["AdvanceResult", "EmissionContext"], "EmissionProjection"]
 
 #: Transaction-owned per-row status bits — the PORT-ADV-004 vocabulary
 #: extension settled at the Phase-6c preflight (design §Phase-6c
@@ -371,6 +421,10 @@ ROW_STATUS_BOOK_INVARIANT = 65536
 #: The decode produced more labels than the replay queue can hold —
 #: rejected as a port defect, never truncated.
 ROW_STATUS_BURST_OVERFLOW = 131072
+#: The decode result violates the tensor/result contract (negative or
+#: over-width length, invalid active nonblank id, or status mismatch).
+#: Its length is sanitized to zero before the adapter sees it.
+ROW_STATUS_DECODE_INVARIANT = 262144
 
 #: Model-row roles at a scheduler step (the transaction's own
 #: vocabulary; values match the retiring ``forward_ops`` constants for
@@ -482,11 +536,7 @@ def make_table_resolver(
             raise KeyError(f"no callable bound for arm {required!r}")
     compiled: list[tuple[str, ...]] = []
     for label in labels:
-        tiers = sorted(
-            t
-            for (g, t, la) in table.entries
-            if g == label and la == lane
-        )
+        tiers = sorted(t for (g, t, la) in table.entries if g == label and la == lane)
         if not tiers:
             raise KeyError(f"no measured tiers for {label!r}/{lane!r}")
         by_batch: list[str] = [""]
@@ -507,24 +557,18 @@ def make_table_resolver(
                 low_arm = table.entries[(label, lower, lane)]
                 high_arm = table.entries[(label, upper, lane)]
                 if low_arm != high_arm:
-                    by_batch.append(
-                        low_arm
-                        if low_arm in SYNC_FREE_ARMS
-                        else high_arm
-                    )
+                    by_batch.append(low_arm if low_arm in SYNC_FREE_ARMS else high_arm)
                 else:
-                    by_batch.append(
-                        low_arm
-                        if (batch - lower) <= (upper - batch)
-                        else high_arm
-                    )
+                    by_batch.append(low_arm if (batch - lower) <= (upper - batch) else high_arm)
         for arm in set(by_batch[1:]):
             if arm not in arms:
                 raise KeyError(f"no callable bound for arm {arm!r}")
         logger.info(
-            "decode dispatch %s/%s: compiled batches 1..%d "
-            "(%d unmeasured resolved by nearest/crossover-gap)",
-            label, lane, max_batch, fallbacks,
+            "decode dispatch %s/%s: compiled batches 1..%d (%d unmeasured resolved by nearest/crossover-gap)",
+            label,
+            lane,
+            max_batch,
+            fallbacks,
         )
         compiled.append(tuple(by_batch))
     compiled_t = tuple(compiled)
@@ -539,10 +583,7 @@ def make_table_resolver(
             )
         batch = min(max(request.execution_batch_size, 1), max_batch)
         arm = compiled_t[request.geometry][batch]
-        if (
-            request.ready_decode_buckets > 1
-            and arm not in SYNC_FREE_ARMS
-        ):
+        if request.ready_decode_buckets > 1 and arm not in SYNC_FREE_ARMS:
             return ResolvedDecode(
                 arm=sync_free_eager,
                 decode_fn=arms[sync_free_eager],
@@ -565,7 +606,7 @@ class CapturePlan:
 
 @dataclass(frozen=True)
 class CaptureRecord:
-    """One committed CHUNK row's named-capture record.
+    """One candidate CHUNK row's named-capture record.
 
     Host identity: ``row`` (call row position), ``block_id``, the
     registry's ``admission_generation`` (the block-reuse/ABA guard),
@@ -590,68 +631,60 @@ class CaptureRecord:
     encoder_length: torch.Tensor
 
 
-class CaptureReservation(Protocol):
-    """Reserved sink slots for one call's prepared records.
+@dataclass(frozen=True)
+class CommitPlan:
+    """Atomic status + optional capture reservation request.
 
-    ``publish`` transfers already-prepared records into the reserved
-    slots — by construction no-fail: no allocation, serialization,
-    copying, or durable I/O after commit. ``cancel`` releases the
-    reservation idempotently on any earlier failure.
+    The complete ordered row bindings bind the eventual device status rows
+    to request, block, generation, and controls. Task 5's production sink
+    revalidates/pins their registry lease through ``stage``/``cancel``;
+    carrying only request ids and generations would not prevent row swaps.
+    ``capture`` is ``None`` when capture is disabled, so the measured path
+    prepares no capture-only state.
     """
 
-    def publish(self, records: Sequence[CaptureRecord]) -> None: ...
+    bindings: tuple[PreparedRowBinding, ...]
+    capture: CapturePlan | None
+
+    @property
+    def request_ids(self) -> tuple[str, ...]:
+        """Ordered request identities for bounded-sink indexing."""
+        return tuple(binding.request_id for binding in self.bindings)
+
+    @property
+    def generations(self) -> tuple[int, ...]:
+        """Ordered admission generations for ABA filtering."""
+        return tuple(binding.admission_generation for binding in self.bindings)
+
+
+class CommitReservation(Protocol):
+    """One composite ticket spanning status and capture capacity.
+
+    ``stage`` is the sole post-commit operation and is no-fail by
+    construction: it stages the device status plus already-prepared
+    candidate records into reserved storage. The sink exposes only
+    status-clean records after the asynchronous status completes.
+    ``cancel`` is idempotent and releases the whole reservation.
+    """
+
+    def stage(
+        self,
+        row_status: torch.Tensor,
+        records: Sequence[CaptureRecord],
+    ) -> None: ...
 
     def cancel(self) -> None: ...
 
 
-class CaptureSink(Protocol):
-    """A model/worker-owned bounded capture sink (PORT-HOOK-001 as
-    amended).
+class CommitSink(Protocol):
+    """Model/worker-owned bounded composite handoff (PORT-HOOK-001).
 
-    ``reserve`` is called pre-commit with the exact
-    :class:`CapturePlan` after every fallible transaction operation
-    has completed; failure to reserve is pre-commit fatal. The
-    published records are CANDIDATES carrying their device row
-    status; the sink exposes only committed (status-clean) records
-    once the asynchronous status handoff completes — the sync-free
-    realization of the committed-rows rule. Implementations are
-    bounded and concurrency-safe; ``capture_sink=None`` disables
-    capture entirely, including candidate construction.
+    Serving always provides this sink; GPU-free probes may omit it
+    when capture is disabled. One pre-commit ``reserve`` admits both
+    status and optional capture capacity atomically.
     """
 
-    def reserve(self, plan: CapturePlan) -> CaptureReservation: ...
-
-
-class StatusTicket(Protocol):
-    """A reserved request-aware status slot.
-
-    ``stage`` runs post-commit, exactly once, with the
-    device-resident ``(N,)`` int32 row status in plan row order — and
-    is no-fail by construction: the ticket's storage was preallocated
-    at reservation, so staging is one non-blocking device-to-pinned
-    copy. The host consumes it at the normal scheduling boundary —
-    protocol bits terminate the identified session, invariant bits
-    escalate as port defects (PORT-STATE-008 tiers).
-    """
-
-    def stage(self, row_status: torch.Tensor) -> None: ...
-
-
-class StatusSink(Protocol):
-    """The transaction's single batched asynchronous status handoff.
-
-    ``reserve`` is called PRE-commit with the call's ordered request
-    identities and admission generations; failure (capacity, identity
-    mismatch) is pre-commit fatal. The serving path always supplies a
-    sink so a failed session can be terminated and reclaimed; probes
-    may omit it. Never synchronizes in the hot path.
-    """
-
-    def reserve(
-        self,
-        request_ids: Sequence[str],
-        generations: Sequence[int],
-    ) -> StatusTicket: ...
+    def reserve(self, plan: CommitPlan) -> CommitReservation: ...
 
 
 def make_mrv1_adapter(
@@ -679,9 +712,7 @@ def make_mrv1_adapter(
     """
     del blank_id  # bursts are nonblank by contract; id pins identity
 
-    def adapter(
-        result: AdvanceResult, context: EmissionContext
-    ) -> EmissionProjection:
+    def adapter(result: AdvanceResult, context: EmissionContext) -> EmissionProjection:
         book = context.book
         queue = context.queue
         n = book.shape[0]
@@ -691,6 +722,7 @@ def make_mrv1_adapter(
             BOOK_PENDING_ECHO,
             QUEUE_HEAD,
             QUEUE_LEN,
+            QUEUE_PROMPT,
         )
 
         ok = context.row_status == 0
@@ -700,9 +732,7 @@ def make_mrv1_adapter(
 
         queue_out = queue.clone()
         book_out = book.clone()
-        decisions = torch.full(
-            (n,), park_id, dtype=torch.long, device=device
-        )
+        decisions = torch.full((n,), park_id, dtype=torch.long, device=device)
 
         # ---- CHUNK rows: burst into the queue, first label out ----
         chunk_rows = context.chunk_rows
@@ -715,38 +745,38 @@ def make_mrv1_adapter(
             old_q = queue_out.index_select(0, chunk_rows)
             new_q = torch.zeros_like(old_q)
             if k:
-                new_q[:, : min(k, new_q.shape[1])] = burst[
-                    :, : new_q.shape[1]
-                ]
+                copied = min(k, int(new_q.shape[1]))
+                cols = torch.arange(copied, device=device).unsqueeze(0)
+                new_q[:, :copied] = torch.where(
+                    cols < blen.unsqueeze(1),
+                    burst[:, :copied],
+                    torch.zeros_like(burst[:, :copied]),
+                )
             queue_out.index_copy_(
-                0, chunk_rows,
+                0,
+                chunk_rows,
                 torch.where(cok.unsqueeze(1), new_q, old_q),
             )
             has = blen > 0
-            first = (
-                burst[:, 0].long() if k else torch.zeros_like(blen)
-            )
-            decision_c = torch.where(
-                has, first, torch.full_like(blen, park_id)
-            )
+            first = burst[:, 0].long() if k else torch.zeros_like(blen)
+            decision_c = torch.where(has, first, torch.full_like(blen, park_id))
             old_b = book_out.index_select(0, chunk_rows)
             new_b = old_b.clone()
             dt = new_b.dtype
             new_b[:, QUEUE_HEAD] = has.to(dt)  # 1 past the emitted
             new_b[:, QUEUE_LEN] = blen.to(dt)
             new_b[:, BOOK_PENDING_ECHO] = has.to(dt)
-            new_b[:, BOOK_EXPECTED_LABEL] = torch.where(
-                has, first, torch.zeros_like(first)
-            ).to(dt)
+            new_b[:, BOOK_EXPECTED_LABEL] = torch.where(has, first, torch.zeros_like(first)).to(dt)
+            new_b[:, QUEUE_PROMPT] = context.prompt_index.index_select(0, chunk_rows).to(dt)
             book_out.index_copy_(
-                0, chunk_rows,
+                0,
+                chunk_rows,
                 torch.where(cok.unsqueeze(1), new_b, old_b),
             )
             decisions.index_copy_(
-                0, chunk_rows,
-                torch.where(
-                    cok, decision_c, torch.full_like(decision_c, park_id)
-                ),
+                0,
+                chunk_rows,
+                torch.where(cok, decision_c, torch.full_like(decision_c, park_id)),
             )
 
         # ---- REPLAY rows: validated echo → next label or park ----
@@ -757,19 +787,11 @@ def make_mrv1_adapter(
         # transaction's book-invariant bit, but the gather itself must
         # stay in-bounds for every row (a negative index is a device
         # fault, not a maskable value).
-        next_label = (
-            queue.gather(
-                1, head.clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1)
-            )
-            .squeeze(1)
-            .long()
-        )
+        next_label = queue.gather(1, head.clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1)).squeeze(1).long()
         emit_rep = rep & ~drained
         decisions = torch.where(emit_rep, next_label, decisions)
         dt = book_out.dtype
-        book_out[:, QUEUE_HEAD] = torch.where(
-            emit_rep, (head + 1).to(dt), book_out[:, QUEUE_HEAD]
-        )
+        book_out[:, QUEUE_HEAD] = torch.where(emit_rep, (head + 1).to(dt), book_out[:, QUEUE_HEAD])
         book_out[:, BOOK_EXPECTED_LABEL] = torch.where(
             emit_rep,
             next_label.to(dt),
@@ -793,15 +815,153 @@ def make_mrv1_adapter(
         # min/max range guard is a host synchronization
         # (PORT-ADV-004); the id range is a STARTUP invariant
         # (num_logits < 2**24 keeps every id fp32-integer-exact).
-        rows = torch.zeros(
-            n, hidden_size, dtype=torch.float32, device=device
-        )
+        rows = torch.zeros(n, hidden_size, dtype=torch.float32, device=device)
         rows[:, 0] = decisions.to(rows.dtype)
         return EmissionProjection(
-            rows=rows, queue=queue_out, book=book_out
+            rows=rows,
+            queue=queue_out,
+            book=book_out,
+            row_status=context.row_status,
         )
 
     return adapter
+
+
+def _mrv1_projection_invariant_rows(
+    result: AdvanceResult,
+    context: EmissionContext,
+    projection: EmissionProjection,
+    effective_status: torch.Tensor,
+    *,
+    park_id: int,
+    blank_id: int,
+) -> torch.Tensor:
+    """Validate MRV1 output and queue/book transitions exactly on device.
+
+    Phase 6c serves only the MRV1 adapter. The future native-burst adapter
+    receives its own typed projection validator with PORT-DEC-010; it must not
+    silently pass through this one-token decision-carrier contract.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    rows = projection.rows
+    decision = rows[:, 0]
+    finite = torch.isfinite(decision)
+    integral = finite & (decision == decision.trunc())
+    legal = (decision == park_id) | ((decision >= 0) & (decision < blank_id))
+    bad = (~integral) | (~legal)
+    if rows.shape[1] > 1:
+        bad |= (rows[:, 1:] != 0).any(dim=1)
+
+    queue_changed = (projection.queue != context.queue).any(dim=1)
+    book_changed = (projection.book != context.book).any(dim=1)
+    clean = effective_status == 0
+    failed = ~clean
+    bad |= failed & ((decision != park_id) | queue_changed | book_changed)
+
+    is_flush = clean & (context.roles == ROLE_FLUSH)
+    bad |= is_flush & ((decision != park_id) | queue_changed | book_changed)
+
+    # REPLAY consumes exactly the prior queue item at old head, updates only
+    # head/pending/expected, and never rewrites queue payload or identity.
+    head = context.book[:, QUEUE_HEAD].long()
+    length = context.book[:, QUEUE_LEN].long()
+    cap = int(context.queue.shape[1])
+    next_label = (
+        context.queue.gather(
+            1,
+            head.clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    replay = clean & (context.roles == ROLE_REPLAY)
+    replay_emits = replay & (head < length)
+    replay_drained = replay & ~replay_emits
+    expected_replay_decision = torch.where(
+        replay_emits,
+        next_label,
+        torch.full_like(next_label, park_id),
+    )
+    expected_replay_head = torch.where(replay_emits, head + 1, head)
+    expected_replay_pending = torch.where(
+        replay_emits,
+        torch.ones_like(head),
+        torch.zeros_like(head),
+    )
+    expected_replay_label = torch.where(
+        replay_emits,
+        next_label,
+        context.book[:, BOOK_EXPECTED_LABEL].long(),
+    )
+    replay_bad = (
+        (decision.long() != expected_replay_decision)
+        | queue_changed
+        | (projection.book[:, QUEUE_HEAD].long() != expected_replay_head)
+        | (projection.book[:, QUEUE_LEN] != context.book[:, QUEUE_LEN])
+        | (projection.book[:, QUEUE_LAST_LABEL] != context.book[:, QUEUE_LAST_LABEL])
+        | (projection.book[:, QUEUE_PROMPT] != context.book[:, QUEUE_PROMPT])
+        | (projection.book[:, BOOK_PENDING_ECHO].long() != expected_replay_pending)
+        | (projection.book[:, BOOK_EXPECTED_LABEL].long() != expected_replay_label)
+        | (projection.book[:, BOOK_GEOMETRY] != context.book[:, BOOK_GEOMETRY])
+    )
+    bad |= (replay | replay_drained) & replay_bad
+
+    # CHUNK replaces the queue with exactly its active burst, emits the first
+    # label, and arms an echo iff the burst is nonempty.
+    chunk_rows = context.chunk_rows
+    if int(chunk_rows.shape[0]):
+        chunk_clean = clean.index_select(0, chunk_rows)
+        chunk_queue = projection.queue.index_select(0, chunk_rows)
+        chunk_book = projection.book.index_select(0, chunk_rows)
+        chunk_decision = decision.index_select(0, chunk_rows)
+        lengths = result.token_lengths.long()
+        has = lengths > 0
+        width = int(result.token_ids.shape[1])
+        expected_queue = torch.zeros_like(chunk_queue)
+        copied = min(width, cap)
+        if copied:
+            cols = torch.arange(copied, device=chunk_queue.device).unsqueeze(0)
+            expected_queue[:, :copied] = torch.where(
+                cols < lengths.unsqueeze(1),
+                result.token_ids[:, :copied].to(expected_queue.dtype),
+                torch.zeros_like(expected_queue[:, :copied]),
+            )
+            first = result.token_ids[:, 0].long()
+        else:
+            first = torch.zeros_like(lengths)
+        expected_decision = torch.where(
+            has,
+            first,
+            torch.full_like(first, park_id),
+        )
+        old_book = context.book.index_select(0, chunk_rows)
+        chunk_bad = (
+            (chunk_decision.long() != expected_decision)
+            | (chunk_queue != expected_queue).any(dim=1)
+            | (chunk_book[:, QUEUE_HEAD].long() != has.long())
+            | (chunk_book[:, QUEUE_LEN].long() != lengths)
+            | (chunk_book[:, QUEUE_LAST_LABEL] != old_book[:, QUEUE_LAST_LABEL])
+            | (chunk_book[:, QUEUE_PROMPT].long() != context.prompt_index.index_select(0, chunk_rows))
+            | (chunk_book[:, BOOK_PENDING_ECHO].long() != has.long())
+            | (chunk_book[:, BOOK_EXPECTED_LABEL].long() != torch.where(has, first, torch.zeros_like(first)))
+            | (chunk_book[:, BOOK_GEOMETRY] != old_book[:, BOOK_GEOMETRY])
+        )
+        chunk_bad &= chunk_clean
+        bad.index_copy_(
+            0,
+            chunk_rows,
+            bad.index_select(0, chunk_rows) | chunk_bad,
+        )
+    return bad
 
 
 # @spec PORT-ADV-001, PORT-ADV-004
@@ -925,25 +1085,16 @@ def advance_session(
     # frontend composes in its own FINALIZED and invariant bits.
     hop = core.featurizer.hop_length
     if row_status is None:
-        incoming = torch.zeros(
-            n_rows, dtype=torch.int32, device=device
-        )
+        incoming = torch.zeros(n_rows, dtype=torch.int32, device=device)
     else:
-        incoming = row_status.to(
-            device=device, dtype=torch.int32
-        ).clone()
-    incoming |= (
-        (batch.geometry_id.to(device) != geometry).to(torch.int32)
-        * ROW_STATUS_GEOMETRY
-    )
-    incoming |= (
-        batch.chunk_sequence.to(device)
-        != counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]
-    ).to(torch.int32) * ROW_STATUS_SEQUENCE
-    incoming |= (
-        batch.final_tail.to(device)
-        & (batch.valid_samples.to(device) >= cadence * hop)
-    ).to(torch.int32) * ROW_STATUS_FINAL_OVERSIZE
+        incoming = row_status.to(device=device, dtype=torch.int32).clone()
+    incoming |= (batch.geometry_id.to(device) != geometry).to(torch.int32) * ROW_STATUS_GEOMETRY
+    incoming |= (batch.chunk_sequence.to(device) != counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]).to(
+        torch.int32
+    ) * ROW_STATUS_SEQUENCE
+    incoming |= (batch.final_tail.to(device) & (batch.valid_samples.to(device) >= cadence * hop)).to(
+        torch.int32
+    ) * ROW_STATUS_FINAL_OVERSIZE
     # Regular-cadence targets, vectorized: B_{seq+1} = (8L+1) + seq·C
     # (final rows ignore targets inside the frontend).
     targets = (8 * lookahead + 1) + batch.chunk_sequence * cadence
@@ -982,16 +1133,10 @@ def advance_session(
     )
     combined = torch.cat([prefix, new_frames], dim=2)
     col = torch.arange(mel_width, device=device).view(1, 1, -1)
-    gidx = (col + (MEL_TAIL_FRAMES - p).view(-1, 1, 1)).clamp(
-        max=combined.shape[2] - 1
-    )
-    mel = combined.gather(
-        2, gidx.expand(n_rows, combined.shape[1], mel_width)
-    )
+    gidx = (col + (MEL_TAIL_FRAMES - p).view(-1, 1, 1)).clamp(max=combined.shape[2] - 1)
+    mel = combined.gather(2, gidx.expand(n_rows, combined.shape[1], mel_width))
     mel_len = p + counts
-    mel = torch.where(
-        col < mel_len.view(-1, 1, 1), mel, mel.new_zeros(())
-    )
+    mel = torch.where(col < mel_len.view(-1, 1, 1), mel, mel.new_zeros(()))
 
     # Per-row pre-encode drop and logical encoder lengths; the padded
     # encoder width is the host formula on the fixed mel width.
@@ -1008,11 +1153,7 @@ def advance_session(
         ),
         torch.zeros_like(counts),
     )
-    out_width = int(
-        core.encoder.pre_encode.output_lengths(
-            torch.tensor([mel_width])
-        )[0]
-    )
+    out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
 
     caches = _GatheredCaches(state)
     with torch.no_grad():
@@ -1021,7 +1162,9 @@ def advance_session(
             # the gathered batch; stream_step reads only the shared
             # .channel/.time/.valid surface (the forward_step.py
             # precedent, migration-proven bit-for-bit).
-            core.encoder, mel, caches,  # type: ignore[arg-type]
+            core.encoder,
+            mel,
+            caches,  # type: ignore[arg-type]
             out_offsets=drop,
             out_lengths=enc_lengths,
             out_width=out_width,
@@ -1039,17 +1182,93 @@ def advance_session(
             conditioned,
             conditioned.new_zeros(()),
         )
-        decode = DecodeState(
+        decode_in = DecodeState(
             h=state.h.transpose(0, 1).contiguous(),
             c=state.c.transpose(0, 1).contiguous(),
-            last_label=state.last_label,
+            last_label=state.last_label.clone(),
         )
-        token_ids, token_lengths, decode = decode_fn(
-            conditioned, enc_lengths, core.predictor, core.joint, decode
+        # Extension callables receive writable tensors. Preserve an
+        # independent oracle before handing them over so an in-place decoder
+        # cannot rewrite the baseline used for no-emission/state checks.
+        decode_baseline = DecodeState(
+            h=decode_in.h.clone(),
+            c=decode_in.c.clone(),
+            last_label=decode_in.last_label.clone(),
         )
-    state.h.copy_(decode.h.transpose(0, 1))
-    state.c.copy_(decode.c.transpose(0, 1))
-    state.last_label.copy_(decode.last_label)
+        token_ids, token_lengths, decode_out = decode_fn(
+            conditioned,
+            enc_lengths,
+            core.predictor,
+            core.joint,
+            decode_in,
+        )
+    if (
+        token_ids.device != device
+        or token_ids.dtype != torch.int32
+        or token_ids.dim() != 2
+        or token_ids.shape[0] != n_rows
+        or not token_ids.is_contiguous()
+        or token_lengths.device != device
+        or token_lengths.dtype != torch.int32
+        or tuple(token_lengths.shape) != (n_rows,)
+        or not token_lengths.is_contiguous()
+    ):
+        raise ValueError("decode_fn returned malformed token tensors")
+    decode_type = type(decode_out)
+    if decode_type.__module__ != DecodeState.__module__ or decode_type.__qualname__ != DecodeState.__qualname__:
+        raise ValueError("decode_fn must return DecodeState")
+    for name, actual, expected in (
+        ("h", decode_out.h, decode_baseline.h),
+        ("c", decode_out.c, decode_baseline.c),
+        ("last_label", decode_out.last_label, decode_baseline.last_label),
+    ):
+        if (
+            tuple(actual.shape) != tuple(expected.shape)
+            or actual.dtype != expected.dtype
+            or actual.device != expected.device
+            or not actual.is_contiguous()
+        ):
+            raise ValueError(f"decode_fn next-state {name} changed shape/dtype/device/layout")
+    lengths = token_lengths.long()
+    token_width = int(token_ids.shape[1])
+    length_valid = (lengths >= 0) & (lengths <= token_width)
+    has_emission = length_valid & (lengths > 0)
+    if token_width:
+        last_emitted = (
+            token_ids.gather(
+                1,
+                (lengths - 1).clamp(min=0, max=token_width - 1).unsqueeze(1),
+            )
+            .squeeze(1)
+            .long()
+        )
+    else:
+        last_emitted = torch.zeros_like(decode_out.last_label)
+    zero_state_changed = (
+        (decode_out.h != decode_baseline.h).any(dim=(0, 2))
+        | (decode_out.c != decode_baseline.c).any(dim=(0, 2))
+        | (decode_out.last_label != decode_baseline.last_label)
+    )
+    decode_bad = (
+        (~torch.isfinite(decode_out.h)).any(dim=(0, 2))
+        | (~torch.isfinite(decode_out.c)).any(dim=(0, 2))
+        | (decode_out.last_label < 0)
+        | (decode_out.last_label > int(core.blank_id))
+        | (~length_valid)
+        | (has_emission & (decode_out.last_label != last_emitted))
+        | ((lengths == 0) & zero_state_changed)
+    )
+    row_status = row_status | (decode_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT)
+    decode_clean = (row_status == 0).view(-1, 1, 1)
+    state.h.copy_(torch.where(decode_clean, decode_out.h.transpose(0, 1), state.h))
+    state.c.copy_(torch.where(decode_clean, decode_out.c.transpose(0, 1), state.c))
+    state.last_label.copy_(
+        torch.where(
+            row_status == 0,
+            decode_out.last_label,
+            state.last_label,
+        )
+    )
     counters[:, CTR_ENCODED_MEL_FRAMES] = torch.where(
         row_ok,
         counters[:, CTR_COMMITTED_MEL_FRAMES],
@@ -1066,9 +1285,7 @@ def advance_session(
     # zero-commit row stages all three tensors at zero length — its
     # mel capture is fully zero even where the encoder input carried
     # the pre-encode prefix.
-    cap_mel_len = torch.where(
-        counts > 0, mel_len, torch.zeros_like(mel_len)
-    )
+    cap_mel_len = torch.where(counts > 0, mel_len, torch.zeros_like(mel_len))
     return AdvanceResult(
         token_ids=token_ids,
         token_lengths=token_lengths,
@@ -1132,9 +1349,7 @@ class _GatheredCaches:
     @valid.setter
     def valid(self, value: torch.Tensor) -> None:
         for slot in self._window_valid:
-            slot.copy_(
-                value.reshape(slot.shape).to(slot.dtype)
-            )
+            slot.copy_(value.reshape(slot.shape).to(slot.dtype))
 
 
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -1147,9 +1362,7 @@ def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     return t.to(device)
 
 
-def _structural_preflight(
-    plan: RowPlan, n_ids: int, n_embeds: int
-) -> torch.Tensor:
+def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Tensor:
     """PORT-STATE-007: whole-call structural validation, HOST-side
     over the plan's CPU authority tensors, before any page read.
 
@@ -1159,17 +1372,22 @@ def _structural_preflight(
     Raises:
         ValueError: naming the first structural defect.
     """
+    if plan.num_decodes < 0 or plan.num_prefills < 0:
+        raise ValueError("plan row counts must be nonnegative")
+    if plan.num_pool_blocks <= 0:
+        raise ValueError("plan.num_pool_blocks must be positive")
+    if not 0 <= plan.null_block_id < plan.num_pool_blocks:
+        raise ValueError("plan.null_block_id outside the resident pool")
     n_real = plan.num_decodes + plan.num_prefills
     if n_ids != n_real or n_embeds != n_real:
         raise ValueError(
-            f"row count mismatch: plan has {n_real} real rows, "
-            f"input_ids {n_ids}, inputs_embeds {n_embeds}"
+            f"row count mismatch: plan has {n_real} real rows, input_ids {n_ids}, inputs_embeds {n_embeds}"
         )
     d = plan.state_indices_d
+    if d.device.type != "cpu" or d.dtype != torch.int64:
+        raise ValueError("state_indices_d must be CPU int64 authority")
     if d.dim() != 2:
-        raise ValueError(
-            f"state_indices_d must be (rows, K); got dim {d.dim()}"
-        )
+        raise ValueError(f"state_indices_d must be (rows, K); got dim {d.dim()}")
     if d.shape[1] != 1:
         raise ValueError(
             f"{d.shape[1]} decode index columns: extra speculative "
@@ -1177,67 +1395,448 @@ def _structural_preflight(
             "flatten (PORT-STATE-007)"
         )
     if d.shape[0] < plan.num_decodes:
-        raise ValueError(
-            f"state_indices_d has {d.shape[0]} rows for "
-            f"{plan.num_decodes} real decodes"
-        )
+        raise ValueError(f"state_indices_d has {d.shape[0]} rows for {plan.num_decodes} real decodes")
     real_d = d[: plan.num_decodes, 0]
     pad_d = d[plan.num_decodes :, 0]
     if pad_d.numel() and bool((pad_d != plan.null_block_id).any()):
         raise ValueError(
-            "graph-padding rows must carry the null block id "
-            f"{plan.null_block_id} (real/padding mismatch)"
+            f"graph-padding rows must carry the null block id {plan.null_block_id} (real/padding mismatch)"
         )
     p = plan.state_indices_p
+    if p.device.type != "cpu" or p.dtype != torch.int64:
+        raise ValueError("state_indices_p must be CPU int64 authority")
     if p.dim() != 1 or p.shape[0] != plan.num_prefills:
-        raise ValueError(
-            f"state_indices_p shape {tuple(p.shape)} for "
-            f"{plan.num_prefills} prefills"
-        )
-    if plan.has_initial_states_p.shape[0] != plan.num_prefills:
+        raise ValueError(f"state_indices_p shape {tuple(p.shape)} for {plan.num_prefills} prefills")
+    if (
+        plan.has_initial_states_p.device.type != "cpu"
+        or plan.has_initial_states_p.dtype != torch.bool
+        or plan.has_initial_states_p.dim() != 1
+        or plan.has_initial_states_p.shape[0] != plan.num_prefills
+    ):
         raise ValueError("has_initial_states_p shape mismatch")
     per_row = (
-        ("geometry_id", plan.geometry_id, n_real),
-        ("is_chunk", plan.is_chunk, n_real),
-        ("admission_generation", plan.admission_generation, n_real),
-        ("prompt_index", plan.prompt_index, n_real),
+        ("geometry_id", plan.geometry_id, torch.int64),
+        ("prompt_index", plan.prompt_index, torch.int64),
+        ("is_chunk", plan.is_chunk, torch.bool),
+        ("admission_generation", plan.admission_generation, torch.int64),
+        ("ready_deadline_ns", plan.ready_deadline_ns, torch.int64),
     )
-    for name, t, want in per_row:
-        if t.shape[0] != want:
-            raise ValueError(
-                f"plan.{name} has {t.shape[0]} rows, expected {want}"
-            )
+    for name, tensor, dtype in per_row:
+        if tensor.device.type != "cpu" or tensor.dtype != dtype or tensor.dim() != 1 or tensor.shape[0] != n_real:
+            raise ValueError(f"plan.{name} must be CPU {dtype} shaped ({n_real},)")
+    live = plan.live_block_ids
+    if live.device.type != "cpu" or live.dtype != torch.int64 or live.dim() != 1:
+        raise ValueError("plan.live_block_ids must be rank-one CPU int64")
     if len(plan.request_ids) != n_real:
-        raise ValueError(
-            f"plan.request_ids has {len(plan.request_ids)} entries, "
-            f"expected {n_real}"
-        )
+        raise ValueError(f"plan.request_ids has {len(plan.request_ids)} entries, expected {n_real}")
+    if any(not isinstance(req_id, str) or not req_id for req_id in plan.request_ids):
+        raise ValueError("plan.request_ids must be nonempty strings")
+    if len(set(plan.request_ids)) != len(plan.request_ids):
+        raise ValueError("plan.request_ids must be unique within the call")
+    if len(plan.bindings) != n_real:
+        raise ValueError(f"plan.bindings has {len(plan.bindings)} entries, expected {n_real}")
+    if bool((plan.admission_generation < 0).any()):
+        raise ValueError("plan.admission_generation must be nonnegative")
+    chunk_deadlines = plan.ready_deadline_ns[plan.is_chunk]
+    if chunk_deadlines.numel() and bool((chunk_deadlines <= 0).any()):
+        raise ValueError("selected CHUNK deadlines must be positive")
+    if bool((plan.ready_deadline_ns[~plan.is_chunk] != 0).any()):
+        raise ValueError("non-CHUNK rows must carry deadline zero")
     if plan.execution_tier < 0:
         raise ValueError("plan.execution_tier must be >= 0")
     idx = torch.cat([real_d, p])
     if idx.numel():
         if bool((idx == plan.null_block_id).any()):
             raise ValueError("null block id claimed by a real row")
-        if bool((idx < 0).any()) or bool(
-            (idx >= plan.num_pool_blocks).any()
-        ):
-            raise ValueError(
-                f"state index out of range [0, {plan.num_pool_blocks})"
-            )
+        if bool((idx < 0).any()) or bool((idx >= plan.num_pool_blocks).any()):
+            raise ValueError(f"state index out of range [0, {plan.num_pool_blocks})")
         if int(torch.unique(idx).numel()) != int(idx.numel()):
-            raise ValueError(
-                "duplicate state index across the decode/prefill "
-                "composition"
-            )
+            raise ValueError("duplicate state index across the decode/prefill composition")
         if bool((~torch.isin(idx, plan.live_block_ids)).any()):
-            raise ValueError(
-                "state index outside the live (registry-allocated) "
-                "block set"
-            )
+            raise ValueError("state index outside the live (registry-allocated) block set")
+    for row, binding in enumerate(plan.bindings):
+        if not isinstance(binding, PreparedRowBinding):
+            raise ValueError("plan.bindings must contain PreparedRowBinding")
+        if type(binding.request_id) is not str or not binding.request_id:
+            raise ValueError("binding request_id must be a nonempty string")
+        integer_fields = (
+            binding.block_id,
+            binding.admission_generation,
+            binding.geometry_id,
+            binding.prompt_index,
+            binding.prior_prompt_index,
+            binding.ready_deadline_ns,
+        )
+        if any(type(value) is not int for value in integer_fields):
+            raise ValueError("binding numeric controls must be exact ints")
+        if type(binding.is_chunk) is not bool:
+            raise ValueError("binding is_chunk must be bool")
+        if type(binding.allow_prompt_transition) is not bool:
+            raise ValueError("binding allow_prompt_transition must be bool")
+        expected = PreparedRowBinding(
+            request_id=plan.request_ids[row],
+            block_id=int(idx[row]),
+            admission_generation=int(plan.admission_generation[row]),
+            geometry_id=int(plan.geometry_id[row]),
+            prompt_index=int(plan.prompt_index[row]),
+            prior_prompt_index=binding.prior_prompt_index,
+            allow_prompt_transition=binding.allow_prompt_transition,
+            is_chunk=bool(plan.is_chunk[row]),
+            ready_deadline_ns=int(plan.ready_deadline_ns[row]),
+        )
+        if binding != expected:
+            raise ValueError(f"row {row} does not reproduce its atomically prepared request/block/control binding")
+        prompt_changed = binding.prior_prompt_index != binding.prompt_index
+        if binding.allow_prompt_transition != prompt_changed:
+            raise ValueError("prompt transition authorization must exactly match a prior-to-current prompt change")
+        if binding.allow_prompt_transition and not binding.is_chunk:
+            raise ValueError("only a newly minted CHUNK may change prompt")
+    fresh_prefills = (~plan.has_initial_states_p).nonzero(as_tuple=True)[0]
+    for local_row in fresh_prefills.tolist():
+        binding = plan.bindings[plan.num_decodes + local_row]
+        if binding.allow_prompt_transition:
+            raise ValueError("a fresh admission has no persisted prompt to transition")
+    if live.numel():
+        if bool((live < 0).any()) or bool((live >= plan.num_pool_blocks).any()):
+            raise ValueError("live block authority contains an out-of-range id")
+        if bool((live == plan.null_block_id).any()):
+            raise ValueError("live block authority must exclude the null block")
+        if int(torch.unique(live).numel()) != int(live.numel()):
+            raise ValueError("live block authority contains duplicates")
     return idx
 
 
-# @spec PORT-ADV-003, PORT-STATE-007, PORT-STATE-008
+def _gather_initialized_rows(
+    pool: torch.Tensor,
+    blocks: torch.Tensor,
+    fresh_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Gather only continuing rows; fresh rows start as exact zero state."""
+    rows = int(blocks.shape[0])
+    scratch = torch.zeros((rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
+    continuing_cpu = (~fresh_cpu).nonzero(as_tuple=True)[0]
+    if int(continuing_cpu.numel()):
+        continuing = _h2d(continuing_cpu, pool.device)
+        continuing_blocks = blocks.index_select(0, continuing)
+        scratch.index_copy_(
+            0,
+            continuing,
+            pool.index_select(0, continuing_blocks),
+        )
+    return scratch
+
+
+def _counter_invariant_rows(
+    counters: torch.Tensor,
+    *,
+    raw_tail_capacity: int,
+    mel_tail_capacity: int,
+    hop_length: int,
+    n_fft: int,
+    cadence_frames: torch.Tensor,
+) -> torch.Tensor:
+    """Return rows whose persisted frontend-control state is impossible."""
+    from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+        CTR_COMMITTED_MEL_FRAMES,
+        CTR_ENCODED_MEL_FRAMES,
+        CTR_EXPECTED_CHUNK_SEQUENCE,
+        CTR_FINALIZED,
+        CTR_MEL_TAIL_LENGTH,
+        CTR_RAW_TAIL_LENGTH,
+        CTR_RAW_TAIL_ORIGIN,
+        CTR_TOTAL_VALID_SAMPLES,
+    )
+
+    total = counters[:, CTR_TOTAL_VALID_SAMPLES]
+    committed = counters[:, CTR_COMMITTED_MEL_FRAMES]
+    encoded = counters[:, CTR_ENCODED_MEL_FRAMES]
+    raw_origin = counters[:, CTR_RAW_TAIL_ORIGIN]
+    raw_length = counters[:, CTR_RAW_TAIL_LENGTH]
+    mel_length = counters[:, CTR_MEL_TAIL_LENGTH]
+    finalized = counters[:, CTR_FINALIZED]
+    expected_sequence = counters[:, CTR_EXPECTED_CHUNK_SEQUENCE]
+    chunk_samples = cadence_frames * hop_length
+    regular_chunks_from_total = total // chunk_samples
+    regular_remainder = total % chunk_samples
+    expected_regular_committed = torch.where(
+        regular_chunks_from_total == 0,
+        torch.zeros_like(committed),
+        regular_chunks_from_total * cadence_frames - 7,
+    )
+    final_base_committed = torch.where(
+        regular_chunks_from_total == 0,
+        torch.zeros_like(committed),
+        regular_chunks_from_total * cadence_frames - 7,
+    )
+    final_available = total // hop_length
+    expected_final_committed = torch.where(
+        final_available - final_base_committed >= 8,
+        final_available,
+        final_base_committed,
+    )
+    finalized_bad = (finalized == 1) & (
+        (expected_sequence != regular_chunks_from_total + 1) | (committed != expected_final_committed)
+    )
+    expected_mel_length = torch.minimum(
+        committed,
+        torch.full_like(committed, mel_tail_capacity),
+    )
+    bounded_committed = torch.minimum(
+        committed.clamp(min=0),
+        (total // hop_length).clamp(min=0),
+    )
+    expected_raw_origin = torch.clamp(
+        bounded_committed * hop_length - n_fft // 2 - 1,
+        min=0,
+    )
+    expected_raw_length = torch.clamp(total - expected_raw_origin, min=0)
+    raw_retention_bad = torch.where(
+        finalized == 1,
+        (raw_origin != total) | (raw_length != 0),
+        (raw_origin != expected_raw_origin) | (raw_length != expected_raw_length),
+    )
+    return (
+        (counters < 0).any(dim=1)
+        | (encoded != committed)
+        | (committed > total // hop_length)
+        | (
+            (finalized == 0)
+            & (
+                (expected_sequence != regular_chunks_from_total)
+                | (regular_remainder != 0)
+                | (committed != expected_regular_committed)
+            )
+        )
+        | finalized_bad
+        | (raw_origin > total)
+        | (raw_length > raw_tail_capacity)
+        | (raw_origin + raw_length != total)
+        | raw_retention_bad
+        | (mel_length > mel_tail_capacity)
+        | (mel_length != expected_mel_length)
+        | ((finalized != 0) & (finalized != 1))
+    )
+
+
+def _validate_result_structure(
+    result: AdvanceResult,
+    *,
+    rows: int,
+    device: torch.device,
+    capture: bool,
+    expected_capture: (tuple[tuple[int, int, int], tuple[int, int, int], torch.dtype] | None) = None,
+) -> None:
+    """Validate result/capture metadata without reading device values."""
+    if (
+        result.token_ids.device != device
+        or result.token_ids.dtype != torch.int32
+        or result.token_ids.dim() != 2
+        or result.token_ids.shape[0] != rows
+        or not result.token_ids.is_contiguous()
+    ):
+        raise ValueError("AdvanceResult.token_ids must be device-local int32 shaped (B, K)")
+    if (
+        result.token_lengths.device != device
+        or result.token_lengths.dtype != torch.int32
+        or tuple(result.token_lengths.shape) != (rows,)
+        or not result.token_lengths.is_contiguous()
+    ):
+        raise ValueError("AdvanceResult.token_lengths must be device-local int32 shaped (B,)")
+    if (
+        result.row_status is None
+        or result.row_status.device != device
+        or result.row_status.dtype != torch.int32
+        or tuple(result.row_status.shape) != (rows,)
+        or not result.row_status.is_contiguous()
+    ):
+        raise ValueError("AdvanceResult.row_status must be device-local int32 shaped (B,)")
+    captures = result.captures
+    if not capture:
+        if captures is not None:
+            raise ValueError("capture-off transition returned capture tensors")
+        return
+    if captures is None:
+        raise ValueError("capture enabled but AdvanceResult has no captures")
+    if expected_capture is None:
+        raise ValueError("capture validation requires host-derived geometry")
+    expected_mel, expected_encoder, expected_encoder_dtype = expected_capture
+    if (
+        captures.frontend_mel.device != device
+        or tuple(captures.frontend_mel.shape) != expected_mel
+        or captures.frontend_mel.dtype != torch.float32
+        or not captures.frontend_mel.is_contiguous()
+        or captures.mel_lengths.device != device
+        or captures.mel_lengths.dtype != torch.int64
+        or tuple(captures.mel_lengths.shape) != (rows,)
+        or not captures.mel_lengths.is_contiguous()
+    ):
+        raise ValueError("malformed frontend capture tensors")
+    raw = captures.encoder_raw
+    conditioned = captures.encoder_conditioned
+    if (
+        raw.device != device
+        or conditioned.device != device
+        or tuple(raw.shape) != expected_encoder
+        or tuple(conditioned.shape) != expected_encoder
+        or raw.dtype != expected_encoder_dtype
+        or conditioned.dtype != expected_encoder_dtype
+        or not raw.is_contiguous()
+        or not conditioned.is_contiguous()
+        or raw.shape[0] != rows
+        or captures.encoder_lengths.device != device
+        or captures.encoder_lengths.dtype != torch.int64
+        or tuple(captures.encoder_lengths.shape) != (rows,)
+        or not captures.encoder_lengths.is_contiguous()
+    ):
+        raise ValueError("malformed encoder capture tensors")
+
+
+def _validated_result(
+    result: AdvanceResult,
+    *,
+    incoming: torch.Tensor,
+    blank_id: int,
+    queue_capacity: int,
+    geometry_bound: int,
+    capture: bool,
+    expected_capture: (tuple[tuple[int, int, int], tuple[int, int, int], torch.dtype] | None) = None,
+    expected_capture_lengths: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> AdvanceResult:
+    """Compose device result predicates and sanitize every failed burst."""
+    rows = int(incoming.shape[0])
+    _validate_result_structure(
+        result,
+        rows=rows,
+        device=incoming.device,
+        capture=capture,
+        expected_capture=expected_capture,
+    )
+    assert result.row_status is not None
+    lengths = result.token_lengths.long()
+    width = int(result.token_ids.shape[1])
+    safe_for_mask = lengths.clamp(min=0, max=width)
+    columns = torch.arange(width, device=incoming.device).unsqueeze(0)
+    active = columns < safe_for_mask.unsqueeze(1)
+    invalid_token = (((result.token_ids < 0) | (result.token_ids >= blank_id)) & active).any(dim=1)
+    lost_incoming = (result.row_status & incoming) != incoming
+    unknown = (result.row_status & ~((1 << 19) - 1)) != 0
+    invalid = (
+        (lengths < 0) | (lengths > width) | invalid_token | lost_incoming | unknown | ((incoming != 0) & (lengths != 0))
+    )
+    status = incoming | result.row_status | (invalid.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT)
+    legal_bound = min(queue_capacity, geometry_bound)
+    overflow = lengths > legal_bound
+    status |= overflow.to(torch.int32) * ROW_STATUS_BURST_OVERFLOW
+    captures = result.captures
+    if captures is not None:
+        if expected_capture_lengths is None:
+            raise ValueError("capture validation requires independently derived logical lengths")
+        expected_mel_lengths, expected_encoder_lengths = expected_capture_lengths
+        capture_bad = (
+            (captures.mel_lengths < 0)
+            | (captures.mel_lengths > captures.frontend_mel.shape[2])
+            | (captures.encoder_lengths < 0)
+            | (captures.encoder_lengths > captures.encoder_raw.shape[1])
+            | (captures.mel_lengths != expected_mel_lengths)
+            | (captures.encoder_lengths != expected_encoder_lengths)
+        )
+        status |= capture_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    sanitized_lengths = torch.where(
+        status == 0,
+        lengths.clamp(max=legal_bound),
+        torch.zeros_like(lengths),
+    ).to(torch.int32)
+    return AdvanceResult(
+        token_ids=result.token_ids,
+        token_lengths=sanitized_lengths,
+        row_status=status,
+        captures=result.captures,
+    )
+
+
+@dataclass(frozen=True)
+class _ScatterDescriptor:
+    pool: torch.Tensor
+    scratch: torch.Tensor
+    blocks: torch.Tensor
+    row_status: torch.Tensor
+
+
+def _resident_pool_sequence(
+    *,
+    channel_pools: Sequence[torch.Tensor],
+    time_pools: Sequence[torch.Tensor],
+    len_pools: Sequence[torch.Tensor],
+    h_pool: torch.Tensor,
+    c_pool: torch.Tensor,
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    frontend_raw_pool: torch.Tensor,
+    frontend_mel_pool: torch.Tensor,
+    frontend_counter_pool: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Return the complete resident-pool inventory in commit order."""
+    return (
+        *channel_pools,
+        *time_pools,
+        *len_pools,
+        h_pool,
+        c_pool,
+        queue_pool,
+        book_pool,
+        frontend_raw_pool,
+        frontend_mel_pool,
+        frontend_counter_pool,
+    )
+
+
+# @spec PORT-PERF-001, PORT-STATE-008
+def warmup_advance_model_rows_scatter(
+    *,
+    channel_pools: Sequence[torch.Tensor],
+    time_pools: Sequence[torch.Tensor],
+    len_pools: Sequence[torch.Tensor],
+    h_pool: torch.Tensor,
+    c_pool: torch.Tensor,
+    queue_pool: torch.Tensor,
+    book_pool: torch.Tensor,
+    frontend_raw_pool: torch.Tensor,
+    frontend_mel_pool: torch.Tensor,
+    frontend_counter_pool: torch.Tensor,
+) -> None:
+    """Warm every fixed-shape commit specialization before admission.
+
+    Task 5 calls this once after the actual resident pools are allocated and
+    before the first session is admitted. Transaction scratch is contiguous,
+    so each one-row scratch below reproduces the runtime source stride while
+    preserving the destination pool's actual (possibly padded) block stride.
+    Runtime validation then fails closed if a later pool/layout was omitted.
+    """
+    pools = _resident_pool_sequence(
+        channel_pools=channel_pools,
+        time_pools=time_pools,
+        len_pools=len_pools,
+        h_pool=h_pool,
+        c_pool=c_pool,
+        queue_pool=queue_pool,
+        book_pool=book_pool,
+        frontend_raw_pool=frontend_raw_pool,
+        frontend_mel_pool=frontend_mel_pool,
+        frontend_counter_pool=frontend_counter_pool,
+    )
+    for pool in pools:
+        if pool.dim() < 1:
+            raise ValueError("every resident pool must have a block dimension")
+        scratch = torch.empty(
+            (1, *pool.shape[1:]),
+            dtype=pool.dtype,
+            device=pool.device,
+        )
+        warmup_masked_page_scatter(pool, scratch)
+
+
+# @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
+# @spec PORT-PERF-001, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(
     core: NemotronASRCore,
     input_ids: torch.Tensor,
@@ -1258,14 +1857,13 @@ def advance_model_rows(
     decode_resolver: DecodeResolver,
     placeholder_id: int,
     park_id: int,
-    capture_sink: CaptureSink | None = None,
-    status_sink: StatusSink | None = None,
+    commit_sink: CommitSink | None = None,
+    capture: bool = False,
     graph_covers_decode: bool = False,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
-    Fixed order (design §advance_session, steps 1–6, with the
-    Phase-6c seams — design §Phase-6c transaction seams):
+    Fixed order (design §Phase-6c transaction seams):
 
     1. compose decode-then-prefill indices from ``plan`` and validate
        every structural row/page property HOST-SIDE before any page
@@ -1275,44 +1873,36 @@ def advance_model_rows(
        speculative-column exclusion (extra decode columns);
        real/padding-row agreement — then upload the validated indices
        asynchronously for the device gathers;
-    2. initialize fresh rows (``~plan.has_initial_states_p``) from
-       plan authority — never recycled page contents — then gather
-       only the small session/emission book; evaluate replay echoes
+    2. reject unqualified graph coverage, form CHUNK buckets from CPU
+       plan authority, order them by earliest deadline, and resolve
+       every eager decode before the first resident read;
+    3. initialize fresh rows from plan authority without reading
+       recycled pages, then gather only continuing rows' required
+       session state; evaluate replay echoes
        and the host-role cross-check ON DEVICE into the transaction's
        ``ROW_STATUS_*`` bits (echo mismatch is row-local after
        trusted preflight, PORT-DEC-007 as amended); classify each
        real row CHUNK / REPLAY / FLUSH;
-    3. group CHUNK rows by execution profile + immutable geometry
+    4. group CHUNK rows by execution profile + immutable geometry
        (host authority: ``plan.is_chunk`` + ``plan.geometry_id``) and
        gather their full frontend/encoder/predictor scratch; valid
        length stays a per-row tensor, not a batch-key component;
-    4. resolve the decode callable once per bucket through
-       ``decode_resolver`` (typed :class:`DecodeRequest` — padded
-       execution tier, invocation graph coverage, ready decode
-       buckets) and run :func:`advance_session` over each bucket into
-       scratch;
-    5. prepare immutable capture records beside each
-       :class:`AdvanceResult` and reserve their exact bounded
-       footprint through ``capture_sink`` BEFORE any resident commit
-       (reservation failure is pre-commit fatal; ``None`` disables
-       capture with zero capture-only allocations), then project the
-       committed result through ``adapter``;
-    6. commit recurrent/session state, emission bookkeeping (the
-       persistent replay book), and returnable output together as
-       masked no-allocation writes; stage the single batched
-       asynchronous row-status handoff through ``status_sink``; and
-       publish the prepared records into the reserved slots — a
-       no-fail in-memory handoff — only for committed CHUNK rows, in
-       request/chunk and checkpoint order.
+       and run :func:`advance_session` with its pre-resolved callable;
+    5. validate complete decode results, merge and project them,
+       prepare optional candidate records, and validate the complete
+       all-bucket scatter plan before one composite reservation;
+    6. issue fixed-shape predicated page scatters (failed rows issue
+       no store), then perform the reservation's one no-fail combined
+       status/candidate stage.
 
     Suppression (PORT-STATE-008): any structural defect fails the
     whole call before a read; an expected per-row defect resolves to
-    a device status bit and a masked park-only no-op; a bucket
-    failure suppresses its bucket; an unexpected Python/CUDA failure
-    aborts the whole call before any scatter and propagates (a CUDA
-    context failure is worker-fatal, never row suppression). No row
-    scatters unless its emission result can be returned. Kernels
-    never mutate resident pages directly.
+    a device status bit and a masked park-only no-op. An unexpected
+    Python/CUDA compute failure aborts the whole call before scatter;
+    a catastrophic device failure during the prevalidated commit is
+    worker-fatal, never bucket/row suppression or rollback. No row
+    scatters unless its emission result can be returned. Transition
+    kernels never mutate resident pages directly.
 
     Returns:
         The runner's row output as projected by ``adapter`` (e.g. the
@@ -1324,7 +1914,11 @@ def advance_model_rows(
             always before any resident mutation.
     """
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+        CTR_COMMITTED_MEL_FRAMES,
+        CTR_EXPECTED_CHUNK_SEQUENCE,
         CTR_FINALIZED,
+        CTR_TOTAL_VALID_SAMPLES,
+        MEL_TAIL_FRAMES,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
         CADENCES,
@@ -1333,6 +1927,7 @@ def advance_model_rows(
         BOOK_EXPECTED_LABEL,
         BOOK_GEOMETRY,
         BOOK_PENDING_ECHO,
+        MAX_SYMBOLS_PER_STEP,
         QUEUE_HEAD,
         QUEUE_LAST_LABEL,
         QUEUE_LEN,
@@ -1341,78 +1936,192 @@ def advance_model_rows(
 
     if not callable(decode_resolver):
         raise ValueError(
-            "advance_model_rows requires a decode resolver: dispatch "
-            "is never a hardcoded default (PORT-DEC-008)"
+            "advance_model_rows requires a decode resolver: dispatch is never a hardcoded default (PORT-DEC-008)"
         )
+    if input_ids.dim() != 1 or inputs_embeds.dim() != 2:
+        raise ValueError("input_ids/inputs_embeds must be rank one/two")
+    if input_ids.dtype != torch.int64 or inputs_embeds.dtype != torch.float32:
+        raise ValueError("row ids must be int64 and raw envelopes must be fp32")
+    if input_ids.device != inputs_embeds.device:
+        raise ValueError("input ids and envelopes must share a device")
     n_real = plan.num_decodes + plan.num_prefills
     hidden = int(inputs_embeds.shape[1])
     device = inputs_embeds.device
-    idx_cpu = _structural_preflight(
-        plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0])
-    )
-    lookaheads = [right for (_, right) in CADENCES.values()]
-    num_prompts = int(core.lid.num_prompts)
-    cap = int(queue_pool.shape[1])
-    blank = int(core.blank_id)
-    if n_real and (
-        bool((plan.geometry_id < 0).any())
-        or bool((plan.geometry_id >= len(lookaheads)).any())
-    ):
-        raise ValueError("plan.geometry_id outside the admitted set")
-    if n_real and (
-        bool((plan.prompt_index < 0).any())
-        or bool((plan.prompt_index >= num_prompts).any())
-    ):
+    idx_cpu = _structural_preflight(plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0]))
+    if graph_covers_decode:
         raise ValueError(
-            "plan.prompt_index outside the prompt dictionary — the "
-            "admitted authority is host-validated at admission"
+            "graph-covered outer decode is rejected until exact runner "
+            "padding is implemented and pod-qualified (PORT-DEC-008)"
         )
+    if plan.execution_tier != 0:
+        raise ValueError("eager execution requires plan.execution_tier == 0")
+    if capture and commit_sink is None:
+        raise ValueError("capture requires a composite commit sink")
+    lookaheads = [right for (_, right) in CADENCES.values()]
+    hop = int(core.featurizer.hop_length)
+    num_prompts = int(core.lid.num_prompts)
+    if queue_pool.dim() != 2 or book_pool.dim() != 2:
+        raise ValueError("queue and book pools must be rank two")
+    cap = int(queue_pool.shape[1])
+    if cap <= 0:
+        raise ValueError("replay queue capacity must be positive")
+    if book_pool.shape[1] != 7:
+        raise ValueError("session book must match the seven-slot manifest")
+    blank = int(core.blank_id)
+    if n_real and (bool((plan.geometry_id < 0).any()) or bool((plan.geometry_id >= len(lookaheads)).any())):
+        raise ValueError("plan.geometry_id outside the admitted set")
+    if n_real and (bool((plan.prompt_index < 0).any()) or bool((plan.prompt_index >= num_prompts).any())):
+        raise ValueError(
+            "plan.prompt_index outside the prompt dictionary — the admitted authority is host-validated at admission"
+        )
+    if any(binding.prior_prompt_index < 0 or binding.prior_prompt_index >= num_prompts for binding in plan.bindings):
+        raise ValueError("binding prior prompt outside the prompt dictionary")
+    required_hidden = 1  # every runner row must carry one decision id
+    for geometry, lookahead in enumerate(lookaheads):
+        if bool((plan.is_chunk & (plan.geometry_id == geometry)).any()):
+            required_hidden = max(
+                required_hidden,
+                ENVELOPE_HEADER_SLOTS + 8 * (lookahead + 1) * hop,
+            )
+    if hidden < required_hidden:
+        raise ValueError(f"carrier width {hidden} is smaller than the selected rows require ({required_hidden})")
 
-    # ---- small book/counter gather + originals + fresh init ----
+    pools = _resident_pool_sequence(
+        channel_pools=channel_pools,
+        time_pools=time_pools,
+        len_pools=len_pools,
+        h_pool=h_pool,
+        c_pool=c_pool,
+        queue_pool=queue_pool,
+        book_pool=book_pool,
+        frontend_raw_pool=frontend_raw_pool,
+        frontend_mel_pool=frontend_mel_pool,
+        frontend_counter_pool=frontend_counter_pool,
+    )
+    if any(pool.dim() < 1 for pool in pools):
+        raise ValueError("every resident pool must have a block dimension")
+    if any(int(pool.shape[0]) != plan.num_pool_blocks for pool in pools):
+        raise ValueError("resident pool extent disagrees with RowPlan authority")
+    if any(pool.device != device for pool in pools):
+        raise ValueError("every resident pool must share the compute device")
+    if queue_pool.dtype != torch.int32 or book_pool.dtype != torch.int32:
+        raise ValueError("queue and book pools must use int32")
+    if frontend_counter_pool.dtype != torch.int64:
+        raise ValueError("frontend counters must use int64")
+    if (
+        any(pool.dtype != torch.float32 for pool in channel_pools)
+        or any(pool.dtype != torch.float32 for pool in time_pools)
+        or any(pool.dtype != torch.int32 for pool in len_pools)
+        or h_pool.dtype != torch.float32
+        or c_pool.dtype != torch.float32
+        or frontend_raw_pool.dtype != torch.float32
+        or frontend_mel_pool.dtype != torch.float32
+    ):
+        raise ValueError("resident pool dtypes disagree with the state manifest")
+    if (
+        frontend_raw_pool.dim() != 2
+        or frontend_mel_pool.dim() != 3
+        or frontend_counter_pool.dim() != 2
+        or frontend_counter_pool.shape[1] != 8
+        or h_pool.dim() != 3
+        or c_pool.dim() != 3
+        or tuple(h_pool.shape) != tuple(c_pool.shape)
+        or h_pool.dtype != c_pool.dtype
+    ):
+        raise ValueError("frontend/predictor resident pool geometry is invalid")
+    layer_count = len(core.encoder.layers)
+    if not (len(channel_pools) == len(time_pools) == len(len_pools) == layer_count):
+        raise ValueError("encoder state pool counts disagree with model layers")
+    if (
+        any(pool.dim() != 3 for pool in channel_pools)
+        or any(pool.dim() != 3 for pool in time_pools)
+        or any(pool.dim() != 2 or pool.shape[1] != 1 for pool in len_pools)
+    ):
+        raise ValueError("encoder resident pool geometry is invalid")
+
+    # Resolve ALL buckets from CPU authority before the first resident read.
+    unresolved: list[tuple[int, torch.Tensor, int, int]] = []
+    for geometry in range(len(lookaheads)):
+        positions = (plan.is_chunk & (plan.geometry_id == geometry)).nonzero(as_tuple=True)[0]
+        if int(positions.numel()):
+            deadline = int(plan.ready_deadline_ns.index_select(0, positions).min())
+            unresolved.append((geometry, positions, deadline, int(positions[0])))
+    unresolved.sort(key=lambda item: (item[2], item[3]))
+    ready = len(unresolved)
+    bucket_pos: list[tuple[int, torch.Tensor, ResolvedDecode]] = []
+    for geometry, positions, _, _ in unresolved:
+        live = int(positions.numel())
+        if (lookaheads[geometry] + 1) * MAX_SYMBOLS_PER_STEP > cap:
+            raise ValueError(f"geometry {geometry}'s legal burst bound exceeds the replay queue capacity {cap}")
+        resolved = decode_resolver(
+            DecodeRequest(
+                geometry=geometry,
+                execution_batch_size=live,
+                graph_covers_decode=False,
+                ready_decode_buckets=ready,
+            )
+        )
+        if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
+            raise ValueError("decode resolver returned an invalid binding")
+        bucket_pos.append((geometry, positions, resolved))
+
+    # ---- small continuing-row gather + metadata-only fresh init ----
     didx = _h2d(idx_cpu, device)
-    book_orig = book_pool.index_select(0, didx)
-    queue_orig = queue_pool.index_select(0, didx)
-    book = book_orig.clone()
-    queue = queue_orig.clone()
-    counters_small = frontend_counter_pool.index_select(0, didx)
     fresh_local = (~plan.has_initial_states_p).nonzero(as_tuple=True)[0]
     fresh_mask_cpu = torch.zeros(n_real, dtype=torch.bool)
-    if fresh_local.numel():
+    if int(fresh_local.numel()):
         fresh_pos_cpu = plan.num_decodes + fresh_local
         fresh_mask_cpu[fresh_pos_cpu] = True
-        finit = torch.zeros(
-            int(fresh_local.numel()), book.shape[1], dtype=torch.int64
-        )
+    book = _gather_initialized_rows(book_pool, didx, fresh_mask_cpu)
+    queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
+    counters_small = _gather_initialized_rows(frontend_counter_pool, didx, fresh_mask_cpu)
+    if int(fresh_local.numel()):
+        finit = torch.zeros(int(fresh_local.numel()), book.shape[1], dtype=torch.int64)
         finit[:, QUEUE_LAST_LABEL] = blank
-        finit[:, QUEUE_PROMPT] = plan.prompt_index.index_select(
-            0, fresh_pos_cpu
-        )
-        finit[:, BOOK_GEOMETRY] = plan.geometry_id.index_select(
-            0, fresh_pos_cpu
-        )
+        finit[:, QUEUE_PROMPT] = plan.prompt_index.index_select(0, fresh_pos_cpu)
+        finit[:, BOOK_GEOMETRY] = plan.geometry_id.index_select(0, fresh_pos_cpu)
         fresh_dev = _h2d(fresh_pos_cpu, device)
         book.index_copy_(0, fresh_dev, _h2d(finit, device).to(book.dtype))
-        queue.index_fill_(0, fresh_dev, 0)
-        counters_small.index_fill_(0, fresh_dev, 0)
 
     # ---- device role/protocol/invariant composition ----
     is_chunk_dev = _h2d(plan.is_chunk, device)
     plan_geom_dev = _h2d(plan.geometry_id, device)
     admitted_prompt_dev = _h2d(plan.prompt_index, device)
+    prior_prompt_dev = _h2d(
+        torch.tensor(
+            [binding.prior_prompt_index for binding in plan.bindings],
+            dtype=torch.int64,
+        ),
+        device,
+    )
     ids_dev = input_ids.long()
     head_all = book[:, QUEUE_HEAD].long()
     len_all = book[:, QUEUE_LEN].long()
     pend_col = book[:, BOOK_PENDING_ECHO]
-    pending = pend_col != 0
+    pending = pend_col == 1
     remaining = len_all - head_all
     last = book[:, QUEUE_LAST_LABEL].long()
     expected = book[:, BOOK_EXPECTED_LABEL].long()
-    finalized = counters_small[:, CTR_FINALIZED] != 0
+    finalized_col = counters_small[:, CTR_FINALIZED]
+    finalized = finalized_col == 1
     slot = torch.arange(cap, device=device).unsqueeze(0)
-    queued_bad = (
-        ((queue < 0) | (queue >= blank))
-        & (slot < len_all.unsqueeze(1))
-    ).any(dim=1)
+    queued_bad = (((queue < 0) | (queue >= blank)) & (slot < len_all.unsqueeze(1))).any(dim=1)
+    prior_emitted = (
+        queue.gather(
+            1,
+            (head_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    queue_last = (
+        queue.gather(
+            1,
+            (len_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
     book_bad = (
         (head_all < 0)
         | (head_all > len_all)
@@ -1422,94 +2131,61 @@ def advance_model_rows(
         | (last > blank)
         | (expected < 0)
         | (expected > blank)
+        | (pending & (expected >= blank))
         | queued_bad
+        | (pending & (head_all < 1))
+        | (pending & (expected != prior_emitted))
+        | ((len_all > 0) & (last != queue_last))
+        | ((remaining > 0) & (~pending))
+    )
+    counter_bad = _counter_invariant_rows(
+        counters_small,
+        raw_tail_capacity=int(frontend_raw_pool.shape[1]),
+        mel_tail_capacity=int(frontend_mel_pool.shape[2]),
+        hop_length=hop,
+        n_fft=int(core.featurizer.n_fft),
+        cadence_frames=torch.tensor(
+            [8 * (lookahead + 1) for lookahead in lookaheads],
+            dtype=torch.int64,
+            device=device,
+        ).index_select(0, plan_geom_dev),
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
-    status |= (
-        is_chunk_dev != (ids_dev == placeholder_id)
-    ).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
-    status |= (
-        (~is_chunk_dev) & pending & (ids_dev != expected)
-    ).to(torch.int32) * ROW_STATUS_ECHO_MISMATCH
-    status |= (
-        is_chunk_dev & (pending | (remaining > 0))
-    ).to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
-    status |= (
-        (~is_chunk_dev)
-        & (~pending)
-        & ((remaining > 0) | (~finalized))
-    ).to(torch.int32) * ROW_STATUS_SESSION_PROTOCOL
-    status |= (
-        book[:, BOOK_GEOMETRY].long() != plan_geom_dev
-    ).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
-    status |= book_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+    status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
+    status |= ((~is_chunk_dev) & pending & (ids_dev != expected)).to(torch.int32) * ROW_STATUS_ECHO_MISMATCH
+    status |= (is_chunk_dev & (pending | (remaining > 0))).to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
+    status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized))).to(
+        torch.int32
+    ) * ROW_STATUS_SESSION_PROTOCOL
+    status |= (book[:, BOOK_GEOMETRY].long() != plan_geom_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
+    status |= (book[:, QUEUE_PROMPT].long() != prior_prompt_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
+    status |= (book_bad | counter_bad).to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
     # Safe substitution (PORT-ADV-004 as amended): a corrupt book's
     # last label must never reach the predictor embedding.
     safe_last = torch.where(
-        book_bad, torch.full_like(last, blank), last.clamp(0, blank)
+        book_bad | counter_bad,
+        torch.full_like(last, blank),
+        last.clamp(0, blank),
     )
-    roles = torch.full(
-        (n_real,), ROLE_FLUSH, dtype=torch.long, device=device
-    )
+    roles = torch.full((n_real,), ROLE_FLUSH, dtype=torch.long, device=device)
     roles = torch.where(
         (~is_chunk_dev) & pending,
         torch.full_like(roles, ROLE_REPLAY),
         roles,
     )
-    roles = torch.where(
-        is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles
-    )
+    roles = torch.where(is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles)
 
-    # ---- geometry buckets → gather → advance_session (scratch) ----
-    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
-        MAX_SYMBOLS_PER_STEP,
-    )
-
-    bucket_pos: list[tuple[int, torch.Tensor]] = []
-    for g in range(len(lookaheads)):
-        pos_t = (
-            plan.is_chunk & (plan.geometry_id == g)
-        ).nonzero(as_tuple=True)[0]
-        if int(pos_t.numel()):
-            bucket_pos.append((g, pos_t))
-    ready = len(bucket_pos)
-    hop = int(core.featurizer.hop_length)
-    capture_on = capture_sink is not None
+    # ---- deadline-ordered buckets → fresh-aware gather → transition ----
+    capture_on = capture
     executed: list[dict[str, Any]] = []
-    for g, pos_t in bucket_pos:
-        live = int(pos_t.numel())
-        if graph_covers_decode:
-            if plan.execution_tier <= 0:
-                raise ValueError(
-                    "graph-covered decode requires the plan's padded "
-                    "execution tier (PORT-DEC-008 as amended)"
-                )
-            tier = plan.execution_tier
-        else:
-            # Eager buckets are unpadded: live IS the execution size.
-            tier = live
-        if (lookaheads[g] + 1) * MAX_SYMBOLS_PER_STEP > cap:
-            raise ValueError(
-                f"geometry {g}'s legal burst bound exceeds the replay "
-                f"queue capacity {cap} — a manifest/config defect"
-            )
-        resolved = decode_resolver(
-            DecodeRequest(
-                geometry=g,
-                execution_batch_size=tier,
-                graph_covers_decode=graph_covers_decode,
-                ready_decode_buckets=ready,
-            )
-        )
+    for g, pos_t, resolved in bucket_pos:
         rows_dev = _h2d(pos_t, device)
         blocks_dev = didx.index_select(0, rows_dev)
+        fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
         cadence = 8 * (lookaheads[g] + 1)
         s_g = cadence * hop
         if ENVELOPE_HEADER_SLOTS + s_g > hidden:
-            raise ValueError(
-                f"carrier width {hidden} cannot hold geometry {g}'s "
-                f"{s_g}-sample cadence"
-            )
+            raise ValueError(f"carrier width {hidden} cannot hold geometry {g}'s {s_g}-sample cadence")
         env = inputs_embeds.index_select(0, rows_dev)
         hdr = env[:, :ENVELOPE_HEADER_SLOTS]
         final_col = hdr[:, ENV_FINAL_TAIL]
@@ -1530,9 +2206,7 @@ def advance_model_rows(
             | prompt_mm.to(torch.int32) * ROW_STATUS_PROMPT_MISMATCH
         )
         batch = ChunkBatch(
-            samples=env[
-                :, ENVELOPE_HEADER_SLOTS : ENVELOPE_HEADER_SLOTS + s_g
-            ],
+            samples=env[:, ENVELOPE_HEADER_SLOTS : ENVELOPE_HEADER_SLOTS + s_g],
             valid_samples=valid_col.long(),
             geometry_id=hdr[:, ENV_GEOMETRY_ID].long(),
             final_tail=final_col != 0,
@@ -1542,76 +2216,142 @@ def advance_model_rows(
             chunk_sequence=hdr[:, ENV_CHUNK_SEQUENCE].long(),
         )
         state = SessionStateBatch(
-            raw_tail=frontend_raw_pool.index_select(0, blocks_dev),
-            mel_tail=frontend_mel_pool.index_select(0, blocks_dev),
+            raw_tail=_gather_initialized_rows(frontend_raw_pool, blocks_dev, fresh_bucket),
+            mel_tail=_gather_initialized_rows(frontend_mel_pool, blocks_dev, fresh_bucket),
             frontend_counters=counters_small.index_select(0, rows_dev),
-            channel=[
-                pool.index_select(0, blocks_dev)
-                for pool in channel_pools
-            ],
-            window_valid=[
-                pool.index_select(0, blocks_dev) for pool in len_pools
-            ],
-            time=[
-                pool.index_select(0, blocks_dev) for pool in time_pools
-            ],
-            h=h_pool.index_select(0, blocks_dev),
-            c=c_pool.index_select(0, blocks_dev),
+            channel=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in channel_pools],
+            window_valid=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in len_pools],
+            time=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in time_pools],
+            h=_gather_initialized_rows(h_pool, blocks_dev, fresh_bucket),
+            c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
-        # A fresh CHUNK row computes from zero scratch (PORT-STATE-003);
-        # if it later masks, the commit's conditional payload restores
-        # the untouched page, so no orig clones are needed here.
-        fl = fresh_mask_cpu.index_select(0, pos_t).nonzero(
-            as_tuple=True
-        )[0]
-        if int(fl.numel()):
-            fdev = _h2d(fl, device)
-            for t in (
-                state.raw_tail, state.mel_tail, state.h, state.c,
-                *state.channel, *state.window_valid, *state.time,
-            ):
-                t.index_fill_(0, fdev, 0)
         result = advance_session(
-            core, batch, state,
+            core,
+            batch,
+            state,
             geometry=g,
             decode_fn=resolved.decode_fn,
             capture=capture_on,
             row_status=incoming,
         )
-        rs = (
-            result.row_status
-            if result.row_status is not None
-            else incoming
+        old_counters = counters_small.index_select(0, rows_dev)
+        next_counters = state.frontend_counters
+        committed_delta = (
+            next_counters[:, CTR_COMMITTED_MEL_FRAMES] - old_counters[:, CTR_COMMITTED_MEL_FRAMES]
+        ).clamp(min=0)
+        session_first = batch.chunk_sequence == 0
+        capture_mel_lengths = torch.where(
+            committed_delta > 0,
+            committed_delta
+            + torch.where(
+                session_first,
+                torch.zeros_like(committed_delta),
+                torch.full_like(committed_delta, MEL_TAIL_FRAMES),
+            ),
+            torch.zeros_like(committed_delta),
         )
-        # Burst overflow is rejected, never truncated: fold it into
-        # the row status BEFORE any consumer of rs (PORT-DEC-001).
-        rs = rs | (
-            result.token_lengths.long() > cap
-        ).to(torch.int32) * ROW_STATUS_BURST_OVERFLOW
+        capture_drop = torch.where(
+            session_first,
+            torch.zeros_like(committed_delta),
+            torch.full_like(committed_delta, PRE_ENCODE_DROP),
+        )
+        capture_encoder_lengths = torch.where(
+            committed_delta > 0,
+            torch.clamp(
+                core.encoder.pre_encode.output_lengths(capture_mel_lengths) - capture_drop,
+                min=0,
+            ),
+            torch.zeros_like(committed_delta),
+        )
+        result = _validated_result(
+            result,
+            incoming=incoming,
+            blank_id=blank,
+            queue_capacity=cap,
+            geometry_bound=(lookaheads[g] + 1) * MAX_SYMBOLS_PER_STEP,
+            capture=capture_on,
+            expected_capture=(
+                (
+                    int(rows_dev.shape[0]),
+                    int(state.mel_tail.shape[1]),
+                    int(state.mel_tail.shape[2]) + cadence + 6,
+                ),
+                (
+                    int(rows_dev.shape[0]),
+                    int(
+                        core.encoder.pre_encode.output_lengths(
+                            torch.tensor([int(state.mel_tail.shape[2]) + cadence + 6])
+                        )[0]
+                    ),
+                    int(state.channel[0].shape[2]),
+                ),
+                state.channel[0].dtype,
+            )
+            if capture_on
+            else None,
+            expected_capture_lengths=(
+                capture_mel_lengths,
+                capture_encoder_lengths,
+            )
+            if capture_on
+            else None,
+        )
+        assert result.row_status is not None
+        rs = result.row_status
+        counter_bad = _counter_invariant_rows(
+            next_counters,
+            raw_tail_capacity=int(state.raw_tail.shape[1]),
+            mel_tail_capacity=int(state.mel_tail.shape[2]),
+            hop_length=hop,
+            n_fft=int(core.featurizer.n_fft),
+            cadence_frames=torch.full_like(
+                next_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE],
+                cadence,
+            ),
+        )
+        clean = rs == 0
+        counter_bad |= clean & (
+            next_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] != old_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] + 1
+        )
+        counter_bad |= clean & (
+            next_counters[:, CTR_TOTAL_VALID_SAMPLES] - old_counters[:, CTR_TOTAL_VALID_SAMPLES] != batch.valid_samples
+        )
+        counter_bad |= clean & (next_counters[:, CTR_FINALIZED] != batch.final_tail.to(torch.int64))
+        rs |= counter_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+        result = AdvanceResult(
+            token_ids=result.token_ids,
+            token_lengths=torch.where(
+                rs == 0,
+                result.token_lengths,
+                torch.zeros_like(result.token_lengths),
+            ),
+            row_status=rs,
+            captures=result.captures,
+        )
         status.index_copy_(0, rows_dev, rs)
         # The transition's advanced last_label goes into the book
-        # scratch unconditionally; the commit's conditional payload
-        # restores the original book for any failed row.
+        # scratch unconditionally; its scatter predicate suppresses
+        # every failed row without reading/restoring the old page.
         brows = book.index_select(0, rows_dev)
         brows[:, QUEUE_LAST_LABEL] = state.last_label.to(brows.dtype)
         book.index_copy_(0, rows_dev, brows)
-        executed.append({
-            "geometry": g,
-            "pos": pos_t,
-            "rows_dev": rows_dev,
-            "blocks_dev": blocks_dev,
-            "state": state,
-            "result": result,
-            "batch": batch,
-            "rs": rs,
-        })
+        executed.append(
+            {
+                "geometry": g,
+                "pos": pos_t,
+                "rows_dev": rows_dev,
+                "blocks_dev": blocks_dev,
+                "state": state,
+                "result": result,
+                "batch": batch,
+                "rs": rs,
+            }
+        )
 
     # ---- merged results + adapter projection (still fallible) ----
     chunk_all_t = (
-        torch.cat([p for _, p in bucket_pos])
-        if bucket_pos
-        else torch.zeros(0, dtype=torch.long)
+        torch.cat([positions for _, positions, _ in bucket_pos]) if bucket_pos else torch.zeros(0, dtype=torch.long)
     )
     chunk_all_dev = _h2d(chunk_all_t, device)
     b_total = int(chunk_all_t.numel())
@@ -1619,12 +2359,8 @@ def advance_model_rows(
         (int(ex["result"].token_ids.shape[1]) for ex in executed),
         default=0,
     )
-    merged_ids = torch.zeros(
-        b_total, k_max, dtype=torch.int32, device=device
-    )
-    merged_len = torch.zeros(
-        b_total, dtype=torch.int32, device=device
-    )
+    merged_ids = torch.zeros(b_total, k_max, dtype=torch.int32, device=device)
+    merged_len = torch.zeros(b_total, dtype=torch.int32, device=device)
     row0 = 0
     for ex in executed:
         nb = int(ex["pos"].numel())
@@ -1643,14 +2379,35 @@ def advance_model_rows(
         chunk_rows=chunk_all_dev,
         queue=queue,
         book=book,
+        prompt_index=admitted_prompt_dev,
         row_status=status,
     )
-    projection = adapter(merged, context)
+    # The adapter is an extension seam, not transaction authority. Give it
+    # independent writable snapshots and retain ``merged``/``context`` as the
+    # immutable semantic oracle. Otherwise an in-place adapter could clear a
+    # status bit or rewrite replay/FLUSH scratch before validation.
+    adapter_result = AdvanceResult(
+        token_ids=merged.token_ids.clone(),
+        token_lengths=merged.token_lengths.clone(),
+        row_status=merged.row_status.clone() if merged.row_status is not None else None,
+    )
+    adapter_context = EmissionContext(
+        roles=context.roles.clone(),
+        input_ids=context.input_ids.clone(),
+        chunk_rows=context.chunk_rows.clone(),
+        queue=context.queue.clone(),
+        book=context.book.clone(),
+        prompt_index=context.prompt_index.clone(),
+        row_status=context.row_status.clone(),
+    )
+    projection = adapter(adapter_result, adapter_context)
 
     # ---- every conversion + shape/dtype validation, pre-commit ----
     if (
         tuple(projection.rows.shape) != (n_real, hidden)
         or projection.rows.dtype != inputs_embeds.dtype
+        or projection.rows.device != device
+        or not projection.rows.is_contiguous()
     ):
         raise ValueError(
             "adapter returned rows shaped "
@@ -1660,27 +2417,98 @@ def advance_model_rows(
     if (
         tuple(projection.queue.shape) != tuple(queue.shape)
         or projection.queue.dtype != queue_pool.dtype
+        or projection.queue.device != device
         or tuple(projection.book.shape) != tuple(book.shape)
         or projection.book.dtype != book_pool.dtype
+        or projection.book.device != device
     ):
-        raise ValueError(
-            "adapter returned queue/book scratch with a different "
-            "shape or dtype than the resident pools"
+        raise ValueError("adapter returned queue/book scratch with a different shape or dtype than the resident pools")
+    if (
+        projection.row_status.device != device
+        or projection.row_status.dtype != torch.int32
+        or tuple(projection.row_status.shape) != (n_real,)
+        or not projection.row_status.is_contiguous()
+    ):
+        raise ValueError("adapter row_status must be device-local int32 shaped (N,)")
+
+    # Validate the adapter's proposed persistent book before it can
+    # become resident. Any defect is a row-tier masked park/no-store.
+    pbook = projection.book
+    phead = pbook[:, QUEUE_HEAD].long()
+    plen = pbook[:, QUEUE_LEN].long()
+    ppend_col = pbook[:, BOOK_PENDING_ECHO]
+    ppend = ppend_col == 1
+    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
+    plast = pbook[:, QUEUE_LAST_LABEL].long()
+    premaining = plen - phead
+    proposed_queued_bad = (((projection.queue < 0) | (projection.queue >= blank)) & (slot < plen.unsqueeze(1))).any(
+        dim=1
+    )
+    proposed_prior_emitted = (
+        projection.queue.gather(
+            1,
+            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
         )
-    # Conditional commit payloads (PORT-ADV-004 as amended): a failed
-    # row — fresh initialization included — scatters its ORIGINAL page
-    # content back, bit-identical. All allocations happen here,
-    # before any resident write.
-    ok_all = status == 0
-    okc = ok_all.unsqueeze(1)
-    final_queue = torch.where(okc, projection.queue, queue_orig)
-    final_book = torch.where(okc, projection.book, book_orig)
-    scatter_ops: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        .squeeze(1)
+        .long()
+    )
+    proposed_queue_last = (
+        projection.queue.gather(
+            1,
+            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_bad = (
+        (phead < 0)
+        | (phead > plen)
+        | (plen > cap)
+        | ((ppend_col != 0) & (ppend_col != 1))
+        | (plast < 0)
+        | (plast > blank)
+        | (pexpected < 0)
+        | (pexpected > blank)
+        | (ppend & (pexpected >= blank))
+        | proposed_queued_bad
+        | (ppend & (phead < 1))
+        | (ppend & (pexpected != proposed_prior_emitted))
+        | ((plen > 0) & (plast != proposed_queue_last))
+        | ((premaining > 0) & (~ppend))
+        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
+        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
+    )
+    incoming_adapter_status = status
+    lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
+    status = incoming_adapter_status | projection.row_status
+    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+    projection_bad = _mrv1_projection_invariant_rows(
+        merged,
+        context,
+        projection,
+        status,
+        park_id=park_id,
+        blank_id=blank,
+    )
+    status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    failed = status != 0
+    projection_rows = projection.rows
+    projection_rows.masked_fill_(failed.reshape(-1, 1), 0)
+    if hidden:
+        projection_rows[:, 0] = torch.where(
+            failed,
+            torch.full_like(projection_rows[:, 0], park_id),
+            projection_rows[:, 0],
+        )
+
+    scatter_ops: list[_ScatterDescriptor] = []
     for ex in executed:
         rows_dev = ex["rows_dev"]
         blocks = ex["blocks_dev"]
         st = ex["state"]
-        okb = ok_all.index_select(0, rows_dev)
+        bucket_status = status.index_select(0, rows_dev)
         pairs: list[tuple[torch.Tensor, torch.Tensor]] = [
             (frontend_raw_pool, st.raw_tail),
             (frontend_mel_pool, st.mel_tail),
@@ -1692,30 +2520,26 @@ def advance_model_rows(
         pairs += list(zip(time_pools, st.time, strict=True))
         pairs += list(zip(len_pools, st.window_valid, strict=True))
         for pool, scratch in pairs:
-            if (
-                scratch.dtype != pool.dtype
-                or tuple(scratch.shape[1:]) != tuple(pool.shape[1:])
-            ):
-                raise ValueError(
-                    "scratch/pool shape or dtype disagreement at "
-                    "commit prep — a port defect"
-                )
-            view = okb.reshape(-1, *([1] * (scratch.dim() - 1)))
-            payload = torch.where(
-                view, scratch, pool.index_select(0, blocks)
-            )
-            scatter_ops.append((pool, blocks, payload))
+            scatter_ops.append(_ScatterDescriptor(pool, scratch, blocks, bucket_status))
+    scatter_ops.extend(
+        (
+            _ScatterDescriptor(queue_pool, projection.queue, didx, status),
+            _ScatterDescriptor(book_pool, projection.book, didx, status),
+        )
+    )
+    # Complete-plan validation is intentionally a separate pass: no
+    # descriptor may launch before every later descriptor is known good.
+    for op in scatter_ops:
+        validate_masked_page_scatter(op.pool, op.scratch, op.blocks, op.row_status)
 
-    # ---- composite reservation: captures + status, both pre-commit --
-    reservation: CaptureReservation | None = None
+    # ---- records + ONE composite reservation, still pre-commit ----
     records: list[CaptureRecord] = []
     if capture_on and b_total:
         for ex in executed:
             caps = ex["result"].captures
             if caps is None:
                 raise ValueError(
-                    "capture enabled but the transition staged no "
-                    "captures (PORT-HOOK-001 pre-commit fatal)"
+                    "capture enabled but the transition staged no captures (PORT-HOOK-001 pre-commit fatal)"
                 )
             for i, pos in enumerate(ex["pos"].tolist()):
                 records.append(
@@ -1723,13 +2547,11 @@ def advance_model_rows(
                         row=pos,
                         request_id=plan.request_ids[pos],
                         block_id=int(idx_cpu[pos]),
-                        admission_generation=int(
-                            plan.admission_generation[pos]
-                        ),
+                        admission_generation=int(plan.admission_generation[pos]),
                         geometry=int(ex["geometry"]),
                         chunk_sequence=ex["batch"].chunk_sequence[i],
                         prompt_index=ex["batch"].prompt_index[i],
-                        row_status=ex["rs"][i],
+                        row_status=status[pos],
                         frontend_mel=caps.frontend_mel[i],
                         mel_length=caps.mel_lengths[i],
                         encoder_raw=caps.encoder_raw[i],
@@ -1739,41 +2561,55 @@ def advance_model_rows(
                 )
         records.sort(key=lambda r: r.row)
         payload_bytes = sum(
-            r.frontend_mel.numel() * r.frontend_mel.element_size()
-            + r.encoder_raw.numel() * r.encoder_raw.element_size()
-            + r.encoder_conditioned.numel()
-            * r.encoder_conditioned.element_size()
-            for r in records
-        )
-        assert capture_sink is not None
-        reservation = capture_sink.reserve(
-            CapturePlan(rows=len(records), payload_bytes=payload_bytes)
-        )
-    ticket: StatusTicket | None = None
-    if status_sink is not None:
-        try:
-            ticket = status_sink.reserve(
-                plan.request_ids,
-                tuple(int(x) for x in plan.admission_generation.tolist()),
+            tensor.numel() * tensor.element_size()
+            for record in records
+            for tensor in (
+                record.chunk_sequence,
+                record.prompt_index,
+                record.row_status,
+                record.frontend_mel,
+                record.mel_length,
+                record.encoder_raw,
+                record.encoder_conditioned,
+                record.encoder_length,
             )
+        )
+        capture_plan: CapturePlan | None = CapturePlan(rows=len(records), payload_bytes=payload_bytes)
+    else:
+        capture_plan = None
+    reservation: CommitReservation | None = None
+    cancel_reservation: Callable[[], None] | None = None
+    stage_reservation: Callable[[torch.Tensor, Sequence[CaptureRecord]], None] | None = None
+    if commit_sink is not None:
+        reservation = commit_sink.reserve(
+            CommitPlan(
+                bindings=plan.bindings,
+                capture=capture_plan,
+            )
+        )
+        cancel_candidate = getattr(reservation, "cancel", None)
+        if not callable(cancel_candidate):
+            raise ValueError("commit sink returned a reservation without cancel()")
+        cancel_reservation = cancel_candidate
+        try:
+            stage_candidate = getattr(reservation, "stage", None)
         except BaseException:
-            if reservation is not None:
-                reservation.cancel()
+            cancel_reservation()
             raise
+        if not callable(stage_candidate):
+            cancel_reservation()
+            raise ValueError("commit sink returned a reservation without stage()")
+        stage_reservation = stage_candidate
 
     # ---- commit: prevalidated, allocation-free scatters only ----
     try:
-        for pool, blocks, payload in scatter_ops:
-            pool.index_copy_(0, blocks, payload)
-        queue_pool.index_copy_(0, didx, final_queue)
-        book_pool.index_copy_(0, didx, final_book)
+        for op in scatter_ops:
+            masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
     except BaseException:
-        if reservation is not None:
-            reservation.cancel()
+        if cancel_reservation is not None:
+            cancel_reservation()
         raise
-    # ---- no-fail publications through the reserved tickets ----
-    if ticket is not None:
-        ticket.stage(status)
-    if reservation is not None:
-        reservation.publish(records)
-    return projection.rows
+    # ---- ONE no-fail combined stage through the reserved ticket ----
+    if stage_reservation is not None:
+        stage_reservation(status, records)
+    return projection_rows
