@@ -580,6 +580,22 @@ def test_incomparable_validation_report_is_rejected() -> None:
         )
 
 
+def test_validation_accepts_different_driver_minor() -> None:
+    # An independent host IS the point of the validation run: the
+    # comparability projection holds algorithm/model/lane/policy/
+    # math/device fixed but not the driver minor (rounds 8/9 ran on
+    # .09 vs .20). The table's runtime validity still binds the
+    # SOURCE run's driver.
+    report = _two_tier_report()
+    other = _validation_copy(report)
+    other["fingerprint"]["driver"] = "580.126.09"
+    table = generate_dispatch_table(
+        report, validation_reports=[other],
+    )
+    assert table.validation_runs == 1
+    assert table.fingerprint["driver"] == "580.126.20"
+
+
 def test_validation_key_coverage_must_match() -> None:
     report = _two_tier_report()
     partial = _validation_copy(report)

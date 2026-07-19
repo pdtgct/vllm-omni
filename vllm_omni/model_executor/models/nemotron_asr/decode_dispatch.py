@@ -94,6 +94,14 @@ _FINGERPRINT_KEYS = (
     "decode_algo_revision", "probe_schema",
     "lane_definitions_digest", "tf32_matmul",
 )
+#: Comparability projection for cross-run VALIDATION: the
+#: algorithm/model/lane/policy/math/device identity must match, but
+#: NOT the driver minor — an independent host is the point of the
+#: validation run; the table's runtime validity still binds the
+#: SOURCE run's driver via _FINGERPRINT_KEYS.
+_VALIDATION_COMPARABILITY_KEYS = tuple(
+    k for k in _FINGERPRINT_KEYS if k != "driver"
+)
 
 
 class FingerprintMismatchError(RuntimeError):
@@ -605,7 +613,7 @@ def generate_dispatch_table(
             # run would launder the validation requirement.
             other_fp = other_report["fingerprint"]
             incomparable = [
-                k for k in _FINGERPRINT_KEYS
+                k for k in _VALIDATION_COMPARABILITY_KEYS
                 if other_fp.get(k) != fingerprint.get(k)
             ]
             if incomparable:
