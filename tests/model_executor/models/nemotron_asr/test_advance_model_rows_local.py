@@ -377,6 +377,7 @@ def _call(
     commit_sink: Any = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    staging: Any = None,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = advance.make_mrv1_adapter(
@@ -396,6 +397,7 @@ def _call(
         commit_sink=commit_sink,
         capture=capture,
         graph_covers_decode=graph_covers_decode,
+        staging=staging,
         **pools,
     )
     return out
@@ -2545,7 +2547,7 @@ def test_all_scatter_descriptors_validate_before_first_write(
         writes["count"] += 1
 
     monkeypatch.setattr(advance, "validate_masked_page_scatter", fail_late)
-    monkeypatch.setattr(advance, "masked_page_scatter_", observe_write)
+    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", observe_write)
     torch.manual_seed(5)
     carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
     with pytest.raises(ValueError, match="later scatter"):
@@ -2572,7 +2574,7 @@ def test_commit_failure_cancels_composite_ticket_once(
     def fail_commit(*_args: Any) -> None:
         raise RuntimeError("scatter launch failed")
 
-    monkeypatch.setattr(advance, "masked_page_scatter_", fail_commit)
+    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", fail_commit)
     torch.manual_seed(5)
     carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
     with pytest.raises(RuntimeError, match="scatter launch"):
@@ -2587,6 +2589,47 @@ def test_commit_failure_cancels_composite_ticket_once(
     assert sink.log == ["reserve", "cancel"]
     assert sink.cancels == 1
     assert sink.staged == []
+
+
+# @spec PORT-ADV-003, PORT-STATE-008
+def test_commit_loop_never_revalidates_a_prevalidated_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The complete-plan pass validates every scatter descriptor once,
+    # BEFORE the no-fail commit window; the commit loop then calls the
+    # private prevalidated executor directly (state_scatter.py's own
+    # module docstring), so a successful two-bucket transaction must
+    # validate each descriptor EXACTLY once total — zero times inside
+    # the commit loop.
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    counts = {"n": 0}
+    real_validate = advance.validate_masked_page_scatter
+
+    def counting_validate(*args: Any) -> None:
+        counts["n"] += 1
+        real_validate(*args)
+
+    monkeypatch.setattr(advance, "validate_masked_page_scatter", counting_validate)
+    torch.manual_seed(5)
+    reg = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0, geometry=GEOM_REG)
+    fin = _envelope(torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0, geometry=GEOM_FINAL)
+    plan = _plan(
+        prefills=[1, 2],
+        num_pool_blocks=4,
+        geometries=[GEOM_REG, GEOM_FINAL],
+    )
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long),
+        torch.stack([reg, fin]),
+        plan,
+    )
+    assert out.shape == (2, CARRIER_HIDDEN)
+    per_bucket = len(pools["channel_pools"]) + len(pools["time_pools"]) + len(pools["len_pools"]) + 5
+    expected_descriptors = 2 * per_bucket + 2  # two buckets + queue/book
+    assert counts["n"] == expected_descriptors
 
 
 def test_burst_overflow_is_rejected_not_truncated() -> None:
@@ -2977,3 +3020,106 @@ def test_table_resolver_unbound_arm_fails_at_startup() -> None:
     del arms["compact-eager"]
     with pytest.raises(KeyError):
         advance.make_table_resolver(_table(), lane="fp32", arms=arms, max_batch=1024)
+
+
+# ---- PORT-PERF-001: reusable host staging (HostStaging) -------------------
+
+
+def test_host_staging_rejects_oversized_vector() -> None:
+    staging = advance.HostStaging(4)
+    with pytest.raises(ValueError):
+        staging.stage(
+            "composed_indices",
+            torch.arange(5, dtype=torch.int64),
+            torch.device("cpu"),
+        )
+
+
+def test_host_staging_rejects_unknown_slot() -> None:
+    staging = advance.HostStaging(4)
+    with pytest.raises(ValueError):
+        staging.stage(
+            "not_a_slot",
+            torch.arange(2, dtype=torch.int64),
+            torch.device("cpu"),
+        )
+
+
+def _run_burst_then_drain(staging: Any) -> tuple[Pools, list[int]]:
+    """The ``test_burst_then_drain_then_park_matches_reference`` arc,
+    parameterized by staging, so it can be run once unstaged and once
+    through a :class:`advance.HostStaging` and diffed bit-for-bit."""
+    core = _tiny_core(seed=1)  # two-distinct-label burst by design
+    torch.manual_seed(5)
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    pools = _fresh_pools()
+    plan = _plan(prefills=[1], geometries=[GEOM_FINAL])
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        plan,
+        staging=staging,
+    )
+    emitted = [_decision(out)[0]]
+    decode_plan = _plan(decodes=[1], geometries=[GEOM_FINAL])
+    for _ in range(CAP + 1):  # bounded: a drain never exceeds queue capacity
+        if emitted[-1] == PARK_ID:
+            break
+        out = _call(
+            core,
+            pools,
+            torch.tensor([emitted[-1]], dtype=torch.long),
+            torch.zeros(1, CARRIER_HIDDEN),
+            decode_plan,
+            staging=staging,
+        )
+        emitted.append(_decision(out)[0])
+    return pools, emitted
+
+
+def test_host_staging_matches_unstaged_transaction_bit_identical() -> None:
+    pools_unstaged, emitted_unstaged = _run_burst_then_drain(None)
+    pools_staged, emitted_staged = _run_burst_then_drain(advance.HostStaging(8))
+    assert len(emitted_unstaged) >= 3 and len(set(emitted_unstaged)) >= 2
+    assert emitted_staged == emitted_unstaged
+    _assert_pools_equal(pools_staged, pools_unstaged)
+
+
+def test_host_staging_slot_reuse_across_calls_is_safe() -> None:
+    # ONE HostStaging instance drives two structurally different
+    # transactions back to back; each call's own slots are fully
+    # overwritten by stage(), so a later call must not observe an
+    # earlier call's staged content.
+    staging = advance.HostStaging(8)
+    core = _tiny_core()
+    replay_pools = _fresh_pools()
+    _set_replay_book(replay_pools, 1, queue=[3, 5], head=1, expected=3)
+    replay_plan = _plan(decodes=[1], pad_decodes_to=2, padding_value=NULL_INDEX)
+    out1 = _call(
+        core,
+        replay_pools,
+        torch.tensor([3], dtype=torch.long),
+        torch.zeros(1, CARRIER_HIDDEN),
+        replay_plan,
+        staging=staging,
+    )
+    assert _decision(out1) == [5]
+    assert int(replay_pools["book_pool"][1, _BOOK["queue_head"]]) == 2
+
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    chunk_pools = _fresh_pools()
+    chunk_plan = _plan(prefills=[1])
+    out2 = _call(
+        core,
+        chunk_pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        chunk_plan,
+        staging=staging,
+    )
+    assert out2.shape == (1, CARRIER_HIDDEN)
+    assert _decision(out2)[0] != PARK_ID  # a real chunk computed, unaffected by call 1

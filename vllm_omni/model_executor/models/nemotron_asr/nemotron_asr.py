@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     DecodeRequest,
     DecodeResolver,
     EmissionAdapter,
+    HostStaging,
     ResolvedDecode,
     make_mrv1_adapter,
 )
@@ -488,6 +489,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             vllm_config.scheduler_config.max_num_seqs
         )
         self._commit_sink: BoundedCommitSink | None = None
+        self._host_staging: HostStaging | None = None
 
     def _build_state_pages(
         self, n_layers: int, cfg: Any, policy: PrecisionPolicy
@@ -779,6 +781,13 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             )
         return self._commit_sink
 
+    def _ensure_host_staging(self) -> HostStaging:
+        """The reusable pinned H2D staging, constructed at first use
+        alongside the commit sink (PORT-PERF-001)."""
+        if self._host_staging is None:
+            self._host_staging = HostStaging(self._max_num_seqs)
+        return self._host_staging
+
     def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
         """Drain one staged transaction at the scheduling boundary.
 
@@ -950,6 +959,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             commit_sink=self._ensure_commit_sink(inputs_embeds.device),
             capture=False,
             graph_covers_decode=False,
+            staging=self._ensure_host_staging(),
         )
 
     def compute_logits(

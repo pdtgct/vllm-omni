@@ -40,15 +40,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
-    _execute_masked_page_scatter_ as masked_page_scatter_,
-)
-from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
+    _execute_masked_page_scatter_,
     validate_masked_page_scatter,
     warmup_masked_page_scatter,
 )
@@ -1352,11 +1350,99 @@ class _GatheredCaches:
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Host-authority tensor to the compute device without a hot-path
     synchronization: pinned staging + non-blocking copy on CUDA (a
-    reusable model-owned staging buffer is a later allocation-audit
-    refinement), plain move elsewhere."""
+    fresh ``pin_memory()`` allocation every call — the un-pooled
+    fallback :class:`HostStaging` exists to avoid), plain move
+    elsewhere."""
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)
     return t.to(device)
+
+
+@dataclass
+class HostStaging:
+    """Model-owned reusable pinned H2D staging (PORT-PERF-001).
+
+    Preallocated once per worker at ``capacity`` rows: each named
+    purpose below copies host data into its OWN dedicated slice of a
+    persistent pinned buffer and issues one non-blocking H2D from
+    that same storage every call, eliminating the per-call
+    ``pin_memory()`` allocation :func:`_h2d` otherwise performs.
+    ``None`` (the default everywhere staging is threaded through)
+    keeps the un-pooled ``_h2d`` path for probes/CPU.
+
+    Every named purpose is staged AT MOST ONCE per
+    :func:`advance_model_rows` call: the composed decode-then-prefill
+    indices, fresh row positions, the fresh-init book rows, the
+    ``is_chunk`` role vector, geometry, admitted prompt, prior
+    prompt, and the merged CHUNK row positions (``chunk_all``).
+    Distinct purposes are distinct storage — two purposes must never
+    share a slot within one call, since a slot's non-blocking H2D
+    copy can still be in flight (unsynchronized on the host) when the
+    next ``stage()`` overwrites its pinned memory. The per-bucket
+    CHUNK row-position vector (staged once per RESOLVED BUCKET, not
+    once per call — a call can resolve several buckets) is
+    deliberately NOT a slot here for the same reason; see its call
+    site in :func:`advance_model_rows`.
+    """
+
+    capacity: int
+
+    #: The single-occurrence-per-call int64 purposes, in arena row
+    #: order. ``is_chunk`` (bool) and ``fresh_init_book`` ((n, 7))
+    #: live in their own dedicated buffers below, not this arena.
+    _INT64_SLOTS: ClassVar[tuple[str, ...]] = (
+        "composed_indices",
+        "fresh_positions",
+        "chunk_all",
+        "geometry",
+        "admitted_prompt",
+        "prior_prompt",
+    )
+
+    _arena: torch.Tensor = field(init=False, repr=False)
+    _book_init: torch.Tensor = field(init=False, repr=False)
+    _is_chunk_buf: torch.Tensor = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.capacity <= 0:
+            raise ValueError("HostStaging capacity must be positive")
+        pin = torch.cuda.is_available()
+        self._arena = torch.empty(
+            (len(self._INT64_SLOTS), self.capacity),
+            dtype=torch.int64,
+            pin_memory=pin,
+        )
+        self._book_init = torch.empty((self.capacity, 7), dtype=torch.int64, pin_memory=pin)
+        self._is_chunk_buf = torch.empty((self.capacity,), dtype=torch.bool, pin_memory=pin)
+
+    def stage(
+        self,
+        slot_name: str,
+        cpu_tensor: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Copy ``cpu_tensor`` into ``slot_name``'s leading rows and
+        return its non-blocking device copy.
+
+        Raises:
+            ValueError: ``cpu_tensor`` has more rows than
+                ``capacity``, or ``slot_name`` names no known slot.
+        """
+        n = int(cpu_tensor.shape[0])
+        if n > self.capacity:
+            raise ValueError(f"staged vector of {n} rows exceeds HostStaging capacity {self.capacity}")
+        if slot_name == "fresh_init_book":
+            buf = self._book_init[:n]
+        elif slot_name == "is_chunk":
+            buf = self._is_chunk_buf[:n]
+        else:
+            try:
+                row = self._INT64_SLOTS.index(slot_name)
+            except ValueError:
+                raise ValueError(f"unknown HostStaging slot {slot_name!r}") from None
+            buf = self._arena[row, :n]
+        buf.copy_(cpu_tensor)
+        return buf.to(device, non_blocking=True)
 
 
 def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Tensor:
@@ -1857,6 +1943,7 @@ def advance_model_rows(
     commit_sink: CommitSink | None = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    staging: HostStaging | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -1900,6 +1987,16 @@ def advance_model_rows(
     worker-fatal, never bucket/row suppression or rollback. No row
     scatters unless its emission result can be returned. Transition
     kernels never mutate resident pages directly.
+
+    Host staging (PORT-PERF-001): ``staging`` is optional reusable
+    pinned H2D buffering (:class:`HostStaging`) for the once-per-call
+    composed-index, fresh-row, and control vectors; ``None`` keeps
+    the un-pooled per-call :func:`_h2d` path (probes/CPU). The
+    per-bucket CHUNK row-position vector, staged once per resolved
+    bucket inside step 4's loop, stays on the un-pooled path even
+    when ``staging`` is given: a call can resolve several buckets,
+    and a shared slot's non-blocking copy from one bucket can still
+    be in flight when the next bucket's stage would overwrite it.
 
     Returns:
         The runner's row output as projected by ``adapter`` (e.g. the
@@ -2063,7 +2160,14 @@ def advance_model_rows(
         bucket_pos.append((geometry, positions, resolved))
 
     # ---- small continuing-row gather + metadata-only fresh init ----
-    didx = _h2d(idx_cpu, device)
+    def _stage(slot_name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Route one once-per-call vector through ``staging`` when
+        given, else the un-pooled :func:`_h2d` path."""
+        if staging is not None:
+            return staging.stage(slot_name, cpu_tensor, device)
+        return _h2d(cpu_tensor, device)
+
+    didx = _stage("composed_indices", idx_cpu)
     fresh_local = (~plan.has_initial_states_p).nonzero(as_tuple=True)[0]
     fresh_mask_cpu = torch.zeros(n_real, dtype=torch.bool)
     if int(fresh_local.numel()):
@@ -2077,19 +2181,19 @@ def advance_model_rows(
         finit[:, QUEUE_LAST_LABEL] = blank
         finit[:, QUEUE_PROMPT] = plan.prompt_index.index_select(0, fresh_pos_cpu)
         finit[:, BOOK_GEOMETRY] = plan.geometry_id.index_select(0, fresh_pos_cpu)
-        fresh_dev = _h2d(fresh_pos_cpu, device)
-        book.index_copy_(0, fresh_dev, _h2d(finit, device).to(book.dtype))
+        fresh_dev = _stage("fresh_positions", fresh_pos_cpu)
+        book.index_copy_(0, fresh_dev, _stage("fresh_init_book", finit).to(book.dtype))
 
     # ---- device role/protocol/invariant composition ----
-    is_chunk_dev = _h2d(plan.is_chunk, device)
-    plan_geom_dev = _h2d(plan.geometry_id, device)
-    admitted_prompt_dev = _h2d(plan.prompt_index, device)
-    prior_prompt_dev = _h2d(
+    is_chunk_dev = _stage("is_chunk", plan.is_chunk)
+    plan_geom_dev = _stage("geometry", plan.geometry_id)
+    admitted_prompt_dev = _stage("admitted_prompt", plan.prompt_index)
+    prior_prompt_dev = _stage(
+        "prior_prompt",
         torch.tensor(
             [binding.prior_prompt_index for binding in plan.bindings],
             dtype=torch.int64,
         ),
-        device,
     )
     ids_dev = input_ids.long()
     head_all = book[:, QUEUE_HEAD].long()
@@ -2176,6 +2280,11 @@ def advance_model_rows(
     capture_on = capture
     executed: list[dict[str, Any]] = []
     for g, pos_t, resolved in bucket_pos:
+        # NOT routed through ``staging``: a call can resolve several
+        # buckets, and a shared slot's non-blocking copy for THIS
+        # bucket could still be in flight when the NEXT bucket's
+        # stage() overwrites the same pinned host memory (HostStaging
+        # only guarantees safety for the once-per-call vectors).
         rows_dev = _h2d(pos_t, device)
         blocks_dev = didx.index_select(0, rows_dev)
         fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
@@ -2350,7 +2459,7 @@ def advance_model_rows(
     chunk_all_t = (
         torch.cat([positions for _, positions, _ in bucket_pos]) if bucket_pos else torch.zeros(0, dtype=torch.long)
     )
-    chunk_all_dev = _h2d(chunk_all_t, device)
+    chunk_all_dev = _stage("chunk_all", chunk_all_t)
     b_total = int(chunk_all_t.numel())
     k_max = max(
         (int(ex["result"].token_ids.shape[1]) for ex in executed),
@@ -2601,9 +2710,12 @@ def advance_model_rows(
         stage_reservation = stage_candidate
 
     # ---- commit: prevalidated, allocation-free scatters only ----
+    # Every descriptor was already validated above (the complete-plan
+    # pass); the commit window calls the private prevalidated
+    # executor directly so no descriptor is re-validated here.
     try:
         for op in scatter_ops:
-            masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+            _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
     except BaseException:
         if cancel_reservation is not None:
             cancel_reservation()
