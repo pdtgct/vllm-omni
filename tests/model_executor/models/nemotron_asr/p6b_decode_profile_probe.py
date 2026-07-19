@@ -200,18 +200,36 @@ def _driver_version() -> str | None:
 
 def _probe_revision() -> dict[str, Any]:
     """The fork revision + dirty flag this probe ran from — evidence
-    identity, so an artifact binds to exact code."""
+    identity, so an artifact binds to exact code. Dirty means
+    TRACKED modifications only (untracked scratch on a pod checkout
+    cannot change probe behavior and made round 6's artifact
+    generator-ineligible for no reproducibility reason); the paths
+    are recorded so a dirty flag is auditable, and untracked files
+    are counted separately."""
     root = Path(__file__).resolve().parents[4]
     try:
         rev = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
-        dirty = bool(subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
+        tracked = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain",
+             "--untracked-files=no"],
             capture_output=True, text=True, timeout=10,
-        ).stdout.strip())
-        return {"fork_commit": rev, "dirty_tree": dirty}
+        ).stdout.strip()
+        untracked = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others",
+             "--exclude-standard"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        return {
+            "fork_commit": rev,
+            "dirty_tree": bool(tracked),
+            "dirty_paths": tracked.splitlines()[:20],
+            "untracked_files": (
+                len(untracked.splitlines()) if untracked else 0
+            ),
+        }
     except Exception:
         return {"fork_commit": None, "dirty_tree": None}
 
