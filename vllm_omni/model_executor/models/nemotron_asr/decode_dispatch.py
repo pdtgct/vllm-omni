@@ -96,9 +96,12 @@ _FINGERPRINT_KEYS = (
 )
 #: Comparability projection for cross-run VALIDATION: the
 #: algorithm/model/lane/policy/math/device identity must match, but
-#: NOT the driver minor — an independent host is the point of the
-#: validation run; the table's runtime validity still binds the
-#: SOURCE run's driver via _FINGERPRINT_KEYS.
+#: the ENTIRE driver field is excluded (any component may differ —
+#: rounds 8/9 differed only in the maintenance component, but this
+#: projection would also accept a different driver branch): an
+#: independent host is the point of the validation run, and the
+#: table's runtime validity still binds the SOURCE run's exact
+#: driver via _FINGERPRINT_KEYS.
 _VALIDATION_COMPARABILITY_KEYS = tuple(
     k for k in _FINGERPRINT_KEYS if k != "driver"
 )
