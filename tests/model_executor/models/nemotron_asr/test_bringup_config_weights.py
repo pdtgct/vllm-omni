@@ -191,12 +191,16 @@ def test_derive_n_layers_from_encoder_layer_keys() -> None:
     assert derive_n_layers(sd) == N_LAYERS
 
 
-def test_derive_n_layers_counts_the_highest_index_not_the_key_count() -> None:
-    # Sparse/non-contiguous indices still derive the correct depth —
-    # the count is max(index) + 1, not len(matching keys).
+def test_derive_n_layers_rejects_non_contiguous_indices() -> None:
+    # A gap (here {0, 5}) is a partial/corrupt dump, not a 6-layer
+    # model: the runtime builds a dense range(n_layers) ModuleList and
+    # loads encoder.layers.{i}.* into it, so a hole would describe a
+    # stack the weights cannot fill. Fail closed rather than paper it
+    # over with max(index)+1.
     sd = _checkpoint_shaped_state_dict(V, n_layers=1)
     sd["encoder.layers.5.conv.weight"] = torch.zeros(1)
-    assert derive_n_layers(sd) == 6
+    with pytest.raises(ConversionError, match="not contiguous"):
+        derive_n_layers(sd)
 
 
 def test_derive_n_layers_rejects_missing_tensor() -> None:
@@ -329,6 +333,34 @@ def test_init_registers_all_state_pages() -> None:
     # Every page landed under an F4-compliant prefix.
     assert "encoder.layers.0.window" in ctx
     assert "predictor.layers.0.lstm_state" in ctx
+
+
+def test_config_n_layers_drives_encoder_depth_and_state_pages() -> None:
+    # Regression (migration round): n_layers must actually build the
+    # encoder, not just ride the published manifest. A non-24-layer
+    # config must construct exactly that many encoder layers AND the
+    # matching per-layer state pages — otherwise a non-24-layer
+    # checkpoint publishes a manifest for one depth while runtime
+    # builds another (hard weight-load failure at best, silent
+    # manifest/runtime disagreement at worst).
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRForRNNT,
+    )
+
+    cfg = NemotronASRConfig(n_layers=2, decode_dispatch_arm="dense-eager")
+    ctx: dict = {}
+    vc = _duck_vllm_config(cfg)
+    vc.compilation_config.static_forward_context = ctx
+    model = NemotronASRForRNNT(vllm_config=vc)
+    assert len(model.core.encoder.layers) == 2
+    # Per-layer state pages track the built depth exactly: layers 0..1
+    # present, layer 2 absent.
+    assert "encoder.layers.0.window" in ctx
+    assert "encoder.layers.1.window" in ctx
+    assert "encoder.layers.2.window" not in ctx
+    assert "encoder.layers.0.conv" in ctx
+    assert "encoder.layers.1.conv" in ctx
+    assert "encoder.layers.2.conv" not in ctx
 
 
 def test_load_weights_missing_prompt_kernel_is_fatal() -> None:

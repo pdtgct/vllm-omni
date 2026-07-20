@@ -118,6 +118,7 @@ class NemotronASRCore(nn.Module):
         vocab_size: int,
         att_context: tuple[int, int] = (56, 13),
         enc_hidden: int = 1024,
+        n_layers: int = 24,
         pred_hidden: int = 640,
         pred_rnn_layers: int = 2,
         joint_hidden: int = 640,
@@ -131,7 +132,13 @@ class NemotronASRCore(nn.Module):
         self.vocab_size = vocab_size
         self.blank_id = vocab_size
         self.featurizer = MelFeaturizer(filterbank=filterbank, window=window)
-        self.encoder = FastConformerEncoder(att_context=att_context)
+        # n_layers is a checkpoint property, not a fixed default: the
+        # served path passes hf_config.n_layers and the dump loader
+        # derives it from the converted tensors, so the encoder depth
+        # always matches the weights (and the published state manifest).
+        self.encoder = FastConformerEncoder(
+            n_layers=n_layers, att_context=att_context
+        )
         self.lid = PromptConditioner(
             enc_hidden=enc_hidden, num_prompts=num_prompts
         )
@@ -256,6 +263,7 @@ def load_core_from_dump(
 
     from vllm_omni.model_executor.models.nemotron_asr.convert import (
         convert_state_dict,
+        derive_n_layers,
     )
     from vllm_omni.model_executor.models.nemotron_asr.rules import NEMO_RULES
 
@@ -266,6 +274,10 @@ def load_core_from_dump(
     core = NemotronASRCore(
         vocab_size=int(meta["vocab_size"]),
         att_context=att_context,
+        # Derive the encoder depth from the converted tensors (the same
+        # source publish.py uses), never the module default — this
+        # loader must build an encoder that matches the dump's weights.
+        n_layers=derive_n_layers(converted),
         filterbank=converted["featurizer.fb"][0],
         window=converted["featurizer.window"],
         policy=policy,
@@ -437,6 +449,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                 hf_config.att_context_right,
             ),
             enc_hidden=hf_config.d_model,
+            n_layers=hf_config.n_layers,
             pred_hidden=hf_config.pred_hidden,
             pred_rnn_layers=hf_config.pred_rnn_layers,
             joint_hidden=hf_config.joint_hidden,
@@ -445,7 +458,9 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             window=torch.zeros(_WIN_LENGTH),
             policy=policy,
         )
-        # The encoder is the source of truth for its layer count.
+        # The encoder is the source of truth for its layer count — now
+        # built at hf_config.n_layers, so this matches the published
+        # state manifest for any checkpoint depth, not just 24.
         n_layers = len(self.core.encoder.layers)
         self._state_pages = self._build_state_pages(
             n_layers, hf_config, policy

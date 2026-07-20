@@ -196,9 +196,18 @@ def derive_n_layers(state_dict: Mapping[str, torch.Tensor]) -> int:
     observed index — never a copied constant, and never silently
     wrong for a checkpoint whose depth changes.
 
+    Fails closed on a non-contiguous index set (a gap like ``{0, 1, 3}``
+    or a set that does not start at 0): the runtime builds a dense
+    ``nn.ModuleList`` of ``range(n_layers)`` and loads by
+    ``encoder.layers.{i}.*``, so a hole means the published depth would
+    describe a layer stack the weights cannot fill — a corrupt/partial
+    dump, never a smaller model. ``max(indices) + 1`` alone would
+    silently paper over that gap.
+
     Raises:
         ConversionError: If no ``encoder.layers.{i}.*`` tensor is
-            present (the state dict does not look converted).
+            present (the state dict does not look converted), or if the
+            observed indices are not exactly ``0..max`` contiguous.
     """
     indices = {
         int(m.group(1))
@@ -209,6 +218,14 @@ def derive_n_layers(state_dict: Mapping[str, torch.Tensor]) -> int:
         raise ConversionError(
             "cannot derive n_layers: no 'encoder.layers.{i}.*' tensor "
             "in the converted state dict"
+        )
+    expected = set(range(max(indices) + 1))
+    if indices != expected:
+        missing = sorted(expected - indices)
+        raise ConversionError(
+            "encoder layer indices are not contiguous 0.."
+            f"{max(indices)}: missing {missing} — the converted state "
+            "dict is partial or corrupt, not a shorter model"
         )
     return max(indices) + 1
 
