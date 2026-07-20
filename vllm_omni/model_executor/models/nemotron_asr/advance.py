@@ -1389,10 +1389,12 @@ class HostStaging:
     share a slot within one call, since a slot's non-blocking H2D
     copy can still be in flight (unsynchronized on the host) when the
     next ``stage()`` overwrites its pinned memory. The per-bucket
-    CHUNK row-position vector (staged once per RESOLVED BUCKET, not
-    once per call — a call can resolve several buckets) is
-    deliberately NOT a slot here for the same reason; see its call
-    site in :func:`advance_model_rows`.
+    CHUNK row-position vector is staged once per RESOLVED BUCKET (a
+    call can resolve several buckets), so it cannot share the
+    once-per-call arena; instead :meth:`stage_bucket` gives it one
+    dedicated buffer PER GEOMETRY (each geometry resolves at most once
+    per call), which is both allocation-free and free of the
+    overwrite race a single shared bucket slot would carry.
     """
 
     capacity: int
@@ -1412,10 +1414,15 @@ class HostStaging:
     _arena: torch.Tensor = field(init=False, repr=False)
     _book_init: torch.Tensor = field(init=False, repr=False)
     _is_chunk_buf: torch.Tensor = field(init=False, repr=False)
+    _bucket_arena: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.capacity <= 0:
             raise ValueError("HostStaging capacity must be positive")
+        from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+            CADENCES,
+        )
+
         pin = torch.cuda.is_available()
         self._arena = torch.empty(
             (len(self._INT64_SLOTS), self.capacity),
@@ -1424,6 +1431,15 @@ class HostStaging:
         )
         self._book_init = torch.empty((self.capacity, 7), dtype=torch.int64, pin_memory=pin)
         self._is_chunk_buf = torch.empty((self.capacity,), dtype=torch.bool, pin_memory=pin)
+        # One dedicated bucket-position buffer PER GEOMETRY: each
+        # geometry resolves at most once per call, so a per-geometry
+        # buffer's in-flight non-blocking copy is never overwritten
+        # within a call — which is exactly what a single shared slot
+        # could not guarantee, and why the per-bucket vector used to
+        # fall back to the un-pooled (pin_memory-per-call) _h2d path.
+        self._bucket_arena = torch.empty(
+            (len(CADENCES), self.capacity), dtype=torch.int64, pin_memory=pin
+        )
 
     def stage(
         self,
@@ -1451,6 +1467,32 @@ class HostStaging:
             except ValueError:
                 raise ValueError(f"unknown HostStaging slot {slot_name!r}") from None
             buf = self._arena[row, :n]
+        buf.copy_(cpu_tensor)
+        return buf.to(device, non_blocking=True)
+
+    def stage_bucket(
+        self,
+        geometry: int,
+        cpu_tensor: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Copy one resolved bucket's row-position vector into
+        ``geometry``'s OWN pinned buffer and return its non-blocking
+        device copy. Safe to call once per resolved bucket within a
+        call: distinct geometries use distinct buffers, so no bucket's
+        in-flight copy is ever overwritten by a later bucket in the
+        same call.
+
+        Raises:
+            ValueError: ``cpu_tensor`` has more rows than ``capacity``,
+                or ``geometry`` is outside the per-geometry arena.
+        """
+        n = int(cpu_tensor.shape[0])
+        if n > self.capacity:
+            raise ValueError(f"staged bucket of {n} rows exceeds HostStaging capacity {self.capacity}")
+        if not 0 <= geometry < self._bucket_arena.shape[0]:
+            raise ValueError(f"bucket geometry {geometry} outside the staging arena")
+        buf = self._bucket_arena[geometry, :n]
         buf.copy_(cpu_tensor)
         return buf.to(device, non_blocking=True)
 
@@ -2003,10 +2045,13 @@ def advance_model_rows(
     composed-index, fresh-row, and control vectors; ``None`` keeps
     the un-pooled per-call :func:`_h2d` path (probes/CPU). The
     per-bucket CHUNK row-position vector, staged once per resolved
-    bucket inside step 4's loop, stays on the un-pooled path even
-    when ``staging`` is given: a call can resolve several buckets,
-    and a shared slot's non-blocking copy from one bucket can still
-    be in flight when the next bucket's stage would overwrite it.
+    bucket inside step 4's loop, also rides ``staging`` when given —
+    through :meth:`HostStaging.stage_bucket`, which keeps one
+    dedicated buffer PER GEOMETRY. Since each geometry resolves at
+    most once per call, no bucket's in-flight copy is overwritten by a
+    later bucket, so this is allocation-free without the overwrite
+    race a single shared bucket slot would carry; it falls back to
+    ``_h2d`` only when ``staging`` is ``None``.
 
     Returns:
         The runner's row output as projected by ``adapter`` (e.g. the
@@ -2291,12 +2336,17 @@ def advance_model_rows(
     capture_on = capture
     executed: list[dict[str, Any]] = []
     for g, pos_t, resolved in bucket_pos:
-        # NOT routed through ``staging``: a call can resolve several
-        # buckets, and a shared slot's non-blocking copy for THIS
-        # bucket could still be in flight when the NEXT bucket's
-        # stage() overwrites the same pinned host memory (HostStaging
-        # only guarantees safety for the once-per-call vectors).
-        rows_dev = _h2d(pos_t, device)
+        # Routed through ``staging`` by GEOMETRY: each geometry resolves
+        # at most once per call, so its dedicated per-geometry buffer's
+        # non-blocking copy is never overwritten by a later bucket in
+        # this call — allocation-free without the overwrite race a
+        # single shared bucket slot would carry. Falls back to the
+        # un-pooled _h2d path (probes/CPU) when no staging is given.
+        rows_dev = (
+            staging.stage_bucket(g, pos_t, device)
+            if staging is not None
+            else _h2d(pos_t, device)
+        )
         blocks_dev = didx.index_select(0, rows_dev)
         fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
         cadence = 8 * (lookaheads[g] + 1)

@@ -3089,6 +3089,59 @@ def test_host_staging_matches_unstaged_transaction_bit_identical() -> None:
     _assert_pools_equal(pools_staged, pools_unstaged)
 
 
+def _run_multi_bucket(staging: Any) -> tuple[Pools, list[int]]:
+    """One transaction spanning TWO chunk geometries (GEOM_REG +
+    GEOM_FINAL) plus a replay row, so ``HostStaging.stage_bucket`` is
+    invoked once per geometry WITHIN a single call — the multi-bucket
+    case a single shared bucket slot could not serve safely. Diffed
+    staged-vs-unstaged bit-for-bit."""
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=5)
+    _set_replay_book(pools, 3, queue=[7, 9], head=1, expected=7)
+    plan = _plan(
+        decodes=[3],
+        prefills=[1, 2],
+        num_pool_blocks=5,
+        geometries=[GEOM_REG, GEOM_REG, GEOM_FINAL],
+    )
+    torch.manual_seed(5)
+    reg = _envelope(
+        torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0, geometry=GEOM_REG
+    )
+    fin = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0, geometry=GEOM_FINAL
+    )
+    input_ids = torch.tensor([7, PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long)
+    embeds = torch.stack([torch.zeros(CARRIER_HIDDEN), reg, fin])
+    out = _call(core, pools, input_ids, embeds, plan, staging=staging)
+    return pools, _decision(out)
+
+
+def test_host_staging_multi_bucket_matches_unstaged_bit_identical() -> None:
+    # Two chunk geometries in ONE call invoke stage_bucket twice (once
+    # per geometry); each geometry's dedicated buffer must not clobber
+    # the other's in-flight copy. Bit-identical to the un-pooled path
+    # proves the per-geometry bucket routing is correct.
+    pools_unstaged, dec_unstaged = _run_multi_bucket(None)
+    pools_staged, dec_staged = _run_multi_bucket(advance.HostStaging(8))
+    assert dec_staged[0] == 9  # replay row advanced its queue
+    assert dec_staged[2] != PARK_ID  # the final-chunk burst emitted
+    assert dec_staged == dec_unstaged
+    _assert_pools_equal(pools_staged, pools_unstaged)
+
+
+def test_host_staging_stage_bucket_rejects_oversized_and_bad_geometry() -> None:
+    staging = advance.HostStaging(4)
+    with pytest.raises(ValueError, match="exceeds HostStaging capacity"):
+        staging.stage_bucket(
+            0, torch.arange(5, dtype=torch.int64), torch.device("cpu")
+        )
+    with pytest.raises(ValueError, match="outside the staging arena"):
+        staging.stage_bucket(
+            999, torch.arange(2, dtype=torch.int64), torch.device("cpu")
+        )
+
+
 def test_host_staging_slot_reuse_across_calls_is_safe() -> None:
     # ONE HostStaging instance drives two structurally different
     # transactions back to back; each call's own slots are fully
