@@ -1399,7 +1399,13 @@ def test_advance_model_rows_emits_the_burst_then_parks() -> None:
     assert int(book[1, _BOOK["expected_label"]]) == emitted[0]
     assert int(pools["frontend_counter_pool"][1, _CTR["finalized"]]) == 1
 
-    decode_plan = _plan(decodes=[1])
+    # geometries must match what the CHUNK phase actually committed to
+    # the book (GEOM_FINAL) — _plan's default (GEOM_REG) would trip
+    # ROW_STATUS_BOOK_IDENTITY on every iteration and mask every
+    # decision to park_id, which is what the pre-reseed fixture never
+    # surfaced (its len(set(expected))>=2 precondition always failed
+    # first, so this decode_plan was never actually exercised before).
+    decode_plan = _plan(decodes=[1], geometries=[GEOM_FINAL])
     for _ in range(len(expected) + 1):
         if emitted[-1] == PARK_ID:
             break
