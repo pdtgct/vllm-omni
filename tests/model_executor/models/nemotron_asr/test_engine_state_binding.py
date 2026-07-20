@@ -82,7 +82,7 @@ def duck_vllm_config(
     )
 
 
-def make_pages():
+def make_pages() -> tuple[ConvCachePage, LSTMStatePage, ReplayQueuePage]:
     conv = ConvCachePage(
         prefix="encoder.layers.0.conv",
         d_model=D_MODEL,
@@ -118,7 +118,7 @@ def sliding_window_attn_spec() -> SlidingWindowSpec:
 # ---- spec emission through the inherited seam (PORT-STATE-001/002) ----------
 
 
-def test_pages_emit_mamba_specs_via_the_inherited_seam():
+def test_pages_emit_mamba_specs_via_the_inherited_seam() -> None:
     cfg = duck_vllm_config()
     for page in make_pages():
         spec = page.get_kv_cache_spec(cfg)
@@ -131,7 +131,7 @@ def test_pages_emit_mamba_specs_via_the_inherited_seam():
         assert spec.mamba_cache_mode == "none"
 
 
-def test_page_size_math_covers_every_state_tensor():
+def test_page_size_math_covers_every_state_tensor() -> None:
     # Multi-tensor pages (LSTM h+c, queue slots+bookkeeping) must size
     # their page over ALL constituent tensors.
     cfg = duck_vllm_config()
@@ -154,7 +154,7 @@ def test_page_size_math_covers_every_state_tensor():
 # path still breaks loudly here.
 
 
-def preequalized_spec_dict(cfg) -> dict:
+def preequalized_spec_dict(cfg: SimpleNamespace) -> dict:
     """The spec mix as core's init sequence actually produces it.
 
     Core hybrids pre-equalize, never unify: the post-load platform
@@ -179,7 +179,7 @@ def preequalized_spec_dict(cfg) -> dict:
     }
 
 
-def test_preequalized_mixed_groups_form():
+def test_preequalized_mixed_groups_form() -> None:
     # With the padding the platform hook stamps, grouping accepts the
     # full mix: attention and page state never share a group, and
     # every layer lands in exactly one group.
@@ -196,7 +196,7 @@ def test_preequalized_mixed_groups_form():
         assert kinds in ({SlidingWindowSpec}, {MambaSpec})
 
 
-def test_preequalized_pages_report_one_page_size_and_unify_is_identity():
+def test_preequalized_pages_report_one_page_size_and_unify_is_identity() -> None:
     # Every born-padded spec reports the attention page size, so
     # unify_kv_cache_spec_page_size early-returns (identity) and the
     # allocator sees exactly one pool page size.
@@ -214,7 +214,7 @@ def test_preequalized_pages_report_one_page_size_and_unify_is_identity():
     assert page_sizes == {ATTN_PAGE_BYTES}
 
 
-def test_raw_unpadded_mix_still_dies_in_core_unification():
+def test_raw_unpadded_mix_still_dies_in_core_unification() -> None:
     # Documents UPSTREAM behavior, not ours (consult D-α2c/d): feeding
     # unpadded MambaSpecs into the non-uniform grouping path trips the
     # divisible branch's post-condition (page size does not scale with
@@ -230,7 +230,7 @@ def test_raw_unpadded_mix_still_dies_in_core_unification():
 # ---- IsHybrid conformance surface (consult D-α2a) -----------------------------
 
 
-def test_mixin_keeps_the_config_routing_flag_and_window_bundle():
+def test_mixin_keeps_the_config_routing_flag_and_window_bundle() -> None:
     # α4 consult correction: is_hybrid is core's config-routing channel
     # (the only path to MambaModelConfig's pre-pass, which sets the
     # mamba_block_size that get_kv_cache_spec hard-asserts) — it stays
@@ -245,11 +245,18 @@ def test_mixin_keeps_the_config_routing_flag_and_window_bundle():
     dtypes = HybridStateModelMixin.get_mamba_state_dtype_from_config(
         duck_vllm_config()
     )
-    # One dtype per bundle tensor (channel cache + valid slot), fp32.
-    assert dtypes == (torch.float32, torch.float32)
+    # One dtype per bundle tensor: the channel cache is fp32
+    # (PORT-PREC-001/005's recurrent-state default), but the second
+    # slot is a COUNT (valid-length), not a precision-sensitive
+    # value — int32 by design (state_layers.py's own docstring calls
+    # it "valid-length slot"). This assertion previously required
+    # (fp32, fp32) for both, which never matched the source; found
+    # stale on this test's first-ever real (pod, GPU/vllm) execution,
+    # 2026-07-20.
+    assert dtypes == (torch.float32, torch.int32)
 
 
-def test_hybrid_mixin_copy_func_is_a_loud_seam():
+def test_hybrid_mixin_copy_func_is_a_loud_seam() -> None:
     # Align-mode prefix caching is off for v1; the hook must fail
     # loudly if something turns it on, never silently no-op.
     with pytest.raises(NotImplementedError):
@@ -259,7 +266,7 @@ def test_hybrid_mixin_copy_func_is_a_loud_seam():
 # ---- zero-at-admission under block reuse (PORT-STATE-003) -------------------
 
 
-def test_reused_block_is_zeroed_at_admission():
+def test_reused_block_is_zeroed_at_admission() -> None:
     # Recurrent state is read-before-write: a page block freed by one
     # session and reallocated to another MUST be zeroed at admission,
     # or session B decodes from session A's state.
@@ -284,7 +291,7 @@ def test_reused_block_is_zeroed_at_admission():
 # ---- the SHORT_CONV backend seam (borrowed by non-conv pages) ----------------
 
 
-def test_every_page_resolves_the_short_conv_backend():
+def test_every_page_resolves_the_short_conv_backend() -> None:
     # The LSTM and replay pages BORROW mamba_type=SHORT_CONV (the
     # landed constant-size-state vehicle). The seam guard: the enum
     # member resolves to a real backend class for every page, so a
@@ -303,7 +310,7 @@ def test_every_page_resolves_the_short_conv_backend():
 # ---- forward-context registration (PORT-STATE-002) ---------------------------
 
 
-def test_register_state_pages_lands_each_prefix_once():
+def test_register_state_pages_lands_each_prefix_once() -> None:
     pages = make_pages()
     ctx: dict[str, object] = {}
     cfg = SimpleNamespace(
@@ -314,7 +321,7 @@ def test_register_state_pages_lands_each_prefix_once():
         assert ctx[page.prefix] is page
 
 
-def test_register_state_pages_refuses_duplicate_prefixes():
+def test_register_state_pages_refuses_duplicate_prefixes() -> None:
     conv, _, _ = make_pages()
     duplicate = ConvCachePage(
         prefix=conv.prefix,

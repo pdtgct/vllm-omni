@@ -98,7 +98,7 @@ PARK_ID = 9000
 PLACEHOLDER_ID = 9001
 VOCAB = 12
 NUM_PROMPTS = 4
-CARRIER_HIDDEN = 5_126
+CARRIER_HIDDEN = 5_127
 RAW_TAIL = 1_953
 NULL_BLOCK_ID = 0
 NUM_GEOMETRIES = len(manifests.CADENCES)
@@ -234,7 +234,13 @@ def _fresh_pools(
 
 
 def _header(
-    *, valid: int, geometry: int, final: bool, prompt: int = 0, seq: int = 0
+    *,
+    valid: int,
+    geometry: int,
+    final: bool,
+    prompt: int = 0,
+    seq: int = 0,
+    admission_ms_mod: int = 0,
 ) -> tuple[float, ...]:
     return (
         float(advance.ENVELOPE_VERSION),
@@ -243,11 +249,19 @@ def _header(
         1.0 if final else 0.0,
         float(prompt),
         float(seq),
+        float(admission_ms_mod),
     )
 
 
 def _carrier(
-    samples: torch.Tensor, *, final: bool, seq: int, geometry: int, prompt: int, hidden: int
+    samples: torch.Tensor,
+    *,
+    final: bool,
+    seq: int,
+    geometry: int,
+    prompt: int,
+    hidden: int,
+    admission_ms_mod: int = 0,
 ) -> torch.Tensor:
     n = samples.shape[0]
     row = torch.zeros(hidden)
@@ -257,6 +271,7 @@ def _carrier(
     row[advance.ENV_FINAL_TAIL] = 1.0 if final else 0.0
     row[advance.ENV_PROMPT_INDEX] = prompt
     row[advance.ENV_CHUNK_SEQUENCE] = seq
+    row[advance.ENV_ADMISSION_MS_MOD] = admission_ms_mod
     row[advance.ENVELOPE_HEADER_SLOTS : advance.ENVELOPE_HEADER_SLOTS + n] = samples
     return row
 

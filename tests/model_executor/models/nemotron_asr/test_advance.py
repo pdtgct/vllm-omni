@@ -124,11 +124,25 @@ Pools = dict[str, Any]
 
 def _tiny_core(seed: int = 7) -> Any:
     # Seed 7 is the shared fixture default; the burst-arc test builds
-    # a seed-1 core — through the REAL featurizer path the seed-7 tiny
-    # joint is single-label on every probed signal family (the
-    # log-guard-dominated mel is near-constant), while seed 1 yields a
-    # deterministic cap-saturated burst with two distinct labels, the
-    # drain-order discriminator (measured 2026-07-19, local twin).
+    # a seed-40 core — through the REAL featurizer path the seed-7
+    # tiny joint is single-label on every probed signal family (the
+    # log-guard-dominated mel is near-constant), while seed 40 yields
+    # a deterministic cap-saturated burst with three distinct labels
+    # across two transitions, the drain-order discriminator. NOTE ON
+    # FRAGILITY (found 2026-07-20, pod round): this class of fixture —
+    # untrained random weights feeding a recurrent greedy-argmax decode
+    # over 40 steps — is inherently sensitive to environment-level
+    # floating-point differences (torch build, BLAS backend, thread
+    # count); a prior seed choice (1) that reportedly qualified when
+    # authored no longer produces a multi-distinct-label burst in
+    # EITHER of two independently checked environments (an Apple
+    # Silicon local run and an A100 SXM pod, both landing on the same
+    # degenerate single-label collapse). Seed 40 was swept and
+    # confirmed stable across repeated local runs, but no seed choice
+    # here is guaranteed permanent — if this test's own precondition
+    # ("need a multi-label, multi-distinct burst") starts failing
+    # again after a torch/dependency bump, re-sweep rather than assume
+    # a code regression.
     # Returns a duck-typed SimpleNamespace, not a real NemotronASRCore
     # (Any, matching test_forward_step.py's fixture idiom).
     from types import SimpleNamespace
@@ -1359,7 +1373,7 @@ def test_advance_model_rows_emits_the_burst_then_parks() -> None:
     # burst queued with echo state armed (head=1 past the emitted
     # first label), drained one label per step against the golden
     # reference, park once drained + finalized.
-    core = _tiny_core(seed=1)  # two-distinct-label burst by design
+    core = _tiny_core(seed=40)  # three-distinct-label burst by design
     torch.manual_seed(5)
     samples = torch.randn(FINAL_SAMPLES) * 0.01
     expected = _reference_burst(core, samples, prompt_index=0)
