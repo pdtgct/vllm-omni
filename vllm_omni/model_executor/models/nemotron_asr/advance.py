@@ -1409,6 +1409,7 @@ class HostStaging:
         "geometry",
         "admitted_prompt",
         "prior_prompt",
+        "cadence_frames",
     )
 
     _arena: torch.Tensor = field(init=False, repr=False)
@@ -2301,11 +2302,21 @@ def advance_model_rows(
         mel_tail_capacity=int(frontend_mel_pool.shape[2]),
         hop_length=hop,
         n_fft=int(core.featurizer.n_fft),
-        cadence_frames=torch.tensor(
-            [8 * (lookahead + 1) for lookahead in lookaheads],
-            dtype=torch.int64,
-            device=device,
-        ).index_select(0, plan_geom_dev),
+        # Build the per-geometry cadence table on the HOST and index it
+        # by the CPU RowPlan geometry authority, THEN stage the per-row
+        # result to the device — never ``torch.tensor(list,
+        # device=cuda)``, which is a synchronizing host→device
+        # construction on the per-turn hot path (the full-turn probe's
+        # sync tripwire named exactly this call). Mirrors how
+        # ``prior_prompt`` etc. are staged: CPU build, pooled
+        # non-blocking H2D.
+        cadence_frames=_stage(
+            "cadence_frames",
+            torch.tensor(
+                [8 * (lookahead + 1) for lookahead in lookaheads],
+                dtype=torch.int64,
+            ).index_select(0, plan.geometry_id),
+        ),
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
     status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
