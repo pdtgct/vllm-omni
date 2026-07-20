@@ -45,6 +45,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
+    ENV_ADMISSION_MS_MOD,
     ENV_CHUNK_SEQUENCE,
     ENV_FINAL_TAIL,
     ENV_GEOMETRY_ID,
@@ -56,6 +57,40 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     PreparedRowBinding,
     RowPlan,
 )
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    ADMISSION_EPOCH_MODULUS_MS,
+    FRONTEND_CONSTANTS,
+    RAW_SAMPLES_PER_CHUNK,
+)
+
+#: Per-geometry deadline SLO budget, in ns: the cadence period itself
+#: (a row must be serviced before its next chunk would arrive) —
+#: derived from the manifest's sample counts and sample rate, never a
+#: copied constant. Index = geometry id, in ``RAW_SAMPLES_PER_CHUNK``'s
+#: (== ``CADENCES``'s) order.
+_SAMPLES_PER_MS = FRONTEND_CONSTANTS["sample_rate"] / 1000
+_DEADLINE_BUDGET_NS_BY_GEOMETRY: tuple[int, ...] = tuple(
+    round(samples / _SAMPLES_PER_MS * 1_000_000)
+    for samples in RAW_SAMPLES_PER_CHUNK.values()
+)
+
+
+def _reconstruct_deadline_ns(
+    admission_ms_mod: int, *, now_ns: int, geometry: int
+) -> int:
+    """The absolute deadline from the envelope's wraparound admission
+    stamp, the worker's own wall-clock ``now_ns``, and the geometry's
+    cadence-period budget (design §Ingress-deadline plumbing).
+
+    Wraparound-safe by construction: correct as long as true elapsed
+    time between minting and this reconstruction stays under
+    ``ADMISSION_EPOCH_MODULUS_MS`` milliseconds (~4.66 hours) — see
+    that constant's docstring for the headroom argument.
+    """
+    now_ms_mod = (now_ns // 1_000_000) % ADMISSION_EPOCH_MODULUS_MS
+    elapsed_ms = (now_ms_mod - admission_ms_mod) % ADMISSION_EPOCH_MODULUS_MS
+    admission_ns = now_ns - elapsed_ms * 1_000_000
+    return admission_ns + _DEADLINE_BUDGET_NS_BY_GEOMETRY[geometry]
 
 
 @dataclass(frozen=True)
@@ -233,7 +268,7 @@ class SessionRegistry:
         *,
         num_prompts: int,
         num_geometries: int,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         header = row.envelope_header
         if header is None:
             raise ValueError(
@@ -274,7 +309,19 @@ class SessionRegistry:
                 f"envelope header for {row.request_id!r} carries prompt "
                 f"{prompt} outside the prompt dictionary"
             )
-        return geometry, prompt
+        # Host-side mirror of the device-side range check (design
+        # §Ingress-deadline plumbing) — the same dual-validation
+        # pattern already used for geometry/prompt.
+        admission_ms_mod = _header_int(
+            header, ENV_ADMISSION_MS_MOD, "admission_ms_mod"
+        )
+        if not 0 <= admission_ms_mod < ADMISSION_EPOCH_MODULUS_MS:
+            raise ValueError(
+                f"envelope header for {row.request_id!r} carries "
+                f"admission_ms_mod {admission_ms_mod} outside "
+                f"[0, {ADMISSION_EPOCH_MODULUS_MS})"
+            )
+        return geometry, prompt, admission_ms_mod
 
     def bind_rows(
         self,
@@ -294,9 +341,19 @@ class SessionRegistry:
         tier, block remap, duplicate ownership, unregistered
         continuation) raises: this is the host structural tier, before
         any resident read (PORT-STATE-007 posture).
+
+        ``now_ns``: the WORKER's own wall-clock nanoseconds since
+        epoch (design §Ingress-deadline plumbing) — NOT monotonic;
+        every CHUNK row's true deadline is reconstructed from the
+        envelope's wraparound admission stamp against this reference,
+        so it must be directly comparable to the frontend process's
+        wall clock (the same cross-process basis vLLM's own scheduler
+        uses for ``Request.arrival_time``).
         """
         if now_ns <= 0:
-            raise ValueError("now_ns must be a positive monotonic stamp")
+            raise ValueError(
+                "now_ns must be a positive wall-clock nanosecond stamp"
+            )
         # Two-phase delta commit: validate the complete row set against
         # a filtered registry view, staging only newly admitted sessions
         # and prompt proposals. No resident map is cloned on the hot path.
@@ -363,7 +420,7 @@ class SessionRegistry:
                         f"block {row.block_id} is already owned by "
                         f"{owner!r} — duplicate ownership"
                     )
-                geometry, prompt = self._parse_chunk_header(
+                geometry, prompt, admission_ms_mod = self._parse_chunk_header(
                     row,
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
@@ -387,7 +444,11 @@ class SessionRegistry:
                         prior_prompt_index=prompt,
                         allow_prompt_transition=False,
                         is_chunk=True,
-                        ready_deadline_ns=now_ns,
+                        ready_deadline_ns=_reconstruct_deadline_ns(
+                            admission_ms_mod,
+                            now_ns=now_ns,
+                            geometry=geometry,
+                        ),
                     )
                 )
                 continue
@@ -409,7 +470,7 @@ class SessionRegistry:
                     "pending from the previous CHUNK"
                 )
             if is_chunk:
-                _, prompt = self._parse_chunk_header(
+                _, prompt, admission_ms_mod = self._parse_chunk_header(
                     row,
                     num_prompts=num_prompts,
                     num_geometries=num_geometries,
@@ -430,7 +491,17 @@ class SessionRegistry:
                         prior_prompt_index=prior,
                         allow_prompt_transition=prompt != prior,
                         is_chunk=True,
-                        ready_deadline_ns=now_ns,
+                        # The SESSION's admitted geometry, not the
+                        # envelope's parsed value — the same
+                        # authority-over-cross-check pattern used for
+                        # the admitted prompt (device-side
+                        # ROW_STATUS_GEOMETRY already cross-checks the
+                        # envelope against this same host authority).
+                        ready_deadline_ns=_reconstruct_deadline_ns(
+                            admission_ms_mod,
+                            now_ns=now_ns,
+                            geometry=session.geometry_id,
+                        ),
                     )
                 )
                 continue

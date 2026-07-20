@@ -143,7 +143,9 @@ def test_zero_audio_still_emits_one_final_tail_transaction():
     envelope = yields[0]["multi_modal_data"]["audio"]
     assert envelope[1] == 0
     assert envelope[3] == 1
-    assert envelope.shape[0] == 6
+    assert envelope.shape[0] == len(
+        _MODULES["manifests"].ENVELOPE_HEADER_FIELDS
+    )
 
 
 def test_next_chunk_holds_until_park_echo():

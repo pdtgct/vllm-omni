@@ -34,6 +34,8 @@ from vllm_omni.model_executor.models.nemotron_asr.convert import (
     convert_state_dict,
 )
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    ENVELOPE_HEADER_FIELDS,
+    RAW_SAMPLES_PER_CHUNK,
     author_checkpoint_profile,
     author_emission_manifest,
     author_geometry_manifest,
@@ -60,11 +62,12 @@ _MANIFEST_FILES = (
 #: placeholder = V+2 (author_config enforces > V and distinctness).
 _PARK_OFFSET = 1
 _PLACEHOLDER_OFFSET = 2
-#: The chunk-envelope carrier width: six header slots + the largest
-#: admitted raw cadence (1120 ms at 16 kHz = 17,920 samples). Derived,
-#: not measured — author_geometry_manifest re-validates it (supersedes
-#: the BU-c1 mel-carrier width 15,617; PORT-REGIME-001 raw envelope).
-_HIDDEN_SIZE = 17_926
+#: The chunk-envelope carrier width: the header slots + the largest
+#: admitted raw cadence (1120 ms at 16 kHz = 17,920 samples). DERIVED
+#: from the manifests, never a copied constant — author_geometry_
+#: manifest re-validates it (supersedes the BU-c1 mel-carrier width
+#: 15,617; PORT-REGIME-001 raw envelope).
+_HIDDEN_SIZE = len(ENVELOPE_HEADER_FIELDS) + max(RAW_SAMPLES_PER_CHUNK.values())
 #: Tokenizer artifacts to copy into the served dir. A strict whitelist,
 #: NOT "every file in tokenizer_dir": the .nemo dump mixes the tokenizer
 #: with the raw-name ``nemo_state.safetensors`` + ``meta.json``, and

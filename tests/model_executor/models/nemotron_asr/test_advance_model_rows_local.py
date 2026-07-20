@@ -80,9 +80,10 @@ PARK_ID = 9000
 PLACEHOLDER_ID = 9001
 VOCAB = 12
 CAP = 48
-#: Header + the largest cadence THESE fixtures admit (320 ms = 5,120
-#: raw samples) — the tiny-core analogue of the production 17,926.
-CARRIER_HIDDEN = 5_126
+#: Header (7 slots, design §Ingress-deadline plumbing) + the largest
+#: cadence THESE fixtures admit (320 ms = 5,120 raw samples) — the
+#: tiny-core analogue of the production 17,927.
+CARRIER_HIDDEN = 5_127
 RAW_TAIL = 1_953
 NULL_INDEX = 0  # NULL_BLOCK_ID at the pin (utils.py:46 @ ee0da84)
 

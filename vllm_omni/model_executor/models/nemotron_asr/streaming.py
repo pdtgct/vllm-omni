@@ -12,12 +12,15 @@ it — via the thin ``SupportsRealtime.buffer_realtime_audio`` classmethod
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import numpy as np
 
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    ADMISSION_EPOCH_MODULUS_MS,
     CADENCES,
     ENVELOPE_HEADER_FIELDS,
     RAW_SAMPLES_PER_CHUNK,
@@ -35,8 +38,20 @@ _GEOMETRY_BY_SAMPLES = {
     RAW_SAMPLES_PER_CHUNK[label]: index
     for index, label in enumerate(CADENCES)
 }
-_ENVELOPE_VERSION = 1.0
+_ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
+
+
+def _admission_ms_mod() -> int:
+    """The acceptance wall-clock stamp (design §Ingress-deadline
+    plumbing): milliseconds since epoch, modulo
+    ``manifests.ADMISSION_EPOCH_MODULUS_MS`` so it stays FP32-exact
+    when it rides the envelope header. Wall-clock, not monotonic —
+    this value crosses from the frontend process into the worker
+    process, and only wall-clock is comparable across that boundary
+    (the same basis vLLM's own scheduler uses for cross-process
+    ``Request.arrival_time`` ordering)."""
+    return int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS
 
 
 def mint_envelope(
@@ -46,6 +61,7 @@ def mint_envelope(
     final_tail: bool,
     prompt_index: int,
     chunk_sequence: int,
+    admission_ms_mod: int,
 ) -> np.ndarray:
     """Mint one CHUNK envelope: the versioned header + raw samples.
 
@@ -53,7 +69,9 @@ def mint_envelope(
     transaction seams): the worker-side plan provider reads the same
     header host-side to stamp the session registry, and the device path
     re-validates it against that authority. Header integers must stay
-    exactly FP32-representable (PORT-INT-004).
+    exactly FP32-representable (PORT-INT-004). ``admission_ms_mod`` is
+    the caller's job to capture at true cadence-completion time, not at
+    mint time — see :func:`buffer_stream`'s ready-queue.
     """
     header = np.zeros(_HEADER_SLOTS, dtype=np.float32)
     header[0] = _ENVELOPE_VERSION
@@ -62,6 +80,7 @@ def mint_envelope(
     header[3] = 1.0 if final_tail else 0.0
     header[4] = float(prompt_index)
     header[5] = float(chunk_sequence)
+    header[6] = float(admission_ms_mod)
     return np.concatenate([header, samples.astype(np.float32, copy=False)])
 
 
@@ -106,7 +125,9 @@ async def buffer_stream(
 
     sequence = 0
 
-    def prompt(chunk: np.ndarray, *, final_tail: bool) -> dict[str, Any]:
+    def prompt(
+        chunk: np.ndarray, *, final_tail: bool, admission_ms_mod: int
+    ) -> dict[str, Any]:
         # TokensPrompt shape: one placeholder token per chunk
         # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
         # invalid on the real render path. The mm payload is the minted
@@ -119,6 +140,7 @@ async def buffer_stream(
             final_tail=final_tail,
             prompt_index=prompt_index,
             chunk_sequence=sequence,
+            admission_ms_mod=admission_ms_mod,
         )
         sequence += 1
         return {
@@ -127,14 +149,31 @@ async def buffer_stream(
         }
 
     buffer = np.zeros(0, dtype=np.float32)
+    # Detection (stamping a completed cadence's admission time) and
+    # delivery (yielding behind hold_until_park backpressure) are
+    # deliberately DECOUPLED: PORT-SESS-001 requires a ready unit's
+    # timestamp to reflect when its audio truly completed, "even
+    # behind an in-flight CHUNK" — so every chunk completable from
+    # the buffer is stamped in one synchronous pass (no ``await``
+    # between completion and stamping), then drained through the
+    # hold in FIFO order. Without this, a second chunk completed in
+    # the same burst would only be stamped when the generator resumes
+    # after the first chunk's hold — understating its true queuing
+    # delay exactly in the case the LLD calls out.
+    ready: deque[tuple[np.ndarray, int]] = deque()
     yielded = False
     async for frame in audio_stream:
         buffer = np.concatenate([buffer, frame])
         while buffer.shape[0] >= chunk_samples:
             chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
+            ready.append((chunk, _admission_ms_mod()))
+        while ready:
+            chunk, admission_ms_mod = ready.popleft()
             if yielded:
                 await hold_until_park()
-            yield prompt(chunk, final_tail=False)
+            yield prompt(
+                chunk, final_tail=False, admission_ms_mod=admission_ms_mod
+            )
             yielded = True
     # Finalization is an explicit protocol transaction even when the
     # residual is shorter than the frontend's minimum commit or is
@@ -142,4 +181,6 @@ async def buffer_stream(
     # session transition still needs the final marker (PORT-SESS-003).
     if yielded:
         await hold_until_park()
-    yield prompt(buffer, final_tail=True)
+    yield prompt(
+        buffer, final_tail=True, admission_ms_mod=_admission_ms_mod()
+    )

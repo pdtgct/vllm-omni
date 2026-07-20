@@ -729,7 +729,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             placeholder_id=int(self.config.audio_chunk_token_id),
             num_prompts=int(self.core.lid.num_prompts),
             num_geometries=len(CADENCES),
-            now_ns=time.monotonic_ns(),
+            # WALL-CLOCK, not monotonic (design §Ingress-deadline
+            # plumbing): the registry reconstructs each CHUNK row's
+            # true deadline from the envelope's admission stamp,
+            # which crosses from the frontend process — only wall
+            # time is directly comparable across that boundary.
+            now_ns=time.time_ns(),
             step=self._plan_step,
         )
         self._plan_slot.stage(context)

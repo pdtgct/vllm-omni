@@ -65,7 +65,7 @@ def _checkpoint_config() -> Any:
         pred_rnn_layers=2,
         pred_hidden=640,
         n_mels=128,
-        hidden_size=17_926,  # >= 6 header slots + 17,920 raw samples
+        hidden_size=17_927,  # >= 7 header slots + 17,920 raw samples
     )
 
 
@@ -80,7 +80,7 @@ def _tiny_config() -> Any:
         pred_rnn_layers=2,
         pred_hidden=16,
         n_mels=16,
-        hidden_size=17_926,
+        hidden_size=17_927,
     )
 
 
@@ -229,7 +229,7 @@ def test_frontend_counters_are_the_eight_decided_slots_in_order() -> None:
     )
 
 
-def test_envelope_header_fields_are_the_six_decided_slots_in_order() -> None:
+def test_envelope_header_fields_are_the_seven_decided_slots_in_order() -> None:
     # @spec PORT-REGIME-001
     assert manifests.ENVELOPE_HEADER_FIELDS == (
         "version",
@@ -238,6 +238,7 @@ def test_envelope_header_fields_are_the_six_decided_slots_in_order() -> None:
         "final_tail",
         "prompt_index",
         "chunk_sequence",
+        "admission_ms_mod",
     )
 
 
@@ -289,7 +290,7 @@ def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
     needed = len(manifests.ENVELOPE_HEADER_FIELDS) + max(
         manifests.RAW_SAMPLES_PER_CHUNK.values()
     )
-    assert needed == 17_926
+    assert needed == 17_927
     assert _checkpoint_config().hidden_size >= needed
 
 
@@ -386,7 +387,7 @@ def test_author_geometry_manifest_produces_the_exact_manifest() -> None:
             },
         },
         "envelope": {
-            "version": 1,
+            "version": 2,
             "header_fields": [
                 "version",
                 "valid_samples",
@@ -394,9 +395,10 @@ def test_author_geometry_manifest_produces_the_exact_manifest() -> None:
                 "final_tail",
                 "prompt_index",
                 "chunk_sequence",
+                "admission_ms_mod",
             ],
         },
-        "carrier_width": 17_926,
+        "carrier_width": 17_927,
         "frontend": manifests.FRONTEND_CONSTANTS,
     }
 
@@ -404,7 +406,7 @@ def test_author_geometry_manifest_produces_the_exact_manifest() -> None:
 def test_author_geometry_manifest_rejects_a_narrow_carrier() -> None:
     # @spec PORT-WGT-004
     cfg = _checkpoint_config()
-    cfg.hidden_size = 17_925  # one short of header + largest cadence
+    cfg.hidden_size = 17_926  # one short of header + largest cadence
     with pytest.raises(ValueError, match="carrier_width|hidden_size"):
         manifests.author_geometry_manifest(cfg)
 

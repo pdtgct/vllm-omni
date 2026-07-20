@@ -11,7 +11,7 @@ silently drifting (PORT-STATE-009).
 
 This module is the single source of the canonical field NAMES and
 ORDER for the seven-slot session book, the eight frontend counters,
-the six envelope header slots, and the frontend constants/boundary
+the seven envelope header slots, and the frontend constants/boundary
 formulas — ``advance.py``'s torch-side slot constants and the Phase-6
 ``state_layers``/``rnnt`` layouts must match these tuples exactly.
 
@@ -49,6 +49,15 @@ RAW_SAMPLES_PER_CHUNK: dict[str, int] = {
 
 #: Chunk-envelope header slot names, in slot order (design §Chunk
 #: envelope; ``advance.py``'s ``ENV_*`` indices mirror this tuple).
+#: ``admission_ms_mod`` carries the PORT-owned cadence segmenter's
+#: acceptance wall-clock stamp across the frontend-process/worker-
+#: process boundary (design §Ingress-deadline plumbing) — vLLM's own
+#: scheduler crosses that same boundary with ``time.time()``
+#: (``Request.arrival_time``), so wall-clock is the established
+#: cross-process basis; it rides the header as milliseconds-since-
+#: epoch MODULO :data:`ADMISSION_EPOCH_MODULUS_MS` because an
+#: unreduced epoch value is far outside the FP32-exact-integer range
+#: every header integer must stay within.
 ENVELOPE_HEADER_FIELDS: tuple[str, ...] = (
     "version",
     "valid_samples",
@@ -56,7 +65,19 @@ ENVELOPE_HEADER_FIELDS: tuple[str, ...] = (
     "final_tail",
     "prompt_index",
     "chunk_sequence",
+    "admission_ms_mod",
 )
+
+#: The wraparound period for the envelope's admission timestamp: a
+#: standard bounded-width relative-clock encoding (the RTP/NTP-
+#: short-format pattern) chosen because absolute epoch milliseconds
+#: (~1.8e12 today) cannot fit under the FP32-exact-integer ceiling
+#: ``2**24``. ~4.66 hours of wraparound headroom is enormous against
+#: the ready-to-park latency this timestamp orders (target cadence
+#: 80–1120 ms; even severe backlog is expected in seconds, not
+#: hours) — reconstruction assumes true elapsed time never reaches
+#: this modulus.
+ADMISSION_EPOCH_MODULUS_MS = 2**24
 
 #: The seven-slot session book, in page-slot order with each field's
 #: OWN initialization rule (the book never initializes wholesale as
@@ -279,7 +300,7 @@ def author_geometry_manifest(config: Any) -> dict[str, Any]:
     Schema: ``{"schema": "geometry-manifest-v1", "cadences": {label:
     {"att_context": [l, r], "frames_per_chunk": r + 1,
     "raw_samples_per_chunk": RAW_SAMPLES_PER_CHUNK[label]}, ...},
-    "envelope": {"version": 1, "header_fields":
+    "envelope": {"version": 2, "header_fields":
     list(ENVELOPE_HEADER_FIELDS)}, "carrier_width":
     config.hidden_size, "frontend": FRONTEND_CONSTANTS}``. One cadence
     entry per :data:`CADENCES` label — the five published cadences,
@@ -287,7 +308,10 @@ def author_geometry_manifest(config: Any) -> dict[str, Any]:
     plus the largest admitted raw cadence
     (``len(ENVELOPE_HEADER_FIELDS) + max(RAW_SAMPLES_PER_CHUNK
     .values())``); it is derived and authored, never a copied magic
-    constant.
+    constant. Envelope version 2 (bumped from 1) adds the
+    ``admission_ms_mod`` header slot (design §Ingress-deadline
+    plumbing) — a genuine wire-schema change, not additive-compatible,
+    since every consumer validates the exact header slot count.
 
     Raises:
         ValueError: if ``config.hidden_size`` cannot carry the header
@@ -311,7 +335,7 @@ def author_geometry_manifest(config: Any) -> dict[str, Any]:
             for label, (left, right) in CADENCES.items()
         },
         "envelope": {
-            "version": 1,
+            "version": 2,
             "header_fields": list(ENVELOPE_HEADER_FIELDS),
         },
         "carrier_width": config.hidden_size,

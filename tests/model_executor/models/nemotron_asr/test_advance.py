@@ -86,9 +86,10 @@ PARK_ID = 9000
 PLACEHOLDER_ID = 9001
 VOCAB = 12
 CAP = 48  # holds a cap-saturated burst (max_symbols × enc_frames)
-#: Header + the largest cadence THESE fixtures admit (320 ms = 5,120
-#: raw samples) — the tiny-core analogue of the production 17,926.
-CARRIER_HIDDEN = 5_126
+#: Header (7 slots, design §Ingress-deadline plumbing) + the largest
+#: cadence THESE fixtures admit (320 ms = 5,120 raw samples) — the
+#: tiny-core analogue of the production 17,927.
+CARRIER_HIDDEN = 5_127
 RAW_TAIL = 1_953  # pre_encode_cache(9) * hop(160) + n_fft(512) + 1
 #: The reserved null block id at the pin (``NULL_BLOCK_ID``,
 #: vllm/v1/attention/backends/utils.py:46 @ ee0da84): block 0 is the
@@ -1477,7 +1478,7 @@ def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
     )
 
     needed = ENVELOPE_HEADER_SLOTS + max(RAW_SAMPLES_PER_CHUNK.values())
-    assert needed == 17_926
+    assert needed == 17_927
     assert NemotronASRConfig().hidden_size >= needed, (
         f"hidden_size must cover the raw chunk envelope: need {needed}, config has {NemotronASRConfig().hidden_size}"
     )

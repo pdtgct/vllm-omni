@@ -74,10 +74,19 @@ RnntDecodeFn = Callable[
 
 #: Chunk-envelope header layout (design §Chunk envelope): the versioned
 #: FP32 carrier row is ``[version, valid_samples, geometry_id,
-#: final_tail, prompt_index, chunk_sequence, samples...]``. Every header
-#: integer must be exactly representable in FP32 (< 2**24). Slot order
-#: is the LLD's listing order and is part of the pinned contract.
-ENVELOPE_VERSION = 1
+#: final_tail, prompt_index, chunk_sequence, admission_ms_mod,
+#: samples...]``. Every header integer must be exactly representable
+#: in FP32 (< 2**24). Slot order is the LLD's listing order — and
+#: ``manifests.ENVELOPE_HEADER_FIELDS`` is the single canonical source
+#: of that order; this tuple is cross-pinned to it by test, the same
+#: pattern the module docstring already uses for the book/counter
+#: slot layouts. VERSION 2 (bumped from 1, design §Ingress-deadline
+#: plumbing): adds ``admission_ms_mod``, the PORT-owned segmenter's
+#: acceptance wall-clock stamp (milliseconds since epoch modulo
+#: ``manifests.ADMISSION_EPOCH_MODULUS_MS``) — a genuine schema
+#: change, not additive-compatible, since the transaction validates
+#: the exact header slot count on every row.
+ENVELOPE_VERSION = 2
 (
     ENV_VERSION,
     ENV_VALID_SAMPLES,
@@ -85,8 +94,9 @@ ENVELOPE_VERSION = 1
     ENV_FINAL_TAIL,
     ENV_PROMPT_INDEX,
     ENV_CHUNK_SEQUENCE,
-) = range(6)
-ENVELOPE_HEADER_SLOTS = 6
+    ENV_ADMISSION_MS_MOD,
+) = range(7)
+ENVELOPE_HEADER_SLOTS = 7
 
 
 @dataclass(frozen=True)
@@ -2015,6 +2025,7 @@ def advance_model_rows(
         MEL_TAIL_FRAMES,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+        ADMISSION_EPOCH_MODULUS_MS,
         CADENCES,
     )
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
@@ -2301,6 +2312,8 @@ def advance_model_rows(
         env_bad |= (final_col != 0) & (final_col != 1)
         env_bad |= valid_col > s_g
         env_bad |= (final_col == 0) & (valid_col != s_g)
+        admission_col = hdr[:, ENV_ADMISSION_MS_MOD]
+        env_bad |= (admission_col < 0) | (admission_col >= ADMISSION_EPOCH_MODULUS_MS)
         tail = env[:, ENVELOPE_HEADER_SLOTS + s_g :]
         if tail.shape[1]:
             env_bad |= (tail != 0).any(dim=1)

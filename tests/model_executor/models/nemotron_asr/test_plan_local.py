@@ -64,7 +64,12 @@ commit_sink_mod = mods["commit_sink"]
 PLACEHOLDER_ID = 9001
 NUM_PROMPTS = 4
 NUM_GEOMETRIES = 5
-NOW_NS = 1_000_000
+#: Round numbers chosen so the deadline-reconstruction math in the
+#: tests below is easy to verify by hand: NOW_NS is exactly 10,000 ms
+#: since epoch, and _DEFAULT_ADMISSION_MS matches it exactly — the
+#: "zero elapsed time" baseline every other test's default assumes.
+NOW_NS = 10_000_000_000
+_DEFAULT_ADMISSION_MS = 10_000
 
 
 def _header(
@@ -74,11 +79,12 @@ def _header(
     final: int = 0,
     prompt: int = 0,
     seq: int = 0,
-    version: float = 1.0,
+    version: float = 2.0,
+    admission_ms_mod: int = _DEFAULT_ADMISSION_MS,
 ) -> tuple[float, ...]:
     return (
         float(version), float(valid), float(geometry), float(final),
-        float(prompt), float(seq),
+        float(prompt), float(seq), float(admission_ms_mod),
     )
 
 
@@ -125,7 +131,12 @@ def test_fresh_chunk_registers_with_monotonic_generation() -> None:
     )
     assert b1.admission_generation == 1
     assert b2.admission_generation == 2
-    assert b1.is_chunk and b1.ready_deadline_ns == NOW_NS
+    # Zero elapsed time (the default admission stamp matches NOW_NS
+    # exactly) -> the reconstructed deadline is NOW_NS plus geometry
+    # 0's cadence-period budget, never a raw now_ns passthrough.
+    assert b1.is_chunk and b1.ready_deadline_ns == (
+        NOW_NS + plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[0]
+    )
     assert not b1.allow_prompt_transition
     assert b2.prompt_index == 2 and b2.prior_prompt_index == 2
     assert registry.live_block_ids() == [3, 4]
@@ -236,6 +247,11 @@ def test_prepare_context_rejects_rows_missing_from_resident_authority() -> None:
         ({"prompt": 9}, "outside the prompt dictionary"),
         ({"final": 2}, "non-boolean final"),
         ({"seq": 1.5}, "not an exact integer"),
+        ({"admission_ms_mod": -1}, "admission_ms_mod"),
+        (
+            {"admission_ms_mod": plan_mod.ADMISSION_EPOCH_MODULUS_MS},
+            "admission_ms_mod",
+        ),
     ],
 )
 def test_malformed_minted_header_is_a_loud_port_defect(
@@ -350,6 +366,97 @@ def test_lease_validation_tracks_registry_currency() -> None:
     with pytest.raises(ValueError, match="lease"):
         registry.validate_lease([binding])
     assert not registry.lease_is_current([binding])
+
+
+# ---- ingress-deadline reconstruction (design §Ingress-deadline plumbing) --
+
+
+def test_deadline_reconstruction_is_now_plus_geometry_budget_at_zero_elapsed() -> None:
+    registry = plan_mod.SessionRegistry()
+    for geometry in range(NUM_GEOMETRIES):
+        [binding] = _bind(
+            registry,
+            [
+                _row(
+                    f"g{geometry}", geometry + 1, chunk=True, prior=False,
+                    header=_header(geometry=geometry),
+                )
+            ],
+        )
+        expected = NOW_NS + plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[geometry]
+        assert binding.ready_deadline_ns == expected
+    # Budgets strictly increase with cadence — a longer-cadence row's
+    # deadline is always later than a shorter one admitted at the
+    # same instant (PORT-PERF-001 cross-geometry ordering).
+    assert list(plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY) == sorted(
+        plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY
+    )
+
+
+def test_deadline_reconstruction_accounts_for_elapsed_time() -> None:
+    # Admitted 5ms before "now": the reconstructed admission instant
+    # is now_ns - 5ms, shifting the deadline back from the
+    # zero-elapsed baseline by exactly that much.
+    registry = plan_mod.SessionRegistry()
+    elapsed_ms = 5
+    header = _header(admission_ms_mod=_DEFAULT_ADMISSION_MS - elapsed_ms)
+    [binding] = _bind(
+        registry, [_row("a", 3, chunk=True, prior=False, header=header)]
+    )
+    expected = (
+        NOW_NS
+        - elapsed_ms * 1_000_000
+        + plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[0]
+    )
+    assert binding.ready_deadline_ns == expected
+
+
+def test_deadline_reconstruction_handles_wraparound() -> None:
+    # now_ms_mod effectively 2 (just past a wrap); admission was
+    # minted 3ms earlier at ms_mod == modulus - 1 (just before the
+    # wrap) -> true elapsed is 3ms, not a huge negative-then-wrong
+    # value from a naive unmodded subtraction.
+    registry = plan_mod.SessionRegistry()
+    modulus = plan_mod.ADMISSION_EPOCH_MODULUS_MS
+    now_ns = (modulus + 2) * 1_000_000
+    header = _header(admission_ms_mod=modulus - 1)
+    [binding] = _bind(
+        registry,
+        [_row("a", 3, chunk=True, prior=False, header=header)],
+        now_ns=now_ns,
+    )
+    expected = (
+        now_ns - 3 * 1_000_000 + plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[0]
+    )
+    assert binding.ready_deadline_ns == expected
+
+
+def test_deadline_reconstruction_continuing_chunk_uses_session_geometry() -> None:
+    # A continuing CHUNK's budget comes from the SESSION's admitted
+    # geometry (host authority), not the envelope's parsed value —
+    # mirrors the admitted-prompt authority pattern; the device layer
+    # cross-checks the envelope separately (ROW_STATUS_GEOMETRY). The
+    # envelope here deliberately claims a DIFFERENT (but still
+    # in-bounds) geometry than the session's, so this test actually
+    # discriminates "used session.geometry_id" from "used the
+    # freshly-parsed envelope value" — a prior version of this test
+    # used the same geometry in both headers and would have passed
+    # under either implementation.
+    registry = plan_mod.SessionRegistry()
+    _bind(
+        registry,
+        [_row("a", 3, chunk=True, prior=False, header=_header(geometry=2))],
+    )
+    [binding] = _bind(
+        registry,
+        [_row("a", 3, chunk=True, header=_header(geometry=4, seq=1))],
+    )
+    expected = NOW_NS + plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[2]
+    assert binding.ready_deadline_ns == expected
+    assert (
+        plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[2]
+        != plan_mod._DEADLINE_BUDGET_NS_BY_GEOMETRY[4]
+    )
 
 
 # ---- consume-once slot and context assembly -------------------------------
