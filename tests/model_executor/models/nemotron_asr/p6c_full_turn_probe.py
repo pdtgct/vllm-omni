@@ -66,6 +66,7 @@ import os
 import platform
 import sys
 import time
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -424,33 +425,17 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
     from torch.profiler import ProfilerActivity, profile
 
     cell: dict[str, Any] = {}
+    # The core is inference-only (weights never mutate), so every
+    # fixture below shares it; only the RESIDENT state (pools, registry,
+    # sink, staging) is rebuilt per run.
     core = _tiny_core(device, seed=1)
-    num_blocks = 8
-    pools = _fresh_pools(
-        n_layers=N_LAYERS, window=WINDOW, d_model=D_MODEL, kernel=KERNEL,
-        pred_layers=2, pred_hidden=PRED_HIDDEN, cap=CAP, raw_tail=RAW_TAIL,
-        n_mels=FEAT, num_blocks=num_blocks, device=device,
+    adapter = advance.make_mrv1_adapter(
+        hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id
     )
-    advance.warmup_advance_model_rows_scatter(**pools)
-    registry = plan_mod.SessionRegistry()
-    sink = commit_sink_mod.BoundedCommitSink(registry, max_rows=8, device=torch.device(device))
-    staging = advance.HostStaging(8)
-    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id)
 
-    # Untimed setup turn: register replay_sess/flush_sess's identity,
-    # then seed their pool rows directly — the pending-echo/drained
-    # states a real prior CHUNK would have left, without spending a
-    # measured transaction to produce them.
-    _register_fresh(registry, request_id="replay_sess", block=1, geometry=GEOM_REG, prompt=0, now_ns=1, resident=[])
-    _register_fresh(registry, request_id="flush_sess", block=2, geometry=GEOM_FINAL, prompt=0, now_ns=2, resident=["replay_sess"])
-    _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3, geometry=GEOM_REG, prompt=0)
-    _set_drained_book(pools, 2, blank=core.blank_id, geometry=GEOM_FINAL, prompt=0)
-    pools["frontend_counter_pool"][2, _CTR["finalized"]] = 1
-    pools["frontend_counter_pool"][2, _CTR["expected_chunk_sequence"]] = 1
-    torch.accelerator.synchronize()
-
-    # Reference labels, off-trace: what each fresh CHUNK will emit —
-    # used to build turn 2's input_ids without a mid-run device read.
+    # Reference labels, off-trace and deterministic: what each fresh
+    # CHUNK will emit — used to build turn 2's input_ids without a
+    # mid-run device read. Identical for every fixture below.
     torch.manual_seed(21)
     chunk_reg_samples = torch.randn(REG_FINAL_SAMPLES) * 0.01
     torch.manual_seed(22)
@@ -459,82 +444,160 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
     ref_final = _reference_first_label(core, chunk_final_samples, geometry=GEOM_FINAL, prompt=0, device=device)
     cell["reference_first_labels"] = {"chunk_reg": ref_reg, "chunk_final": ref_final}
 
-    rows1 = [
-        plan_mod.ObservedRow("replay_sess", 1, 3, True, None),
-        plan_mod.ObservedRow("flush_sess", 2, PARK_ID, True, None),
-        plan_mod.ObservedRow(
-            # A session-first FINAL chunk (not a regular mid-session
-            # one): turn 2 treats chunk_reg as a continuing decode row
-            # regardless of whether the burst was empty, and only a
-            # FINALIZED session's drained queue is a legal FLUSH
-            # (an unfinalized drained queue is ROW_STATUS_SESSION_
-            # PROTOCOL — a regular chunk expects another CHUNK next,
-            # never a decode/replay/flush step).
-            "chunk_reg", 3, PLACEHOLDER_ID, False,
-            _header(valid=REG_FINAL_SAMPLES, geometry=GEOM_REG, final=True, seq=0),
-        ),
-        plan_mod.ObservedRow(
-            "chunk_final", 4, PLACEHOLDER_ID, False,
-            _header(valid=FINAL_SAMPLES, geometry=GEOM_FINAL, final=True, seq=0),
-        ),
-    ]
-    context1 = _context(registry, rows1, now_ns=100, step=1)
-    plan1 = plan_mod.build_row_plan(
-        context1, num_decodes=2, num_prefills=2, null_block_id=NULL_BLOCK_ID, num_pool_blocks=num_blocks
-    )
-    input_ids1 = torch.tensor([3, PARK_ID, PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long, device=device)
-    embeds1 = torch.stack(
-        [
-            torch.zeros(CARRIER_HIDDEN),
-            torch.zeros(CARRIER_HIDDEN),
-            _carrier(chunk_reg_samples, final=True, seq=0, geometry=GEOM_REG, prompt=0, hidden=CARRIER_HIDDEN),
-            _carrier(chunk_final_samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=0, hidden=CARRIER_HIDDEN),
-        ]
-    ).to(device)
-
-    def turn1() -> torch.Tensor:
-        return advance.advance_model_rows(
-            core, input_ids1, embeds1, plan1,
-            adapter=adapter, decode_resolver=_dense_eager_resolver,
-            placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
-            commit_sink=sink, capture=False, graph_covers_decode=False,
-            staging=staging, **pools,
+    def build_fixture() -> SimpleNamespace:
+        """One complete, independent turn fixture: fresh resident pools,
+        registry, sink, and staging, seeded to the pending-echo/drained
+        states a real prior CHUNK would have left. Deterministic — every
+        call reproduces byte-identical inputs, so the tripwire run and
+        the Kineto run measure the SAME transaction on INDEPENDENT state
+        (neither retries the other's mutated pools / burned registry
+        generation, the reason a single shared run had to combine both
+        and could not cleanly separate them)."""
+        num_blocks = 8
+        pools = _fresh_pools(
+            n_layers=N_LAYERS, window=WINDOW, d_model=D_MODEL, kernel=KERNEL,
+            pred_layers=2, pred_hidden=PRED_HIDDEN, cap=CAP, raw_tail=RAW_TAIL,
+            n_mels=FEAT, num_blocks=num_blocks, device=device,
         )
+        advance.warmup_advance_model_rows_scatter(**pools)
+        registry = plan_mod.SessionRegistry()
+        sink = commit_sink_mod.BoundedCommitSink(registry, max_rows=8, device=torch.device(device))
+        staging = advance.HostStaging(8)
+        _register_fresh(registry, request_id="replay_sess", block=1, geometry=GEOM_REG, prompt=0, now_ns=1, resident=[])
+        _register_fresh(registry, request_id="flush_sess", block=2, geometry=GEOM_FINAL, prompt=0, now_ns=2, resident=["replay_sess"])
+        _set_replay_book(pools, 1, queue=[3, 5], head=1, expected=3, geometry=GEOM_REG, prompt=0)
+        _set_drained_book(pools, 2, blank=core.blank_id, geometry=GEOM_FINAL, prompt=0)
+        pools["frontend_counter_pool"][2, _CTR["finalized"]] = 1
+        pools["frontend_counter_pool"][2, _CTR["expected_chunk_sequence"]] = 1
+        torch.accelerator.synchronize()
 
-    # ---- measured (i): mixed batch, tripwire + Kineto together ----
-    # A tripwire-fired transaction cannot be safely retried (partial
-    # resident mutation + a burned registry generation) — tripwire and
-    # profiler share this ONE execution rather than two.
-    torch.cuda.set_sync_debug_mode(2)
-    try:
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof1:
-            turn1_out = turn1()
-        cell["turn1_tripwire"] = "clean"
-    except RuntimeError as err:
-        turn1_out = None
-        cell["turn1_tripwire"] = f"FIRED: {err}"
-    finally:
-        torch.cuda.set_sync_debug_mode(0)
+        rows1 = [
+            plan_mod.ObservedRow("replay_sess", 1, 3, True, None),
+            plan_mod.ObservedRow("flush_sess", 2, PARK_ID, True, None),
+            plan_mod.ObservedRow(
+                # A session-first FINAL chunk (not a regular mid-session
+                # one): turn 2 treats chunk_reg as a continuing decode row
+                # regardless of whether the burst was empty, and only a
+                # FINALIZED session's drained queue is a legal FLUSH
+                # (an unfinalized drained queue is ROW_STATUS_SESSION_
+                # PROTOCOL — a regular chunk expects another CHUNK next,
+                # never a decode/replay/flush step).
+                "chunk_reg", 3, PLACEHOLDER_ID, False,
+                _header(valid=REG_FINAL_SAMPLES, geometry=GEOM_REG, final=True, seq=0),
+            ),
+            plan_mod.ObservedRow(
+                "chunk_final", 4, PLACEHOLDER_ID, False,
+                _header(valid=FINAL_SAMPLES, geometry=GEOM_FINAL, final=True, seq=0),
+            ),
+        ]
+        context1 = _context(registry, rows1, now_ns=100, step=1)
+        plan1 = plan_mod.build_row_plan(
+            context1, num_decodes=2, num_prefills=2, null_block_id=NULL_BLOCK_ID, num_pool_blocks=num_blocks
+        )
+        input_ids1 = torch.tensor([3, PARK_ID, PLACEHOLDER_ID, PLACEHOLDER_ID], dtype=torch.long, device=device)
+        embeds1 = torch.stack(
+            [
+                torch.zeros(CARRIER_HIDDEN),
+                torch.zeros(CARRIER_HIDDEN),
+                _carrier(chunk_reg_samples, final=True, seq=0, geometry=GEOM_REG, prompt=0, hidden=CARRIER_HIDDEN),
+                _carrier(chunk_final_samples, final=True, seq=0, geometry=GEOM_FINAL, prompt=0, hidden=CARRIER_HIDDEN),
+            ]
+        ).to(device)
+
+        rows2 = [
+            plan_mod.ObservedRow("chunk_reg", 3, ref_reg, True, None),
+            plan_mod.ObservedRow("chunk_final", 4, ref_final, True, None),
+        ]
+        input_ids2 = torch.tensor([ref_reg, ref_final], dtype=torch.long, device=device)
+        embeds2 = torch.zeros(2, CARRIER_HIDDEN, device=device)
+
+        def turn1() -> torch.Tensor:
+            return advance.advance_model_rows(
+                core, input_ids1, embeds1, plan1,
+                adapter=adapter, decode_resolver=_dense_eager_resolver,
+                placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
+                commit_sink=sink, capture=False, graph_covers_decode=False,
+                staging=staging, **pools,
+            )
+
+        def turn2() -> torch.Tensor:
+            # Built at call time: the continuing plan reads the registry
+            # AFTER turn1/collect1 have advanced it.
+            context2 = _context(registry, rows2, now_ns=200, step=2)
+            plan2 = plan_mod.build_row_plan(
+                context2, num_decodes=2, num_prefills=0, null_block_id=NULL_BLOCK_ID, num_pool_blocks=num_blocks
+            )
+            return advance.advance_model_rows(
+                core, input_ids2, embeds2, plan2,
+                adapter=adapter, decode_resolver=_dense_eager_resolver,
+                placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
+                commit_sink=sink, capture=False, graph_covers_decode=False,
+                staging=staging, **pools,
+            )
+
+        return SimpleNamespace(sink=sink, turn1=turn1, turn2=turn2)
+
+    trace_dir = out_dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    def _run_guarded(fn: Any, label: str) -> tuple[bool, Any]:
+        """Run one transaction under the sync-debug tripwire, capturing
+        the COMPLETE failure (type, message, traceback) into the cell
+        immediately — a fired tripwire, or any real error, must not be
+        reduced to a downstream ``collect()`` ValueError. Always drains
+        outstanding CUDA work in ``finally`` so a partial transaction
+        cannot leak queued work into the next fixture."""
+        torch.cuda.set_sync_debug_mode(2)
+        try:
+            out = fn()
+            cell[f"{label}_tripwire"] = "clean"
+            return True, out
+        except Exception as err:  # tripwire raises RuntimeError; catch real errors too
+            cell[f"{label}_tripwire"] = f"FIRED: {type(err).__name__}: {err}"
+            cell[f"{label}_traceback"] = traceback.format_exc()
+            return False, None
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+            torch.accelerator.synchronize()
+
+    # ======================================================================
+    # Fixture A — TRIPWIRE ONLY (never profiled): the correctness signal
+    # (each transaction is sync-free) plus the report's status/lease
+    # content. Profiler instrumentation can itself introduce syncs, so a
+    # FIRED result here names a real transaction sync, not a measurement
+    # artifact.
+    # ======================================================================
+    fx_tw = build_fixture()
+
+    ok1, turn1_out = _run_guarded(fx_tw.turn1, "turn1")
     check.equal(cell["turn1_tripwire"], "clean", "sync.turn1.tripwire")
-    cell["turn1_kineto"] = _sync_counts(prof1)
-    check.equal(cell["turn1_kineto"], {}, "sync.turn1.kineto_sync_markers")
+    if not ok1:
+        # PRIMARY failure fully captured (see turn1_traceback). Do NOT
+        # call collect() — its "no staged commit" ValueError would
+        # overwrite this evidence with an unrelated symptom.
+        cell["arm_outcome"] = "halted: turn1 tripwire fired before staging (see turn1_traceback)"
+        return cell
+    del turn1_out
+    # A clean turn1 MUST have staged; a clean-but-unstaged transaction is
+    # a distinct postcondition defect, recorded as itself.
+    if not fx_tw.sink.has_staged:
+        check.ok(False, "sync.turn1.postcondition_staged")
+        cell["arm_outcome"] = "halted: turn1 returned clean but nothing staged"
+        return cell
 
-    # collect() is the sole sanctioned host sync: fire the tripwire on
-    # a dry attempt (its sync is the FIRST line, so nothing is
-    # consumed/released yet), then call it again for the real result.
+    # collect() is the sole sanctioned host sync: fire the tripwire on a
+    # dry attempt (its sync is the FIRST line, so nothing is consumed/
+    # released yet), then call it again for the real result.
     torch.cuda.set_sync_debug_mode(2)
     try:
-        sink.collect()
+        fx_tw.sink.collect()
         cell["collect1_tripwire"] = "no-fire (UNEXPECTED)"
     except RuntimeError:
         cell["collect1_tripwire"] = "fired-as-expected"
     finally:
         torch.cuda.set_sync_debug_mode(0)
     check.equal(cell["collect1_tripwire"], "fired-as-expected", "sync.collect1.tripwire")
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profc1:
-        reports1, _records1, lease_ok1 = sink.collect()
-    cell["collect1_kineto"] = _sync_counts(profc1)
-    check.ok(bool(cell["collect1_kineto"]), "sync.collect1.kineto_sync_markers_present")
+    reports1, _records1, lease_ok1 = fx_tw.sink.collect()
     check.ok(lease_ok1, "sync.turn1.lease_ok")
     check.equal(
         sorted((r.request_id, r.row_status) for r in reports1),
@@ -547,63 +610,68 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
         "sync.turn1.reports",
     )
 
-    trace_dir = out_dir / "traces"
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    prof1.export_chrome_trace(str(trace_dir / "turn1.json"))
-    profc1.export_chrome_trace(str(trace_dir / "collect1.json"))
-
-    # ---- measured (ii): follow-up echo turn ----
-    rows2 = [
-        plan_mod.ObservedRow("chunk_reg", 3, ref_reg, True, None),
-        plan_mod.ObservedRow("chunk_final", 4, ref_final, True, None),
-    ]
-    context2 = _context(registry, rows2, now_ns=200, step=2)
-    plan2 = plan_mod.build_row_plan(
-        context2, num_decodes=2, num_prefills=0, null_block_id=NULL_BLOCK_ID, num_pool_blocks=num_blocks
-    )
-    input_ids2 = torch.tensor([ref_reg, ref_final], dtype=torch.long, device=device)
-    embeds2 = torch.zeros(2, CARRIER_HIDDEN, device=device)
-
-    def turn2() -> torch.Tensor:
-        return advance.advance_model_rows(
-            core, input_ids2, embeds2, plan2,
-            adapter=adapter, decode_resolver=_dense_eager_resolver,
-            placeholder_id=PLACEHOLDER_ID, park_id=PARK_ID,
-            commit_sink=sink, capture=False, graph_covers_decode=False,
-            staging=staging, **pools,
-        )
-
-    torch.cuda.set_sync_debug_mode(2)
-    try:
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof2:
-            turn2()
-        cell["turn2_tripwire"] = "clean"
-    except RuntimeError as err:
-        cell["turn2_tripwire"] = f"FIRED: {err}"
-    finally:
-        torch.cuda.set_sync_debug_mode(0)
+    ok2, _turn2_out = _run_guarded(fx_tw.turn2, "turn2")
     check.equal(cell["turn2_tripwire"], "clean", "sync.turn2.tripwire")
-    cell["turn2_kineto"] = _sync_counts(prof2)
-    check.equal(cell["turn2_kineto"], {}, "sync.turn2.kineto_sync_markers")
-    prof2.export_chrome_trace(str(trace_dir / "turn2.json"))
-
+    if not ok2:
+        cell["arm_outcome"] = "halted: turn2 tripwire fired before staging (see turn2_traceback)"
+        return cell
+    if not fx_tw.sink.has_staged:
+        check.ok(False, "sync.turn2.postcondition_staged")
+        cell["arm_outcome"] = "halted: turn2 returned clean but nothing staged"
+        return cell
     torch.cuda.set_sync_debug_mode(2)
     try:
-        sink.collect()
+        fx_tw.sink.collect()
         cell["collect2_tripwire"] = "no-fire (UNEXPECTED)"
     except RuntimeError:
         cell["collect2_tripwire"] = "fired-as-expected"
     finally:
         torch.cuda.set_sync_debug_mode(0)
     check.equal(cell["collect2_tripwire"], "fired-as-expected", "sync.collect2.tripwire")
-    reports2, _records2, lease_ok2 = sink.collect()
+    reports2, _records2, lease_ok2 = fx_tw.sink.collect()
     check.ok(lease_ok2, "sync.turn2.lease_ok")
     check.equal(
         sorted((r.request_id, r.row_status) for r in reports2),
         sorted([("chunk_reg", 0), ("chunk_final", 0)]),
         "sync.turn2.reports",
     )
-    del turn1_out
+
+    # ======================================================================
+    # Fixture B — KINETO ONLY (never sync-debugged): the trace exports and
+    # sync-marker counts, on second, independent, identically-seeded
+    # state. Kept fully separate so profiler behavior can never
+    # contaminate fixture A's tripwire verdicts above. Guarded so a
+    # failure HERE (the secondary, trace-only fixture) degrades to a
+    # recorded note rather than discarding fixture A's authoritative
+    # correctness evidence already in ``cell``.
+    # ======================================================================
+    try:
+        fx_kn = build_fixture()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof1:
+            fx_kn.turn1()
+        cell["turn1_kineto"] = _sync_counts(prof1)
+        check.equal(cell["turn1_kineto"], {}, "sync.turn1.kineto_sync_markers")
+        prof1.export_chrome_trace(str(trace_dir / "turn1.json"))
+        # collect() is expected to sync — profile the real call to
+        # confirm markers ARE present (its sanctioned host sync), and
+        # advance the fixture for turn 2.
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profc1:
+            fx_kn.sink.collect()
+        cell["collect1_kineto"] = _sync_counts(profc1)
+        check.ok(bool(cell["collect1_kineto"]), "sync.collect1.kineto_sync_markers_present")
+        profc1.export_chrome_trace(str(trace_dir / "collect1.json"))
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof2:
+            fx_kn.turn2()
+        cell["turn2_kineto"] = _sync_counts(prof2)
+        check.equal(cell["turn2_kineto"], {}, "sync.turn2.kineto_sync_markers")
+        prof2.export_chrome_trace(str(trace_dir / "turn2.json"))
+        fx_kn.sink.collect()  # drain the staged step
+        cell["arm_outcome"] = "complete"
+    except Exception as err:
+        check.ok(False, "sync.kineto_fixture_uncaught")
+        cell["kineto_fixture_error"] = f"{type(err).__name__}: {err}"
+        cell["kineto_fixture_traceback"] = traceback.format_exc()
+        cell["arm_outcome"] = "tripwire-complete; kineto fixture failed (see kineto_fixture_traceback)"
     return cell
 
 
@@ -936,6 +1004,7 @@ def run_production_arm(check: Check, device: str) -> dict[str, Any]:
     torch.manual_seed(91)
     core = NemotronASRCore(
         vocab_size=PROD_VOCAB,
+        n_layers=PROD_N_LAYERS,
         filterbank=torch.zeros(128, 257),
         window=torch.zeros(400),
     ).to(device)
@@ -1050,23 +1119,37 @@ def main() -> None:
         print("FATAL: this probe is CUDA-only (sync/allocation/warmup arms need a real device)", flush=True)
         sys.exit(2)
 
-    if args.arm in ("all", "sync"):
-        report["arms"]["sync"] = run_sync_arm(check, device, out_dir)
-    if args.arm in ("all", "allocation"):
-        report["arms"]["allocation"] = run_allocation_arm(check, device)
-    if args.arm in ("all", "warmup"):
-        report["arms"]["warmup"] = run_warmup_arm(check, device)
-    if args.arm in ("all", "resolver"):
-        report["arms"]["resolver"] = run_resolver_arm(check, device)
-    if args.arm in ("all", "production"):
-        report["arms"]["production"] = run_production_arm(check, device)
+    def _checkpoint() -> None:
+        # Persist the running report after every arm so a later arm's
+        # exception can never destroy earlier arms' evidence.
+        report["checks"] = check.count
+        report["failures"] = check.failures
+        report["pass"] = not check.failures
+        if args.out:
+            args.out.write_text(json.dumps(report, indent=2, default=str))
 
-    report["checks"] = check.count
-    report["failures"] = check.failures
-    report["pass"] = not check.failures
+    arms = (
+        ("sync", lambda: run_sync_arm(check, device, out_dir)),
+        ("allocation", lambda: run_allocation_arm(check, device)),
+        ("warmup", lambda: run_warmup_arm(check, device)),
+        ("resolver", lambda: run_resolver_arm(check, device)),
+        ("production", lambda: run_production_arm(check, device)),
+    )
+    for name, fn in arms:
+        if args.arm not in ("all", name):
+            continue
+        try:
+            report["arms"][name] = fn()
+        except Exception as err:  # a crash must not erase earlier arms
+            check.ok(False, f"{name}.arm_uncaught_exception")
+            report["arms"][name] = {
+                "arm_outcome": f"UNCAUGHT: {type(err).__name__}: {err}",
+                "traceback": traceback.format_exc(),
+            }
+        _checkpoint()
+
+    _checkpoint()
     text = json.dumps(report, indent=2, default=str)
-    if args.out:
-        args.out.write_text(text)
     print(text)
     print(
         f"{'PASS' if report['pass'] else 'FAIL'}: {check.count} checks, {len(check.failures)} failures",
