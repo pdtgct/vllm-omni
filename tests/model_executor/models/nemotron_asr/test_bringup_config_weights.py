@@ -29,6 +29,7 @@ from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr imp
 from vllm_omni.model_executor.models.nemotron_asr.convert import (
     ConversionError,
     author_config,
+    derive_n_layers,
     derive_vocab_size,
 )
 from vllm_omni.model_executor.models.nemotron_asr.state_layers import (
@@ -40,25 +41,41 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 V = 13087  # the label-set size for this checkpoint (derived, not asserted)
 JOINT_HIDDEN = 640
 PRED_HIDDEN = 640
+#: The layer count this fixture's synthetic encoder keys imply — small
+#: and arbitrary (this fixture is not tied to production dims), but
+#: >1 so it is distinguishable from a degenerate single-layer default.
+N_LAYERS = 2
 
 
-def _checkpoint_shaped_state_dict(v: int = V) -> dict:
-    """A converted state dict with the two vocab-bearing tensors.
+def _checkpoint_shaped_state_dict(v: int = V, *, n_layers: int = 0) -> dict:
+    """A converted state dict with the vocab-bearing tensors, optionally
+    plus depth-bearing ones.
 
     The joint final linear is ``(V+1, joint_hidden)`` (blank last);
-    the predictor embedding is ``(V+1, pred_hidden)``.
+    the predictor embedding is ``(V+1, pred_hidden)``. ``n_layers``
+    defaults to 0 (no ``encoder.layers.*`` keys at all) so every
+    EXISTING caller — the vocab-derivation and load_weights tests,
+    which don't want fabricated encoder-shaped names in their state
+    dict — sees exactly the same fixture as before ``derive_n_layers``
+    existed; only the ``author_config``/``derive_n_layers`` tests
+    below opt in with ``n_layers=N_LAYERS``, adding one
+    ``encoder.layers.{i}.*`` tensor per layer (``derive_n_layers``
+    only needs the key to exist, not a realistic shape).
     """
-    return {
+    sd = {
         "joint.joint_net.1.weight": torch.zeros(v + 1, JOINT_HIDDEN),
         "joint.joint_net.1.bias": torch.zeros(v + 1),
         "predictor.embed.weight": torch.zeros(v + 1, PRED_HIDDEN),
     }
+    for i in range(n_layers):
+        sd[f"encoder.layers.{i}.conv.weight"] = torch.zeros(1)
+    return sd
 
 
 # ---- the shared architecture constant (PORT-INT-001) --------------------------
 
 
-def test_architecture_constant_and_model_type():
+def test_architecture_constant_and_model_type() -> None:
     assert ARCHITECTURE == "Nemotron3_5AsrForRNNT"
     assert MODEL_TYPE == "nemotron_asr"
     # The config declares the architecture it belongs to.
@@ -68,7 +85,7 @@ def test_architecture_constant_and_model_type():
 # ---- the config class (PORT-WGT-004) ------------------------------------------
 
 
-def test_config_carries_the_bringup_fields():
+def test_config_carries_the_bringup_fields() -> None:
     cfg = NemotronASRConfig(
         vocab_size=13089,
         hidden_size=15488,
@@ -81,13 +98,14 @@ def test_config_carries_the_bringup_fields():
     assert cfg.hidden_size == 15488  # the mm-carrier width, not d_model
     assert cfg.d_model == 1024
     assert cfg.eos_token_id == 13087
+    assert cfg.n_layers == 24
     assert cfg.decode_dispatch_arm == "dense-eager"
     assert cfg.decode_dispatch_table is None
     assert cfg.performance_gated is True
     assert cfg.torch_dtype in ("float32", torch.float32)
 
 
-def test_config_registers_with_autoconfig():
+def test_config_registers_with_autoconfig() -> None:
     # Importing the registration module runs AutoConfig.register once;
     # a config.json with our model_type then loads without
     # trust_remote_code.
@@ -100,7 +118,7 @@ def test_config_registers_with_autoconfig():
     assert built.vocab_size == 13090
 
 
-def test_config_roundtrips_through_from_dict():
+def test_config_roundtrips_through_from_dict() -> None:
     # Regression (pod BU-a): from_dict re-passes EVERY key, so a config
     # whose dict already carries "architectures" (author_config and
     # to_dict both do) must not collide with an explicit arg. This is
@@ -121,7 +139,7 @@ def test_config_roundtrips_through_from_dict():
     assert rebuilt.performance_gated is True
 
 
-def test_declared_dense_graphed_arm_is_not_an_eager_binding():
+def test_declared_dense_graphed_arm_is_not_an_eager_binding() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         build_decode_resolver,
     )
@@ -132,7 +150,7 @@ def test_declared_dense_graphed_arm_is_not_an_eager_binding():
         )
 
 
-def test_num_asr_labels_survives_construction():
+def test_num_asr_labels_survives_construction() -> None:
     # Regression (pod BU-a): the label count must NOT use the reserved
     # ``num_labels`` field — PretrainedConfig resets that to a 2-label
     # default in super().__init__, clobbering it. The renamed field
@@ -145,11 +163,11 @@ def test_num_asr_labels_survives_construction():
 # ---- vocab derivation from tensor shapes (PORT-WGT-004, OPEN-α4-ARCH) ----------
 
 
-def test_derive_vocab_size_from_corroborating_tensors():
+def test_derive_vocab_size_from_corroborating_tensors() -> None:
     assert derive_vocab_size(_checkpoint_shaped_state_dict(V)) == V
 
 
-def test_derive_vocab_size_rejects_tensor_disagreement():
+def test_derive_vocab_size_rejects_tensor_disagreement() -> None:
     # Joint implies V, predictor implies V+1 — a real corruption, not
     # a metadata footnote; hard-fail, never pick one.
     sd = _checkpoint_shaped_state_dict(V)
@@ -158,21 +176,45 @@ def test_derive_vocab_size_rejects_tensor_disagreement():
         derive_vocab_size(sd)
 
 
-def test_derive_vocab_size_rejects_missing_tensor():
+def test_derive_vocab_size_rejects_missing_tensor() -> None:
     sd = _checkpoint_shaped_state_dict(V)
     del sd["joint.joint_net.1.weight"]
     with pytest.raises(ConversionError):
         derive_vocab_size(sd)
 
 
+# ---- encoder-depth derivation from tensor names (PORT-WGT-004) ----------------
+
+
+def test_derive_n_layers_from_encoder_layer_keys() -> None:
+    sd = _checkpoint_shaped_state_dict(V, n_layers=N_LAYERS)
+    assert derive_n_layers(sd) == N_LAYERS
+
+
+def test_derive_n_layers_counts_the_highest_index_not_the_key_count() -> None:
+    # Sparse/non-contiguous indices still derive the correct depth —
+    # the count is max(index) + 1, not len(matching keys).
+    sd = _checkpoint_shaped_state_dict(V, n_layers=1)
+    sd["encoder.layers.5.conv.weight"] = torch.zeros(1)
+    assert derive_n_layers(sd) == 6
+
+
+def test_derive_n_layers_rejects_missing_tensor() -> None:
+    # The default fixture (n_layers=0) has no encoder.layers.* key at
+    # all — the same "does not look converted" failure a genuinely
+    # corrupt/mismatched state dict would hit.
+    with pytest.raises(ConversionError):
+        derive_n_layers(_checkpoint_shaped_state_dict(V))
+
+
 # ---- config authoring (PORT-WGT-004) ------------------------------------------
 
 
-def test_author_config_accounts_for_minted_specials():
+def test_author_config_accounts_for_minted_specials() -> None:
     # ids 0..V-1 are labels and V is blank, so the minted specials are
     # the two ids past blank: park = V+1, placeholder = V+2.
     cfg = author_config(
-        _checkpoint_shaped_state_dict(V),
+        _checkpoint_shaped_state_dict(V, n_layers=N_LAYERS),
         eos_token_id=V + 1,
         audio_chunk_token_id=V + 2,
         hidden_size=15488,
@@ -185,16 +227,17 @@ def test_author_config_accounts_for_minted_specials():
     assert cfg["eos_token_id"] == V + 1
     assert cfg["audio_chunk_token_id"] == V + 2
     assert cfg["torch_dtype"] == "float32"
+    assert cfg["n_layers"] == N_LAYERS
 
 
-def test_author_config_hardfails_on_reference_disagreement():
+def test_author_config_hardfails_on_reference_disagreement() -> None:
     # The .nemo meta.json / model card cross-check: if a supplied
     # reference vocab disagrees with the derived V, hard-fail (the
     # 13087-vs-13088 question is settled by the tensors, and a
     # genuine mismatch must never pass silently).
     with pytest.raises(ConversionError):
         author_config(
-            _checkpoint_shaped_state_dict(V),
+            _checkpoint_shaped_state_dict(V, n_layers=N_LAYERS),
             eos_token_id=V + 1,
             audio_chunk_token_id=V + 2,
             hidden_size=15488,
@@ -202,21 +245,21 @@ def test_author_config_hardfails_on_reference_disagreement():
         )
 
 
-def test_author_config_rejects_specials_that_shadow_labels_or_blank():
+def test_author_config_rejects_specials_that_shadow_labels_or_blank() -> None:
     # A minted special must be a NEW id past blank (> V) and distinct.
     # An id <= V shadows a real label (< V) or blank (= V) — the pod
     # facts confirmed blank = V = 13087, so eos = V is a collision.
     for bad_eos in (5, V):  # 5 = a real label; V = blank
         with pytest.raises(ConversionError):
             author_config(
-                _checkpoint_shaped_state_dict(V),
+                _checkpoint_shaped_state_dict(V, n_layers=N_LAYERS),
                 eos_token_id=bad_eos,
                 audio_chunk_token_id=V + 2,
                 hidden_size=15488,
             )
     with pytest.raises(ConversionError):
         author_config(
-            _checkpoint_shaped_state_dict(V),
+            _checkpoint_shaped_state_dict(V, n_layers=N_LAYERS),
             eos_token_id=V + 1,
             audio_chunk_token_id=V + 1,  # not distinct from park
             hidden_size=15488,
@@ -226,7 +269,7 @@ def test_author_config_rejects_specials_that_shadow_labels_or_blank():
 # ---- F4-compliant page prefixes (PORT-STATE-002) ------------------------------
 
 
-def test_state_page_prefixes_are_extract_layer_index_safe():
+def test_state_page_prefixes_are_extract_layer_index_safe() -> None:
     prefixes = state_page_prefixes(24)
     # 24 window + 24 conv + 1 lstm + 1 replay + the frontend pair
     # (fp32 buffers + int64 counters, split for typed-view alignment).
@@ -261,7 +304,7 @@ def _duck_vllm_config(cfg: NemotronASRConfig) -> SimpleNamespace:
     )
 
 
-def test_init_sets_num_logits_from_config_vocab_size():
+def test_init_sets_num_logits_from_config_vocab_size() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRForRNNT,
     )
@@ -273,7 +316,7 @@ def test_init_sets_num_logits_from_config_vocab_size():
     assert model.num_logits == 13089
 
 
-def test_init_registers_all_state_pages():
+def test_init_registers_all_state_pages() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRForRNNT,
     )
@@ -288,7 +331,7 @@ def test_init_registers_all_state_pages():
     assert "predictor.layers.0.lstm_state" in ctx
 
 
-def test_load_weights_missing_prompt_kernel_is_fatal():
+def test_load_weights_missing_prompt_kernel_is_fatal() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRForRNNT,
     )
@@ -304,7 +347,7 @@ def test_load_weights_missing_prompt_kernel_is_fatal():
         model.load_weights(iter(weights_without_lid))
 
 
-def test_load_weights_rejects_unexpected_name():
+def test_load_weights_rejects_unexpected_name() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRForRNNT,
     )

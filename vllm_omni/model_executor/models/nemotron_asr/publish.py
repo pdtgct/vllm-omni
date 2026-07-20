@@ -121,6 +121,7 @@ def publish(
         hidden_size=cfg_dict["hidden_size"],
         eos_token_id=cfg_dict["eos_token_id"],
         audio_chunk_token_id=cfg_dict["audio_chunk_token_id"],
+        n_layers=cfg_dict["n_layers"],
         decode_dispatch_arm=decode_dispatch_arm,
         performance_gated=False,
     )
@@ -166,6 +167,7 @@ def publish(
         "eos_token_id": cfg_dict["eos_token_id"],
         "audio_chunk_token_id": cfg_dict["audio_chunk_token_id"],
         "hidden_size": cfg_dict["hidden_size"],
+        "n_layers": cfg_dict["n_layers"],
         "architectures": cfg_dict["architectures"],
         "decode_dispatch_arm": decode_dispatch_arm,
         "tensors_consumed": len(report.consumed),

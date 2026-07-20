@@ -58,6 +58,7 @@ class NemotronASRConfig(PretrainedConfig):
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
         d_model: int = 1024,
+        n_layers: int = 24,
         conv_kernel: int = 9,
         att_context_left: int = 56,
         att_context_right: int = 13,
@@ -88,6 +89,7 @@ class NemotronASRConfig(PretrainedConfig):
         self.decode_dispatch_table = decode_dispatch_table
         self.performance_gated = performance_gated
         self.d_model = d_model
+        self.n_layers = n_layers
         self.conv_kernel = conv_kernel
         self.att_context_left = att_context_left
         self.att_context_right = att_context_right

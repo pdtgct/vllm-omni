@@ -184,6 +184,34 @@ def diff_against_referee(
 
 # ---- config authoring (PORT-WGT-004, bring-up sub-slice BU-a) -----------------
 
+_ENCODER_LAYER_RE = re.compile(r"^encoder\.layers\.(\d+)\.")
+
+
+def derive_n_layers(state_dict: Mapping[str, torch.Tensor]) -> int:
+    """The encoder's layer count, derived from checkpoint tensor names.
+
+    Reality wins over a hand-authored default: the converted state
+    dict's keys are ``encoder.layers.{i}.*`` (``rules.py``'s own
+    target pattern), so the layer count is one past the highest
+    observed index — never a copied constant, and never silently
+    wrong for a checkpoint whose depth changes.
+
+    Raises:
+        ConversionError: If no ``encoder.layers.{i}.*`` tensor is
+            present (the state dict does not look converted).
+    """
+    indices = {
+        int(m.group(1))
+        for name in state_dict
+        if (m := _ENCODER_LAYER_RE.match(name)) is not None
+    }
+    if not indices:
+        raise ConversionError(
+            "cannot derive n_layers: no 'encoder.layers.{i}.*' tensor "
+            "in the converted state dict"
+        )
+    return max(indices) + 1
+
 
 def derive_vocab_size(state_dict: Mapping[str, torch.Tensor]) -> int:
     """The label-set size V, derived from checkpoint tensor shapes.
@@ -231,7 +259,10 @@ def author_config(
     ``eos_token_id`` and the audio-chunk placeholder must be distinct
     and both >= V, i.e. genuinely new ids); ``architectures`` = the
     shared ``ARCHITECTURE`` constant; ``hidden_size`` = the mm-carrier
-    width; ``eos_token_id`` = the park token; ``torch_dtype`` = float32.
+    width; ``eos_token_id`` = the park token; ``torch_dtype`` = float32;
+    ``n_layers`` = the derived encoder depth (:func:`derive_n_layers`) —
+    ``author_state_manifest``'s per-layer state-page enumeration reads
+    this field and previously had no source for it at all.
 
     Raises:
         ConversionError: If ``reference_vocab_size`` (a metadata
@@ -239,6 +270,7 @@ def author_config(
             or if the two minted special ids are not distinct new ids.
     """
     v = derive_vocab_size(state_dict)
+    n_layers = derive_n_layers(state_dict)
     if reference_vocab_size is not None and reference_vocab_size != v:
         raise ConversionError(
             f"reference vocab size {reference_vocab_size} disagrees with "
@@ -273,4 +305,5 @@ def author_config(
         "eos_token_id": eos_token_id,
         "audio_chunk_token_id": audio_chunk_token_id,
         "torch_dtype": "float32",
+        "n_layers": n_layers,
     }
