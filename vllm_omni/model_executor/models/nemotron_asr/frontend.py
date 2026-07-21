@@ -164,6 +164,7 @@ def advance_frontend(
     raw_tail: torch.Tensor,
     mel_tail: torch.Tensor,
     counters: torch.Tensor,
+    cadence_frames: int,
     pad_frames: int,
     row_status: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -185,10 +186,12 @@ def advance_frontend(
     Length-aware (PORT-ADV-004): rows commit PER-ROW counts — mixed
     session-first / continuing / final / zero-frame rows share one
     call. The returned mel tensor has the fixed host-derived width
-    ``pad_frames`` (the bucket bound is ``C + 6``, design §Exact
-    Bounded Frontend — a legal final residual is strictly under one
-    cadence per PORT-SESS-001/003); columns at or past a row's count
-    are exactly zero. Failure handling is the ``ROW_STATUS_*``
+    ``pad_frames`` (the production bucket bound is one cadence ``C``,
+    design §Exact Bounded Frontend); columns at or past a row's count
+    are exactly zero. Finalization reproduces the reference buffer
+    walk: at most one ``C``-frame cadence shift is committed, and the
+    remaining sub-eight boundary debt is dropped. Failure handling is
+    the ``ROW_STATUS_*``
     bitmask: the caller's incoming protocol bits are AND-composed
     with the frontend-owned FINALIZED predicate and the
     design-invariant predicates, and any row with a set bit mutates
@@ -210,6 +213,8 @@ def advance_frontend(
         mel_tail: ``(B, n_mels, MEL_TAIL_FRAMES)`` committed-boundary
             mel tail, updated in place.
         counters: ``(B, 8)`` int64 counters, updated in place.
+        cadence_frames: host-derived admitted cadence ``C`` in mel
+            frames. Final rows consume at most one such shift.
         pad_frames: host-derived padded output width; a row whose
             commit would exceed it takes ROW_STATUS_PAD_OVERFLOW and
             masks (defense in depth under a caller-tightened bound).
@@ -231,6 +236,10 @@ def advance_frontend(
     half = n_fft // 2
     batch = samples.shape[0]
     capacity = raw_tail.shape[1]
+    if cadence_frames <= 0:
+        raise ValueError(
+            f"cadence_frames must be positive, got {cadence_frames}"
+        )
 
     device = counters.device
     valid_samples = valid_samples.to(device=device, dtype=torch.long)
@@ -266,14 +275,24 @@ def advance_frontend(
     eff0 = torch.where(clean, valid_samples, valid_samples.new_zeros(()))
     total0 = total_before + eff0
     stable = torch.clamp((total0 - half) // hop + 1, min=0)
-    # Final residual rule (design §Exact Bounded Frontend): commit the
-    # remaining valid frames only when at least EIGHT new mel frames
-    # lie past the committed (encoder) boundary; a shorter remainder
-    # is DROPPED — finalization still marks atomically either way.
+    # Final residual rule (PORT-FEAT-004): reproduce the reference
+    # buffer walk. If a complete cadence shift is available, consume
+    # exactly C and drop the resulting sub-eight boundary debt. With
+    # less than C available, consume the actual remainder only when it
+    # has at least eight frames. Finalization still marks atomically
+    # when nothing is committed.
     n_final = total0 // hop  # == final_frames(total0)
-    final_target = torch.where(
-        n_final - committed >= 8, n_final, committed
+    final_remaining = n_final - committed
+    final_count = torch.where(
+        final_remaining >= cadence_frames,
+        torch.full_like(final_remaining, cadence_frames),
+        torch.where(
+            final_remaining >= 8,
+            final_remaining,
+            torch.zeros_like(final_remaining),
+        ),
     )
+    final_target = committed + final_count
     tgt0 = torch.where(is_final, final_target, target_frames)
     chk = clean & regular
     status |= (

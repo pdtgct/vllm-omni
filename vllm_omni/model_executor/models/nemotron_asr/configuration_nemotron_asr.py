@@ -34,6 +34,52 @@ _CARRIER_WIDTH = len(ENVELOPE_HEADER_FIELDS) + max(
 )
 
 
+def validate_prompt_dictionary(
+    prompt_dictionary: object,
+    num_prompts: object,
+) -> dict[str, int]:
+    """Validate the published locale-to-conditioning-row authority.
+
+    Config construction remains permissive so Transformers can create an
+    empty default config for registry/introspection work. The serving model
+    calls this guard before allocating model state; a served artifact may
+    never start without a complete, in-range prompt binding.
+
+    Args:
+        prompt_dictionary: Candidate locale-to-row mapping.
+        num_prompts: Number of conditioning rows in the checkpoint.
+
+    Returns:
+        A defensive copy with normalized static types.
+
+    Raises:
+        ValueError: If the row count or any mapping entry is invalid.
+    """
+    if (
+        isinstance(num_prompts, bool)
+        or not isinstance(num_prompts, int)
+        or num_prompts <= 0
+    ):
+        raise ValueError("num_prompts must be a positive integer")
+    if not isinstance(prompt_dictionary, dict) or not prompt_dictionary:
+        raise ValueError("prompt_dictionary must be a non-empty object")
+    validated: dict[str, int] = {}
+    for locale, index in prompt_dictionary.items():
+        if (
+            not isinstance(locale, str)
+            or not locale
+            or isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < num_prompts
+        ):
+            raise ValueError(
+                "prompt_dictionary must map non-empty locale strings to "
+                f"integer rows in [0, {num_prompts})"
+            )
+        validated[locale] = index
+    return validated
+
+
 class NemotronASRConfig(PretrainedConfig):
     """Config for the FastConformer RNN-T streaming ASR model.
 
@@ -57,6 +103,7 @@ class NemotronASRConfig(PretrainedConfig):
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
+        prompt_dictionary: dict[str, int] | None = None,
         d_model: int = 1024,
         n_layers: int = 24,
         conv_kernel: int = 9,
@@ -88,6 +135,10 @@ class NemotronASRConfig(PretrainedConfig):
         self.decode_dispatch_arm = decode_dispatch_arm
         self.decode_dispatch_table = decode_dispatch_table
         self.performance_gated = performance_gated
+        # Complete locale -> prompt-row authority, authored from the
+        # source checkpoint metadata. Serving must never rely on a
+        # sidecar path or reconstruct this binding from labels.
+        self.prompt_dictionary = dict(prompt_dictionary or {})
         self.d_model = d_model
         self.n_layers = n_layers
         self.conv_kernel = conv_kernel

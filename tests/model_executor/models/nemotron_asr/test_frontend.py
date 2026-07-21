@@ -90,9 +90,12 @@ def _stream(
         # Arbitrary-packet differentials cap at stability itself (the
         # loosest legal target); cadence tests pass real boundaries.
         target = frontend.stable_frames(offset, n_fft=512, hop=160)
-        # The harness host-knows the exact commit; production derives
-        # the bucket-safe C+7 bound instead (design §Exact Bounded
-        # Frontend). Finals may commit past the stable target.
+        # The harness host-knows the exact commit; production passes the
+        # admitted cadence C (design §Exact Bounded Frontend). Arbitrary
+        # packet tests deliberately use a cadence no smaller than their
+        # exact host-known commit so they exercise packetization rather
+        # than the ingress cadence walk. Finals may commit past the
+        # stable target.
         pad = (
             target
             - int(state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES])
@@ -105,6 +108,7 @@ def _stream(
             torch.tensor([is_final]),
             torch.tensor([target], dtype=torch.long),
             **state,
+            cadence_frames=max(pad, 1),
             pad_frames=max(pad, 0),
         )
         assert status.tolist() == [0]
@@ -267,10 +271,12 @@ def test_chunk_after_finalization_is_a_masked_no_op() -> None:
         torch.tensor([True]),
         torch.zeros(1, dtype=torch.long),  # target ignored on final
     )
-    frontend.advance_frontend(feat, *args, **state, pad_frames=8)
+    frontend.advance_frontend(
+        feat, *args, **state, cadence_frames=8, pad_frames=8
+    )
     before = {k: v.clone() for k, v in state.items()}
     out, counts, status = frontend.advance_frontend(
-        feat, *args, **state, pad_frames=8
+        feat, *args, **state, cadence_frames=8, pad_frames=8
     )
     assert int(counts[0]) == 0
     assert status.tolist() == [frontend.ROW_STATUS_FINALIZED]
@@ -326,10 +332,10 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     signal = torch.randn(3 * chunk) * 0.1
     state = _fresh_state()
     committed: list[torch.Tensor] = []
-    # The production bucket bound: C + 6 (design §Exact Bounded
-    # Frontend — a legal final residual is strictly under one cadence
-    # per PORT-SESS-001/003), uniform for first and continuing rows.
-    pad = 8 * (la + 1) + 6
+    # The production bucket bound is one reference cadence shift C,
+    # uniform for first, continuing, and final rows.
+    cadence = 8 * (la + 1)
+    pad = cadence
     for k in (1, 2, 3):
         out, counts, status = frontend.advance_frontend(
             feat,
@@ -341,6 +347,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
                 dtype=torch.long,
             ),
             **state,
+            cadence_frames=cadence,
             pad_frames=pad,
         )
         assert status.tolist() == [0]
@@ -362,6 +369,7 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
         torch.tensor([True]),
         torch.zeros(1, dtype=torch.long),
         **state,
+        cadence_frames=cadence,
         pad_frames=pad,
     )
     # Exact-cadence finalization: final_frames - B_3 = 7 new frames
@@ -380,6 +388,83 @@ def test_cadence_capped_run_commits_exactly_the_boundaries() -> None:
     _assert_prefix_equal(feat, signal, streamed)
 
 
+@pytest.mark.parametrize(("chunk", "la"), sorted(LOOKAHEADS.items()))
+def test_final_tail_consumes_one_reference_cadence_shift(
+    chunk: int, la: int
+) -> None:
+    # @spec PORT-FEAT-004
+    # After one regular unit the committed boundary trails the complete
+    # mel grid by seven frames. A maximum legal final residual therefore
+    # exposes C+6 frames past the boundary. The reference buffer walk
+    # consumes exactly one C-frame shift and drops the remaining six;
+    # consuming all C+6 would create a cadence-dependent extra encoder
+    # output at 80/160/320 ms.
+    feat = _featurizer()
+    torch.manual_seed(180 + la)
+    cadence = 8 * (la + 1)
+    signal = torch.randn(2 * chunk - 1) * 0.1
+    state = _fresh_state()
+    first_boundary = frontend.cadence_boundary(1, lookahead=la)
+    frontend.advance_frontend(
+        feat,
+        signal[:chunk].unsqueeze(0),
+        torch.tensor([chunk], dtype=torch.long),
+        torch.tensor([False]),
+        torch.tensor([first_boundary], dtype=torch.long),
+        **state,
+        cadence_frames=cadence,
+        pad_frames=cadence,
+    )
+    raw_tail_before_final = state["raw_tail"].clone()
+    out, counts, status = frontend.advance_frontend(
+        feat,
+        signal[chunk:].unsqueeze(0),
+        torch.tensor([chunk - 1], dtype=torch.long),
+        torch.tensor([True]),
+        torch.zeros(1, dtype=torch.long),
+        **state,
+        cadence_frames=cadence,
+        pad_frames=cadence,
+    )
+    assert status.tolist() == [0]
+    assert counts.tolist() == [cadence]
+    assert out.shape == (1, N_MELS, cadence)
+    whole = _whole_mel(feat, signal)
+    expected = whole[:, first_boundary : first_boundary + cadence]
+    torch.testing.assert_close(out[0], expected, rtol=0, atol=2e-6)
+    torch.testing.assert_close(
+        state["mel_tail"][0],
+        whole[
+            :,
+            first_boundary
+            + cadence
+            - frontend.MEL_TAIL_FRAMES : first_boundary
+            + cadence,
+        ],
+        rtol=0,
+        atol=2e-6,
+    )
+    # Finalization clears raw-tail LOGICAL residency without a needless
+    # physical write; the complete next state is still deterministic.
+    torch.testing.assert_close(
+        state["raw_tail"], raw_tail_before_final, rtol=0, atol=0
+    )
+    assert int(
+        state["counters"][0, frontend.CTR_COMMITTED_MEL_FRAMES]
+    ) == first_boundary + cadence
+    assert state["counters"][0].tolist() == [
+        signal.shape[0],
+        first_boundary + cadence,
+        0,
+        signal.shape[0],
+        0,
+        frontend.MEL_TAIL_FRAMES,
+        0,
+        1,
+    ]
+    assert int(state["counters"][0, frontend.CTR_FINALIZED]) == 1
+
+
 def test_target_past_stability_is_a_margin_violation() -> None:
     # @spec PORT-ADV-004
     # Design-invariant violations are port defects reported as named
@@ -396,6 +481,7 @@ def test_target_past_stability_is_a_margin_violation() -> None:
         torch.tensor([False]),
         torch.tensor([99], dtype=torch.long),  # stable is only 9
         **state,
+        cadence_frames=99,
         pad_frames=99,
     )
     assert status.tolist() == [frontend.ROW_STATUS_MARGIN]
@@ -419,6 +505,7 @@ def test_target_below_committed_is_rejected() -> None:
         torch.tensor([False]),
         torch.tensor([1], dtype=torch.long),
         **state,
+        cadence_frames=8,
         pad_frames=8,
     )
     assert (
@@ -465,6 +552,7 @@ def test_batched_rows_with_shared_geometry_match_single_rows() -> None:
         torch.tensor([False, False]),
         torch.tensor([stable] * 2, dtype=torch.long),
         **state2,
+        cadence_frames=stable,
         pad_frames=stable,
     )
     assert status2.tolist() == [0, 0]
@@ -500,7 +588,8 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
     chunk, la = 17920, 13
     b1 = frontend.cadence_boundary(1, lookahead=la)
     b2 = frontend.cadence_boundary(2, lookahead=la)
-    pad = 8 * (la + 1) + 6  # the bucket bound C + 6 = 118
+    cadence = 8 * (la + 1)
+    pad = cadence
     n_rows = 5
     signals = [
         torch.randn(3 * chunk) * s for s in (0.1, 0.2, 0.15, 0.3, 0.25)
@@ -510,9 +599,8 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
     # 1 = continuing regular (commit C = 112);
     # 2 = continuing final, partial residual (commit 174 - 105 = 69);
     # 3 = continuing final at the MAXIMUM legal residual — one sample
-    #     short of a full cadence unit (commit 223 - 105 = 118,
-    #     exactly the C + 6 bound; PORT-SESS-001/003 make a full-unit
-    #     final illegal ingress);
+    #     short of a full cadence unit. There are C+6 available frames
+    #     past the boundary; the reference consumes C and drops six.
     # 4 = zero-sample final after TWO units (residual 224 - 217 = 7,
     #     below eight: DROPPED, zero commit).
     pre_units = [0, 1, 1, 1, 2]
@@ -531,6 +619,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
                     dtype=torch.long,
                 ),
                 **s1,
+                cadence_frames=cadence,
                 pad_frames=pad,
             )
         pre.append(s1)
@@ -541,7 +630,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         signals[0][:chunk],  # first regular
         signals[1][chunk : 2 * chunk],  # continuing regular
         signals[2][chunk : chunk + 10_000],  # final, 69-frame residual
-        signals[3][chunk : 2 * chunk - 160],  # max legal final: 118
+        signals[3][chunk : 2 * chunk - 160],  # max legal final: commit C
         signals[4][2 * chunk : 2 * chunk],  # zero-sample final
     ]
     samples = torch.zeros(n_rows, chunk)
@@ -560,6 +649,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         finals,
         targets,
         **stateN,
+        cadence_frames=cadence,
         pad_frames=pad,
     )
     assert statusN.tolist() == [0] * n_rows
@@ -568,7 +658,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
         b1,
         b2 - b1,
         (chunk + 10_000) // 160 - b1,
-        (2 * chunk - 160) // 160 - b1,
+        cadence,
         0,
     ]
     assert expected_counts[3] == pad
@@ -581,6 +671,7 @@ def test_mixed_phase_batch_rows_match_single_rows() -> None:
             finals[row : row + 1],
             targets[row : row + 1],
             **s1,
+            cadence_frames=cadence,
             pad_frames=pad,
         )
         assert (
@@ -652,6 +743,7 @@ def test_incoming_status_bit_is_a_masked_no_op() -> None:
         torch.tensor([False, False]),
         torch.tensor([stable] * 2, dtype=torch.long),
         **state2,
+        cadence_frames=stable,
         pad_frames=stable,
         row_status=incoming,
     )
@@ -691,7 +783,8 @@ def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
     chunk, la = 17920, 13
     b1 = frontend.cadence_boundary(1, lookahead=la)
     b2 = frontend.cadence_boundary(2, lookahead=la)
-    pad = 8 * (la + 1) + 6
+    cadence = 8 * (la + 1)
+    pad = cadence
     signal = torch.randn(2 * chunk) * 0.1
 
     # Legal decomposition: unit 2 as a regular CHUNK, then the
@@ -709,6 +802,7 @@ def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
                 dtype=torch.long,
             ),
             **legal,
+            cadence_frames=cadence,
             pad_frames=pad,
         )
         assert status.tolist() == [0]
@@ -720,6 +814,7 @@ def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
         torch.tensor([True]),
         torch.zeros(1, dtype=torch.long),
         **legal,
+        cadence_frames=cadence,
         pad_frames=pad,
     )
     assert status.tolist() == [0]
@@ -741,6 +836,7 @@ def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
         torch.tensor([False]),
         torch.tensor([b1], dtype=torch.long),
         **coalesced,
+        cadence_frames=cadence,
         pad_frames=pad,
     )
     before = {k: v.clone() for k, v in coalesced.items()}
@@ -751,6 +847,7 @@ def test_exact_boundary_endpoint_has_one_legal_decomposition() -> None:
         torch.tensor([True]),
         torch.zeros(1, dtype=torch.long),
         **coalesced,
+        cadence_frames=cadence,
         pad_frames=pad,
         row_status=torch.tensor(
             [frontend.ROW_STATUS_FINAL_OVERSIZE], dtype=torch.int32

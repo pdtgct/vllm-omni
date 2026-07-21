@@ -12,8 +12,9 @@ hard-fail as the conversion tests pin.
 
 Usage (on the pod):
     python -m vllm_omni.model_executor.models.nemotron_asr.publish \
+        --source-model /workspace/weights/nemotron-3.5-asr-streaming-0.6b.nemo \
         --nemo-state /workspace/weights/nemo-dump/nemo_state.safetensors \
-        --tokenizer-dir /workspace/weights/nemo-dump/tokenizer \
+        --tokenizer-dir /workspace/weights/nemo-dump \
         --out /workspace/weights/served-nemotron-asr
 """
 
@@ -43,6 +44,11 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     author_transition_manifest,
     canonical_json,
     manifest_hash,
+)
+from vllm_omni.model_executor.models.nemotron_asr.publication_identity import (
+    load_publish_metadata,
+    sha256_file,
+    verify_dump_provenance,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rules import NEMO_RULES
 from vllm_omni.model_executor.models.nemotron_asr.staging import (
@@ -89,6 +95,8 @@ def publish(
     nemo_state: Path,
     out_dir: Path,
     *,
+    source_model: Path,
+    metadata_path: Path | None,
     tokenizer_dir: Path | None,
     reference_vocab_size: int | None,
     decode_dispatch_arm: str,
@@ -99,6 +107,31 @@ def publish(
             "decode_dispatch_arm must name a currently executable eager "
             "arm; dense-graphed is not a graph binding"
         )
+    if not source_model.is_file():
+        raise ValueError(f"source .nemo checkpoint does not exist: {source_model}")
+    metadata_path = metadata_path or nemo_state.with_name("meta.json")
+    (
+        prompt_dictionary,
+        num_prompts,
+        metadata_vocab_size,
+        metadata_source_digest,
+        metadata_dump_digest,
+    ) = load_publish_metadata(metadata_path)
+    if (
+        reference_vocab_size is not None
+        and reference_vocab_size != metadata_vocab_size
+    ):
+        raise ValueError(
+            "--reference-vocab-size disagrees with meta.json: "
+            f"{reference_vocab_size} != {metadata_vocab_size}"
+        )
+    reference_vocab_size = metadata_vocab_size
+    source_checkpoint_digest, converted_dump_digest = verify_dump_provenance(
+        source_model,
+        nemo_state,
+        expected_source_digest=metadata_source_digest,
+        expected_dump_digest=metadata_dump_digest,
+    )
     raw = load_file(str(nemo_state))
     converted, report = convert_state_dict(raw, NEMO_RULES)
 
@@ -122,6 +155,8 @@ def publish(
         eos_token_id=cfg_dict["eos_token_id"],
         audio_chunk_token_id=cfg_dict["audio_chunk_token_id"],
         n_layers=cfg_dict["n_layers"],
+        num_prompts=num_prompts,
+        prompt_dictionary=prompt_dictionary,
         decode_dispatch_arm=decode_dispatch_arm,
         performance_gated=False,
     )
@@ -141,12 +176,23 @@ def publish(
         authored = manifest_authors[key](config)
         authored_manifests[key] = authored
         manifest_hashes[key] = manifest_hash(authored)
-    profile = author_checkpoint_profile(manifest_hashes)
+    published_summary: dict[str, object] = {}
 
     def _build(staging_dir: Path) -> None:
         save_file(
             {k: t.contiguous() for k, t in converted.items()},
             str(staging_dir / "model.safetensors"),
+        )
+        derived_model_digest = sha256_file(
+            staging_dir / "model.safetensors"
+        )
+        prompt_dictionary_hash = manifest_hash(prompt_dictionary)
+        profile = author_checkpoint_profile(
+            manifest_hashes,
+            source_checkpoint_digest=source_checkpoint_digest,
+            converted_dump_digest=converted_dump_digest,
+            derived_model_digest=derived_model_digest,
+            prompt_dictionary_hash=prompt_dictionary_hash,
         )
         config.save_pretrained(str(staging_dir))
         if tokenizer_dir is not None and tokenizer_dir.exists():
@@ -160,39 +206,48 @@ def publish(
         (staging_dir / "checkpoint-profile.json").write_text(
             canonical_json(profile) + "\n"
         )
-
-    summary = {
-        "derived_V": v,
-        "vocab_size": cfg_dict["vocab_size"],
-        "eos_token_id": cfg_dict["eos_token_id"],
-        "audio_chunk_token_id": cfg_dict["audio_chunk_token_id"],
-        "hidden_size": cfg_dict["hidden_size"],
-        "n_layers": cfg_dict["n_layers"],
-        "architectures": cfg_dict["architectures"],
-        "decode_dispatch_arm": decode_dispatch_arm,
-        "tensors_consumed": len(report.consumed),
-        "out_dir": str(out_dir),
-        "checkpoint_profile_id": profile["id"],
-        "state_manifest_hash": manifest_hashes["state"],
-        "geometry_manifest_hash": manifest_hashes["geometry"],
-        "transition_manifest_hash": manifest_hashes["transition"],
-        "emission_manifest_hash": manifest_hashes["emission"],
-        "checkpoint_profile_content_hash": profile["content_hash"],
-    }
-
-    def _build_with_summary(staging_dir: Path) -> None:
-        _build(staging_dir)
+        published_summary.update(
+            {
+                "derived_V": v,
+                "vocab_size": cfg_dict["vocab_size"],
+                "eos_token_id": cfg_dict["eos_token_id"],
+                "audio_chunk_token_id": cfg_dict["audio_chunk_token_id"],
+                "hidden_size": cfg_dict["hidden_size"],
+                "n_layers": cfg_dict["n_layers"],
+                "architectures": cfg_dict["architectures"],
+                "decode_dispatch_arm": decode_dispatch_arm,
+                "tensors_consumed": len(report.consumed),
+                "out_dir": str(out_dir),
+                "checkpoint_profile_id": profile["id"],
+                "source_checkpoint_digest": source_checkpoint_digest,
+                "converted_dump_digest": converted_dump_digest,
+                "derived_model_digest": derived_model_digest,
+                "prompt_dictionary_hash": prompt_dictionary_hash,
+                "state_manifest_hash": manifest_hashes["state"],
+                "geometry_manifest_hash": manifest_hashes["geometry"],
+                "transition_manifest_hash": manifest_hashes["transition"],
+                "emission_manifest_hash": manifest_hashes["emission"],
+                "checkpoint_profile_content_hash": profile["content_hash"],
+            }
+        )
         (staging_dir / "publish_summary.json").write_text(
-            json.dumps(summary, indent=2)
+            json.dumps(published_summary, indent=2)
         )
 
-    atomic_publish_dir(out_dir, _build_with_summary)
-    return summary
+    atomic_publish_dir(out_dir, _build)
+    return published_summary
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--source-model", type=Path, required=True)
     ap.add_argument("--nemo-state", type=Path, required=True)
+    ap.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="dump metadata JSON; defaults to meta.json beside --nemo-state",
+    )
     ap.add_argument("--tokenizer-dir", type=Path, default=None)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument(
@@ -212,6 +267,8 @@ def main() -> None:
     summary = publish(
         args.nemo_state,
         args.out,
+        source_model=args.source_model,
+        metadata_path=args.metadata,
         tokenizer_dir=args.tokenizer_dir,
         reference_vocab_size=args.reference_vocab_size,
         decode_dispatch_arm=args.decode_dispatch_arm,

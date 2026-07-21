@@ -45,6 +45,9 @@ tail.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -70,6 +73,80 @@ TENSOR_CHECKPOINTS: tuple[str, ...] = (
 #: ``manifests.CADENCES`` at import time instead of trusting this list
 #: alone to stay in sync.
 CADENCE_LABELS: tuple[str, ...] = ("80ms", "160ms", "320ms", "560ms", "1120ms")
+
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CONTAINER_DIGEST_RE = re.compile(
+    r"^(?P<repository>[^\s@]+)@sha256:(?P<digest>[0-9a-f]{64})$"
+)
+_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+_MANIFEST_FILES = {
+    "state": "state-manifest.json",
+    "geometry": "geometry-manifest.json",
+    "transition": "transition-manifest.json",
+    "emission": "emission-manifest.json",
+}
+
+
+@dataclass(frozen=True)
+class CheckpointIdentity:
+    """Verified identity fields consumed by the parity fingerprint."""
+
+    source_checkpoint_digest: str
+    converted_dump_digest: str
+    derived_model_digest: str
+    checkpoint_profile_id: str
+    checkpoint_profile_hash: str
+    manifest_hashes: dict[str, str]
+    prompt_dictionary: dict[str, int]
+    num_prompts: int
+
+
+def validate_capture_qualification_inputs(
+    *,
+    seed: int,
+    container_image_digest: str,
+    venv_freeze_hash: str,
+    source_tree_clean: bool,
+    cublas_workspace_config: str | None,
+) -> None:
+    """Fail closed on the matrix's qualifying capture inputs.
+
+    This is intentionally loader-safe so the negative contract can run
+    without CUDA. Exploratory captures belong in a different probe; this
+    Task-7 command produces only adoption-eligible evidence.
+
+    Raises:
+        ValueError: If any qualifying input is missing or inconsistent.
+    """
+    if seed != 42:
+        raise ValueError(f"qualifying P7 capture requires seed 42, got {seed}")
+    container_match = _CONTAINER_DIGEST_RE.fullmatch(
+        container_image_digest
+    )
+    if (
+        container_match is None
+        or container_match.group("repository").lower()
+        in {"unknown", "none", "placeholder"}
+        or int(container_match.group("digest"), 16) == 0
+    ):
+        raise ValueError(
+            "container_image_digest must be a non-placeholder "
+            "repo@sha256:<64-hex> identity"
+        )
+    if (
+        not _SHA256_RE.fullmatch(venv_freeze_hash)
+        or int(venv_freeze_hash.removeprefix("sha256:"), 16) == 0
+    ):
+        raise ValueError(
+            "venv_freeze_hash must be a non-placeholder sha256:<64-hex>"
+        )
+    if not source_tree_clean:
+        raise ValueError("qualifying P7 capture requires a clean source tree")
+    if cublas_workspace_config != _CUBLAS_WORKSPACE_CONFIG:
+        raise ValueError(
+            "CUBLAS_WORKSPACE_CONFIG must equal "
+            f"{_CUBLAS_WORKSPACE_CONFIG!r}"
+        )
 
 
 class ChunkDeltaGeometry(NamedTuple):
@@ -189,6 +266,131 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_hash(value: Any) -> str:
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_object(path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read valid JSON object from {path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return loaded
+
+
+def load_checkpoint_identity(checkpoint_dir: Path) -> CheckpointIdentity:
+    """Verify and return every checkpoint-bound fingerprint input.
+
+    The source checkpoint is not expected to be present in the served
+    directory; its digest is authored into the checkpoint profile by
+    ``publish.py``. Every derived file that is present is rehashed here
+    before capture, so a stale or edited artifact fails before any GPU
+    work can produce apparently comparable evidence.
+    """
+    profile_path = checkpoint_dir / "checkpoint-profile.json"
+    profile = _load_object(profile_path)
+    profile_hash = profile.get("content_hash")
+    if not isinstance(profile_hash, str) or not _SHA256_RE.fullmatch(profile_hash):
+        raise ValueError(f"{profile_path} has malformed content_hash")
+    body = {key: value for key, value in profile.items() if key != "content_hash"}
+    if _canonical_hash(body) != profile_hash:
+        raise ValueError(f"{profile_path} content_hash does not match its content")
+
+    required = {
+        "schema",
+        "id",
+        "precision_policy",
+        "limits",
+        "source_checkpoint_digest",
+        "converted_dump_digest",
+        "derived_model_digest",
+        "prompt_dictionary_hash",
+        *(f"{name}_manifest_hash" for name in _MANIFEST_FILES),
+    }
+    missing = sorted(required - set(body))
+    if missing:
+        raise ValueError(f"{profile_path} missing required fields: {missing}")
+    if body["schema"] != "checkpoint-profile-v2":
+        raise ValueError(
+            f"{profile_path} schema must be 'checkpoint-profile-v2'"
+        )
+    if body["precision_policy"] != "fp32-bringup-v1":
+        raise ValueError(
+            f"{profile_path} must bind precision_policy 'fp32-bringup-v1'"
+        )
+
+    manifest_hashes: dict[str, str] = {}
+    for name, filename in _MANIFEST_FILES.items():
+        expected = profile[f"{name}_manifest_hash"]
+        actual = _canonical_hash(_load_object(checkpoint_dir / filename))
+        if expected != actual:
+            raise ValueError(
+                f"{filename} hash mismatch: profile={expected!r}, actual={actual!r}"
+            )
+        manifest_hashes[name] = actual
+
+    derived_model_digest = sha256_file(checkpoint_dir / "model.safetensors")
+    if profile["derived_model_digest"] != derived_model_digest:
+        raise ValueError("model.safetensors digest disagrees with checkpoint profile")
+
+    config = _load_object(checkpoint_dir / "config.json")
+    num_prompts = config.get("num_prompts")
+    if (
+        isinstance(num_prompts, bool)
+        or not isinstance(num_prompts, int)
+        or num_prompts <= 0
+    ):
+        raise ValueError("config.json num_prompts must be a positive integer")
+    prompt_value = config.get("prompt_dictionary")
+    if not isinstance(prompt_value, dict) or not prompt_value:
+        raise ValueError("config.json must carry a non-empty prompt_dictionary")
+    prompt_dictionary: dict[str, int] = {}
+    for locale, index in prompt_value.items():
+        if (
+            not isinstance(locale, str)
+            or not locale
+            or isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < num_prompts
+        ):
+            raise ValueError(
+                "prompt_dictionary must map non-empty strings to rows in "
+                f"[0, {num_prompts})"
+            )
+        prompt_dictionary[locale] = index
+    prompt_hash = _canonical_hash(prompt_dictionary)
+    if profile["prompt_dictionary_hash"] != prompt_hash:
+        raise ValueError("prompt_dictionary hash disagrees with checkpoint profile")
+
+    source_digest = profile["source_checkpoint_digest"]
+    if not isinstance(source_digest, str) or not _SHA256_RE.fullmatch(source_digest):
+        raise ValueError("source_checkpoint_digest is missing or malformed")
+    converted_dump_digest = profile["converted_dump_digest"]
+    if (
+        not isinstance(converted_dump_digest, str)
+        or not _SHA256_RE.fullmatch(converted_dump_digest)
+    ):
+        raise ValueError("converted_dump_digest is missing or malformed")
+    profile_id = profile["id"]
+    if not isinstance(profile_id, str) or not profile_id:
+        raise ValueError("checkpoint profile id must be a non-empty string")
+    return CheckpointIdentity(
+        source_checkpoint_digest=source_digest,
+        converted_dump_digest=converted_dump_digest,
+        derived_model_digest=derived_model_digest,
+        checkpoint_profile_id=profile_id,
+        checkpoint_profile_hash=profile_hash,
+        manifest_hashes=manifest_hashes,
+        prompt_dictionary=prompt_dictionary,
+        num_prompts=num_prompts,
+    )
 
 
 def build_manifest(

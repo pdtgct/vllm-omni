@@ -37,6 +37,9 @@ def test_identifier_matches_harness_scheme():
     # to the same identifier the eval harness records in golden/run
     # provenance (EVAL-GOLD-004) — provenance keys are shared across repos.
     assert FP32_BRINGUP.identifier == "pp-d479361445b4"
+    assert FP32_BRINGUP.content_hash == (
+        "sha256:d479361445b45b54ce1b0df4cd11b7ee1a06deb235ceeb8cf97c565bed2f5ccd"
+    )
 
 
 def test_identifier_is_order_independent_and_distinct():

@@ -400,14 +400,22 @@ def author_emission_manifest(config: Any) -> dict[str, Any]:
 
 def author_checkpoint_profile(
     manifest_hashes: dict[str, str],
+    *,
+    source_checkpoint_digest: str,
+    converted_dump_digest: str,
+    derived_model_digest: str,
+    prompt_dictionary_hash: str,
 ) -> dict[str, Any]:
     """Author the checkpoint profile (PORT-INT-005).
 
-    Schema: ``{"schema": "checkpoint-profile-v1", "id":
+    Schema: ``{"schema": "checkpoint-profile-v2", "id":
     "cp-nemotron-3.5-asr-streaming-0.6b", "precision_policy":
     PRECISION_POLICY_ID, "limits": SESSION_LIMITS,
     "state_manifest_hash": ..., "geometry_manifest_hash": ...,
     "transition_manifest_hash": ..., "emission_manifest_hash": ...,
+    "source_checkpoint_digest": ..., "converted_dump_digest": ...,
+    "derived_model_digest": ...,
+    "prompt_dictionary_hash": ...,
     "content_hash": "sha256:..."}`` — ``content_hash`` is
     :func:`manifest_hash` over the profile dict WITHOUT the
     ``content_hash`` key itself (no self-reference).
@@ -415,10 +423,15 @@ def author_checkpoint_profile(
     Args:
         manifest_hashes: the four manifest hashes, keyed
             ``"state"``/``"geometry"``/``"transition"``/``"emission"``.
+        source_checkpoint_digest: Exact source ``.nemo`` file digest.
+        converted_dump_digest: Exact converted ``nemo_state.safetensors``
+            digest recorded by the source-restoring dump step.
+        derived_model_digest: Exact published ``model.safetensors`` digest.
+        prompt_dictionary_hash: Canonical hash of the complete locale to
+            prompt-index dictionary authored into ``config.json``.
 
     Raises:
-        ValueError: if ``manifest_hashes`` is missing a key or a value
-            is not a well-formed ``"sha256:" + 64-hex`` string.
+        ValueError: if a required digest is missing or malformed.
     """
     for key in ("state", "geometry", "transition", "emission"):
         value = manifest_hashes.get(key)
@@ -429,8 +442,19 @@ def author_checkpoint_profile(
                 f"manifest_hashes['{key}'] is not a sha256:<64-hex> "
                 f"string: {value!r}"
             )
+    identity_hashes = {
+        "source_checkpoint_digest": source_checkpoint_digest,
+        "converted_dump_digest": converted_dump_digest,
+        "derived_model_digest": derived_model_digest,
+        "prompt_dictionary_hash": prompt_dictionary_hash,
+    }
+    for key, value in identity_hashes.items():
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError(
+                f"{key} is not a sha256:<64-hex> string: {value!r}"
+            )
     body: dict[str, Any] = {
-        "schema": "checkpoint-profile-v1",
+        "schema": "checkpoint-profile-v2",
         "id": "cp-nemotron-3.5-asr-streaming-0.6b",
         "precision_policy": PRECISION_POLICY_ID,
         "limits": SESSION_LIMITS,
@@ -438,6 +462,7 @@ def author_checkpoint_profile(
         "geometry_manifest_hash": manifest_hashes["geometry"],
         "transition_manifest_hash": manifest_hashes["transition"],
         "emission_manifest_hash": manifest_hashes["emission"],
+        **identity_hashes,
     }
     return dict(body, content_hash=manifest_hash(body))
 

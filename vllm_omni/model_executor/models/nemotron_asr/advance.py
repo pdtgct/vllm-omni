@@ -994,8 +994,8 @@ def advance_session(
     Length-aware (PORT-ADV-004): one call serves one profile+geometry
     bucket carrying mixed session-first / continuing / final /
     zero-frame rows. Every shape is host-derived from the bucket
-    geometry (padded frontend width ``C + 6`` — a legal final residual
-    is strictly under one cadence per PORT-SESS-001/003 — and encoder
+    geometry (padded frontend width ``C``, matching the reference's
+    largest single regular/final cadence shift, and encoder
     width from the subsampling formula); validity is per-row length
     tensors. Every per-row failure — wrong chunk sequence, audio
     after finalization, an envelope geometry different from the
@@ -1072,13 +1072,10 @@ def advance_session(
         raise ValueError(f"unknown bucket geometry id {geometry}")
     lookahead = lookaheads[geometry]
     cadence = 8 * (lookahead + 1)
-    # The bucket's padded frontend width: a first row commits C-7, a
-    # continuing row C, and a legal final tail at most C+6 — the
-    # segmentation contract (PORT-SESS-001/003) drains complete
-    # cadences as regular units before minting the actual residual,
-    # so a final carrier holds strictly less than one cadence unit
-    # (design §Exact Bounded Frontend).
-    pad_frames = cadence + 6
+    # The bucket's padded frontend width is one reference cadence
+    # shift: first rows commit C-7, continuing rows C, and final rows
+    # consume at most C before dropping the sub-eight boundary debt.
+    pad_frames = cadence
     mel_width = MEL_TAIL_FRAMES + pad_frames
 
     counters = state.frontend_counters
@@ -1121,6 +1118,7 @@ def advance_session(
         raw_tail=state.raw_tail,
         mel_tail=state.mel_tail,
         counters=state.frontend_counters,
+        cadence_frames=cadence,
         pad_frames=pad_frames,
         row_status=incoming,
     )
@@ -1705,11 +1703,17 @@ def _counter_invariant_rows(
         regular_chunks_from_total * cadence_frames - 7,
     )
     final_available = total // hop_length
-    expected_final_committed = torch.where(
-        final_available - final_base_committed >= 8,
-        final_available,
-        final_base_committed,
+    final_remaining = final_available - final_base_committed
+    final_count = torch.where(
+        final_remaining >= cadence_frames,
+        cadence_frames,
+        torch.where(
+            final_remaining >= 8,
+            final_remaining,
+            torch.zeros_like(final_remaining),
+        ),
     )
+    expected_final_committed = final_base_committed + final_count
     finalized_bad = (finalized == 1) & (
         (expected_sequence != regular_chunks_from_total + 1) | (committed != expected_final_committed)
     )
@@ -2455,13 +2459,13 @@ def advance_model_rows(
                 (
                     int(rows_dev.shape[0]),
                     int(state.mel_tail.shape[1]),
-                    int(state.mel_tail.shape[2]) + cadence + 6,
+                    int(state.mel_tail.shape[2]) + cadence,
                 ),
                 (
                     int(rows_dev.shape[0]),
                     int(
                         core.encoder.pre_encode.output_lengths(
-                            torch.tensor([int(state.mel_tail.shape[2]) + cadence + 6])
+                            torch.tensor([int(state.mel_tail.shape[2]) + cadence])
                         )[0]
                     ),
                     int(state.channel[0].shape[2]),

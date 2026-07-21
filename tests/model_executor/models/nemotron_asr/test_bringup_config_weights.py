@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr imp
     ARCHITECTURE,
     MODEL_TYPE,
     NemotronASRConfig,
+    validate_prompt_dictionary,
 )
 from vllm_omni.model_executor.models.nemotron_asr.convert import (
     ConversionError,
@@ -92,6 +93,7 @@ def test_config_carries_the_bringup_fields() -> None:
         eos_token_id=13087,
         decode_dispatch_arm="dense-eager",
         performance_gated=True,
+        prompt_dictionary={"en-US": 0, "de-DE": 7},
     )
     assert cfg.model_type == MODEL_TYPE
     assert cfg.vocab_size == 13089
@@ -102,6 +104,7 @@ def test_config_carries_the_bringup_fields() -> None:
     assert cfg.decode_dispatch_arm == "dense-eager"
     assert cfg.decode_dispatch_table is None
     assert cfg.performance_gated is True
+    assert cfg.prompt_dictionary == {"en-US": 0, "de-DE": 7}
     assert cfg.torch_dtype in ("float32", torch.float32)
 
 
@@ -129,6 +132,7 @@ def test_config_roundtrips_through_from_dict() -> None:
         eos_token_id=13088,
         decode_dispatch_table="decode-dispatch.json",
         performance_gated=True,
+        prompt_dictionary={"en-US": 0, "auto": 127},
     ).to_dict()
     assert d["architectures"] == [ARCHITECTURE]
     rebuilt = NemotronASRConfig.from_dict(d)
@@ -137,6 +141,7 @@ def test_config_roundtrips_through_from_dict() -> None:
     assert rebuilt.decode_dispatch_arm is None
     assert rebuilt.decode_dispatch_table == "decode-dispatch.json"
     assert rebuilt.performance_gated is True
+    assert rebuilt.prompt_dictionary == {"en-US": 0, "auto": 127}
 
 
 def test_declared_dense_graphed_arm_is_not_an_eager_binding() -> None:
@@ -308,14 +313,49 @@ def _duck_vllm_config(cfg: NemotronASRConfig) -> SimpleNamespace:
     )
 
 
-def test_init_sets_num_logits_from_config_vocab_size() -> None:
+def _served_config(**kwargs: object) -> NemotronASRConfig:
+    kwargs.setdefault("decode_dispatch_arm", "dense-eager")
+    kwargs.setdefault("prompt_dictionary", {"en-US": 0})
+    return NemotronASRConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("prompt_dictionary", "num_prompts"),
+    (({}, 128), ({"en-US": 128}, 128), ({"en-US": 0}, 0)),
+)
+def test_served_prompt_dictionary_rejects_missing_or_out_of_range_rows(
+    prompt_dictionary: dict[str, int], num_prompts: int
+) -> None:
+    with pytest.raises(ValueError):
+        validate_prompt_dictionary(prompt_dictionary, num_prompts)
+
+
+@pytest.mark.parametrize(
+    ("prompt_dictionary", "num_prompts"),
+    (({}, 128), ({"en-US": 128}, 128), ({"en-US": 0}, 0)),
+)
+def test_model_startup_rejects_invalid_published_prompt_rows(
+    prompt_dictionary: dict[str, int], num_prompts: int
+) -> None:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRForRNNT,
     )
 
     cfg = NemotronASRConfig(
-        vocab_size=13089, decode_dispatch_arm="dense-eager"
+        decode_dispatch_arm="dense-eager",
+        prompt_dictionary=prompt_dictionary,
+        num_prompts=num_prompts,
     )
+    with pytest.raises(ValueError, match="prompt_dictionary|num_prompts"):
+        NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
+
+
+def test_init_sets_num_logits_from_config_vocab_size() -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRForRNNT,
+    )
+
+    cfg = _served_config(vocab_size=13089)
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     assert model.num_logits == 13089
 
@@ -325,7 +365,7 @@ def test_init_registers_all_state_pages() -> None:
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
+    cfg = _served_config()
     ctx: dict = {}
     vc = _duck_vllm_config(cfg)
     vc.compilation_config.static_forward_context = ctx
@@ -347,7 +387,7 @@ def test_config_n_layers_drives_encoder_depth_and_state_pages() -> None:
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig(n_layers=2, decode_dispatch_arm="dense-eager")
+    cfg = _served_config(n_layers=2)
     ctx: dict = {}
     vc = _duck_vllm_config(cfg)
     vc.compilation_config.static_forward_context = ctx
@@ -368,7 +408,7 @@ def test_load_weights_missing_prompt_kernel_is_fatal() -> None:
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
+    cfg = _served_config()
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     weights_without_lid = [
         (n, t)
@@ -384,7 +424,7 @@ def test_load_weights_rejects_unexpected_name() -> None:
         NemotronASRForRNNT,
     )
 
-    cfg = NemotronASRConfig(decode_dispatch_arm="dense-eager")
+    cfg = _served_config()
     model = NemotronASRForRNNT(vllm_config=_duck_vllm_config(cfg))
     with pytest.raises((ValueError, KeyError)):
         model.load_weights(iter([("not.a.real.tensor", torch.zeros(4))]))

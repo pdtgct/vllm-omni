@@ -433,6 +433,14 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         """
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
+        from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+            validate_prompt_dictionary,
+        )
+
+        validate_prompt_dictionary(
+            getattr(hf_config, "prompt_dictionary", None),
+            getattr(hf_config, "num_prompts", None),
+        )
         reject_unsupported_outer_graph_mode(
             getattr(vllm_config, "compilation_config", None)
         )

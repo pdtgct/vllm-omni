@@ -58,6 +58,7 @@ Usage:
         --checkpoint /workspace/weights/served-nemotron-asr \\
         --clip /workspace/datasets/clips/en-US_sample.wav \\
         --target-lang en-US \\
+        --seed 42 \\
         --model-revision <served checkpoint's own revision/tag> \\
         --nemo-commit de242add77945a110568c7c44bdae4891451851e \\
         --out /workspace/evidence/p7-parity-capture/<clip_id> \\
@@ -67,7 +68,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import random
 import subprocess
 import sys
 import time
@@ -79,10 +83,13 @@ from typing import Any
 import numpy as np
 import torch
 from p7_capture_manifest import (
+    CheckpointIdentity,
     build_chunk_record,
     build_manifest,
     chunk_delta_geometry,
+    load_checkpoint_identity,
     sha256_file,
+    validate_capture_qualification_inputs,
 )
 from safetensors.torch import load_file, save_file
 
@@ -177,39 +184,36 @@ def _carrier(
 
 
 def _git_tree_identity(start: Path) -> tuple[str, bool]:
-    """Best-effort ``(content_digest, clean)`` for the fork checkout —
-    NOT the harness's own ``nemotron_omni_port.eval.fingerprint.
-    source_tree_identity`` (deliberately not imported, per the
-    two-venv/file-format-only coupling above); ``git rev-parse
-    HEAD^{tree}`` is a genuine content digest (unlike the commit hash,
-    which also encodes authorship/parent/timestamp — the schema's own
-    docstring: "a commit label is NOT code identity"). Falls back to
-    ``("unknown", False)`` rather than failing the probe when git is
-    unavailable (Phase-1 scaffold; see module docstring)."""
+    """Return the harness-compatible tracked-content digest and cleanliness.
+
+    This reproduces ``eval.fingerprint.source_tree_identity`` without
+    importing across the two-venv boundary: SHA-256 over ``git ls-files
+    -s`` plus an exact porcelain-status cleanliness check.
+    """
     try:
-        tree = subprocess.run(
-            ["git", "rev-parse", "HEAD^{tree}"],
+        tracked = subprocess.run(
+            ["git", "ls-files", "-s"],
             cwd=start, capture_output=True, text=True, check=True,
         ).stdout.strip()
         status = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=start, capture_output=True, text=True, check=True,
         ).stdout
-        return tree, status.strip() == ""
+        digest = hashlib.sha256(tracked.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}", status.strip() == ""
     except (OSError, subprocess.CalledProcessError):
         return "unknown", False
 
 
 def _build_execution_fingerprint(
-    *, device: str, model_artifact_digest: str, repo_root: Path,
-    container_image_digest: str, venv_freeze_hash: str,
+    *,
+    device: str,
+    checkpoint_identity: CheckpointIdentity,
+    repo_root: Path,
+    container_image_digest: str,
+    venv_freeze_hash: str,
 ) -> dict[str, Any]:
-    """Real, cheaply-available fields populated for real; the deep
-    checkpoint-profile/manifest-hash fields use the schema's own
-    documented ``"unknown"`` escape hatch (fingerprint.py docstrings)
-    — wiring those requires the real PORT-INT-005 startup fingerprint
-    machinery, out of scope for this Phase-1 scaffold (ledger,
-    2026-07-20)."""
+    """Build a fully checkpoint-bound, adoption-eligible fingerprint."""
     tree_digest, tree_clean = _git_tree_identity(repo_root)
     is_cuda = device == "cuda"
     return {
@@ -233,15 +237,18 @@ def _build_execution_fingerprint(
         "venv_freeze_hash": venv_freeze_hash,
         "source_tree_digest": tree_digest,
         "source_tree_clean": tree_clean,
-        "model_artifact_digest": model_artifact_digest,
+        # The harness compatibility key defines this as the shared
+        # source checkpoint, not the derived PORT safetensors file.
+        "model_artifact_digest": checkpoint_identity.source_checkpoint_digest,
+        "derived_model_digest": checkpoint_identity.derived_model_digest,
         "precision_policy_id": FP32_BRINGUP.identifier,
-        "precision_policy_hash": "unknown",
-        "checkpoint_profile_id": "unknown",
-        "checkpoint_profile_hash": "unknown",
-        "state_manifest_hash": "unknown",
-        "geometry_manifest_hash": "unknown",
-        "transition_manifest_hash": "unknown",
-        "emission_manifest_hash": "unknown",
+        "precision_policy_hash": FP32_BRINGUP.content_hash,
+        "checkpoint_profile_id": checkpoint_identity.checkpoint_profile_id,
+        "checkpoint_profile_hash": checkpoint_identity.checkpoint_profile_hash,
+        "state_manifest_hash": checkpoint_identity.manifest_hashes["state"],
+        "geometry_manifest_hash": checkpoint_identity.manifest_hashes["geometry"],
+        "transition_manifest_hash": checkpoint_identity.manifest_hashes["transition"],
+        "emission_manifest_hash": checkpoint_identity.manifest_hashes["emission"],
     }
 
 
@@ -309,36 +316,27 @@ def _load_core(cfg: dict[str, Any], checkpoint_dir: Path, device: str) -> Nemotr
     return core
 
 
-def _load_prompt_dictionary(
-    cfg: dict[str, Any], override: Path | None
-) -> dict[str, int]:
-    """Locate the locale->prompt-index dictionary (PORT-LID-001).
-
-    Phase-2 real-checkpoint finding: the published checkpoint's
-    ``config.json`` does not carry ``prompt_dictionary`` — only the raw
-    NeMo-dump's ``meta.json`` does (``dump_nemo_weights.py``'s own
-    convention, also what ``load_core_from_dump``/``serve_ws.py``
-    consume). Prefer the checkpoint's own config first in case a future
-    publish pipeline starts carrying it (forward-compatible — no
-    hardcoded assumption that it never will); otherwise require an
-    explicit override rather than guessing a sibling directory layout.
-    """
-    if "prompt_dictionary" in cfg:
-        prompt_dictionary: dict[str, int] = cfg["prompt_dictionary"]
-        return prompt_dictionary
-    if override is not None:
-        loaded: dict[str, Any] = json.loads(override.read_text())
-        resolved: dict[str, int] = (
-            loaded["prompt_dictionary"] if "prompt_dictionary" in loaded else loaded
+def _set_determinism(seed: int) -> None:
+    """Match the oracle lane's deterministic seed/math contract."""
+    required_workspace = ":4096:8"
+    configured_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if configured_workspace not in (None, required_workspace):
+        raise ValueError(
+            "conflicting CUBLAS_WORKSPACE_CONFIG: "
+            f"{configured_workspace!r} != {required_workspace!r}"
         )
-        return resolved
-    raise RuntimeError(
-        "no 'prompt_dictionary' in the checkpoint's config.json and no "
-        "--prompt-dictionary override given — the published checkpoint "
-        "layout does not currently carry this metadata (Task-7 Phase-2 "
-        "finding); pass --prompt-dictionary pointing at a meta.json (or "
-        "a bare {locale: index} JSON file) that has it"
-    )
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = required_workspace
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def _detokenize(checkpoint_dir: Path, label_ids: list[int]) -> str:
@@ -569,6 +567,7 @@ def _run_cadence(
     prompt_index: int, device: str, checkpoint_dir: Path, clip_path: Path,
     clip_id: str, out_root: Path, model_revision: str, nemo_commit: str,
     repo_root: Path, container_image_digest: str, venv_freeze_hash: str,
+    checkpoint_identity: CheckpointIdentity, seed: int,
 ) -> dict[str, Any]:
     geometry_id = list(manifests.CADENCES).index(cadence)
     att_context = manifests.CADENCES[cadence]
@@ -637,7 +636,7 @@ def _run_cadence(
 
     fingerprint = _build_execution_fingerprint(
         device=device,
-        model_artifact_digest=sha256_file(checkpoint_dir / "model.safetensors"),
+        checkpoint_identity=checkpoint_identity,
         repo_root=repo_root,
         container_image_digest=container_image_digest,
         venv_freeze_hash=venv_freeze_hash,
@@ -645,7 +644,7 @@ def _run_cadence(
     manifest = build_manifest(
         model_revision=model_revision, nemo_commit=nemo_commit,
         precision_policy_id=FP32_BRINGUP.identifier, execution_fingerprint=fingerprint,
-        seed=0, cadence=cadence, clip_checksum=sha256_file(clip_path),
+        seed=seed, cadence=cadence, clip_checksum=sha256_file(clip_path),
         att_context_size=att_context, tensors_digest=tensors_digest,
         tensors_size_bytes=tensors_size_bytes, partial_transcripts=partial_transcripts,
         final_transcript=partial_transcripts[-1] if partial_transcripts else "",
@@ -664,6 +663,7 @@ def main() -> None:
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--clip", type=Path, required=True)
     ap.add_argument("--target-lang", default="en-US")
+    ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--model-revision", required=True)
     ap.add_argument("--nemo-commit", required=True)
     ap.add_argument("--out", type=Path, required=True)
@@ -671,40 +671,40 @@ def main() -> None:
         "--cadences", default="80ms,160ms,320ms,560ms,1120ms",
         help="Comma-separated subset of the five PORT-EVAL cadences.",
     )
-    ap.add_argument("--container-image-digest", default="unknown")
-    ap.add_argument("--venv-freeze-hash", default="unknown")
+    ap.add_argument("--container-image-digest", required=True)
+    ap.add_argument("--venv-freeze-hash", required=True)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument(
-        "--prompt-dictionary", type=Path, default=None,
-        help="Path to a JSON file (a meta.json, or a bare "
-        "{locale: index} dict) supplying the locale->prompt-index "
-        "dictionary when the checkpoint's own config.json doesn't carry "
-        "one (Task-7 Phase-2 finding: published checkpoints don't "
-        "currently include it).",
-    )
     args = ap.parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("FATAL: --device cuda but no CUDA device", flush=True)
-        sys.exit(2)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.benchmark = False
-
-    cfg = _load_config(args.checkpoint)
-    core = _load_core(cfg, args.checkpoint, args.device)
-    prompt_dictionary = _load_prompt_dictionary(cfg, args.prompt_dictionary)
-    prompt_index = resolve_prompt_index(prompt_dictionary, args.target_lang)
-    waveform, rate = _read_wav(args.clip)
-    if rate != 16000:
-        print(f"FATAL: clip sample rate {rate} != 16000", flush=True)
-        sys.exit(2)
-    clip_id = args.clip.stem
     repo_root = Path(__file__).resolve()
     for _ in range(6):  # walk up to the fork root (tests/.../nemotron_asr/<file>)
         if (repo_root / ".git").exists():
             break
         repo_root = repo_root.parent
+    _set_determinism(args.seed)
+    _tree_digest, tree_clean = _git_tree_identity(repo_root)
+    validate_capture_qualification_inputs(
+        seed=args.seed,
+        container_image_digest=args.container_image_digest,
+        venv_freeze_hash=args.venv_freeze_hash,
+        source_tree_clean=tree_clean,
+        cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    )
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("FATAL: --device cuda but no CUDA device", flush=True)
+        sys.exit(2)
+
+    checkpoint_identity = load_checkpoint_identity(args.checkpoint)
+    cfg = _load_config(args.checkpoint)
+    core = _load_core(cfg, args.checkpoint, args.device)
+    prompt_index = resolve_prompt_index(
+        checkpoint_identity.prompt_dictionary, args.target_lang
+    )
+    waveform, rate = _read_wav(args.clip)
+    if rate != 16000:
+        print(f"FATAL: clip sample rate {rate} != 16000", flush=True)
+        sys.exit(2)
+    clip_id = args.clip.stem
     cadences = [c.strip() for c in args.cadences.split(",") if c.strip()]
     for cadence in cadences:
         if cadence not in manifests.CADENCES:
@@ -723,6 +723,7 @@ def main() -> None:
                 model_revision=args.model_revision, nemo_commit=args.nemo_commit,
                 repo_root=repo_root, container_image_digest=args.container_image_digest,
                 venv_freeze_hash=args.venv_freeze_hash,
+                checkpoint_identity=checkpoint_identity, seed=args.seed,
             )
         except Exception as err:  # a cadence's failure must not lose the others' evidence
             report["cadences"][cadence] = {

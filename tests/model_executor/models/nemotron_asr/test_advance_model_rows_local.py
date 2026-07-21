@@ -1946,6 +1946,119 @@ def test_finalized_counter_sequence_must_bound_final_residual() -> None:
     _assert_pools_equal(pools, before)
 
 
+def _no_label_decode(
+    frames: torch.Tensor,
+    lengths: torch.Tensor,
+    predictor: Any,
+    joint: Any,
+    state: Any,
+) -> Any:
+    del lengths, predictor, joint
+    rows = frames.shape[0]
+    return (
+        torch.zeros(rows, 1, dtype=torch.int32, device=frames.device),
+        torch.zeros(rows, dtype=torch.int32, device=frames.device),
+        state,
+    )
+
+
+# @spec PORT-FEAT-004, PORT-ADV-004, PORT-STATE-008
+def test_maximum_legal_continuing_final_commits_one_cadence_transactionally() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    chunk_samples = 5_120  # geometry 2 / 320 ms
+    cadence = 32
+    first_boundary = 25
+    torch.manual_seed(194)
+    signal = torch.randn(2 * chunk_samples - 160) * 0.01
+    sink = _CommitRecorder()
+    first = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        _envelope(
+            signal[:chunk_samples],
+            final=False,
+            seq=0,
+            geometry=GEOM_FINAL,
+        ).unsqueeze(0),
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        resolver=_fixed_resolver(_no_label_decode),
+        commit_sink=sink,
+    )
+    assert _decision(first) == [PARK_ID]
+    final = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        _envelope(
+            signal[chunk_samples:],
+            final=True,
+            seq=1,
+            geometry=GEOM_FINAL,
+        ).unsqueeze(0),
+        _plan(
+            decodes=[1],
+            chunk=[True],
+            geometries=[GEOM_FINAL],
+        ),
+        resolver=_fixed_resolver(_no_label_decode),
+        commit_sink=sink,
+    )
+    assert _decision(final) == [PARK_ID]
+    assert all(int(status[0]) == 0 for status in sink.staged)
+    counters = pools["frontend_counter_pool"][1]
+    assert int(counters[_CTR["total_valid_samples"]]) == signal.shape[0]
+    assert int(counters[_CTR["committed_mel_frames"]]) == (
+        first_boundary + cadence
+    )
+    assert int(counters[_CTR["encoded_mel_frames"]]) == (
+        first_boundary + cadence
+    )
+    assert int(counters[_CTR["expected_chunk_sequence"]]) == 2
+    assert int(counters[_CTR["finalized"]]) == 1
+
+
+@pytest.mark.parametrize("old_extra", range(1, 7))
+# @spec PORT-FEAT-004, PORT-ADV-004, PORT-STATE-008
+def test_old_cadence_plus_debt_finalized_tuple_is_rejected_transactionally(
+    old_extra: int,
+) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    pools["book_pool"][1, _BOOK["geometry"]] = GEOM_FINAL
+    cadence = 32
+    first_boundary = 25
+    total = 2 * 5_120 - 160
+    counters = pools["frontend_counter_pool"]
+    counters[1, _CTR["total_valid_samples"]] = total
+    counters[1, _CTR["committed_mel_frames"]] = (
+        first_boundary + cadence + old_extra
+    )
+    counters[1, _CTR["encoded_mel_frames"]] = (
+        first_boundary + cadence + old_extra
+    )
+    counters[1, _CTR["raw_tail_origin"]] = total
+    counters[1, _CTR["raw_tail_length"]] = 0
+    counters[1, _CTR["mel_tail_length"]] = 9
+    counters[1, _CTR["expected_chunk_sequence"]] = 2
+    counters[1, _CTR["finalized"]] = 1
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PARK_ID]),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1], geometries=[GEOM_FINAL]),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [PARK_ID]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_BOOK_INVARIANT
+    _assert_pools_equal(pools, before)
+
+
 # @spec PORT-LID-001, PORT-LID-003, PORT-STATE-008
 def test_authorized_prompt_transition_commits_on_new_chunk() -> None:
     core = _tiny_core()

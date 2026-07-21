@@ -8,6 +8,7 @@ independent of the pod-tier probe."""
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -17,7 +18,9 @@ from p7_capture_manifest import (
     build_chunk_record,
     build_manifest,
     chunk_delta_geometry,
+    load_checkpoint_identity,
     sha256_file,
+    validate_capture_qualification_inputs,
 )
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -168,6 +171,156 @@ def test_sha256_file_is_content_stable(tmp_path: Path) -> None:
     c = tmp_path / "c.bin"
     c.write_bytes(b"different content")
     assert sha256_file(a) != sha256_file(c)
+
+
+def _write_checkpoint_identity_fixture(tmp_path: Path) -> None:
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"derived-model")
+    prompt_dictionary = {"en-US": 0, "auto": 127}
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"prompt_dictionary": prompt_dictionary, "num_prompts": 128}
+        ),
+        encoding="utf-8",
+    )
+    manifest_hashes: dict[str, str] = {}
+    for name in ("state", "geometry", "transition", "emission"):
+        body = {"schema": f"{name}-fixture-v1", "name": name}
+        path = tmp_path / f"{name}-manifest.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        manifest_hashes[name] = _canonical_hash(body)
+    profile_body = {
+        "schema": "checkpoint-profile-v2",
+        "id": "cp-test",
+        "precision_policy": "fp32-bringup-v1",
+        "limits": {},
+        "source_checkpoint_digest": "sha256:" + "a" * 64,
+        "converted_dump_digest": "sha256:" + "b" * 64,
+        "derived_model_digest": sha256_file(model),
+        "prompt_dictionary_hash": _canonical_hash(prompt_dictionary),
+        **{f"{name}_manifest_hash": digest for name, digest in manifest_hashes.items()},
+    }
+    profile = dict(profile_body, content_hash=_canonical_hash(profile_body))
+    (tmp_path / "checkpoint-profile.json").write_text(
+        json.dumps(profile), encoding="utf-8"
+    )
+
+
+def _canonical_hash(value: object) -> str:
+    import hashlib
+
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_checkpoint_identity_binds_source_derived_manifests_and_prompt(
+    tmp_path: Path,
+) -> None:
+    _write_checkpoint_identity_fixture(tmp_path)
+    identity = load_checkpoint_identity(tmp_path)
+    assert identity.source_checkpoint_digest == "sha256:" + "a" * 64
+    assert identity.converted_dump_digest == "sha256:" + "b" * 64
+    assert identity.derived_model_digest == sha256_file(
+        tmp_path / "model.safetensors"
+    )
+    assert identity.checkpoint_profile_id == "cp-test"
+    assert identity.prompt_dictionary == {"en-US": 0, "auto": 127}
+    assert identity.num_prompts == 128
+    assert set(identity.manifest_hashes) == {
+        "state",
+        "geometry",
+        "transition",
+        "emission",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda root: (root / "model.safetensors").write_bytes(b"changed"),
+        lambda root: (root / "state-manifest.json").write_text(
+            json.dumps({"schema": "changed"}), encoding="utf-8"
+        ),
+        lambda root: (root / "config.json").write_text(
+            json.dumps(
+                {"prompt_dictionary": {"en-US": 3}, "num_prompts": 128}
+            ),
+            encoding="utf-8",
+        ),
+    ),
+)
+def test_checkpoint_identity_rejects_content_drift(
+    tmp_path: Path, mutate: object
+) -> None:
+    _write_checkpoint_identity_fixture(tmp_path)
+    mutate(tmp_path)  # type: ignore[operator]
+    with pytest.raises(ValueError):
+        load_checkpoint_identity(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {"prompt_dictionary": {"en-US": 0}},
+        {"prompt_dictionary": {"en-US": 0}, "num_prompts": 0},
+        {"prompt_dictionary": {"en-US": 4}, "num_prompts": 4},
+    ),
+)
+def test_checkpoint_identity_rejects_invalid_prompt_row_bounds(
+    tmp_path: Path, config: dict[str, object]
+) -> None:
+    _write_checkpoint_identity_fixture(tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps(config), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="num_prompts|rows"):
+        load_checkpoint_identity(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"seed": 0}, "seed 42"),
+        ({"container_image_digest": "unknown"}, "container_image_digest"),
+        (
+            {"container_image_digest": "unknown@sha256:" + "c" * 64},
+            "container_image_digest",
+        ),
+        (
+            {"container_image_digest": "image@sha256:" + "0" * 64},
+            "container_image_digest",
+        ),
+        ({"venv_freeze_hash": "unknown"}, "venv_freeze_hash"),
+        ({"venv_freeze_hash": "sha256:" + "0" * 64}, "venv_freeze_hash"),
+        ({"source_tree_clean": False}, "clean source tree"),
+        ({"cublas_workspace_config": ":16:8"}, "CUBLAS_WORKSPACE_CONFIG"),
+    ),
+)
+def test_capture_qualification_inputs_fail_closed(
+    overrides: dict[str, object], message: str
+) -> None:
+    inputs: dict[str, object] = {
+        "seed": 42,
+        "container_image_digest": "image@sha256:" + "c" * 64,
+        "venv_freeze_hash": "sha256:" + "d" * 64,
+        "source_tree_clean": True,
+        "cublas_workspace_config": ":4096:8",
+    }
+    inputs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        validate_capture_qualification_inputs(**inputs)  # type: ignore[arg-type]
+
+
+def test_capture_qualification_inputs_accept_exact_matrix_contract() -> None:
+    validate_capture_qualification_inputs(
+        seed=42,
+        container_image_digest="image@sha256:" + "c" * 64,
+        venv_freeze_hash="sha256:" + "d" * 64,
+        source_tree_clean=True,
+        cublas_workspace_config=":4096:8",
+    )
 
 
 def test_build_manifest_contains_all_required_keys() -> None:

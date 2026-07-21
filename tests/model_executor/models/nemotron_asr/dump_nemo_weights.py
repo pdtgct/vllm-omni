@@ -16,6 +16,7 @@ Usage (dev pod):
 """
 
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -23,6 +24,14 @@ from pathlib import Path
 import torch
 from nemo.collections.asr.models import ASRModel
 from safetensors.torch import save_file
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def main() -> None:
@@ -41,7 +50,8 @@ def main() -> None:
         k: v.to(torch.float32).contiguous()
         for k, v in model.state_dict().items()
     }
-    save_file(state, str(args.out / "nemo_state.safetensors"))
+    dump_path = args.out / "nemo_state.safetensors"
+    save_file(state, str(dump_path))
 
     tok = model.tokenizer
     spm_path = getattr(tok, "model_path", None) or getattr(
@@ -51,6 +61,8 @@ def main() -> None:
         shutil.copy(spm_path, args.out / "tokenizer.model")
 
     meta = {
+        "source_checkpoint_digest": _sha256_file(args.model),
+        "converted_dump_digest": _sha256_file(dump_path),
         "prompt_dictionary": dict(
             model.cfg.model_defaults.get("prompt_dictionary", {})
         ),

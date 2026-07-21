@@ -71,7 +71,7 @@ CHUNK = 17_920  # 1120 ms cadence (geometry id 4, lookahead 13)
 GEOMETRY_1120 = 4
 LOOKAHEAD = 13
 CADENCE = 8 * (LOOKAHEAD + 1)  # 112
-PAD_FRAMES = CADENCE + 6  # the bucket bound (design §Exact Bounded
+PAD_FRAMES = CADENCE  # one reference regular/final cadence shift
 # Frontend: a legal final residual is strictly under one cadence per
 # PORT-SESS-001/003); mel width = MEL_TAIL_FRAMES + PAD_FRAMES
 MEL_WIDTH = frontend.MEL_TAIL_FRAMES + PAD_FRAMES

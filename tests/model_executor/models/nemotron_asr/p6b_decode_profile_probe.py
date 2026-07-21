@@ -255,7 +255,7 @@ def _t_pad(cadence: int) -> int:
         feat_in=16, d_model=32, d_ff=32, n_layers=1, n_heads=2,
         conv_kernel=5, subsampling_channels=8, att_context=(4, 0),
     )
-    mel_width = 9 + cadence + 6
+    mel_width = 9 + cadence
     return int(
         enc.pre_encode.output_lengths(torch.tensor([mel_width]))[0]
     )

@@ -459,11 +459,22 @@ def _four_hashes() -> dict[str, str]:
     }
 
 
+def _profile_identity() -> dict[str, str]:
+    return {
+        "source_checkpoint_digest": "sha256:" + "5" * 64,
+        "converted_dump_digest": "sha256:" + "8" * 64,
+        "derived_model_digest": "sha256:" + "6" * 64,
+        "prompt_dictionary_hash": "sha256:" + "7" * 64,
+    }
+
+
 def test_author_checkpoint_profile_produces_the_exact_profile() -> None:
     # @spec PORT-INT-005
-    profile = manifests.author_checkpoint_profile(_four_hashes())
+    profile = manifests.author_checkpoint_profile(
+        _four_hashes(), **_profile_identity()
+    )
     body = {
-        "schema": "checkpoint-profile-v1",
+        "schema": "checkpoint-profile-v2",
         "id": "cp-nemotron-3.5-asr-streaming-0.6b",
         "precision_policy": "fp32-bringup-v1",
         "limits": manifests.SESSION_LIMITS,
@@ -471,6 +482,7 @@ def test_author_checkpoint_profile_produces_the_exact_profile() -> None:
         "geometry_manifest_hash": "sha256:" + "2" * 64,
         "transition_manifest_hash": "sha256:" + "3" * 64,
         "emission_manifest_hash": "sha256:" + "4" * 64,
+        **_profile_identity(),
     }
     assert profile == dict(body, content_hash=manifests.manifest_hash(body))
 
@@ -478,7 +490,9 @@ def test_author_checkpoint_profile_produces_the_exact_profile() -> None:
 def test_author_checkpoint_profile_content_hash_recomputes() -> None:
     # @spec PORT-INT-005
     # The recomputation rule: strip content_hash, rehash, get it back.
-    profile = manifests.author_checkpoint_profile(_four_hashes())
+    profile = manifests.author_checkpoint_profile(
+        _four_hashes(), **_profile_identity()
+    )
     body = {k: v for k, v in profile.items() if k != "content_hash"}
     assert manifests.manifest_hash(body) == profile["content_hash"]
 
@@ -488,7 +502,7 @@ def test_author_checkpoint_profile_rejects_a_missing_manifest_key() -> None:
     hashes = _four_hashes()
     del hashes["transition"]
     with pytest.raises(ValueError, match="transition"):
-        manifests.author_checkpoint_profile(hashes)
+        manifests.author_checkpoint_profile(hashes, **_profile_identity())
 
 
 def test_author_checkpoint_profile_rejects_a_malformed_hash() -> None:
@@ -496,7 +510,26 @@ def test_author_checkpoint_profile_rejects_a_malformed_hash() -> None:
     hashes = _four_hashes()
     hashes["state"] = "md5:" + "1" * 32
     with pytest.raises(ValueError, match="state"):
-        manifests.author_checkpoint_profile(hashes)
+        manifests.author_checkpoint_profile(hashes, **_profile_identity())
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "source_checkpoint_digest",
+        "converted_dump_digest",
+        "derived_model_digest",
+        "prompt_dictionary_hash",
+    ),
+)
+def test_author_checkpoint_profile_rejects_a_malformed_identity_hash(
+    field: str,
+) -> None:
+    # @spec PORT-INT-005, PORT-LID-001
+    identity = _profile_identity()
+    identity[field] = "unknown"
+    with pytest.raises(ValueError, match=field):
+        manifests.author_checkpoint_profile(_four_hashes(), **identity)
 
 
 # ---- PORT-STATE-009: verify_state_manifest --------------------------------

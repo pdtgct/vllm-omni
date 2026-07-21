@@ -101,15 +101,20 @@ class PrecisionPolicy:
         return _DTYPES[self._name_for(tensor_class)]
 
     @property
-    def identifier(self) -> str:
-        """Content-hash identifier, byte-compatible with the harness."""
+    def content_hash(self) -> str:
+        """Full canonical mapping digest used in run provenance."""
         canonical = json.dumps(
             {key: self._mapping[key] for key in sorted(self._mapping)},
             separators=(",", ":"),
             ensure_ascii=True,
         )
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        return f"pp-{digest[:12]}"
+        return f"sha256:{digest}"
+
+    @property
+    def identifier(self) -> str:
+        """Short content identifier, byte-compatible with the harness."""
+        return f"pp-{self.content_hash.removeprefix('sha256:')[:12]}"
 
     def assert_engine_dtype(self, engine_dtype: torch.dtype) -> None:
         """Fail fast when the launch dtype conflicts with the policy."""
