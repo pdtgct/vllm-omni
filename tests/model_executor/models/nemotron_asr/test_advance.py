@@ -3,8 +3,8 @@
 """Tests-first contract for the advance seam split (ledger P5-1/6c).
 
 Pins the ``advance_session`` / ``advance_model_rows`` contract
-(``advance.py``) that replaces ``forward_step.py``'s
-``run_forward_step``. POD-TIER: importing
+(``advance.py``) that replaced the legacy ``run_forward_step``
+(``forward_step.py``, deleted at Task 7). POD-TIER: importing
 ``vllm_omni.model_executor.models.nemotron_asr.*`` pulls the
 ``vllm_omni`` package, which pulls ``vllm`` — this file cannot be
 collected on macOS and must be run on the pod venv (contrast
@@ -21,12 +21,12 @@ geometry), and the row-tier echo contract (PORT-DEC-007 as amended —
 the prior whole-call echo-abort expectation encoded the superseded
 boundary and contradicted PORT-STATE-008's row tier).
 
-Tests against the two remaining stubs (``make_mrv1_adapter``,
-``advance_model_rows``) FAIL with ``NotImplementedError`` until the
-Phase-6c implementation lands alongside ``forward_step.py``'s
-deletion — that failure is the recorded tests-first evidence. The two
-source-text pins (naming lock + forward wiring) are
-``xfail(strict=True)`` so they flip loudly in that same change.
+The Phase-6c implementation (``make_mrv1_adapter``,
+``advance_model_rows``) has since landed and ``forward_step.py`` was
+deleted at Task 7. Both source-text pins (naming lock + forward
+wiring) have flipped from ``xfail(strict=True)`` to real passing
+assertions — the forward-wiring pin at Task 5, the naming lock at
+Task 7 once the five-cadence parity gate passed.
 """
 
 from pathlib import Path
@@ -144,7 +144,7 @@ def _tiny_core(seed: int = 7) -> Any:
     # again after a torch/dependency bump, re-sweep rather than assume
     # a code regression.
     # Returns a duck-typed SimpleNamespace, not a real NemotronASRCore
-    # (Any, matching test_forward_step.py's fixture idiom).
+    # (Any — the minimal-core fixture idiom used across these tests).
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.nemotron_asr.encoder import (
@@ -1529,17 +1529,14 @@ def test_embed_input_ids_canonical_merge_places_carriers_and_zeros() -> None:
 _NEMOTRON_ASR_DIR = Path(__file__).resolve().parents[4] / ("vllm_omni/model_executor/models/nemotron_asr")
 
 
-@pytest.mark.xfail(strict=True, reason="P5-1 split lands in Phase 6")
 def test_run_forward_step_is_removed_and_advance_model_rows_is_wired() -> None:
     # @spec PORT-REGIME-001
-    # A source-level pin (Path.read_text — no imports needed): once the
-    # P5-1 split lands, the package no longer defines run_forward_step
-    # and nemotron_asr.py calls advance_model_rows. Flips to XPASS
-    # (strict → error) if the mark is left behind after the split, and
-    # to a hard failure if the mark is removed without doing the split.
-    # forward_step.py itself is deleted in that same change (ledger
-    # P5-1), so an absent file also satisfies "no longer defines
-    # run_forward_step" — this must not FileNotFoundError forever.
+    # A source-level pin (Path.read_text — no imports needed): the P5-1
+    # split has landed and the Task-7 parity gate passed, so the package
+    # no longer defines run_forward_step (forward_step.py is deleted) and
+    # nemotron_asr.py calls advance_model_rows. The xfail(strict=True)
+    # mark was removed in that same change (Task 7); the read handles an
+    # absent forward_step.py so this must never FileNotFoundError.
     forward_step_path = _NEMOTRON_ASR_DIR / "forward_step.py"
     forward_step_src = forward_step_path.read_text() if forward_step_path.exists() else ""
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
@@ -1550,9 +1547,9 @@ def test_run_forward_step_is_removed_and_advance_model_rows_is_wired() -> None:
 def test_forward_routes_through_advance_model_rows() -> None:
     # @spec PORT-INT-003
     # Flipped from xfail at Task 5: forward now routes through the
-    # shared transaction. forward_step.py itself survives as the
-    # regression oracle until the Task-7 parity gate deletes it (the
-    # companion naming-lock test above stays xfail until then).
+    # shared transaction. forward_step.py served as the regression
+    # oracle until the Task-7 parity gate passed, then was deleted
+    # (the companion naming-lock test above flipped in that change).
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
     assert "advance_model_rows(" in model_src
     assert "run_forward_step(" not in model_src

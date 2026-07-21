@@ -490,8 +490,9 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             p for k, p in paired if k == "frontend_counter"
         )
         # The pre-encode overlap dropped from non-first chunks
-        # (drop_extra); session-first chunks use 0 (the retained legacy
-        # run_forward_step path until the Task-7 parity gate deletes it).
+        # (drop_extra); session-first chunks use 0. (The legacy
+        # run_forward_step path this mirrored was deleted at Task 7 once
+        # the five-cadence parity gate passed.)
         self._drop_extra = 2
         # ---- Task-5 seams (design §Phase-6c transaction seams) ----
         # Session identity authority + the consume-once hook↔forward

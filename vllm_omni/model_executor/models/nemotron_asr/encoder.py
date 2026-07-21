@@ -530,9 +530,9 @@ def stream_step(
     row leaves its caches bit-identical. No tensor value determines a
     shape; the call issues no host/device synchronization.
 
-    ``drop_extra`` is the uniform legacy adapter (``run_forward_step``
-    and the P3/P4 probes): equivalent to offsets = ``drop_extra``,
-    lengths = full width, over the same single algorithm.
+    ``drop_extra`` is the uniform adapter used by the P3/P4 parity
+    probes: equivalent to offsets = ``drop_extra``, lengths = full
+    width, over the same single algorithm.
     """
     b = chunk_mel.shape[0]
     device = chunk_mel.device

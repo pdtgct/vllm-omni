@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The advance seam split (ledger P5-1; PORT-ADV-001/003).
 
-``run_forward_step`` (``forward_step.py``) is being replaced by two
-narrower operations that separate the storage-agnostic checkpoint
-transition from the outer page-pool transaction:
+The legacy ``run_forward_step`` (``forward_step.py``, deleted at
+Task 7) was replaced by two narrower operations that separate the
+storage-agnostic checkpoint transition from the outer page-pool
+transaction:
 
 - :func:`advance_session` — the ONE storage- and adapter-agnostic
   CHUNK transition (PORT-ADV-001). It owns the incremental frontend:
@@ -29,10 +30,10 @@ transition from the outer page-pool transaction:
 Both operations are implemented as of Phase 6c (the four contract
 seams — plan provenance, decode resolver, capture reservation, and
 the row-status handoff — are the design's §Phase-6c transaction
-seams). ``forward_step.py`` / ``run_forward_step`` remain the legacy
-path and regression oracle until the model ``forward`` is rewired
-through :func:`advance_model_rows` and the pod parity matrix passes;
-they are deleted in that same change (ledger P5-1 — a semantic split,
+seams). The former ``forward_step.py`` / ``run_forward_step`` legacy
+path and regression oracle was deleted at Task 7, once the model
+``forward`` was rewired through :func:`advance_model_rows` and the
+five-cadence pod parity gate passed (ledger P5-1 — a semantic split,
 never a second legacy forward path).
 """
 
@@ -1163,8 +1164,8 @@ def advance_session(
         enc = stream_step(
             # _GatheredCaches is StreamingCaches' structural twin over
             # the gathered batch; stream_step reads only the shared
-            # .channel/.time/.valid surface (the forward_step.py
-            # precedent, migration-proven bit-for-bit).
+            # .channel/.time/.valid surface (the now-deleted
+            # forward_step.py precedent, migration-proven bit-for-bit).
             core.encoder,
             mel,
             caches,  # type: ignore[arg-type]
