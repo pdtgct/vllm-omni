@@ -38,7 +38,19 @@ Five arms, all evidence into one JSON report:
   silently succeeded on the dry attempt and released the only staged
   commit, crashing the real attempt on an empty sink. ``collect()``'s
   sync is instead verified via the Kineto fixture's marker-presence
-  check (``collectN_kineto``).
+  check (``collectN_kineto``, the full ``SYNC_MARKERS``). The TURN
+  body's own strict-empty check (``turnN_kineto``) uses the narrower
+  ``TURN_BODY_SYNC_MARKERS`` — ground-truth traced against a real
+  exported turn trace (pod evidence, 2026-07-21):
+  ``aten::nonzero`` is Kineto category ``cpu_op`` (RowPlan's
+  host-authority tensors, never CUDA); ``Memcpy HtoD``/``Memcpy
+  DtoH`` pair with ``cudaMemcpyAsync`` (``HostStaging``'s pinned
+  copies, ``BoundedCommitSink._stage``'s non-blocking status copy);
+  and the sole ``cudaDeviceSynchronize`` was the trace's absolute
+  LAST event, past a timing gap after the last real op — the
+  profiler's own stop-tracing sync, not code under test. All three
+  are legitimate noise for THIS check's purpose, not evidence of a
+  blocking transaction.
 ``allocation`` — ``torch.cuda.memory_stats()["allocation.all.allocated"]``
   snapshotted immediately before the first prevalidated scatter and
   immediately after the commit ticket's ``stage()`` (monkeypatching
@@ -158,6 +170,46 @@ SYNC_MARKERS = (
     "aten::nonzero",
     "Memcpy DtoH",
     "Memcpy HtoD",
+)
+
+#: The subset of SYNC_MARKERS that unambiguously means the CODE UNDER
+#: TEST blocked the host mid-transaction — used for the TURN body's
+#: strict-empty check specifically (turnN_kineto), never for
+#: collectN_kineto (which legitimately wants SYNC_MARKERS' full set
+#: present, since collect() is the one place a sync is sanctioned).
+#: Ground-truth traced against a real turn's exported Kineto trace
+#: (pod evidence, 2026-07-21) rather than assumed: SYNC_MARKERS' other
+#: three members all turned out to be false positives for a strict-
+#: empty turn-body check —
+#:   - "aten::nonzero": every match is Kineto category "cpu_op", not a
+#:     CUDA op at all. All four .nonzero() call sites in this module
+#:     operate on RowPlan's host-authority fields (is_chunk,
+#:     geometry_id, has_initial_states_p) — CPU tensors by
+#:     construction (plan.py's prepare_plan_context builds every
+#:     PlanContext field via bare torch.tensor(list, dtype=...), no
+#:     device= kwarg).
+#:   - "Memcpy HtoD"/"Memcpy DtoH": every observed instance pairs with
+#:     a cudaMemcpyAsync runtime call (confirmed via the trace's event
+#:     sequence) — the expected, by-design non-blocking traffic from
+#:     HostStaging's pinned per-geometry/per-slot copies and
+#:     BoundedCommitSink._stage's non_blocking=True status copy, not a
+#:     blocking transfer.
+#:   - "cudaDeviceSynchronize": the sole observed instance was the
+#:     trace's ABSOLUTE LAST event, ~288us after the last real op,
+#:     immediately preceding the trace's own "Record Window End"
+#:     marker — torch.profiler's own stop-tracing synchronize, not a
+#:     call our code made (advance_model_rows/state_scatter/
+#:     commit_sink have exactly two .synchronize() call sites, neither
+#:     reachable during a turn: state_scatter's is warmup-only,
+#:     already executed before profiling starts; commit_sink's is
+#:     inside collect(), never called during turn1()/turn2()).
+#: cudaStreamSynchronize/cudaEventSynchronize are kept: unlike the
+#: three above, no known benign source in this codebase produces
+#: them, and they correspond directly to an explicit .synchronize()
+#: call our own code (or a real regression) could make.
+TURN_BODY_SYNC_MARKERS = (
+    "cudaStreamSynchronize",
+    "cudaEventSynchronize",
 )
 
 
@@ -656,7 +708,7 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
         fx_kn = build_fixture()
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof1:
             fx_kn.turn1()
-        cell["turn1_kineto"] = _sync_counts(prof1)
+        cell["turn1_kineto"] = _sync_counts(prof1, TURN_BODY_SYNC_MARKERS)
         check.equal(cell["turn1_kineto"], {}, "sync.turn1.kineto_sync_markers")
         prof1.export_chrome_trace(str(trace_dir / "turn1.json"))
         # collect() is expected to sync — profile the real call to
@@ -669,7 +721,7 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
         profc1.export_chrome_trace(str(trace_dir / "collect1.json"))
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof2:
             fx_kn.turn2()
-        cell["turn2_kineto"] = _sync_counts(prof2)
+        cell["turn2_kineto"] = _sync_counts(prof2, TURN_BODY_SYNC_MARKERS)
         check.equal(cell["turn2_kineto"], {}, "sync.turn2.kineto_sync_markers")
         prof2.export_chrome_trace(str(trace_dir / "turn2.json"))
         fx_kn.sink.collect()  # drain the staged step
@@ -682,10 +734,12 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
     return cell
 
 
-def _sync_counts(prof: Any) -> dict[str, int]:
+def _sync_counts(
+    prof: Any, markers: tuple[str, ...] = SYNC_MARKERS
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for evt in prof.events():
-        for marker in SYNC_MARKERS:
+        for marker in markers:
             if marker in evt.name:
                 counts[marker] = counts.get(marker, 0) + 1
     return counts
