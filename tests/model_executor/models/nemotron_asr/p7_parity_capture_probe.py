@@ -309,6 +309,38 @@ def _load_core(cfg: dict[str, Any], checkpoint_dir: Path, device: str) -> Nemotr
     return core
 
 
+def _load_prompt_dictionary(
+    cfg: dict[str, Any], override: Path | None
+) -> dict[str, int]:
+    """Locate the locale->prompt-index dictionary (PORT-LID-001).
+
+    Phase-2 real-checkpoint finding: the published checkpoint's
+    ``config.json`` does not carry ``prompt_dictionary`` — only the raw
+    NeMo-dump's ``meta.json`` does (``dump_nemo_weights.py``'s own
+    convention, also what ``load_core_from_dump``/``serve_ws.py``
+    consume). Prefer the checkpoint's own config first in case a future
+    publish pipeline starts carrying it (forward-compatible — no
+    hardcoded assumption that it never will); otherwise require an
+    explicit override rather than guessing a sibling directory layout.
+    """
+    if "prompt_dictionary" in cfg:
+        prompt_dictionary: dict[str, int] = cfg["prompt_dictionary"]
+        return prompt_dictionary
+    if override is not None:
+        loaded: dict[str, Any] = json.loads(override.read_text())
+        resolved: dict[str, int] = (
+            loaded["prompt_dictionary"] if "prompt_dictionary" in loaded else loaded
+        )
+        return resolved
+    raise RuntimeError(
+        "no 'prompt_dictionary' in the checkpoint's config.json and no "
+        "--prompt-dictionary override given — the published checkpoint "
+        "layout does not currently carry this metadata (Task-7 Phase-2 "
+        "finding); pass --prompt-dictionary pointing at a meta.json (or "
+        "a bare {locale: index} JSON file) that has it"
+    )
+
+
 def _detokenize(checkpoint_dir: Path, label_ids: list[int]) -> str:
     """Sentencepiece direct decode (p2_parity_probe.py's own approach,
     duplicated per this tree's no-cross-probe-import convention) — the
@@ -370,6 +402,13 @@ class _SessionDriver:
         self._now_ns = 0
         self._step = 0
         self._registered = False
+        # Whether the registry has already admitted this session's
+        # first CHUNK — False only for run_chunk's very first call
+        # (Task-7 Phase-2 finding, see run_chunk's own comment: a
+        # session is registered atomically AT its first minted CHUNK,
+        # plan.py's SessionRegistry docstring — there is no separate
+        # pre-admission step).
+        self._admitted = False
 
     def _replay_turn(self, row: plan_mod.ObservedRow) -> tuple[int, list[advance.CaptureRecord]]:
         """One REPLAY-role turn: no audio (PORT-POOL-001 — only a
@@ -395,7 +434,12 @@ class _SessionDriver:
             commit_sink=self.sink, capture=True, graph_covers_decode=False,
             staging=self.staging, **self.pools,
         )
-        emitted = int(projected[0].item())
+        # advance_model_rows returns an (N, H) decision-carrier, not a
+        # per-row scalar (advance.py:2057-2059) — the emitted label
+        # lives at column 0 of each row (advance.py:818-824, "Decision
+        # carrier: slot 0 of each runner row"); projected[0] alone is
+        # the whole H-wide row, not a scalar (Task-7 Phase-2 finding).
+        emitted = int(projected[0, 0].item())
         reports, records, lease_ok = self.sink.collect()
         if not lease_ok or reports[0].row_status != 0:
             raise RuntimeError(
@@ -405,19 +449,26 @@ class _SessionDriver:
         return emitted, records
 
     def register_fresh(self, *, geometry: int, prompt: int, num_prompts: int) -> None:
+        """Record this session's admission parameters for later calls.
+
+        Deliberately does NOT call ``registry.bind_rows`` itself (an
+        earlier version did — Task-7 Phase-2 finding): the registry
+        admits a session atomically at its first minted CHUNK
+        (``SessionRegistry``'s own docstring), and that SAME call is
+        also what ``advance_model_rows`` uses to decide a row needs
+        fresh pool/book initialization (``RowPlan.has_initial_states_p``,
+        sourced from the identical ``ObservedRow.has_prior_state`` flag
+        — plan.py:643). A separate pre-registration step here would
+        admit the session into the registry without ever running the
+        transaction's fresh-row pool init, so the session's real first
+        ``run_chunk`` call performs both at once instead (unlike
+        ``p6c_full_turn_probe.py``'s own ``_register_fresh``, which
+        pairs registry-only admission with MANUAL pool seeding to build
+        a synthetic mid-stream fixture — this probe drives a real
+        session-first CHUNK live, so it needs the real init to run).
+        """
+        del geometry, prompt  # carried per-call by run_chunk, not stored
         self._num_prompts = num_prompts
-        self.registry.bind_rows(
-            [
-                plan_mod.ObservedRow(
-                    request_id=self.request_id, block_id=1,
-                    scheduled_token_id=self.placeholder_id, has_prior_state=False,
-                    envelope_header=_header(valid=1, geometry=geometry, final=True, prompt=prompt, seq=0),
-                )
-            ],
-            placeholder_id=self.placeholder_id, num_prompts=num_prompts,
-            num_geometries=len(manifests.CADENCES), now_ns=0,
-            resident_request_ids=[self.request_id],
-        )
         self._registered = True
 
     def run_chunk(
@@ -438,10 +489,19 @@ class _SessionDriver:
             samples, final=is_final_tail, seq=seq, geometry=self.geometry_id,
             prompt=prompt, hidden=self.hidden, device=self.device,
         )
+        # has_prior_state is False on exactly this driver's first
+        # run_chunk call (the session's real first CHUNK — the atomic
+        # registry admission AND the transaction's fresh pool/book init
+        # both key off this one flag, plan.py:643/advance.py:2228-2242)
+        # and True on every later call (Task-7 Phase-2 finding: a
+        # separate pre-registration step, tried first, admitted the
+        # registry without ever running fresh-row pool init — see
+        # register_fresh's docstring).
         row = plan_mod.ObservedRow(
-            self.request_id, 1, self.placeholder_id, False,
+            self.request_id, 1, self.placeholder_id, self._admitted,
             _header(valid=int(samples.shape[0]), geometry=self.geometry_id, final=is_final_tail, prompt=prompt, seq=seq),
         )
+        self._admitted = True
         self._now_ns += 1
         self._step += 1
         context = plan_mod.prepare_plan_context(
@@ -461,7 +521,12 @@ class _SessionDriver:
             commit_sink=self.sink, capture=True, graph_covers_decode=False,
             staging=self.staging, **self.pools,
         )
-        emitted = int(projected[0].item())
+        # advance_model_rows returns an (N, H) decision-carrier, not a
+        # per-row scalar (advance.py:2057-2059) — the emitted label
+        # lives at column 0 of each row (advance.py:818-824, "Decision
+        # carrier: slot 0 of each runner row"); projected[0] alone is
+        # the whole H-wide row, not a scalar (Task-7 Phase-2 finding).
+        emitted = int(projected[0, 0].item())
         reports, records, lease_ok = self.sink.collect()
         if not lease_ok or reports[0].row_status != 0:
             raise RuntimeError(
@@ -609,6 +674,14 @@ def main() -> None:
     ap.add_argument("--container-image-digest", default="unknown")
     ap.add_argument("--venv-freeze-hash", default="unknown")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--prompt-dictionary", type=Path, default=None,
+        help="Path to a JSON file (a meta.json, or a bare "
+        "{locale: index} dict) supplying the locale->prompt-index "
+        "dictionary when the checkpoint's own config.json doesn't carry "
+        "one (Task-7 Phase-2 finding: published checkpoints don't "
+        "currently include it).",
+    )
     args = ap.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -620,7 +693,8 @@ def main() -> None:
 
     cfg = _load_config(args.checkpoint)
     core = _load_core(cfg, args.checkpoint, args.device)
-    prompt_index = resolve_prompt_index(cfg["prompt_dictionary"], args.target_lang)
+    prompt_dictionary = _load_prompt_dictionary(cfg, args.prompt_dictionary)
+    prompt_index = resolve_prompt_index(prompt_dictionary, args.target_lang)
     waveform, rate = _read_wav(args.clip)
     if rate != 16000:
         print(f"FATAL: clip sample rate {rate} != 16000", flush=True)
