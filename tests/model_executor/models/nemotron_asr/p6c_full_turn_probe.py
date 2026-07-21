@@ -19,14 +19,26 @@ Five arms, all evidence into one JSON report:
 
 ``sync``       — ``torch.cuda.set_sync_debug_mode(2)`` as a TRIPWIRE
   around a complete turn's dense-eager transaction calls (expected
-  CLEAN), paired with Kineto host-trace sync-marker counts. Covers (i)
-  a mixed batch — 2 geometry buckets (ids 0 and 2) + one REPLAY row +
-  one FLUSH row — and (ii) a follow-up echo turn (the two CHUNK rows'
-  first turn-1 label, precomputed off-trace via a reference single-row
+  CLEAN), paired with Kineto host-trace sync-marker counts, on two
+  INDEPENDENT identically-seeded fixtures (tripwire-only, never
+  profiled; Kineto-only, never sync-debugged — profiler
+  instrumentation can itself sync, so measuring both at once would
+  contaminate the tripwire verdict). Covers (i) a mixed batch — 2
+  geometry buckets (ids 0 and 2) + one REPLAY row + one FLUSH row —
+  and (ii) a follow-up echo turn (the two CHUNK rows' first turn-1
+  label, precomputed off-trace via a reference single-row
   ``advance_session`` call so bridging the two turns needs no runtime
-  device read). The sink's ``collect()`` is deliberately run under the
-  SAME tripwire (expected to FIRE) as the sole sanctioned host sync in
-  the whole turn — confirmed to fire there and only there.
+  device read). The sink's ``collect()`` is the sole sanctioned host
+  sync (via ``torch.cuda.Event.synchronize()``) but is called plainly,
+  NOT under the tripwire: confirmed on real hardware (pod evidence,
+  2026-07-21) that ``set_sync_debug_mode`` does not cover
+  ``Event.synchronize()`` — PyTorch's own docs mark the feature
+  "experimental... not all synchronizing operations are currently
+  covered" — so a prior "expect it to fire, then retry" design here
+  silently succeeded on the dry attempt and released the only staged
+  commit, crashing the real attempt on an empty sink. ``collect()``'s
+  sync is instead verified via the Kineto fixture's marker-presence
+  check (``collectN_kineto``).
 ``allocation`` — ``torch.cuda.memory_stats()["allocation.all.allocated"]``
   snapshotted immediately before the first prevalidated scatter and
   immediately after the commit ticket's ``stage()`` (monkeypatching
@@ -585,18 +597,19 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
         cell["arm_outcome"] = "halted: turn1 returned clean but nothing staged"
         return cell
 
-    # collect() is the sole sanctioned host sync: fire the tripwire on a
-    # dry attempt (its sync is the FIRST line, so nothing is consumed/
-    # released yet), then call it again for the real result.
-    torch.cuda.set_sync_debug_mode(2)
-    try:
-        fx_tw.sink.collect()
-        cell["collect1_tripwire"] = "no-fire (UNEXPECTED)"
-    except RuntimeError:
-        cell["collect1_tripwire"] = "fired-as-expected"
-    finally:
-        torch.cuda.set_sync_debug_mode(0)
-    check.equal(cell["collect1_tripwire"], "fired-as-expected", "sync.collect1.tripwire")
+    # collect() is the sole sanctioned host sync (via
+    # torch.cuda.Event.synchronize()) — but PyTorch's own docs mark
+    # set_sync_debug_mode "experimental... not all synchronizing
+    # operations are currently covered", and Event.synchronize()
+    # confirmed NOT covered on this build (pod evidence, 2026-07-21:
+    # a "dry, expected-to-fire-then-retry" call here silently
+    # succeeded and released the ONLY staged commit, so the real
+    # retry crashed on an already-empty sink — a design that was
+    # never actually exercised until this round, since earlier bugs
+    # always crashed first). collect() is therefore called exactly
+    # ONCE and its result used directly; the sync itself is verified
+    # by the Kineto-only fixture below (collect1_kineto's marker
+    # presence check), not by this tripwire.
     reports1, _records1, lease_ok1 = fx_tw.sink.collect()
     check.ok(lease_ok1, "sync.turn1.lease_ok")
     check.equal(
@@ -619,15 +632,9 @@ def run_sync_arm(check: Check, device: str, out_dir: Path) -> dict[str, Any]:
         check.ok(False, "sync.turn2.postcondition_staged")
         cell["arm_outcome"] = "halted: turn2 returned clean but nothing staged"
         return cell
-    torch.cuda.set_sync_debug_mode(2)
-    try:
-        fx_tw.sink.collect()
-        cell["collect2_tripwire"] = "no-fire (UNEXPECTED)"
-    except RuntimeError:
-        cell["collect2_tripwire"] = "fired-as-expected"
-    finally:
-        torch.cuda.set_sync_debug_mode(0)
-    check.equal(cell["collect2_tripwire"], "fired-as-expected", "sync.collect2.tripwire")
+    # See the collect1 comment above: called once, verified via Kineto
+    # markers (collect2_kineto) instead of the (unsound for
+    # Event.synchronize()) sync-debug tripwire.
     reports2, _records2, lease_ok2 = fx_tw.sink.collect()
     check.ok(lease_ok2, "sync.turn2.lease_ok")
     check.equal(
