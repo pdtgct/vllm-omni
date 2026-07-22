@@ -8,8 +8,7 @@ servicer unchanged. The python-clients conformance run against a live
 server is the ING-2 pod exit gate, not a local test.
 """
 
-from collections.abc import Callable, Mapping
-from concurrent import futures
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,7 +69,7 @@ class FakeOffline:
     def __init__(self) -> None:
         self.calls: list[tuple[npt.NDArray[np.float32], str]] = []
 
-    def transcribe(self, audio: Any, target_lang: str) -> str:
+    async def transcribe(self, audio: Any, target_lang: str) -> str:
         self.calls.append((np.asarray(audio, dtype=np.float32), target_lang))
         return "offline transcript"
 
@@ -85,7 +84,7 @@ class FakeTime:
     def clock(self) -> float:
         return self.t
 
-    def sleep(self, dt: float) -> None:
+    async def sleep(self, dt: float) -> None:
         self.t += dt
         if self.on_sleep is not None:
             self.on_sleep()
@@ -167,10 +166,19 @@ def pcm16(n_samples: int) -> bytes:
     return ramp.astype("<i2").tobytes()
 
 
-def run_stream(harness: Harness, requests: list[Any]) -> list[Any]:
-    return list(
-        harness.servicer.StreamingRecognize(iter(requests), harness.context)
-    )
+async def aiter_requests(requests: list[Any]) -> AsyncIterator[Any]:
+    """An async request iterator (real ``grpc.aio`` hands the servicer one)."""
+    for request in requests:
+        yield request
+
+
+async def run_stream(harness: Harness, requests: list[Any]) -> list[Any]:
+    return [
+        response
+        async for response in harness.servicer.StreamingRecognize(
+            aiter_requests(requests), harness.context
+        )
+    ]
 
 
 def transcripts(responses: list[Any]) -> list[tuple[str, bool]]:
@@ -209,22 +217,26 @@ def test_encoding_names_match_the_generated_enum() -> None:
 
 
 # @spec ING-GRPC-001, ING-GRPC-004
-def test_generated_registration_serves_the_config_rpc() -> None:
+async def test_generated_registration_serves_the_config_rpc() -> None:
+    # The servicer's RPC methods are coroutines/async generators
+    # (ING-VEH-004): registration and the round-trip both need the
+    # asyncio-native server/channel the servicer is duck-typed for
+    # (ING-VEH-002), never the classic threaded ``grpc.server``.
     harness = make_servicer()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    server = grpc.aio.server()
     rasr_grpc.add_RivaSpeechRecognitionServicer_to_server(
         harness.servicer, server
     )
     port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
+    await server.start()
     try:
-        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
             stub = rasr_grpc.RivaSpeechRecognitionStub(channel)
-            response = stub.GetRivaSpeechRecognitionConfig(
+            response = await stub.GetRivaSpeechRecognitionConfig(
                 rasr.RivaSpeechRecognitionConfigRequest(), timeout=5.0
             )
     finally:
-        server.stop(0)
+        await server.stop(0)
     assert response.model_config[0].model_name == MODEL
 
 
@@ -439,24 +451,24 @@ def test_a_config_with_many_violations_names_every_field() -> None:
 
 
 # @spec ING-GRPC-002, ING-LIFE-001
-def test_first_message_must_be_the_streaming_config() -> None:
+async def test_first_message_must_be_the_streaming_config() -> None:
     harness = make_servicer()
     with pytest.raises(AbortError):
-        run_stream(harness, [audio_request(pcm16(CHUNK_SAMPLES))])
+        await run_stream(harness, [audio_request(pcm16(CHUNK_SAMPLES))])
     assert harness.context.code == grpc.StatusCode.FAILED_PRECONDITION
     assert harness.context.details is not None
     assert errors.PROTOCOL_ORDER in harness.context.details
 
 
 # @spec ING-GRPC-002, ING-CORE-005
-def test_interim_results_carry_the_cumulative_hypothesis() -> None:
+async def test_interim_results_carry_the_cumulative_hypothesis() -> None:
     harness = make_servicer()
     requests = [
         config_request(interim=True),
         audio_request(pcm16(2 * CHUNK_SAMPLES)),  # two exact chunks
         audio_request(pcm16(CHUNK_SAMPLES // 2)),  # a sub-chunk residual
     ]
-    responses = run_stream(harness, requests)
+    responses = await run_stream(harness, requests)
     got = transcripts(responses)
     # Riva interim results are cumulative (never deltas): the dialect
     # projection of ING-CORE-005's cumulative hypothesis is identity.
@@ -470,9 +482,9 @@ def test_interim_results_carry_the_cumulative_hypothesis() -> None:
 
 
 # @spec ING-GRPC-002
-def test_interim_results_false_suppresses_partials() -> None:
+async def test_interim_results_false_suppresses_partials() -> None:
     harness = make_servicer()
-    responses = run_stream(
+    responses = await run_stream(
         harness,
         [
             config_request(interim=False),
@@ -485,9 +497,9 @@ def test_interim_results_false_suppresses_partials() -> None:
 
 
 # @spec ING-GRPC-002, ING-LIFE-003
-def test_half_close_with_zero_audio_yields_one_empty_final() -> None:
+async def test_half_close_with_zero_audio_yields_one_empty_final() -> None:
     harness = make_servicer()
-    responses = run_stream(harness, [config_request()])
+    responses = await run_stream(harness, [config_request()])
     got = transcripts(responses)
     assert got == [("", True)]
     (transcriber,) = harness.transcribers
@@ -495,22 +507,22 @@ def test_half_close_with_zero_audio_yields_one_empty_final() -> None:
 
 
 # @spec ING-ADM-001, ING-ERR-001
-def test_busy_aborts_resource_exhausted() -> None:
+async def test_busy_aborts_resource_exhausted() -> None:
     harness = make_servicer(watermark=1, admission_queue=0)
     assert harness.gate.request("other-session", now=0.0) is not None
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request()])
+        await run_stream(harness, [config_request()])
     assert harness.context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
     assert harness.context.details is not None
     assert errors.BUSY in harness.context.details
 
 
 # @spec ING-GRPC-005, ING-ERR-003
-def test_rejected_config_aborts_naming_the_field_taking_no_slot() -> None:
+async def test_rejected_config_aborts_naming_the_field_taking_no_slot() -> None:
     harness = make_servicer()
     config = recognition_config(profanity_filter=True)
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request(config=config)])
+        await run_stream(harness, [config_request(config=config)])
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "profanity_filter" in harness.context.details
@@ -518,7 +530,7 @@ def test_rejected_config_aborts_naming_the_field_taking_no_slot() -> None:
 
 
 # @spec ING-GRPC-005
-def test_capability_class_rejections_abort_unimplemented() -> None:
+async def test_capability_class_rejections_abort_unimplemented() -> None:
     harness = make_servicer()
     config = recognition_config(
         diarization_config=rasr.SpeakerDiarizationConfig(
@@ -526,18 +538,18 @@ def test_capability_class_rejections_abort_unimplemented() -> None:
         )
     )
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request(config=config)])
+        await run_stream(harness, [config_request(config=config)])
     assert harness.context.code == grpc.StatusCode.UNIMPLEMENTED
     assert harness.context.details is not None
     assert "diarization_config" in harness.context.details
 
 
 # @spec ING-FE-001
-def test_off_matrix_format_aborts_naming_both_fields() -> None:
+async def test_off_matrix_format_aborts_naming_both_fields() -> None:
     harness = make_servicer()
     config = recognition_config(encoding=raud.MULAW, sample_rate_hertz=16000)
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request(config=config)])
+        await run_stream(harness, [config_request(config=config)])
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "encoding" in harness.context.details
@@ -545,7 +557,7 @@ def test_off_matrix_format_aborts_naming_both_fields() -> None:
 
 
 # @spec ING-GRPC-002, ING-FE-002, ING-FE-004
-def test_mulaw_8k_session_feeds_exact_16k_chunks() -> None:
+async def test_mulaw_8k_session_feeds_exact_16k_chunks() -> None:
     harness = make_servicer()
     config = recognition_config(encoding=raud.MULAW, sample_rate_hertz=8000)
     requests = [
@@ -553,7 +565,7 @@ def test_mulaw_8k_session_feeds_exact_16k_chunks() -> None:
         # 640 8 kHz samples -> exactly one 1280-sample 16 kHz chunk.
         audio_request(bytes(range(256)) * 2 + bytes(128)),
     ]
-    responses = run_stream(harness, requests)
+    responses = await run_stream(harness, requests)
     (transcriber,) = harness.transcribers
     assert all(len(chunk) == CHUNK_SAMPLES for chunk in transcriber.steps)
     assert len(transcriber.steps) >= 1
@@ -561,39 +573,39 @@ def test_mulaw_8k_session_feeds_exact_16k_chunks() -> None:
 
 
 # @spec ING-FE-004
-def test_resampled_session_records_the_resampler_identifier() -> None:
+async def test_resampled_session_records_the_resampler_identifier() -> None:
     harness = make_servicer()
     config = recognition_config(encoding=raud.MULAW, sample_rate_hertz=8000)
-    run_stream(harness, [config_request(config=config)])
+    await run_stream(harness, [config_request(config=config)])
     (provenance,) = harness.recorded
     assert provenance["resampler_identifier"] == RESAMPLER_ID
     assert provenance["precision_policy_id"]  # base provenance rides along
 
 
 # @spec ING-FE-004
-def test_native_16k_session_records_no_resampler() -> None:
+async def test_native_16k_session_records_no_resampler() -> None:
     harness = make_servicer()
-    run_stream(harness, [config_request()])
+    await run_stream(harness, [config_request()])
     (provenance,) = harness.recorded
     assert "resampler_identifier" not in provenance
 
 
 # @spec ING-GRPC-005, ING-ERR-001
-def test_runtime_config_is_never_silently_ignored() -> None:
+async def test_runtime_config_is_never_silently_ignored() -> None:
     # Not a RecognitionConfig field, but the same honest-subset rule:
     # a request rider this v1 does not honor answers, never drops.
     request = rasr.StreamingRecognizeRequest(audio_content=b"")
     request.runtime_config["hotword"] = "boost"
     harness = make_servicer()
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request(), request])
+        await run_stream(harness, [config_request(), request])
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "runtime_config" in harness.context.details
 
 
 # @spec ING-ADM-002
-def test_queued_admission_admits_when_a_slot_frees() -> None:
+async def test_queued_admission_admits_when_a_slot_frees() -> None:
     harness = make_servicer(watermark=1, admission_queue=1)
     assert harness.gate.request("other-session", now=0.0) is not None
 
@@ -602,7 +614,7 @@ def test_queued_admission_admits_when_a_slot_frees() -> None:
             harness.gate.release("other-session")
 
     harness.time.on_sleep = free_the_slot
-    responses = run_stream(
+    responses = await run_stream(
         harness,
         [config_request(), audio_request(pcm16(CHUNK_SAMPLES))],
     )
@@ -612,20 +624,20 @@ def test_queued_admission_admits_when_a_slot_frees() -> None:
 
 
 # @spec ING-ADM-002, ING-ERR-002
-def test_admission_wait_timeout_aborts_deadline_exceeded() -> None:
+async def test_admission_wait_timeout_aborts_deadline_exceeded() -> None:
     harness = make_servicer(
         watermark=1, admission_queue=1, admission_wait_s=5.0
     )
     assert harness.gate.request("other-session", now=0.0) is not None
     with pytest.raises(AbortError):
-        run_stream(harness, [config_request()])
+        await run_stream(harness, [config_request()])
     assert harness.context.code == grpc.StatusCode.DEADLINE_EXCEEDED
     assert harness.context.details is not None
     assert errors.ADMISSION_WAIT_TIMEOUT in harness.context.details
 
 
 # @spec ING-CORE-001
-def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
+async def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
     # The per-session assembly the β script does by hand (serve_ws:
     # lazy.core = session_core): a transcriber exposing `core` reads
     # the admitted config from its session core, so the servicer must
@@ -636,10 +648,10 @@ def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
             self.core: Any = None
             self.core_at_first_step: Any = None
 
-        def step(self, chunk: Any) -> str:
+        async def step(self, chunk: Any) -> str:
             if self.core_at_first_step is None:
                 self.core_at_first_step = self.core
-            return super().step(chunk)
+            return await super().step(chunk)
 
     values = make_values()
     gate = make_gate(values)
@@ -654,12 +666,15 @@ def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
         chunk_ms=CHUNK_MS,
     )
     context = FakeContext()
-    responses = list(
-        servicer.StreamingRecognize(
-            iter([config_request(), audio_request(pcm16(CHUNK_SAMPLES))]),
+    responses = [
+        response
+        async for response in servicer.StreamingRecognize(
+            aiter_requests(
+                [config_request(), audio_request(pcm16(CHUNK_SAMPLES))]
+            ),
             context,
         )
-    )
+    ]
     assert transcripts(responses)[-1][1] is True
     core = bound.core_at_first_step
     assert core is not None
@@ -681,10 +696,10 @@ def canonical_config_request(interim: bool = True, **overrides: Any) -> Any:
 
 
 # @spec ING-GRPC-007
-def test_canonical_shape_streams_a_pcm16_wav() -> None:
+async def test_canonical_shape_streams_a_pcm16_wav() -> None:
     n_samples = 2 * CHUNK_SAMPLES + CHUNK_SAMPLES // 2
     harness = make_servicer()
-    responses = run_stream(
+    responses = await run_stream(
         harness,
         [canonical_config_request(), audio_request(pcm16_wav(n_samples))],
     )
@@ -700,10 +715,10 @@ def test_canonical_shape_streams_a_pcm16_wav() -> None:
 
 
 # @spec ING-GRPC-007
-def test_a_header_split_across_messages_still_resolves() -> None:
+async def test_a_header_split_across_messages_still_resolves() -> None:
     wav = pcm16_wav(CHUNK_SAMPLES)
     harness = make_servicer()
-    responses = run_stream(
+    responses = await run_stream(
         harness,
         [
             canonical_config_request(),
@@ -720,10 +735,10 @@ def test_a_header_split_across_messages_still_resolves() -> None:
 
 
 # @spec ING-GRPC-007, ING-FE-004
-def test_canonical_mulaw_wav_resamples_and_records_provenance() -> None:
+async def test_canonical_mulaw_wav_resamples_and_records_provenance() -> None:
     wav = riff_wav(7, bytes(range(256)) * 2 + bytes(128), rate=8000, bits=8)
     harness = make_servicer()
-    responses = run_stream(
+    responses = await run_stream(
         harness, [canonical_config_request(), audio_request(wav)]
     )
     assert transcripts(responses)[-1][1] is True
@@ -734,10 +749,10 @@ def test_canonical_mulaw_wav_resamples_and_records_provenance() -> None:
 
 
 # @spec ING-GRPC-007
-def test_declared_rate_is_a_constraint_the_header_must_match() -> None:
+async def test_declared_rate_is_a_constraint_the_header_must_match() -> None:
     harness = make_servicer()
     with pytest.raises(AbortError):
-        run_stream(
+        await run_stream(
             harness,
             [
                 canonical_config_request(sample_rate_hertz=8000),
@@ -750,10 +765,10 @@ def test_declared_rate_is_a_constraint_the_header_must_match() -> None:
 
 
 # @spec ING-GRPC-007
-def test_a_headerless_stream_with_no_declared_format_aborts() -> None:
+async def test_a_headerless_stream_with_no_declared_format_aborts() -> None:
     harness = make_servicer()
     with pytest.raises(AbortError):
-        run_stream(
+        await run_stream(
             harness,
             [
                 canonical_config_request(),
@@ -766,9 +781,9 @@ def test_a_headerless_stream_with_no_declared_format_aborts() -> None:
 
 
 # @spec ING-GRPC-007, ING-LIFE-003
-def test_deferred_zero_audio_session_finalizes_empty() -> None:
+async def test_deferred_zero_audio_session_finalizes_empty() -> None:
     harness = make_servicer()
-    responses = run_stream(harness, [canonical_config_request()])
+    responses = await run_stream(harness, [canonical_config_request()])
     assert transcripts(responses) == [("", True)]
     # Provenance still records exactly once — resampler-less, since no
     # audio ever resolved a format.
@@ -777,7 +792,7 @@ def test_deferred_zero_audio_session_finalizes_empty() -> None:
 
 
 # @spec ING-GRPC-003, ING-GRPC-007
-def test_recognize_accepts_the_canonical_wav_shape() -> None:
+async def test_recognize_accepts_the_canonical_wav_shape() -> None:
     n_samples = 3 * CHUNK_SAMPLES + 21
     harness = make_servicer()
     request = rasr.RecognizeRequest(
@@ -786,14 +801,14 @@ def test_recognize_accepts_the_canonical_wav_shape() -> None:
         ),
         audio=pcm16_wav(n_samples),
     )
-    response = harness.servicer.Recognize(request, harness.context)
+    response = await harness.servicer.Recognize(request, harness.context)
     assert response.results[0].alternatives[0].transcript
     ((clip, _),) = harness.offline.calls
     assert len(clip) == n_samples  # header stripped, data intact
 
 
 # @spec ING-GRPC-003, ING-GRPC-007
-def test_recognize_canonical_alaw_wav_reaches_the_seam_at_16k() -> None:
+async def test_recognize_canonical_alaw_wav_reaches_the_seam_at_16k() -> None:
     payload = bytes(range(256)) * 4
     harness = make_servicer()
     request = rasr.RecognizeRequest(
@@ -802,7 +817,7 @@ def test_recognize_canonical_alaw_wav_reaches_the_seam_at_16k() -> None:
         ),
         audio=riff_wav(6, payload, rate=8000, bits=8, with_fact=True),
     )
-    harness.servicer.Recognize(request, harness.context)
+    await harness.servicer.Recognize(request, harness.context)
     ((clip, _),) = harness.offline.calls
     assert len(clip) == 2 * len(payload)
 
@@ -819,13 +834,13 @@ def test_config_response_states_the_verbatim_deviation() -> None:
 
 
 # @spec ING-GRPC-003
-def test_recognize_is_a_full_context_single_shot() -> None:
+async def test_recognize_is_a_full_context_single_shot() -> None:
     harness = make_servicer()
     n_samples = 5 * CHUNK_SAMPLES + 17  # deliberately not chunk-shaped
     request = rasr.RecognizeRequest(
         config=recognition_config(), audio=pcm16(n_samples)
     )
-    response = harness.servicer.Recognize(request, harness.context)
+    response = await harness.servicer.Recognize(request, harness.context)
     transcript = response.results[0].alternatives[0].transcript
     assert transcript == "offline transcript"
     # One whole-clip call on the offline seam; never a chunked session.
@@ -836,25 +851,25 @@ def test_recognize_is_a_full_context_single_shot() -> None:
 
 
 # @spec ING-GRPC-003, ING-FE-004
-def test_recognize_telephony_input_reaches_the_seam_at_16k() -> None:
+async def test_recognize_telephony_input_reaches_the_seam_at_16k() -> None:
     harness = make_servicer()
     request = rasr.RecognizeRequest(
         config=recognition_config(encoding=raud.ALAW, sample_rate_hertz=8000),
         audio=bytes(range(256)) * 4,
     )
-    harness.servicer.Recognize(request, harness.context)
+    await harness.servicer.Recognize(request, harness.context)
     ((clip, _),) = harness.offline.calls
     assert len(clip) == 2 * 256 * 4  # resampled to 16 kHz, whole clip
 
 
 # @spec ING-GRPC-005
-def test_recognize_dispositions_the_config_too() -> None:
+async def test_recognize_dispositions_the_config_too() -> None:
     harness = make_servicer()
     request = rasr.RecognizeRequest(
         config=recognition_config(profanity_filter=True), audio=pcm16(64)
     )
     with pytest.raises(AbortError):
-        harness.servicer.Recognize(request, harness.context)
+        await harness.servicer.Recognize(request, harness.context)
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "profanity_filter" in harness.context.details
@@ -862,13 +877,13 @@ def test_recognize_dispositions_the_config_too() -> None:
 
 
 # @spec ING-GRPC-005
-def test_recognize_unknown_locale_aborts_naming_the_field() -> None:
+async def test_recognize_unknown_locale_aborts_naming_the_field() -> None:
     harness = make_servicer()
     request = rasr.RecognizeRequest(
         config=recognition_config(language_code="xx-XX"), audio=pcm16(64)
     )
     with pytest.raises(AbortError):
-        harness.servicer.Recognize(request, harness.context)
+        await harness.servicer.Recognize(request, harness.context)
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "language_code" in harness.context.details
@@ -885,9 +900,9 @@ def joined_parameters(response: Any) -> str:
 
 
 # @spec ING-GRPC-004
-def test_config_rpc_reports_the_static_surface() -> None:
+async def test_config_rpc_reports_the_static_surface() -> None:
     harness = make_servicer()
-    response = harness.servicer.GetRivaSpeechRecognitionConfig(
+    response = await harness.servicer.GetRivaSpeechRecognitionConfig(
         rasr.RivaSpeechRecognitionConfigRequest(), harness.context
     )
     entry = response.model_config[0]

@@ -98,7 +98,7 @@ class VllmRealtimeAdapter:
         return [{"type": "session.created", "id": self._core.session_id}]
 
     # @spec ING-LIFE-004
-    def on_disconnect(self, now: float) -> None:
+    async def on_disconnect(self, now: float) -> None:
         """A detected transport drop: immediate ``close``, no reply.
 
         Engine abort and slot free happen now, never left to the
@@ -107,26 +107,26 @@ class VllmRealtimeAdapter:
         """
         self._queued = False
         self._pre_roll.discard()
-        self._core.close(now)
+        await self._core.close(now)
 
-    def on_event(
+    async def on_event(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """Translate one client wire event; return wire events out."""
         event_type = event.get("type")
         if event_type == "session.update":
-            return self._on_session_update(event, now)
+            return await self._on_session_update(event, now)
         if event_type == "input_audio_buffer.append":
-            return self._on_append(event, now)
+            return await self._on_append(event, now)
         if event_type == "input_audio_buffer.commit":
-            return self._on_commit(event, now)
+            return await self._on_commit(event, now)
         return [
             self._error("unknown_event", f"unknown event type {event_type!r}")
         ]
 
-    def poll(self, now: float) -> list[dict[str, Any]]:
+    async def poll(self, now: float) -> list[dict[str, Any]]:
         """Surface timer-driven core events (idle/wait timeouts)."""
-        core_events = self._core.poll(now)
+        core_events = await self._core.poll(now)
         wire: list[dict[str, Any]] = []
         admitted = False
         for core_event in core_events:
@@ -136,7 +136,7 @@ class VllmRealtimeAdapter:
         if self._queued and core_events:
             self._queued = False
             if admitted:
-                wire.extend(self._drain_pre_roll(now))
+                wire.extend(await self._drain_pre_roll(now))
             else:
                 # Negative outcome: the whole pre-roll drops, nothing
                 # half-processed (ING-ADM-005).
@@ -209,7 +209,7 @@ class VllmRealtimeAdapter:
         )
 
     # @spec ING-ADM-001
-    def _on_session_update(
+    async def _on_session_update(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """First update is the configure; later ones are mid-session."""
@@ -217,7 +217,9 @@ class VllmRealtimeAdapter:
             self._pre_roll.hold_update(self._extension_fields(event))
             return []
         if self._configured:
-            core_events = self._core.update(self._extension_fields(event), now)
+            core_events = await self._core.update(
+                self._extension_fields(event), now
+            )
             return self._project_all(core_events)
         model = event.get("model")
         if model is None:
@@ -240,7 +242,7 @@ class VllmRealtimeAdapter:
         return self._project_all(answers)
 
     # @spec ING-ADM-005
-    def _on_append(
+    async def _on_append(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """Decode one append through the front-end into the core."""
@@ -265,7 +267,7 @@ class VllmRealtimeAdapter:
             # processed, queue slot freed, retry-with-backoff safe.
             self._queued = False
             self._pre_roll.discard()
-            self._core.close(now)
+            await self._core.close(now)
             return [
                 self._error(
                     "buffer_overflow",
@@ -274,10 +276,10 @@ class VllmRealtimeAdapter:
                     "answer before streaming)",
                 )
             ]
-        return self._feed_audio(payload, now)
+        return await self._feed_audio(payload, now)
 
     # @spec ING-ERR-004, ING-LIFE-002
-    def _on_commit(
+    async def _on_commit(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """Commit: final=true finalizes; the first non-final is quiet."""
@@ -292,7 +294,7 @@ class VllmRealtimeAdapter:
             if self._queued:
                 self._pre_roll.hold_finalize()
                 return []
-            return self._project_all(self._core.finalize(now))
+            return self._project_all(await self._core.finalize(now))
         if self._core.terminal:
             return self._project_all(
                 [
@@ -319,7 +321,9 @@ class VllmRealtimeAdapter:
             )
         ]
 
-    def _feed_audio(self, payload: str, now: float) -> list[dict[str, Any]]:
+    async def _feed_audio(
+        self, payload: str, now: float
+    ) -> list[dict[str, Any]]:
         """Base64 -> PCM16 -> float32 into the core (byte-safe)."""
         try:
             decoded = base64.b64decode(payload, validate=True)
@@ -332,18 +336,20 @@ class VllmRealtimeAdapter:
             np.frombuffer(data[:usable], dtype="<i2").astype(np.float32)
             / 32768.0
         )
-        return self._project_all(self._core.receive_audio(samples, now))
+        return self._project_all(await self._core.receive_audio(samples, now))
 
-    def _drain_pre_roll(self, now: float) -> list[dict[str, Any]]:
+    async def _drain_pre_roll(self, now: float) -> list[dict[str, Any]]:
         """Replay everything held, in arrival order, post-admission."""
         wire: list[dict[str, Any]] = []
         for kind, payload in self._pre_roll.release():
             if kind == "audio" and isinstance(payload, bytes):
-                wire.extend(self._feed_audio(payload.decode("ascii"), now))
+                wire.extend(await self._feed_audio(payload.decode("ascii"), now))
             elif kind == "update" and isinstance(payload, Mapping):
-                wire.extend(self._project_all(self._core.update(payload, now)))
+                wire.extend(
+                    self._project_all(await self._core.update(payload, now))
+                )
             elif kind == "finalize":
-                wire.extend(self._project_all(self._core.finalize(now)))
+                wire.extend(self._project_all(await self._core.finalize(now)))
         return wire
 
     def _extension_fields(self, event: Mapping[str, Any]) -> dict[str, Any]:

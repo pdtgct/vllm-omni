@@ -120,18 +120,18 @@ def append_event(data: bytes) -> dict[str, Any]:
     return {"type": APPEND, "audio": b64(data)}
 
 
-def configure(
+async def configure(
     adapter: NimRealtimeAdapter, now: float = 0.0, **overrides: Any
 ) -> list[dict[str, Any]]:
-    return adapter.on_event(update_event(**overrides), now)
+    return await adapter.on_event(update_event(**overrides), now)
 
 
-def admitted_adapter(
+async def admitted_adapter(
     **value_overrides: Any,
 ) -> tuple[NimRealtimeAdapter, SessionCore, FakeTranscriber, list[Any]]:
     values = make_values(**value_overrides)
     adapter, core, fake, recorded = make_adapter(values=values)
-    replies = configure(adapter)
+    replies = await configure(adapter)
     assert [e["type"] for e in replies] == [UPDATED]
     return adapter, core, fake, recorded
 
@@ -279,11 +279,11 @@ def test_default_session_object_round_trips_unrejected() -> None:
 
 
 # @spec ING-NIMWS-001, ING-NIMWS-004
-def test_echoed_default_object_is_admitted() -> None:
+async def test_echoed_default_object_is_admitted() -> None:
     values = make_values()
     adapter, _core, _fake, _recorded = make_adapter(values=values)
     echoed = default_session_object(MODEL, values)
-    replies = adapter.on_event({"type": UPDATE, "session": echoed}, 0.0)
+    replies = await adapter.on_event({"type": UPDATE, "session": echoed}, 0.0)
     assert types(replies) == [UPDATED]
     assert not adapter.should_close
 
@@ -305,9 +305,9 @@ def test_conversation_created_on_connect() -> None:
 
 
 # @spec ING-NIMWS-004, ING-CORE-004
-def test_first_update_is_configure_acked_updated_with_provenance() -> None:
+async def test_first_update_is_configure_acked_updated_with_provenance() -> None:
     adapter, core, _fake, recorded = make_adapter()
-    (reply,) = configure(adapter)
+    (reply,) = await configure(adapter)
     assert reply["type"] == UPDATED
     session = reply["session"]
     assert session["input_audio_format"] == "pcm16"
@@ -320,21 +320,21 @@ def test_first_update_is_configure_acked_updated_with_provenance() -> None:
 
 
 # @spec ING-LIFE-001
-def test_first_message_not_update_is_protocol_order_and_close() -> None:
+async def test_first_message_not_update_is_protocol_order_and_close() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    error = only_error(adapter.on_event(append_event(pcm16(16)), 0.0))
+    error = only_error(await adapter.on_event(append_event(pcm16(16)), 0.0))
     assert error["error"]["code"] == errors.PROTOCOL_ORDER
     assert adapter.should_close
 
 
 # @spec ING-ADM-001
-def test_busy_admission_is_error_and_close() -> None:
+async def test_busy_admission_is_error_and_close() -> None:
     values = make_values(watermark=1)
     gate = make_gate(values)
     first, _core1, _fake1, _rec1 = make_adapter(values=values, gate=gate)
-    assert types(configure(first)) == [UPDATED]
+    assert types(await configure(first)) == [UPDATED]
     second, core2, _fake2, recorded2 = make_adapter(values=values, gate=gate)
-    error = only_error(configure(second))
+    error = only_error(await configure(second))
     assert error["error"]["code"] == errors.BUSY
     assert second.should_close
     assert recorded2 == []  # a never-admitted session records nothing
@@ -342,45 +342,45 @@ def test_busy_admission_is_error_and_close() -> None:
 
 
 # @spec ING-ADM-002, ING-ADM-005
-def test_queued_admission_defers_ack_and_replays_pre_roll_after_it() -> None:
+async def test_queued_admission_defers_ack_and_replays_pre_roll_after_it() -> None:
     values = make_values(watermark=1, admission_queue=1)
     gate = make_gate(values)
     first, first_core, _fake1, _rec1 = make_adapter(values=values, gate=gate)
-    assert types(configure(first)) == [UPDATED]
+    assert types(await configure(first)) == [UPDATED]
     second, _core2, fake2, _rec2 = make_adapter(values=values, gate=gate)
-    assert configure(second, now=0.0) == []  # queued: the ack is deferred
+    assert await configure(second, now=0.0) == []  # queued: the ack is deferred
     # Pre-roll: audio sent ahead of the outcome is held, not processed.
-    assert second.on_event(append_event(pcm16(CHUNK_SAMPLES)), 0.1) == []
+    assert await second.on_event(append_event(pcm16(CHUNK_SAMPLES)), 0.1) == []
     assert fake2.steps == []
-    assert second.poll(0.2) == []  # still waiting
-    first.on_event({"type": DONE}, 0.3)  # frees the slot
-    events = second.poll(0.4)
+    assert await second.poll(0.2) == []  # still waiting
+    await first.on_event({"type": DONE}, 0.3)  # frees the slot
+    events = await second.poll(0.4)
     assert types(events) == [UPDATED, DELTA]
     assert len(fake2.steps) == 1  # the held chunk replayed post-admission
 
 
 # @spec ING-ADM-002, ING-ERR-002
-def test_admission_wait_timeout_is_its_own_code_and_closes() -> None:
+async def test_admission_wait_timeout_is_its_own_code_and_closes() -> None:
     values = make_values(watermark=1, admission_queue=1, admission_wait_s=5.0)
     gate = make_gate(values)
     first, _core1, _fake1, _rec1 = make_adapter(values=values, gate=gate)
-    assert types(configure(first)) == [UPDATED]
+    assert types(await configure(first)) == [UPDATED]
     second, _core2, _fake2, _rec2 = make_adapter(values=values, gate=gate)
-    assert configure(second, now=0.0) == []
-    error = only_error(second.poll(6.0))
+    assert await configure(second, now=0.0) == []
+    error = only_error(await second.poll(6.0))
     assert error["error"]["code"] == errors.ADMISSION_WAIT_TIMEOUT
     assert second.should_close
 
 
 # @spec ING-ADM-005
-def test_pre_roll_overflow_is_fatal_buffer_overflow() -> None:
+async def test_pre_roll_overflow_is_fatal_buffer_overflow() -> None:
     values = make_values(watermark=1, admission_queue=1, pre_roll_bytes=64)
     gate = make_gate(values)
     first, _core1, _fake1, _rec1 = make_adapter(values=values, gate=gate)
-    assert types(configure(first)) == [UPDATED]
+    assert types(await configure(first)) == [UPDATED]
     second, core2, fake2, recorded2 = make_adapter(values=values, gate=gate)
-    assert configure(second, now=0.0) == []
-    error = only_error(second.on_event(append_event(pcm16(256)), 0.1))
+    assert await configure(second, now=0.0) == []
+    error = only_error(await second.on_event(append_event(pcm16(256)), 0.1))
     assert error["error"]["code"] == errors.BUFFER_OVERFLOW
     assert second.should_close
     assert fake2.steps == []  # nothing half-processed
@@ -481,10 +481,10 @@ def test_punctuation_and_verbatim_are_model_intrinsic() -> None:
 
 
 # @spec ING-NIMWS-008, ING-ERR-003
-def test_unknown_locale_rejection_and_pre_audio_retry() -> None:
+async def test_unknown_locale_rejection_and_pre_audio_retry() -> None:
     adapter, core, _fake, _recorded = make_adapter()
     error = only_error(
-        configure(adapter, input_audio_transcription={"language": "xx-XX"})
+        await configure(adapter, input_audio_transcription={"language": "xx-XX"})
     )
     assert error["error"]["code"] == errors.UNKNOWN_LOCALE
     assert "language" in (error["error"]["param"] or "")
@@ -492,7 +492,7 @@ def test_unknown_locale_rejection_and_pre_audio_retry() -> None:
     # the corrected update then configures normally.
     assert not adapter.should_close
     assert not core.terminal
-    assert types(configure(adapter)) == [UPDATED]
+    assert types(await configure(adapter)) == [UPDATED]
 
 
 # @spec ING-NIMWS-008
@@ -567,10 +567,10 @@ def test_one_update_reports_every_rejection() -> None:
         ("g711_alaw", 8000),
     ],
 )
-def test_accept_matrix_cells_admit(audio_format: str, rate: int) -> None:
+async def test_accept_matrix_cells_admit(audio_format: str, rate: int) -> None:
     assert validate_nim_format(audio_format, rate, 1) is None
     adapter, _core, _fake, _recorded = make_adapter()
-    replies = configure(
+    replies = await configure(
         adapter,
         input_audio_format=audio_format,
         input_audio_params={"sample_rate_hz": rate, "num_channels": 1},
@@ -588,7 +588,7 @@ def test_accept_matrix_cells_admit(audio_format: str, rate: int) -> None:
         ("mp3", 16000),
     ],
 )
-def test_off_matrix_formats_reject_naming_both_fields(
+async def test_off_matrix_formats_reject_naming_both_fields(
     audio_format: str, rate: int
 ) -> None:
     rejection = validate_nim_format(audio_format, rate, 1)
@@ -597,7 +597,7 @@ def test_off_matrix_formats_reject_naming_both_fields(
     assert {"input_audio_format", "sample_rate_hz"} <= set(rejection.fields)
     adapter, _core, _fake, _recorded = make_adapter()
     error = only_error(
-        configure(
+        await configure(
             adapter,
             input_audio_format=audio_format,
             input_audio_params={"sample_rate_hz": rate, "num_channels": 1},
@@ -619,43 +619,43 @@ def test_multichannel_is_rejected() -> None:
 
 
 # @spec ING-NIMWS-004, ING-CORE-005
-def test_appends_step_chunks_and_emit_deltas() -> None:
+async def test_appends_step_chunks_and_emit_deltas() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
+    await configure(adapter)
     # Two chunks arrive split off sample alignment: framing never
     # shifts the steps the model sees.
     data = pcm16(2 * CHUNK_SAMPLES)
-    first = adapter.on_event(append_event(data[: CHUNK_BYTES + 3]), 1.0)
-    second = adapter.on_event(append_event(data[CHUNK_BYTES + 3 :]), 2.0)
+    first = await adapter.on_event(append_event(data[: CHUNK_BYTES + 3]), 1.0)
+    second = await adapter.on_event(append_event(data[CHUNK_BYTES + 3 :]), 2.0)
     deltas = [e for e in first + second if e["type"] == DELTA]
     assert [d["delta"] for d in deltas] == ["hey", " there"]
     assert [len(step) for step in fake.steps] == [CHUNK_SAMPLES] * 2
 
 
 # @spec ING-CORE-005
-def test_a_chunk_that_adds_nothing_emits_no_delta() -> None:
+async def test_a_chunk_that_adds_nothing_emits_no_delta() -> None:
     adapter, _core, fake, _recorded = make_adapter()
 
-    def silent_step(chunk: Any) -> str:
+    async def silent_step(chunk: Any) -> str:
         fake.steps.append(chunk)
         return "hey"  # cumulative never grows after the first chunk
 
     fake.step = silent_step  # type: ignore[method-assign]
-    configure(adapter)
-    first = adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
-    second = adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
+    await configure(adapter)
+    first = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
+    second = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
     assert [e["delta"] for e in first if e["type"] == DELTA] == ["hey"]
     assert [e for e in second if e["type"] == DELTA] == []
 
 
 # @spec ING-NIMWS-004
-def test_invalid_base64_rides_transcription_failed() -> None:
+async def test_invalid_base64_rides_transcription_failed() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter)
+    await configure(adapter)
     # Ride-along fix (masked by NotImplementedError pre-implementation):
     # the original "not//valid==" payload was, in fact, valid base64 —
     # every character is in the alphabet and the padding is correct.
-    (event,) = adapter.on_event(
+    (event,) = await adapter.on_event(
         {"type": APPEND, "audio": "!!!not-base64!!!"}, 1.0
     )
     assert event["type"] == FAILED
@@ -664,10 +664,10 @@ def test_invalid_base64_rides_transcription_failed() -> None:
 
 
 # @spec ING-NIMWS-004
-def test_unknown_event_type_is_an_error_never_silent() -> None:
+async def test_unknown_event_type_is_an_error_never_silent() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter)
-    error = only_error(adapter.on_event({"type": "response.create"}, 1.0))
+    await configure(adapter)
+    error = only_error(await adapter.on_event({"type": "response.create"}, 1.0))
     assert error["error"]["code"] == "invalid_event"
     assert error["error"]["type"] == "invalid_request_error"
     assert not adapter.should_close
@@ -677,28 +677,28 @@ def test_unknown_event_type_is_an_error_never_silent() -> None:
 
 
 # @spec ING-NIMWS-005
-def test_commit_is_acked_and_never_forces_a_sub_chunk_step() -> None:
+async def test_commit_is_acked_and_never_forces_a_sub_chunk_step() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
-    adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
-    (ack,) = adapter.on_event({"type": COMMIT}, 1.1)
+    await configure(adapter)
+    await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
+    (ack,) = await adapter.on_event({"type": COMMIT}, 1.1)
     assert ack["type"] == COMMITTED
     assert "item_id" in ack and "previous_item_id" in ack
     assert fake.steps == []  # the fixed-chunk invariant outranks the hint
-    events = adapter.on_event(
+    events = await adapter.on_event(
         append_event(pcm16(CHUNK_SAMPLES // 2, start=CHUNK_SAMPLES // 2)), 1.2
     )
     assert [e["type"] for e in events] == [DELTA]
 
 
 # @spec ING-NIMWS-005
-def test_only_done_triggers_the_tail_flush() -> None:
+async def test_only_done_triggers_the_tail_flush() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
-    adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
-    adapter.on_event({"type": COMMIT}, 1.1)
+    await configure(adapter)
+    await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
+    await adapter.on_event({"type": COMMIT}, 1.1)
     assert fake.flush_called is False
-    events = adapter.on_event({"type": DONE}, 1.2)
+    events = await adapter.on_event({"type": DONE}, 1.2)
     assert fake.flush_called is True
     assert fake.flushed is not None and len(fake.flushed) == CHUNK_SAMPLES // 2
     (completed,) = events
@@ -710,23 +710,23 @@ def test_only_done_triggers_the_tail_flush() -> None:
 
 
 # @spec ING-NIMWS-006
-def test_clear_acks_cleared() -> None:
+async def test_clear_acks_cleared() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter)
-    (ack,) = adapter.on_event({"type": CLEAR}, 1.0)
+    await configure(adapter)
+    (ack,) = await adapter.on_event({"type": CLEAR}, 1.0)
     assert ack["type"] == CLEARED
     assert ack["event_id"]
 
 
 # @spec ING-NIMWS-006
-def test_clear_drops_only_the_unreleased_tail() -> None:
+async def test_clear_drops_only_the_unreleased_tail() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
+    await configure(adapter)
     data = pcm16(CHUNK_SAMPLES + CHUNK_SAMPLES // 2)
-    events = adapter.on_event(append_event(data), 1.0)
+    events = await adapter.on_event(append_event(data), 1.0)
     assert [e["type"] for e in events] == [DELTA]  # chunk 1 stepped
-    adapter.on_event({"type": CLEAR}, 1.1)
-    (completed,) = adapter.on_event({"type": DONE}, 1.2)
+    await adapter.on_event({"type": CLEAR}, 1.1)
+    (completed,) = await adapter.on_event({"type": DONE}, 1.2)
     # The un-released half-chunk tail was dropped: nothing to flush,
     # and the final is the stepped cumulative.
     assert fake.flush_called is False
@@ -735,14 +735,14 @@ def test_clear_drops_only_the_unreleased_tail() -> None:
 
 
 # @spec ING-NIMWS-006
-def test_clear_never_rewinds_session_core_or_model_state() -> None:
+async def test_clear_never_rewinds_session_core_or_model_state() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
-    adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
-    adapter.on_event({"type": CLEAR}, 1.1)
+    await configure(adapter)
+    await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
+    await adapter.on_event({"type": CLEAR}, 1.1)
     assert fake.aborted is False
     assert len(fake.steps) == 1  # the stepped chunk stands
-    events = adapter.on_event(
+    events = await adapter.on_event(
         append_event(pcm16(CHUNK_SAMPLES, start=CHUNK_SAMPLES)), 1.2
     )
     assert [e["delta"] for e in events if e["type"] == DELTA] == [" there"]
@@ -752,11 +752,11 @@ def test_clear_never_rewinds_session_core_or_model_state() -> None:
 
 
 # @spec ING-NIMWS-004, ING-LIFE-002
-def test_done_finalizes_with_exactly_one_completed() -> None:
+async def test_done_finalizes_with_exactly_one_completed() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
-    adapter.on_event(append_event(pcm16(CHUNK_SAMPLES + 160)), 1.0)
-    (completed,) = adapter.on_event({"type": DONE}, 2.0)
+    await configure(adapter)
+    await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES + 160)), 1.0)
+    (completed,) = await adapter.on_event({"type": DONE}, 2.0)
     assert completed["type"] == COMPLETED
     assert completed["is_last_result"] is True
     assert completed["transcript"] == "hey [flushed]"
@@ -767,10 +767,10 @@ def test_done_finalizes_with_exactly_one_completed() -> None:
 
 
 # @spec ING-LIFE-003
-def test_zero_audio_done_completes_empty_not_error() -> None:
+async def test_zero_audio_done_completes_empty_not_error() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)
-    (completed,) = adapter.on_event({"type": DONE}, 1.0)
+    await configure(adapter)
+    (completed,) = await adapter.on_event({"type": DONE}, 1.0)
     assert completed["type"] == COMPLETED
     assert completed["transcript"] == ""
     assert completed["is_last_result"] is True
@@ -778,35 +778,35 @@ def test_zero_audio_done_completes_empty_not_error() -> None:
 
 
 # @spec ING-ERR-004, ING-LIFE-002
-def test_events_after_done_answer_session_terminal() -> None:
+async def test_events_after_done_answer_session_terminal() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter)
-    adapter.on_event({"type": DONE}, 1.0)
+    await configure(adapter)
+    await adapter.on_event({"type": DONE}, 1.0)
     for event in (append_event(pcm16(16)), {"type": DONE}, {"type": COMMIT}):
-        error = only_error(adapter.on_event(event, 2.0))
+        error = only_error(await adapter.on_event(event, 2.0))
         assert error["error"]["code"] == errors.SESSION_TERMINAL
 
 
 # @spec ING-LIFE-004
-def test_detected_disconnect_aborts_and_frees_immediately() -> None:
+async def test_detected_disconnect_aborts_and_frees_immediately() -> None:
     values = make_values(watermark=1)
     gate = make_gate(values)
     adapter, core, fake, _recorded = make_adapter(values=values, gate=gate)
-    configure(adapter)
-    adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
-    adapter.on_disconnect(2.0)
+    await configure(adapter)
+    await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
+    await adapter.on_disconnect(2.0)
     assert fake.aborted is True
     assert core.terminal
     assert gate.active == 0  # the slot freed now, not at the idle TTL
 
 
 # @spec ING-LIFE-006, ING-ERR-002
-def test_idle_timeout_surfaces_before_close() -> None:
+async def test_idle_timeout_surfaces_before_close() -> None:
     adapter, _core, fake, _recorded = make_adapter(
         values=make_values(idle_ttl_s=60.0)
     )
-    configure(adapter, now=0.0)
-    error = only_error(adapter.poll(61.0))
+    await configure(adapter, now=0.0)
+    error = only_error(await adapter.poll(61.0))
     assert error["error"]["code"] == errors.IDLE_TIMEOUT
     assert adapter.should_close  # the error reaches the wire, then close
     assert fake.aborted is True
@@ -816,9 +816,9 @@ def test_idle_timeout_surfaces_before_close() -> None:
 
 
 # @spec ING-LIFE-007
-def test_mid_session_language_update_is_honored() -> None:
-    adapter, _core, fake, _recorded = admitted_adapter()
-    (ack,) = adapter.on_event(
+async def test_mid_session_language_update_is_honored() -> None:
+    adapter, _core, fake, _recorded = await admitted_adapter()
+    (ack,) = await adapter.on_event(
         update_event(input_audio_transcription={"language": "es-US"}), 1.0
     )
     assert ack["type"] == UPDATED
@@ -826,25 +826,25 @@ def test_mid_session_language_update_is_honored() -> None:
 
 
 # @spec ING-LIFE-007
-def test_mid_session_unknown_locale_continues_at_prior() -> None:
-    adapter, _core, fake, _recorded = admitted_adapter()
+async def test_mid_session_unknown_locale_continues_at_prior() -> None:
+    adapter, _core, fake, _recorded = await admitted_adapter()
     error = only_error(
-        adapter.on_event(
+        await adapter.on_event(
             update_event(input_audio_transcription={"language": "xx-XX"}), 1.0
         )
     )
     assert error["error"]["code"] == errors.UNKNOWN_LOCALE
     assert fake.locales == []
     assert not adapter.should_close
-    events = adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
+    events = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
     assert [e["type"] for e in events] == [DELTA]  # the session continues
 
 
 # @spec ING-LIFE-008
-def test_mid_session_format_change_is_rejected_with_continuation() -> None:
-    adapter, _core, _fake, _recorded = admitted_adapter()
+async def test_mid_session_format_change_is_rejected_with_continuation() -> None:
+    adapter, _core, _fake, _recorded = await admitted_adapter()
     error = only_error(
-        adapter.on_event(
+        await adapter.on_event(
             update_event(
                 input_audio_format="g711_ulaw",
                 input_audio_params={"sample_rate_hz": 8000, "num_channels": 1},
@@ -854,14 +854,14 @@ def test_mid_session_format_change_is_rejected_with_continuation() -> None:
     )
     assert error["error"]["code"] == errors.CONFIG_CHANGE_REJECTED
     assert not adapter.should_close
-    events = adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
+    events = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
     assert [e["type"] for e in events] == [DELTA]  # admitted config stands
 
 
 # @spec ING-LIFE-009
-def test_mixed_update_rejections_precede_the_truthful_ack() -> None:
-    adapter, _core, fake, _recorded = admitted_adapter()
-    events = adapter.on_event(
+async def test_mixed_update_rejections_precede_the_truthful_ack() -> None:
+    adapter, _core, fake, _recorded = await admitted_adapter()
+    events = await adapter.on_event(
         update_event(
             input_audio_format="g711_ulaw",
             input_audio_params={"sample_rate_hz": 8000, "num_channels": 1},
@@ -875,9 +875,9 @@ def test_mixed_update_rejections_precede_the_truthful_ack() -> None:
 
 
 # @spec ING-LIFE-009
-def test_noop_update_still_gets_a_truthful_ack() -> None:
-    adapter, _core, _fake, _recorded = admitted_adapter()
-    (ack,) = adapter.on_event(update_event(), 1.0)
+async def test_noop_update_still_gets_a_truthful_ack() -> None:
+    adapter, _core, _fake, _recorded = await admitted_adapter()
+    (ack,) = await adapter.on_event(update_event(), 1.0)
     assert ack["type"] == UPDATED
 
 
@@ -885,9 +885,9 @@ def test_noop_update_still_gets_a_truthful_ack() -> None:
 
 
 # @spec ING-FE-004
-def test_8k_session_records_the_resampler_identifier() -> None:
+async def test_8k_session_records_the_resampler_identifier() -> None:
     adapter, _core, _fake, recorded = make_adapter()
-    configure(
+    await configure(
         adapter,
         input_audio_params={"sample_rate_hz": 8000, "num_channels": 1},
     )
@@ -895,9 +895,9 @@ def test_8k_session_records_the_resampler_identifier() -> None:
 
 
 # @spec ING-FE-004
-def test_16k_session_records_no_resampler_identifier() -> None:
+async def test_16k_session_records_no_resampler_identifier() -> None:
     adapter, _core, _fake, recorded = make_adapter()
-    configure(adapter)
+    await configure(adapter)
     assert "resampler_identifier" not in recorded[0]
 
 
@@ -905,15 +905,15 @@ def test_16k_session_records_no_resampler_identifier() -> None:
 
 
 # @spec ING-NIMWS-009
-def test_none_format_defers_to_the_riff_header() -> None:
+async def test_none_format_defers_to_the_riff_header() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    replies = configure(adapter, input_audio_format=DEFERRED_FORMAT)
+    replies = await configure(adapter, input_audio_format=DEFERRED_FORMAT)
     assert types(replies) == [UPDATED]  # admission does not wait for audio
     wav = pcm16_wav(2 * CHUNK_SAMPLES)
     # The header straddles the first two appends: no error while the
     # sniff needs more bytes, and header bytes never decode as samples.
-    assert adapter.on_event(append_event(wav[:10]), 1.0) == []
-    events = adapter.on_event(append_event(wav[10:]), 1.1)
+    assert await adapter.on_event(append_event(wav[:10]), 1.0) == []
+    events = await adapter.on_event(append_event(wav[10:]), 1.1)
     assert [e["type"] for e in events] == [DELTA, DELTA]
     assert [len(step) for step in fake.steps] == [CHUNK_SAMPLES] * 2
     expected = np.arange(CHUNK_SAMPLES, dtype=np.float32) / 32768.0
@@ -921,35 +921,35 @@ def test_none_format_defers_to_the_riff_header() -> None:
 
 
 # @spec ING-NIMWS-009
-def test_none_format_declared_params_are_constraints() -> None:
+async def test_none_format_declared_params_are_constraints() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter, input_audio_format=DEFERRED_FORMAT)
+    await configure(adapter, input_audio_format=DEFERRED_FORMAT)
     # 16 kHz was declared (the dialect always carries params); an 8 kHz
     # header contradicts it.
     error = only_error(
-        adapter.on_event(append_event(pcm16_wav(CHUNK_SAMPLES, rate=8000)), 1.0)
+        await adapter.on_event(append_event(pcm16_wav(CHUNK_SAMPLES, rate=8000)), 1.0)
     )
     assert error["error"]["code"] == errors.UNSUPPORTED_FORMAT
     assert adapter.should_close
 
 
 # @spec ING-NIMWS-009
-def test_none_format_without_a_riff_header_is_rejected() -> None:
+async def test_none_format_without_a_riff_header_is_rejected() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
-    configure(adapter, input_audio_format=DEFERRED_FORMAT)
+    await configure(adapter, input_audio_format=DEFERRED_FORMAT)
     error = only_error(
-        adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
+        await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
     )
     assert error["error"]["code"] == errors.UNSUPPORTED_FORMAT
     assert adapter.should_close
 
 
 # @spec ING-NIMWS-009
-def test_declared_format_is_never_overridden_by_a_header() -> None:
+async def test_declared_format_is_never_overridden_by_a_header() -> None:
     adapter, _core, fake, _recorded = make_adapter()
-    configure(adapter)  # pcm16 declared explicitly
+    await configure(adapter)  # pcm16 declared explicitly
     wav = pcm16_wav(CHUNK_SAMPLES - 22)  # header (44 B) + payload = 1 chunk
-    events = adapter.on_event(append_event(wav), 1.0)
+    events = await adapter.on_event(append_event(wav), 1.0)
     # The declared format wins: the WAV header decodes as audio bytes.
     assert [e["type"] for e in events] == [DELTA]
     assert len(fake.steps[0]) == CHUNK_SAMPLES
@@ -959,13 +959,13 @@ def test_declared_format_is_never_overridden_by_a_header() -> None:
 
 
 # @spec ING-NIMWS-003, ING-NIMWS-004
-def test_every_server_event_carries_a_unique_event_id() -> None:
+async def test_every_server_event_carries_a_unique_event_id() -> None:
     adapter, _core, _fake, _recorded = make_adapter()
     events = adapter.on_connect()
-    events += configure(adapter)
-    events += adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
-    events += adapter.on_event({"type": COMMIT}, 1.1)
-    events += adapter.on_event({"type": DONE}, 2.0)
+    events += await configure(adapter)
+    events += await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
+    events += await adapter.on_event({"type": COMMIT}, 1.1)
+    events += await adapter.on_event({"type": DONE}, 2.0)
     ids = [e["event_id"] for e in events]
     assert all(i.startswith("event_") for i in ids)
     assert len(ids) == len(set(ids))
@@ -973,7 +973,7 @@ def test_every_server_event_carries_a_unique_event_id() -> None:
 
 
 # @spec ING-NIMWS-001, ING-NIMWS-004, ING-NIMWS-005, ING-NIMWS-009
-def test_canonical_file_mode_conformance_flow() -> None:
+async def test_canonical_file_mode_conformance_flow() -> None:
     # The exact realtime_asr_client.py file-mode exchange with default
     # flags (@ 5a443b5): POST object echoed back with the client's
     # overrides (input_audio_format "none", header-derived params,
@@ -995,7 +995,7 @@ def test_canonical_file_mode_conformance_flow() -> None:
         "enable_profanity_filter": False,
         "enable_verbatim_transcripts": False,
     }
-    (ack,) = adapter.on_event({"type": UPDATE, "session": session}, 0.0)
+    (ack,) = await adapter.on_event({"type": UPDATE, "session": session}, 0.0)
     assert ack["type"] == UPDATED
     assert ack["session"]  # the client reads response["session"]
 
@@ -1003,11 +1003,11 @@ def test_canonical_file_mode_conformance_flow() -> None:
     received: list[dict[str, Any]] = []
     step = 1600 * 2  # the client's --file-streaming-chunk in pcm16 bytes
     for start in range(0, len(wav), step):
-        received += adapter.on_event(
+        received += await adapter.on_event(
             append_event(wav[start : start + step]), 1.0
         )
-        received += adapter.on_event({"type": COMMIT}, 1.0)
-    received += adapter.on_event({"type": DONE}, 2.0)
+        received += await adapter.on_event({"type": COMMIT}, 1.0)
+    received += await adapter.on_event({"type": DONE}, 2.0)
 
     deltas = [e["delta"] for e in received if e["type"] == DELTA]
     assert "".join(deltas) == fake.cumulative()

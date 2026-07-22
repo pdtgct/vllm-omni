@@ -39,19 +39,19 @@ class FakeTranscriber:
         self.locales: list[str] = []
         self.aborted = False
 
-    def step(self, chunk: npt.NDArray[np.float32]) -> str:
+    async def step(self, chunk: npt.NDArray[np.float32]) -> str:
         self.steps.append(chunk)
         return " ".join(WORDS[: min(len(self.steps), len(WORDS))])
 
-    def flush(self, residual: npt.NDArray[np.float32]) -> str:
+    async def flush(self, residual: npt.NDArray[np.float32]) -> str:
         self.flush_called = True
         self.flushed = residual
         return self.cumulative() + " [flushed]"
 
-    def update_locale(self, target_lang: str) -> None:
+    async def update_locale(self, target_lang: str) -> None:
         self.locales.append(target_lang)
 
-    def abort(self) -> None:
+    async def abort(self) -> None:
         self.aborted = True
 
     def cumulative(self) -> str:

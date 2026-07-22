@@ -72,27 +72,33 @@ ADMISSION_FIXED_FIELDS = ("chunk_ms", "encoding", "sample_rate_hz")
 class Transcriber(Protocol):
     """The compute seam the session core drives (PORT-owned behavior).
 
-    ``step`` consumes one exact admitted-config chunk and returns the
-    cumulative hypothesis; ``flush`` consumes the raw un-padded
-    sub-chunk residual (PORT-SESS-003 owns the tail transform) and
-    returns the final transcript; ``update_locale`` forwards a
-    validated mid-session locale (PORT-LID-003 applies it at the next
-    chunk boundary); ``abort`` frees engine state immediately.
+    Async because the in-process binding submits directly through the
+    engine's own streaming-generation entry point (ING-VEH-004); a
+    remote-dialect or offline implementation may still complete
+    immediately, but the seam is colored async throughout so no
+    caller bridges a thread or a queue to reach it (ING-VEH-004,
+    ING-VEH-005). ``step`` consumes one exact admitted-config chunk
+    and returns the cumulative hypothesis; ``flush`` consumes the raw
+    un-padded sub-chunk residual (PORT-SESS-003 owns the tail
+    transform) and returns the final transcript; ``update_locale``
+    forwards a validated mid-session locale (PORT-LID-003 applies it
+    at the next chunk boundary); ``abort`` frees engine state
+    immediately.
     """
 
-    def step(self, chunk: FloatAudio) -> str:
+    async def step(self, chunk: FloatAudio) -> str:
         """Advance one chunk; return the cumulative hypothesis."""
         ...
 
-    def flush(self, residual: FloatAudio) -> str:
+    async def flush(self, residual: FloatAudio) -> str:
         """Finalize with the raw residual; return the final transcript."""
         ...
 
-    def update_locale(self, target_lang: str) -> None:
+    async def update_locale(self, target_lang: str) -> None:
         """Forward a validated locale change."""
         ...
 
-    def abort(self) -> None:
+    async def abort(self) -> None:
         """Free engine state immediately (close / idle abort)."""
         ...
 
@@ -431,7 +437,7 @@ class SessionCore:
         return [self._admit(now)]
 
     # @spec ING-CORE-005, ING-FE-006
-    def receive_audio(self, samples: FloatAudio, now: float) -> list[Event]:
+    async def receive_audio(self, samples: FloatAudio, now: float) -> list[Event]:
         """Accumulate decoded audio; step every ready chunk."""
         if self._terminal:
             return [self._terminal_error()]
@@ -455,7 +461,7 @@ class SessionCore:
                 )
             )
         for chunk in self._buffer.pop_chunks():
-            self._cumulative = self._transcriber.step(chunk)
+            self._cumulative = await self._transcriber.step(chunk)
             events.append(
                 Partial(
                     cumulative=self._cumulative, chunk_index=self._chunk_index
@@ -465,7 +471,7 @@ class SessionCore:
         return events
 
     # @spec ING-LIFE-007, ING-LIFE-008, ING-LIFE-009
-    def update(self, fields: Mapping[str, Any], now: float) -> list[Event]:
+    async def update(self, fields: Mapping[str, Any], now: float) -> list[Event]:
         """Mid-session update: rejections first, truthful ack last."""
         if self._terminal:
             return [self._terminal_error()]
@@ -490,7 +496,7 @@ class SessionCore:
                         )
                     )
                 else:
-                    self._transcriber.update_locale(value)
+                    await self._transcriber.update_locale(value)
                     honored["target_lang"] = value
             elif key in ADMISSION_FIXED_FIELDS:
                 rejections.append(
@@ -516,7 +522,7 @@ class SessionCore:
         return rejections
 
     # @spec ING-LIFE-002, ING-LIFE-003
-    def finalize(self, now: float) -> list[Event]:
+    async def finalize(self, now: float) -> list[Event]:
         """Client-driven end of audio; exactly one ``Final``."""
         if self._terminal:
             return [self._terminal_error()]
@@ -529,7 +535,7 @@ class SessionCore:
             ]
         residual = self._buffer.residual()
         if len(residual):
-            transcript = self._transcriber.flush(residual)
+            transcript = await self._transcriber.flush(residual)
         else:
             # Skip-flush: PORT's tail transform never runs on nothing
             # (ING-LIFE-003); an empty session finalizes to "".
@@ -539,7 +545,7 @@ class SessionCore:
         return [Final(transcript=transcript)]
 
     # @spec ING-LIFE-004
-    def close(self, now: float) -> list[Event]:
+    async def close(self, now: float) -> list[Event]:
         """Immediate teardown (client close or detected disconnect)."""
         if self._queued:
             self._queued = False
@@ -547,13 +553,13 @@ class SessionCore:
             self._terminal = True
             return []
         if self._slot_held:
-            self._transcriber.abort()
+            await self._transcriber.abort()
             self._release_slot()
         self._terminal = True
         return []
 
     # @spec ING-ADM-002, ING-LIFE-005, ING-LIFE-006
-    def poll(self, now: float) -> list[Event]:
+    async def poll(self, now: float) -> list[Event]:
         """Timer-driven events: queued admission, wait/idle timeouts."""
         if self._terminal:
             return []
@@ -579,7 +585,7 @@ class SessionCore:
                 ]
             return [Busy(detail="admission watermark full")]
         if self._idle is not None and self._idle.expired(now):
-            self._transcriber.abort()
+            await self._transcriber.abort()
             self._release_slot()
             self._terminal = True
             return [

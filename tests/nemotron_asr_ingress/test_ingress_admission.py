@@ -36,7 +36,7 @@ def test_admitted_answer_carries_provenance() -> None:
 
 
 # @spec ING-ADM-002
-def test_queued_configure_is_answered_when_a_slot_frees() -> None:
+async def test_queued_configure_is_answered_when_a_slot_frees() -> None:
     values = make_values(watermark=1, admission_queue=1)
     gate = make_gate(values)
     first, _, _ = make_core(gate=gate, values=values)
@@ -44,16 +44,16 @@ def test_queued_configure_is_answered_when_a_slot_frees() -> None:
 
     queued, _, _ = make_core(gate=gate, values=values)
     assert queued.configure(Configure(), now=0.0) == []
-    assert queued.poll(now=1.0) == []
+    assert await queued.poll(now=1.0) == []
 
-    first.close(now=2.0)
-    answer = queued.poll(now=2.1)
+    await first.close(now=2.0)
+    answer = await queued.poll(now=2.1)
     assert len(answer) == 1
     assert isinstance(answer[0], Admitted)
 
 
 # @spec ING-ADM-002
-def test_admission_wait_timeout_releases_a_queued_session() -> None:
+async def test_admission_wait_timeout_releases_a_queued_session() -> None:
     values = make_values(watermark=1, admission_queue=1, admission_wait_s=5.0)
     gate = make_gate(values)
     first, _, _ = make_core(gate=gate, values=values)
@@ -61,14 +61,14 @@ def test_admission_wait_timeout_releases_a_queued_session() -> None:
 
     queued, _, _ = make_core(gate=gate, values=values)
     queued.configure(Configure(), now=0.0)
-    (released,) = queued.poll(now=5.1)
+    (released,) = await queued.poll(now=5.1)
     assert isinstance(released, SessionError)
     assert released.code == errors.ADMISSION_WAIT_TIMEOUT
     assert queued.terminal
 
 
 # @spec ING-ADM-002
-def test_idle_timer_never_runs_against_a_queued_session() -> None:
+async def test_idle_timer_never_runs_against_a_queued_session() -> None:
     values = make_values(
         watermark=1,
         admission_queue=1,
@@ -84,7 +84,7 @@ def test_idle_timer_never_runs_against_a_queued_session() -> None:
     # Far past the idle TTL, well inside the admission wait: a queued
     # session is released by the wait timeout only, never the idle
     # timer (PORT-SESS-005 carve-out).
-    assert queued.poll(now=50.0) == []
+    assert await queued.poll(now=50.0) == []
 
 
 # @spec ING-ADM-001, ING-ADM-002
@@ -103,12 +103,12 @@ def test_full_queue_answers_busy() -> None:
 
 
 # @spec ING-ADM-004
-def test_watermark_counts_parked_sessions() -> None:
+async def test_watermark_counts_parked_sessions() -> None:
     values = make_values(watermark=1, admission_queue=0, idle_ttl_s=60.0)
     gate = make_gate(values)
     parked, _, _ = make_core(gate=gate, values=values)
     parked.configure(Configure(chunk_ms=80), now=0.0)
-    parked.receive_audio(audio(1280), now=0.1)
+    await parked.receive_audio(audio(1280), now=0.1)
     # No audio since 0.1: idle-parked between chunks, well inside the
     # TTL. Its GPU residency still occupies the watermark.
     late, _, _ = make_core(gate=gate, values=values)

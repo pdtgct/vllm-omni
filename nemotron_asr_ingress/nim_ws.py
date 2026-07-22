@@ -596,7 +596,7 @@ class NimRealtimeAdapter:
         ]
 
     # @spec ING-LIFE-004
-    def on_disconnect(self, now: float) -> None:
+    async def on_disconnect(self, now: float) -> None:
         """A detected transport drop: immediate ``close``, no reply.
 
         Engine abort and slot free happen now, never left to the
@@ -607,10 +607,10 @@ class NimRealtimeAdapter:
         self._pre_roll.discard()
         self._tail = np.zeros(0, dtype=np.float32)
         self._sniff_buf = b""
-        self._core.close(now)
+        await self._core.close(now)
 
     # @spec ING-NIMWS-004, ING-NIMWS-005, ING-NIMWS-006
-    def on_event(
+    async def on_event(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """Translate one client wire event; return wire events out.
@@ -627,22 +627,22 @@ class NimRealtimeAdapter:
         """
         event_type = event.get("type")
         if event_type == _UPDATE:
-            return self._on_update(event, now)
+            return await self._on_update(event, now)
         if event_type == _APPEND:
-            return self._on_append(event, now)
+            return await self._on_append(event, now)
         if event_type == _COMMIT:
             return self._on_commit()
         if event_type == _CLEAR:
             return self._on_clear()
         if event_type == _DONE:
-            return self._on_done(now)
+            return await self._on_done(now)
         return [
             self._dialect_error(
                 "invalid_event", f"unknown event type {event_type!r}"
             )
         ]
 
-    def poll(self, now: float) -> list[dict[str, Any]]:
+    async def poll(self, now: float) -> list[dict[str, Any]]:
         """Surface timer-driven core events.
 
         Resolves a queued admission (the ``transcription_session.
@@ -650,7 +650,7 @@ class NimRealtimeAdapter:
         negative outcome discards the pre-roll whole, ING-ADM-005)
         and surfaces the wait/idle timeouts as their catalog errors.
         """
-        core_events = self._core.poll(now)
+        core_events = await self._core.poll(now)
         wire: list[dict[str, Any]] = []
         admitted = False
         for core_event in core_events:
@@ -660,7 +660,7 @@ class NimRealtimeAdapter:
         if self._queued and core_events:
             self._queued = False
             if admitted:
-                wire.extend(self._drain_pre_roll(now))
+                wire.extend(await self._drain_pre_roll(now))
             else:
                 # Negative outcome: the whole pre-roll drops, nothing
                 # half-processed (ING-ADM-005).
@@ -773,7 +773,7 @@ class NimRealtimeAdapter:
 
     # ---- client events -----------------------------------------------------
 
-    def _on_update(
+    async def _on_update(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """First update is the configure; later ones are mid-session."""
@@ -783,7 +783,7 @@ class NimRealtimeAdapter:
         if self._queued:
             self._pre_roll.hold_update(dict(session))
             return []
-        return self._on_mid_update(session, now)
+        return await self._on_mid_update(session, now)
 
     # @spec ING-ADM-001, ING-NIMWS-007, ING-NIMWS-008
     def _on_configure(
@@ -831,7 +831,7 @@ class NimRealtimeAdapter:
         return self._project_all(answers)
 
     # @spec ING-LIFE-007, ING-LIFE-008, ING-LIFE-009
-    def _on_mid_update(
+    async def _on_mid_update(
         self, session: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """A mid-session update: the adapter forwards only *changes*.
@@ -894,11 +894,13 @@ class NimRealtimeAdapter:
             else:
                 fields["target_lang"] = language
         if fields or not (changed_fixed or rejected_locale):
-            wire.extend(self._project_all(self._core.update(fields, now)))
+            wire.extend(
+                self._project_all(await self._core.update(fields, now))
+            )
         return wire
 
     # @spec ING-ADM-005, ING-NIMWS-009
-    def _on_append(
+    async def _on_append(
         self, event: Mapping[str, Any], now: float
     ) -> list[dict[str, Any]]:
         """Decode one append through the front-end into the core."""
@@ -934,7 +936,7 @@ class NimRealtimeAdapter:
             # processed, queue slot freed, retry-with-backoff safe.
             self._queued = False
             self._pre_roll.discard()
-            self._core.close(now)
+            await self._core.close(now)
             return [
                 self._catalog_error(
                     SessionError(
@@ -946,8 +948,8 @@ class NimRealtimeAdapter:
                 )
             ]
         if self._deferred and self._front is None:
-            return self._sniff(raw, now)
-        return self._feed(raw, now)
+            return await self._sniff(raw, now)
+        return await self._feed(raw, now)
 
     # @spec ING-NIMWS-005
     def _on_commit(self) -> list[dict[str, Any]]:
@@ -986,7 +988,7 @@ class NimRealtimeAdapter:
         return [{"event_id": _event_id(), "type": _CLEARED}]
 
     # @spec ING-LIFE-002, ING-LIFE-003
-    def _on_done(self, now: float) -> list[dict[str, Any]]:
+    async def _on_done(self, now: float) -> list[dict[str, Any]]:
         """Release the tail, flush, finalize: exactly one completed."""
         if not self._configured:
             return [self._protocol_order("done before the session config")]
@@ -995,11 +997,11 @@ class NimRealtimeAdapter:
         if self._queued:
             self._pre_roll.hold_finalize()
             return []
-        return self._project_all(self._finalize_core(now))
+        return self._project_all(await self._finalize_core(now))
 
     # ---- internals -----------------------------------------------------------
 
-    def _finalize_core(self, now: float) -> list[Event]:
+    async def _finalize_core(self, now: float) -> list[Event]:
         """Release everything held, drain the front-end, finalize."""
         parts = [self._tail]
         self._tail = np.zeros(0, dtype=np.float32)
@@ -1008,15 +1010,15 @@ class NimRealtimeAdapter:
         tail_audio = np.concatenate(parts)
         events: list[Event] = []
         if len(tail_audio):
-            events.extend(self._core.receive_audio(tail_audio, now))
+            events.extend(await self._core.receive_audio(tail_audio, now))
         if self._pending_provenance is not None and not self._recorded:
             # A deferred session that never resolved a format records
             # resampler-less at finalize (gRPC parity, ING-FE-004).
             self._stamp_and_record(self._pending_provenance)
-        events.extend(self._core.finalize(now))
+        events.extend(await self._core.finalize(now))
         return events
 
-    def _feed(self, raw: bytes, now: float) -> list[dict[str, Any]]:
+    async def _feed(self, raw: bytes, now: float) -> list[dict[str, Any]]:
         """Front-end decode; release complete chunks, hold the tail."""
         front = self._front
         if front is None:  # pragma: no cover — guarded by callers
@@ -1029,10 +1031,10 @@ class NimRealtimeAdapter:
         self._tail = self._tail[n_ready * self._chunk_samples :]
         # Always called — an all-tail append still touches the idle
         # clock (the wire receive happened, ING-LIFE-005).
-        return self._project_all(self._core.receive_audio(release, now))
+        return self._project_all(await self._core.receive_audio(release, now))
 
     # @spec ING-NIMWS-009
-    def _sniff(self, raw: bytes, now: float) -> list[dict[str, Any]]:
+    async def _sniff(self, raw: bytes, now: float) -> list[dict[str, Any]]:
         """Resolve a deferred format from the RIFF header, then feed."""
         self._sniff_buf += raw
         sniffed = sniff_riff(self._sniff_buf)
@@ -1092,21 +1094,21 @@ class NimRealtimeAdapter:
             self._pending_provenance = None
         data = self._sniff_buf[sniffed.data_offset :]
         self._sniff_buf = b""
-        return self._feed(data, now)
+        return await self._feed(data, now)
 
-    def _drain_pre_roll(self, now: float) -> list[dict[str, Any]]:
+    async def _drain_pre_roll(self, now: float) -> list[dict[str, Any]]:
         """Replay everything held, in arrival order, post-admission."""
         wire: list[dict[str, Any]] = []
         for kind, payload in self._pre_roll.release():
             if kind == "audio" and isinstance(payload, bytes):
                 if self._deferred and self._front is None:
-                    wire.extend(self._sniff(payload, now))
+                    wire.extend(await self._sniff(payload, now))
                 else:
-                    wire.extend(self._feed(payload, now))
+                    wire.extend(await self._feed(payload, now))
             elif kind == "update" and isinstance(payload, Mapping):
-                wire.extend(self._on_mid_update(payload, now))
+                wire.extend(await self._on_mid_update(payload, now))
             elif kind == "finalize":
-                wire.extend(self._project_all(self._finalize_core(now)))
+                wire.extend(self._project_all(await self._finalize_core(now)))
         return wire
 
     def _effective_session(

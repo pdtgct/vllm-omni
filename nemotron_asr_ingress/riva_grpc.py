@@ -43,8 +43,9 @@ string rides the status ``details`` — the one text channel the
 dialect has for the catalog's stable codes.
 """
 
+import asyncio
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Literal, NoReturn, Protocol, cast
 
 import grpc
@@ -308,7 +309,7 @@ class OfflineTranscriber(Protocol):
     session (ING-GRPC-003).
     """
 
-    def transcribe(self, audio: FloatAudio, target_lang: str) -> str:
+    async def transcribe(self, audio: FloatAudio, target_lang: str) -> str:
         """Transcribe one whole clip in the full-context regime."""
         ...
 
@@ -318,12 +319,18 @@ class RivaAsrServicer:
     """The `RivaSpeechRecognition` servicer over the session core.
 
     Duck-types the generated servicer interface (the three RPC method
-    names and signatures), so
-    ``add_RivaSpeechRecognitionServicer_to_server`` registers it
-    unchanged. Behavior lives in the session core: this class holds
-    the shared gate, the values, and the compute seams, and translates
-    dialect only. Time and sleep are injected values so the GPU-free
-    tier drives every branch without waiting; ``record_session``
+    names and signatures) over ``grpc.aio`` (ING-VEH-002), so
+    ``add_RivaSpeechRecognitionServicer_to_server`` registers it on an
+    asyncio-native server unchanged. Behavior lives in the session
+    core: this class holds the shared gate, the values, and the
+    compute seams, and translates dialect only — every RPC method is
+    a coroutine (or async generator) because the compute seam
+    (:class:`~nemotron_asr_ingress.core.Transcriber`) is async
+    throughout (ING-VEH-004), and ``grpc.aio``'s own
+    ``ServicerContext.abort`` is itself a coroutine that always
+    raises once awaited. Clock and sleep are injected values so the
+    GPU-free tier drives every branch without waiting; no dedicated
+    thread is committed per session (ING-VEH-002). ``record_session``
     receives each admitted session's effective provenance — including
     the conditional ``resampler_identifier`` for 8 kHz sessions
     (ING-FE-004) — for EVAL-ART recording.
@@ -339,7 +346,7 @@ class RivaAsrServicer:
         model_name: str,
         chunk_ms: int = 560,
         clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         poll_s: float = 0.05,
         record_session: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -348,7 +355,9 @@ class RivaAsrServicer:
         ``chunk_ms`` is the server-side admitted chunk config for
         streaming sessions (the Riva dialect has no client chunk-size
         field; the value rides ENV like every other tunable);
-        ``poll_s`` is the queued-admission poll cadence.
+        ``poll_s`` is the queued-admission poll cadence; ``sleep`` is
+        an async sleep (default :func:`asyncio.sleep`) so a queued
+        admission wait never blocks the event loop or a worker thread.
         """
         if poll_s <= 0:
             raise ValueError(f"poll_s must be positive, got {poll_s}")
@@ -365,9 +374,9 @@ class RivaAsrServicer:
         self._record_session = record_session
 
     # @spec ING-GRPC-002, ING-LIFE-001
-    def StreamingRecognize(  # noqa: N802 — grpc method names are fixed
-        self, request_iterator: Iterator[Any], context: Any
-    ) -> Iterator[Any]:
+    async def StreamingRecognize(  # noqa: N802 — grpc method names are fixed
+        self, request_iterator: AsyncIterator[Any], context: Any
+    ) -> AsyncIterator[Any]:
         """One bidi streaming session over the session core.
 
         First message ``streaming_config`` or the stream aborts
@@ -380,19 +389,19 @@ class RivaAsrServicer:
         half-close) -> ``finalize`` -> exactly one ``is_final=true``
         response, then the server closes the stream (ING-GRPC-002).
         """
-        first = next(request_iterator, None)
+        first = await anext(request_iterator, None)
         if first is None or (
             first.WhichOneof("streaming_request") != "streaming_config"
         ):
-            self._abort(
+            await self._abort(
                 context,
                 errors.PROTOCOL_ORDER,
                 "the first message must be streaming_config",
             )
-        self._reject_runtime_config(first, context)
+        await self._reject_runtime_config(first, context)
         streaming_config = first.streaming_config
         recognition = streaming_config.config
-        self._dispose_or_abort(recognition, context)
+        await self._dispose_or_abort(recognition, context)
 
         # An UNSPECIFIED encoding defers format resolution to the RIFF
         # header at the head of the audio stream (ING-GRPC-007, the
@@ -419,17 +428,17 @@ class RivaAsrServicer:
             # SessionCore.config seam — and here the servicer is the
             # assembler.
             cast(Any, transcriber).core = core
-        self._admit_or_abort(core, recognition, context)
+        await self._admit_or_abort(core, recognition, context)
         if front is not None:
             recorded = self._record(provenance, front)
 
         interim = streaming_config.interim_results
         sniff_buf = b""
         try:
-            for request in request_iterator:
-                self._reject_runtime_config(request, context)
+            async for request in request_iterator:
+                await self._reject_runtime_config(request, context)
                 if request.WhichOneof("streaming_request") != "audio_content":
-                    self._abort(
+                    await self._abort(
                         context,
                         errors.PROTOCOL_ORDER,
                         "the session is already configured",
@@ -440,21 +449,22 @@ class RivaAsrServicer:
                     sniffed = sniff_riff(sniff_buf)
                     if sniffed is None:
                         if len(sniff_buf) > _SNIFF_LIMIT_BYTES:
-                            self._abort_error(context, _sniff_limit_error())
+                            await self._abort_error(context, _sniff_limit_error())
                         continue  # the header needs more bytes
                     if isinstance(sniffed, SessionError):
-                        self._abort_error(context, sniffed)
-                    front = self._resolve_deferred(
+                        await self._abort_error(context, sniffed)
+                    front = await self._resolve_deferred(
                         sniffed, recognition, context
                     )
                     recorded = self._record(provenance, front)
                     data = sniff_buf[sniffed.data_offset :]
                 samples = front.feed(data)
-                yield from self._project(
-                    core.receive_audio(samples, self._clock()),
+                async for response in self._project(
+                    await core.receive_audio(samples, self._clock()),
                     interim,
                     context,
-                )
+                ):
+                    yield response
             # Client half-close: drain the front-end lookahead, then
             # finalize — exactly one is_final=true response. A deferred
             # session that never resolved a format (zero or too little
@@ -462,39 +472,41 @@ class RivaAsrServicer:
             if front is not None:
                 tail = front.flush()
                 if len(tail):
-                    yield from self._project(
-                        core.receive_audio(tail, self._clock()),
+                    async for response in self._project(
+                        await core.receive_audio(tail, self._clock()),
                         interim,
                         context,
-                    )
+                    ):
+                        yield response
             if not recorded:
                 self._record(provenance, front)
-            yield from self._project(
-                core.finalize(self._clock()), interim, context
-            )
+            async for response in self._project(
+                await core.finalize(self._clock()), interim, context
+            ):
+                yield response
         finally:
             if not core.terminal:
                 # An abort or a cancelled RPC is a detected end: free
                 # the slot now, never leave it to the idle TTL
                 # (ING-LIFE-004).
-                core.close(self._clock())
+                await core.close(self._clock())
 
     # @spec ING-GRPC-003, ING-GRPC-007
-    def Recognize(  # noqa: N802 — grpc method names are fixed
+    async def Recognize(  # noqa: N802 — grpc method names are fixed
         self, request: Any, context: Any
     ) -> Any:
         """One full-context single-shot; one ``RecognizeResponse``."""
-        self._dispose_or_abort(request.config, context)
+        await self._dispose_or_abort(request.config, context)
         payload = request.audio
         if request.config.encoding == raud.ENCODING_UNSPECIFIED:
             # The whole payload is at hand: an unresolvable head is
             # final here, never need-more-bytes (ING-GRPC-007).
             sniffed = sniff_riff(payload)
             if sniffed is None:
-                self._abort_error(context, _sniff_limit_error())
+                await self._abort_error(context, _sniff_limit_error())
             if isinstance(sniffed, SessionError):
-                self._abort_error(context, sniffed)
-            front = self._resolve_deferred(sniffed, request.config, context)
+                await self._abort_error(context, sniffed)
+            front = await self._resolve_deferred(sniffed, request.config, context)
             payload = payload[sniffed.data_offset :]
         else:
             front = AudioFrontEnd(
@@ -503,13 +515,13 @@ class RivaAsrServicer:
             )
         clip = np.concatenate([front.feed(payload), front.flush()])
         target_lang = request.config.language_code or "auto"
-        transcript = self._offline.transcribe(clip, target_lang)
+        transcript = await self._offline.transcribe(clip, target_lang)
         response = rasr.RecognizeResponse()
         alternative = response.results.add().alternatives.add()
         alternative.transcript = transcript
         return response
 
-    def _resolve_deferred(
+    async def _resolve_deferred(
         self, sniffed: RiffFormat, recognition: Any, context: Any
     ) -> AudioFrontEnd:
         """Turn a header resolution into a validated front-end.
@@ -521,7 +533,7 @@ class RivaAsrServicer:
         """
         declared_rate = recognition.sample_rate_hertz
         if declared_rate and declared_rate != sniffed.sample_rate_hz:
-            self._abort_error(
+            await self._abort_error(
                 context,
                 SessionError(
                     code=errors.UNSUPPORTED_FORMAT,
@@ -534,7 +546,7 @@ class RivaAsrServicer:
             )
         declared_channels = recognition.audio_channel_count
         if declared_channels and declared_channels != sniffed.channels:
-            self._abort_error(
+            await self._abort_error(
                 context,
                 SessionError(
                     code=errors.UNSUPPORTED_FORMAT,
@@ -549,7 +561,7 @@ class RivaAsrServicer:
             sniffed.encoding, sniffed.sample_rate_hz, sniffed.channels
         )
         if rejection is not None:
-            self._abort_error(context, rejection)
+            await self._abort_error(context, rejection)
         return AudioFrontEnd(sniffed.encoding, sniffed.sample_rate_hz)
 
     def _record(
@@ -569,20 +581,22 @@ class RivaAsrServicer:
         return True
 
     # @spec ING-GRPC-004
-    def GetRivaSpeechRecognitionConfig(  # noqa: N802 — grpc-fixed name
+    async def GetRivaSpeechRecognitionConfig(  # noqa: N802 — grpc-fixed name
         self, request: Any, context: Any
     ) -> Any:
         """The static checkpoint/accept-matrix description."""
         return build_config_response(self._values, self._model_name)
 
-    def _admit_or_abort(
+    async def _admit_or_abort(
         self, core: SessionCore, recognition: Any, context: Any
     ) -> None:
         """Run the admission handshake; abort on any negative outcome.
 
         A queued configure polls at ``poll_s`` through the injected
-        sleep until the gate answers (ING-ADM-002) — the wait timeout
-        surfaces as DEADLINE_EXCEEDED, ``busy`` as RESOURCE_EXHAUSTED.
+        async sleep until the gate answers (ING-ADM-002) — the wait
+        timeout surfaces as DEADLINE_EXCEEDED, ``busy`` as
+        RESOURCE_EXHAUSTED. The poll loop never blocks the event loop
+        (ING-VEH-002): each wait yields control via ``await``.
         """
         config = Configure(
             chunk_ms=self._chunk_ms,
@@ -590,24 +604,24 @@ class RivaAsrServicer:
         )
         answers = core.configure(config, self._clock())
         while not answers:
-            self._sleep(self._poll_s)
-            answers = core.poll(self._clock())
+            await self._sleep(self._poll_s)
+            answers = await core.poll(self._clock())
         for event in answers:
             if isinstance(event, Admitted):
                 return
             if isinstance(event, Busy):
-                self._abort(
+                await self._abort(
                     context,
                     errors.BUSY,
                     event.detail or "admission watermark full",
                 )
             if isinstance(event, SessionError):
-                self._abort_error(context, event)
+                await self._abort_error(context, event)
         raise AssertionError(f"unanswerable admission events: {answers}")
 
-    def _project(
+    async def _project(
         self, events: list[Event], interim: bool, context: Any
-    ) -> Iterator[Any]:
+    ) -> AsyncIterator[Any]:
         """Project session-core stream events onto the wire."""
         for event in events:
             if isinstance(event, Partial):
@@ -616,7 +630,7 @@ class RivaAsrServicer:
             elif isinstance(event, Final):
                 yield self._response(event.transcript, is_final=True)
             elif isinstance(event, SessionError):
-                self._abort_error(context, event)
+                await self._abort_error(context, event)
 
     @staticmethod
     def _response(transcript: str, is_final: bool) -> Any:
@@ -627,14 +641,14 @@ class RivaAsrServicer:
         result.alternatives.add().transcript = transcript
         return response
 
-    def _reject_runtime_config(self, request: Any, context: Any) -> None:
+    async def _reject_runtime_config(self, request: Any, context: Any) -> None:
         """Reject a non-empty ``runtime_config`` rider, never ignore it.
 
         The request-level analog of the matrix's
         ``custom_configuration`` row (ING-ERR-001).
         """
         if request.runtime_config:
-            self._abort_error(
+            await self._abort_error(
                 context,
                 _rejection(
                     errors.INVALID_CONFIG_FIELD,
@@ -643,7 +657,7 @@ class RivaAsrServicer:
                 ),
             )
 
-    def _dispose_or_abort(self, recognition: Any, context: Any) -> None:
+    async def _dispose_or_abort(self, recognition: Any, context: Any) -> None:
         """Disposition the config; one abort names every rejection."""
         rejections = disposition(recognition, self._values, self._model_name)
         if not rejections:
@@ -651,17 +665,19 @@ class RivaAsrServicer:
         first = rejections[0]
         projection = errors.catalog()[first.code]
         detail = "; ".join(self._detail(rejection) for rejection in rejections)
-        context.abort(getattr(grpc.StatusCode, projection.grpc_status), detail)
+        await context.abort(
+            getattr(grpc.StatusCode, projection.grpc_status), detail
+        )
         raise AssertionError("context.abort() must raise")
 
-    def _abort(self, context: Any, code: str, detail: str) -> NoReturn:
+    async def _abort(self, context: Any, code: str, detail: str) -> NoReturn:
         """Abort with a catalog code; the code string rides details."""
-        self._abort_error(context, SessionError(code=code, detail=detail))
+        await self._abort_error(context, SessionError(code=code, detail=detail))
 
-    def _abort_error(self, context: Any, error: SessionError) -> NoReturn:
+    async def _abort_error(self, context: Any, error: SessionError) -> NoReturn:
         """Project one catalog error onto the RPC status (ING-ERR-001)."""
         projection = errors.catalog()[error.code]
-        context.abort(
+        await context.abort(
             getattr(grpc.StatusCode, projection.grpc_status),
             self._detail(error),
         )
