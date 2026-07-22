@@ -106,9 +106,6 @@ async def buffer_stream(
     placeholder_id = getattr(
         model_config, "audio_chunk_token_id", _DEFAULT_PLACEHOLDER_ID
     )
-    #: The session-control prompt selected at admission (PORT-LID-001;
-    #: the ING locale-update plumbing replaces this static selection).
-    prompt_index = getattr(model_config, "nemotron_prompt_index", 0)
     geometry_id = _GEOMETRY_BY_SAMPLES.get(int(chunk_samples))
     if geometry_id is None:
         raise ValueError(
@@ -134,11 +131,17 @@ async def buffer_stream(
         # ENVELOPE (header + raw samples), the serving tier's twin
         # admission record (design §Phase-6c transaction seams).
         nonlocal sequence
+        # The session-control prompt is re-read at each mint so the
+        # last valid update ordered before mint is the one stamped
+        # (PORT-LID-001); a live per-session config view (ING-VEH-007)
+        # makes mid-session locale updates visible exactly here.
         envelope = mint_envelope(
             chunk,
             geometry_id=geometry_id,
             final_tail=final_tail,
-            prompt_index=prompt_index,
+            prompt_index=int(
+                getattr(model_config, "nemotron_prompt_index", 0)
+            ),
             chunk_sequence=sequence,
             admission_ms_mod=admission_ms_mod,
         )
