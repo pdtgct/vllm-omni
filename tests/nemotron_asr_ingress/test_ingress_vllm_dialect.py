@@ -368,6 +368,7 @@ class SilentTranscriber:
 
     def __init__(self) -> None:
         self.flush_called = False
+        self.finished = False
 
     async def step(self, chunk: "np.typing.NDArray[np.float32]") -> str:
         return ""
@@ -381,6 +382,9 @@ class SilentTranscriber:
 
     async def abort(self) -> None:
         return None
+
+    async def finish(self) -> None:
+        self.finished = True
 
 
 # @spec ING-CORE-005

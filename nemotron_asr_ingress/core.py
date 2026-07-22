@@ -83,7 +83,16 @@ class Transcriber(Protocol):
     transform) and returns the final transcript; ``update_locale``
     forwards a validated mid-session locale (PORT-LID-003 applies it
     at the next chunk boundary); ``abort`` frees engine state
-    immediately.
+    immediately on a non-normal end (client close, detected
+    disconnect, idle-TTL); ``finish`` frees engine state on the
+    normal end of a session, called exactly once by every
+    ``finalize`` -- including the skip-flush path where ``flush``
+    never runs (ING-LIFE-003) -- so an implementation holding a live
+    resource (e.g. an open engine generation) always gets exactly one
+    terminal call on every path, success or not (ING-VEH-004).
+    Deliberately not named to match ``SessionCore.close`` (the
+    client-disconnect path, which calls ``abort``): the two names
+    would otherwise cross.
     """
 
     async def step(self, chunk: FloatAudio) -> str:
@@ -100,6 +109,16 @@ class Transcriber(Protocol):
 
     async def abort(self) -> None:
         """Free engine state immediately (close / idle abort)."""
+        ...
+
+    async def finish(self) -> None:
+        """Free engine state on a normal finalize, flushed or not.
+
+        Called exactly once by ``SessionCore.finalize`` regardless of
+        whether ``flush`` ran; never called on the abort path (abort
+        already frees state). A transcriber with no persistent
+        resource (e.g. a synchronous stub) may treat this as a no-op.
+        """
         ...
 
 
@@ -542,6 +561,11 @@ class SessionCore:
             transcript = self._cumulative
         self._terminal = True
         self._release_slot()
+        # Unconditional, flush-or-not: the one terminal call every
+        # transcriber gets on the normal end of a session (never
+        # skipped alongside flush -- see the Transcriber.finish
+        # docstring for why the skip-flush path still needs this).
+        await self._transcriber.finish()
         return [Final(transcript=transcript)]
 
     # @spec ING-LIFE-004

@@ -38,6 +38,7 @@ class FakeTranscriber:
         self.flush_called = False
         self.locales: list[str] = []
         self.aborted = False
+        self.finished = False
 
     async def step(self, chunk: npt.NDArray[np.float32]) -> str:
         self.steps.append(chunk)
@@ -53,6 +54,9 @@ class FakeTranscriber:
 
     async def abort(self) -> None:
         self.aborted = True
+
+    async def finish(self) -> None:
+        self.finished = True
 
     def cumulative(self) -> str:
         return " ".join(WORDS[: min(len(self.steps), len(WORDS))])

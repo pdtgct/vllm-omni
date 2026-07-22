@@ -62,6 +62,7 @@ async def test_finalize_hands_the_residual_raw_and_unpadded() -> None:
     # the tail transform is PORT-SESS-003's, never the front-end's.
     assert len(fake.flushed) == residual_len
     np.testing.assert_array_equal(fake.flushed, clip[CHUNK_SAMPLES:])
+    assert fake.finished
 
 
 # @spec ING-LIFE-002
@@ -108,6 +109,25 @@ async def test_zero_audio_finalize_is_a_valid_degenerate_session() -> None:
     # Skip-flush: PORT's tail transform is never invoked with nothing.
     assert not fake.flush_called
     assert core.terminal
+    # But finish() still runs -- a transcriber holding a live resource
+    # (e.g. an open engine generation, ING-VEH-004) gets exactly one
+    # terminal call on every finalize path, flushed or not.
+    assert fake.finished
+
+
+# @spec ING-LIFE-003
+async def test_close_path_aborts_never_finishes() -> None:
+    # The abort path (client disconnect, idle-TTL) and the finalize
+    # path (finish, flush-or-not) are mutually exclusive terminal
+    # calls -- never both -- so a transcriber never needs to guard
+    # against a double teardown.
+    core, fake, gate = make_core()
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    await core.close(now=0.2)
+    assert fake.aborted
+    assert not fake.finished
+    assert gate.active == 0
 
 
 # @spec ING-LIFE-004
