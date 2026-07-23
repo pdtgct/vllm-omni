@@ -21,23 +21,12 @@ import numpy as np
 
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     ADMISSION_EPOCH_MODULUS_MS,
-    CADENCES,
     ENVELOPE_HEADER_FIELDS,
-    RAW_SAMPLES_PER_CHUNK,
+)
+from vllm_omni.model_executor.models.nemotron_asr.session import (
+    NemotronRealtimeSession,
 )
 
-#: Default admitted chunk width (samples) when the session omits it.
-_DEFAULT_CHUNK_SAMPLES = 8960
-#: Minted carrier placeholder id fallback (config's audio_chunk_token_id).
-_DEFAULT_PLACEHOLDER_ID = 13089
-#: Geometry ids follow manifests.CADENCES order; the admitted geometry
-#: is derived from the session's chunk width — an unknown width fails
-#: closed (PORT-SESS-002: geometry is admission-selected, never
-#: invented).
-_GEOMETRY_BY_SAMPLES = {
-    RAW_SAMPLES_PER_CHUNK[label]: index
-    for index, label in enumerate(CADENCES)
-}
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
 
@@ -99,25 +88,26 @@ async def buffer_stream(
     finalize (PORT-SESS-003: exactly one actual-residual final-tail,
     including an explicit zero-sample transaction; never zero-padded).
     """
-    chunk_samples = getattr(
-        model_config, "nemotron_chunk_samples", _DEFAULT_CHUNK_SAMPLES
+    # Every session control is a typed attribute of the session object
+    # riding the model_config position (PORT-RTC-001); anything else is
+    # the channel-less standard path, whose defaults live only in the
+    # factory.
+    session = (
+        model_config
+        if isinstance(model_config, NemotronRealtimeSession)
+        else NemotronRealtimeSession.from_model_config(model_config)
     )
-    park_id = getattr(model_config, "park_token_id", None)
-    placeholder_id = getattr(
-        model_config, "audio_chunk_token_id", _DEFAULT_PLACEHOLDER_ID
-    )
-    geometry_id = _GEOMETRY_BY_SAMPLES.get(int(chunk_samples))
-    if geometry_id is None:
-        raise ValueError(
-            f"chunk width {chunk_samples} is not an admitted cadence "
-            f"({sorted(_GEOMETRY_BY_SAMPLES)}); geometry is selected at "
-            "admission, never invented (PORT-SESS-002)"
-        )
+    geometry = session.geometry
+    chunk_samples = geometry.chunk_samples
+    geometry_id = geometry.geometry_id
+    park_id = session.park_token_id
+    placeholder_id = session.audio_chunk_token_id
+    ledger = session.ledger
 
     async def hold_until_park() -> None:
         while True:
             ids = await input_stream.get()
-            if park_id is None or park_id in ids:
+            if park_id in ids:
                 return
 
     sequence = 0
@@ -139,9 +129,7 @@ async def buffer_stream(
             chunk,
             geometry_id=geometry_id,
             final_tail=final_tail,
-            prompt_index=int(
-                getattr(model_config, "nemotron_prompt_index", 0)
-            ),
+            prompt_index=session.prompt_index,
             chunk_sequence=sequence,
             admission_ms_mod=admission_ms_mod,
         )
@@ -169,7 +157,16 @@ async def buffer_stream(
         buffer = np.concatenate([buffer, frame])
         while buffer.shape[0] >= chunk_samples:
             chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
-            ready.append((chunk, _admission_ms_mod()))
+            stamp = _admission_ms_mod()
+            ready.append((chunk, stamp))
+            # The ticket exists before the prompt is yielded, so a park
+            # returned immediately after cannot outrun its handle
+            # (PORT-RTC-002); the call is synchronous, leaving the
+            # stamp-then-drain pass await-free.
+            if ledger is not None:
+                ledger.mint(final_tail=False, admission_ms_mod=stamp)
+        if ledger is not None:
+            ledger.acknowledge_piece(int(frame.shape[0]))
         while ready:
             chunk, admission_ms_mod = ready.popleft()
             if yielded:
@@ -184,6 +181,7 @@ async def buffer_stream(
     # session transition still needs the final marker (PORT-SESS-003).
     if yielded:
         await hold_until_park()
-    yield prompt(
-        buffer, final_tail=True, admission_ms_mod=_admission_ms_mod()
-    )
+    tail_stamp = _admission_ms_mod()
+    if ledger is not None:
+        ledger.mint(final_tail=True, admission_ms_mod=tail_stamp)
+    yield prompt(buffer, final_tail=True, admission_ms_mod=tail_stamp)

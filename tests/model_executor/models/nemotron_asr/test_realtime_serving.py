@@ -44,7 +44,8 @@ def _load_chain() -> dict[str, Any]:
     loaded: dict[str, Any] = {}
     for mod in (
         "precision", "masks", "featurizer", "encoder", "lid",
-        "manifests", "frontend", "rnnt_cell", "rnnt", "streaming",
+        "manifests", "frontend", "rnnt_cell", "rnnt",
+        "configuration_nemotron_asr", "session", "streaming",
     ):
         spec = importlib.util.spec_from_file_location(
             f"{_BASE}.{mod}", _PKG / f"{mod}.py"
@@ -61,10 +62,31 @@ _MODULES = _load_chain()
 verify_replay_echo = _MODULES["rnnt"].verify_replay_echo
 write_decision_carrier = _MODULES["rnnt"].write_decision_carrier
 buffer_stream = _MODULES["streaming"].buffer_stream
+NemotronRealtimeSession = _MODULES["session"].NemotronRealtimeSession
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PARK_ID = 13089  # placeholder eos in these tests; real value from config
+PARK_ID = 13088  # the config's eos_token_id in these tests
+PLACEHOLDER_ID = 13089
+#: Locales chosen so the stamped rows read as the literal row numbers
+#: the PORT-LID-001 assertions below name.
+PROMPTS = {"auto": 0, "en-US": 2, "de-DE": 7, "fr-FR": 3}
+
+
+def _session(**kwargs: Any) -> Any:
+    """A typed realtime session over a bare config (PORT-RTC-001).
+
+    Every session control the segmenter reads is now a typed attribute
+    of this object; the retired ``getattr``-with-default reads had no
+    writer on the standard serving path.
+    """
+    hf = SimpleNamespace(
+        eos_token_id=PARK_ID,
+        audio_chunk_token_id=PLACEHOLDER_ID,
+        prompt_dictionary=dict(PROMPTS),
+        num_prompts=128,
+    )
+    return NemotronRealtimeSession.from_model_config(hf, **kwargs)
 
 
 def _run(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -92,10 +114,9 @@ async def _collect_yields(
             yield np.zeros(n, dtype=np.float32)
 
     input_stream: asyncio.Queue = asyncio.Queue()
-    model_config = None  # the α4 code phase binds the real config read
     yields = []
     agen = buffer_stream(
-        audio_stream(), input_stream, model_config
+        audio_stream(), input_stream, _session()
     )
     async for prompt in agen:
         yields.append(prompt)
@@ -164,7 +185,7 @@ def test_next_chunk_holds_until_park_echo() -> None:
 
         input_stream: asyncio.Queue = asyncio.Queue()
         agen = buffer_stream(
-            audio_stream(), input_stream, None
+            audio_stream(), input_stream, _session()
         )
         first = await asyncio.wait_for(agen.__anext__(), timeout=2)
         assert first is not None
@@ -178,26 +199,28 @@ def test_locale_update_is_stamped_at_the_next_mint() -> None:
     # PORT-LID-001: the last valid update ordered before CHUNK-carrier
     # mint is stamped into that immutable carrier. A live per-session
     # config view (ING-VEH-007) mutates the selection between chunks;
-    # the change appears at the NEXT mint, never retroactively.
+    # the change appears at the NEXT mint, never retroactively. The
+    # selection now moves through the session's own validated selector
+    # (PORT-RTC-001), not an untyped attribute write.
     import numpy as np
 
     async def scenario() -> None:
-        config = SimpleNamespace(nemotron_prompt_index=2)
+        session = _session(locale="en-US")
 
         async def audio_stream() -> AsyncIterator[Any]:
             yield np.zeros(8960, dtype=np.float32)
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
-        agen = buffer_stream(audio_stream(), input_stream, config)
+        agen = buffer_stream(audio_stream(), input_stream, session)
         first = (await agen.__anext__())["multi_modal_data"]["audio"]
         assert first[4] == 2.0
-        config.nemotron_prompt_index = 7
+        session.select_prompt("de-DE")
         input_stream.put_nowait([PARK_ID])
         second = (await agen.__anext__())["multi_modal_data"]["audio"]
         assert second[4] == 7.0
         assert first[4] == 2.0  # the earlier carrier is immutable
-        config.nemotron_prompt_index = 3
+        session.select_prompt("fr-FR")
         input_stream.put_nowait([PARK_ID])
         tail = (await agen.__anext__())["multi_modal_data"]["audio"]
         assert tail[3] == 1.0
@@ -222,12 +245,11 @@ def test_yield_carries_the_placeholder_token() -> None:
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
-        model_config = SimpleNamespace(audio_chunk_token_id=13089)
         agen = buffer_stream(
-            audio_stream(), input_stream, model_config
+            audio_stream(), input_stream, _session()
         )
         prompt = await agen.__anext__()
-        assert prompt["prompt_token_ids"] == [13089]
+        assert prompt["prompt_token_ids"] == [PLACEHOLDER_ID]
         assert "audio" in prompt["multi_modal_data"]
 
     _run(scenario())
