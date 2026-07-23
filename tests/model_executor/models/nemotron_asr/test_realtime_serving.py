@@ -47,12 +47,19 @@ def _load_chain() -> dict[str, Any]:
         "manifests", "frontend", "rnnt_cell", "rnnt",
         "configuration_nemotron_asr", "session", "streaming",
     ):
-        spec = importlib.util.spec_from_file_location(
-            f"{_BASE}.{mod}", _PKG / f"{mod}.py"
-        )
+        dotted = f"{_BASE}.{mod}"
+        # Reuse-if-present: sibling test files chain-load these same
+        # canonical names at collection time; overwriting would split
+        # class identity across chains (lazy imports resolve through
+        # sys.modules at call time).
+        existing = sys.modules.get(dotted)
+        if existing is not None and getattr(existing, "__file__", None):
+            loaded[mod] = existing
+            continue
+        spec = importlib.util.spec_from_file_location(dotted, _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_BASE}.{mod}"] = module
+        sys.modules[dotted] = module
         spec.loader.exec_module(module)
         loaded[mod] = module
     return loaded

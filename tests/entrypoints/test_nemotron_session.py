@@ -117,6 +117,16 @@ def _load_chain() -> dict[str, Any]:
         ),
     ]
     for dotted, path, short in modules:
+        # Reuse-if-present: multiple test files chain-load these same
+        # canonical names at COLLECTION time, and the module under test
+        # resolves its lazy imports through sys.modules at CALL time —
+        # an unconditional overwrite here would split class identity
+        # between chains and break every isinstance/behavioral check in
+        # whichever file collected first.
+        existing = sys.modules.get(dotted)
+        if existing is not None and getattr(existing, "__file__", None):
+            loaded[short] = existing
+            continue
         spec = importlib.util.spec_from_file_location(dotted, path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
