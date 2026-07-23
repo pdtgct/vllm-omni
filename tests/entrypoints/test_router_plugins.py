@@ -1,36 +1,58 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Contract tests for the generic router-plugin hook.
+"""Contract tests for the generic router-plugin hook (PORT-PLUG-001..003).
 
-Spec IDs are the router-hook candidates from the canonical-service-and-router-hook
-brief (Subject B). NOTE: `PORT-PLUG-001`/`PORT-PLUG-002` are already occupied in
-port-specs.md by unrelated requirements (validation capture, metrics); the brief's
-candidates need renumbering before they land as rows.
-
-These tests never import `vllm_omni.entrypoints.openai.api_server` (which pulls in
-vllm and an engine); the loader module is deliberately import-light, so the whole
-contract is exercised GPU-free against a duck-typed app.
+These tests exercise the hook GPU-free against a duck-typed app. They
+never import `vllm_omni.entrypoints.openai.api_server` (which pulls in
+vllm and an engine); the loader module is deliberately import-light, so
+it is loaded BY FILE PATH under a bare name -- the same technique the
+session/orchestrator tests use -- so a plain `pytest` run collects this
+file without `vllm` on the box (importing it through the
+`vllm_omni.entrypoints.openai` package would trigger the vllm-patching
+`vllm_omni/__init__`). The graduated specs now own the PORT-PLUG-* IDs
+(port-specs.md §vLLM-Omni integration).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import types
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from vllm_omni.entrypoints.openai.router_plugins import (
-    ROUTER_PLUGINS_GROUP,
-    load_router_plugins,
+_MODULE_PATH = Path(
+    os.environ.get("ROUTER_PLUGINS_PATH")
+    or (
+        Path(__file__).resolve().parents[2]
+        / "vllm_omni/entrypoints/openai/router_plugins.py"
+    )
 )
+
+
+def _load_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "router_plugins_under_test", _MODULE_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_RP = _load_module()
+ROUTER_PLUGINS_GROUP = _RP.ROUTER_PLUGINS_GROUP
+load_router_plugins = _RP.load_router_plugins
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-MODULE = "vllm_omni.entrypoints.openai.router_plugins"
+MODULE = "router_plugins_under_test"
 
 
 class StubApp:

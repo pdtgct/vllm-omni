@@ -164,6 +164,15 @@ class ReceiptLedger:
         self._waiter: asyncio.Future[PieceReceipt] | None = None
         self._samples_consumed = 0
         self._sequence = 0
+        self._failed: BaseException | None = None
+
+    def _reject_if_failed(self) -> None:
+        """Raise once the ledger has been terminally failed."""
+        if self._failed is not None:
+            raise RuntimeError(
+                "the receipt ledger was terminally failed; no further "
+                "mint/acknowledge/consume is valid (PORT-RTC-002)"
+            ) from self._failed
 
     @property
     def max_pending_carriers(self) -> int:
@@ -187,8 +196,10 @@ class ReceiptLedger:
             park.
 
         Raises:
-            RuntimeError: If the pending-ticket cap is already reached.
+            RuntimeError: If the pending-ticket cap is already reached,
+                or the ledger has been terminally failed.
         """
+        self._reject_if_failed()
         if len(self._pending) >= self._max_pending_carriers:
             raise RuntimeError(
                 f"pending carrier tickets reached the session's backlog "
@@ -218,8 +229,10 @@ class ReceiptLedger:
             (empty for a sub-cadence frame).
 
         Raises:
-            RuntimeError: If undrained receipts reach the backlog bound.
+            RuntimeError: If undrained receipts reach the backlog bound,
+                or the ledger has been terminally failed.
         """
+        self._reject_if_failed()
         self._samples_consumed += samples
         receipt = PieceReceipt(
             samples_consumed=self._samples_consumed,
@@ -249,10 +262,14 @@ class ReceiptLedger:
             The oldest unread piece receipt.
 
         Raises:
-            RuntimeError: If another consumer is already awaiting one.
+            RuntimeError: If another consumer is already awaiting one, or
+                the ledger has been terminally failed.
+            BaseException: The failure passed to :meth:`fail` if the
+                ledger is failed while this call is awaiting.
         """
         if self._receipts:
             return self._receipts.popleft()
+        self._reject_if_failed()
         if self._waiter is not None:
             raise RuntimeError(
                 "piece acknowledgement is single-slot: feed calls are "
@@ -276,8 +293,10 @@ class ReceiptLedger:
         Raises:
             RuntimeError: If no ticket is pending — the causal chain
                 (ticket, then prompt, then park) can only break on a
-                protocol error, so this is never a silent skip.
+                protocol error, so this is never a silent skip — or the
+                ledger has been terminally failed.
         """
+        self._reject_if_failed()
         if not self._pending:
             raise RuntimeError(
                 "park observed with no pending carrier ticket; a ticket "
@@ -288,6 +307,35 @@ class ReceiptLedger:
         if not ticket.done.done():
             ticket.done.set_result(payload)
         return ticket
+
+    def fail(self, error: BaseException) -> None:
+        """Terminally close the ledger, failing every outstanding waiter.
+
+        Called by the engine binding when generation or rendering ends
+        before the session's normal completion: without this, a consumer
+        blocked in :meth:`next_piece` (engine died before acknowledging a
+        frame) or awaiting a :class:`CarrierTicket`'s ``done`` future
+        (engine died between mint and park) would hang forever. ``fail``
+        fails the piece waiter and every pending ticket with ``error``,
+        and makes later mint/acknowledge/consume calls reject
+        (PORT-RTC-002). Idempotent: a second call is a no-op, so the
+        binding's success and error paths can both call it defensively.
+
+        Args:
+            error: The terminal failure propagated to every waiter.
+        """
+        if self._failed is not None:
+            return
+        self._failed = error
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            self._waiter = None
+            waiter.set_exception(error)
+        while self._pending:
+            ticket = self._pending.popleft()
+            if not ticket.done.done():
+                ticket.done.set_exception(error)
+        self._minted_by_frame.clear()
 
 
 class NemotronRealtimeSession:

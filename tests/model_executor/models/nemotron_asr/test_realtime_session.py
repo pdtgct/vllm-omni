@@ -361,3 +361,78 @@ def test_the_default_backlog_derives_from_the_admitted_cadence() -> None:
 def test_geometry_seconds_backs_the_backlog_derivation() -> None:
     geometry = AdmittedGeometry.from_cadence("560ms")
     assert geometry.seconds == pytest.approx(0.56)
+
+
+# ---- ledger terminal failure propagation (PORT-RTC-002; W3 needs this) ---------
+
+
+def test_fail_unblocks_a_next_piece_waiter_before_acknowledgement() -> None:
+    # @spec PORT-RTC-002
+    # Engine died before consuming a frame: a consumer blocked in
+    # next_piece() must be woken with the failure, not hang forever.
+    async def scenario() -> None:
+        ledger = ReceiptLedger(max_pending_carriers=4)
+        waiter = asyncio.ensure_future(ledger.next_piece())
+        await asyncio.sleep(0)  # let it park on the waiter
+        assert not waiter.done()
+        boom = RuntimeError("engine died mid-generation")
+        ledger.fail(boom)
+        with pytest.raises(RuntimeError, match="engine died"):
+            await waiter
+
+    _run(scenario())
+
+
+def test_fail_rejects_a_pending_ticket_between_mint_and_park() -> None:
+    # @spec PORT-RTC-002
+    # Engine died after a carrier was minted but before its park: the
+    # ticket's done future must fail, not block the consumer forever.
+    async def scenario() -> None:
+        ledger = ReceiptLedger(max_pending_carriers=4)
+        ticket = ledger.mint(final_tail=False, admission_ms_mod=7)
+        boom = RuntimeError("engine died after mint")
+        ledger.fail(boom)
+        with pytest.raises(RuntimeError, match="after mint"):
+            await ticket.done
+
+    _run(scenario())
+
+
+def test_fail_makes_later_operations_reject() -> None:
+    # @spec PORT-RTC-002
+    ledger = ReceiptLedger(max_pending_carriers=4)
+    ledger.fail(RuntimeError("dead"))
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        ledger.mint(final_tail=False, admission_ms_mod=1)
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        ledger.acknowledge_piece(160)
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        ledger.complete_next("x")
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        _run(ledger.next_piece())
+
+
+def test_fail_is_idempotent() -> None:
+    # @spec PORT-RTC-002
+    ledger = ReceiptLedger(max_pending_carriers=4)
+    ledger.fail(RuntimeError("first"))
+    ledger.fail(RuntimeError("second"))  # no raise, no state churn
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        ledger.mint(final_tail=False, admission_ms_mod=1)
+
+
+def test_queued_receipts_drain_before_the_failed_check() -> None:
+    # @spec PORT-RTC-002
+    # A receipt already acknowledged before the failure is still
+    # deliverable to next_piece(); the fail() guard applies only once the
+    # queue is empty (nothing is silently lost that PORT already owned).
+    async def scenario() -> None:
+        ledger = ReceiptLedger(max_pending_carriers=4)
+        ledger.acknowledge_piece(160)  # a receipt is queued
+        ledger.fail(RuntimeError("dead"))
+        receipt = await ledger.next_piece()  # the queued one still drains
+        assert receipt.samples_consumed == 160
+        with pytest.raises(RuntimeError, match="terminally failed"):
+            await ledger.next_piece()  # now empty -> the fail guard bites
+
+    _run(scenario())

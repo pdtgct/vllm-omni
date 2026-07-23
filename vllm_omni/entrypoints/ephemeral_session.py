@@ -108,17 +108,36 @@ class SessionFactory(Protocol):
     authority; the orchestrator neither interprets nor defaults them.
 
     Admission-busy is surfaced by raising :class:`AdmissionBusyError`, not by
-    returning ``None``: ``open`` keeps a total ``SessionLease`` return
-    so no caller threads an Optional or risks proceeding on a ``None``;
-    the busy condition is exceptional (the shared pool is full) and each
-    transport already translates errors to its own busy status at its
-    boundary; and because a raised ``AdmissionBusyError`` means no lease was
-    ever minted, the orchestrator's "release only what you leased"
-    invariant stays trivially correct -- there is nothing to release.
+    returning ``None``: both ``open`` methods keep a total ``SessionLease``
+    return so no caller threads an Optional or risks proceeding on a
+    ``None``; the busy condition is exceptional (the shared pool is full)
+    and each transport already translates errors to its own busy status
+    at its boundary; and because a raised ``AdmissionBusyError`` means no
+    lease was ever minted, the orchestrator's "release only what you
+    leased" invariant stays trivially correct -- there is nothing to
+    release.
+
+    Two entry points, one per regime. ``open_ephemeral`` leases the
+    single-shot session at the model's OWN canonical geometry
+    (PORT-REGIME-002): the caller passes no cadence, so no transport can
+    pick the wrong one and the canonical-geometry choice lives once, in
+    the model-aware factory. ``open`` keeps the general cadence-selecting
+    entry for realtime sessions, where the admitted cadence is a genuine
+    per-session parameter.
     """
 
+    async def open_ephemeral(self, *, locale: str) -> SessionLease:
+        """Lease one canonical single-shot session (PORT-REGIME-002).
+
+        The factory selects the model's canonical ephemeral geometry;
+        the caller supplies only ``locale``. Raises
+        :class:`AdmissionBusyError` when no slot is free.
+        """
+        ...
+
     async def open(self, *, cadence: str, locale: str) -> SessionLease:
-        """Lease one admitted session, or raise :class:`AdmissionBusyError`."""
+        """Lease one realtime session at ``cadence``, or raise
+        :class:`AdmissionBusyError`."""
         ...
 
 
@@ -162,41 +181,48 @@ class TranscriptionResult:
     text: str
 
 
-def _compose_deadline(
-    finalization_timeout_s: float, deadline: float | None
+def _remaining_drain_budget(
+    finalization_timeout_s: float,
+    transport_deadline_at: float | None,
+    now: float,
 ) -> float:
-    """Compose the effective finalization bound (A2: serving owns it).
+    """The finalization bound evaluated FRESH at drain time (A2).
 
     ``finalization_timeout_s`` is the mandatory finite bound
-    (ING-LIFE-005); ``deadline`` is the transport's remaining time
-    budget in seconds (e.g. ``grpc.aio`` ``time_remaining()``), or
-    ``None`` when the transport set none. The drain runs under the
-    earlier of the two, composed here in the ONE place that owns
-    deadlines.
+    (ING-LIFE-005). ``transport_deadline_at`` is the transport's
+    deadline as an ABSOLUTE monotonic-clock instant captured at entry
+    (``None`` when the transport set none), and ``now`` is the current
+    monotonic time. The drain runs under the earlier of the mandatory
+    bound and the transport's REMAINING time -- computed here, after
+    feeding, so a slow feed cannot hand finalization a stale budget. A
+    transport already out of time yields a non-positive budget, which
+    fires the timeout immediately.
     """
-    if not math.isfinite(finalization_timeout_s) or finalization_timeout_s <= 0:
-        raise ValueError(
-            "finalization_timeout_s must be finite and positive, "
-            f"got {finalization_timeout_s}"
-        )
-    if deadline is None:
+    if transport_deadline_at is None:
         return finalization_timeout_s
-    return min(finalization_timeout_s, deadline)
+    return min(finalization_timeout_s, transport_deadline_at - now)
 
 
-async def _drain_within_deadline(lease: SessionLease, drain_timeout: float) -> str:
-    """Flush under the composed deadline; translate only true expiry.
+async def _finalize_within_deadline(
+    lease: SessionLease, drain_timeout: float
+) -> str:
+    """Drain ``flush`` THEN ``finish`` under ONE deadline (PORT-EPH-002).
 
-    ``asyncio.timeout`` (not ``wait_for``) so THIS deadline's expiry is
-    distinguishable from a ``TimeoutError`` the flush itself raises: on
-    expiry (``bound.expired()``) a :class:`FinalizationTimeoutError` is
-    raised; an engine-originated ``TimeoutError`` propagates unchanged.
-    Both outcomes leave the failure to the caller's terminal handler --
-    this helper never aborts or releases.
+    Both terminal steps are bounded together: a stalled ``finish`` can
+    no longer retain the slot after a clean ``flush``. ``asyncio.timeout``
+    (not ``wait_for``) keeps THIS deadline's expiry distinguishable from
+    a ``TimeoutError`` the engine itself raises -- on expiry
+    (``bound.expired()``) a :class:`FinalizationTimeoutError` is raised;
+    an engine-originated ``TimeoutError`` propagates unchanged. This
+    helper never aborts or releases: any failure (expiry, or a raising
+    flush/finish) leaves the terminal handling to the caller, which
+    aborts then releases.
     """
     try:
         async with asyncio.timeout(drain_timeout) as bound:
-            return await lease.flush()
+            transcript = await lease.flush()
+            await lease.finish()
+            return transcript
     except TimeoutError:
         if bound.expired():
             raise FinalizationTimeoutError(drain_timeout) from None
@@ -207,7 +233,6 @@ async def transcribe_ephemeral(
     pieces: Iterable[FloatSamples],
     *,
     factory: SessionFactory,
-    cadence: str,
     locale: str,
     finalization_timeout_s: float,
     submit_bound_samples: int,
@@ -215,19 +240,22 @@ async def transcribe_ephemeral(
 ) -> TranscriptionResult:
     """Run one canonical ephemeral transcription (PORT-EPH-001/002).
 
-    Open a lease through ``factory`` for the opaque model-typed
-    ``cadence``/``locale``; feed the ``pieces`` -- slicing each block so
-    no single ``feed`` exceeds ``submit_bound_samples`` (the serving
+    Lease the model's canonical single-shot session through
+    ``factory.open_ephemeral`` (the caller passes no cadence -- the
+    canonical geometry is the model-aware factory's, not each
+    transport's, PORT-REGIME-002); feed the ``pieces`` -- slicing each block so no
+    single ``feed`` exceeds ``submit_bound_samples`` (the serving
     layer's pre-submit bound, ING-FE-005; NOT a cadence, ING-FE-006) --
-    then drain the final-tail with ``flush`` under the composed
-    deadline, take the single terminal ``finish``, free the slot, and
-    return exactly one :class:`TranscriptionResult`.
+    then drain the final-tail with ``flush`` AND take the terminal
+    ``finish`` together under one deadline, free the slot, and return
+    exactly one :class:`TranscriptionResult`.
 
-    On ANY error or cancellation the lease is ``abort``-ed and
-    ``release``-d idempotently and NO result is emitted: the terminal
-    call is ``finish`` XOR ``abort``, never both, and the slot is freed
-    only after that cleanup. A ``flush`` that hangs past the composed
-    deadline aborts with :class:`FinalizationTimeoutError`; an
+    On ANY error or cancellation -- including a ``flush`` or ``finish``
+    that hangs past the deadline, or a raising ``finish`` -- the lease is
+    ``abort``-ed then ``release``-d and NO result is emitted: the
+    successful terminal call is ``finish``, else ``abort`` recovers, and
+    the slot is freed only after that cleanup on every path. A drain that
+    outlives the deadline raises :class:`FinalizationTimeoutError`; an
     engine-originated ``TimeoutError`` is NOT misclassified as deadline
     expiry.
 
@@ -240,7 +268,6 @@ async def transcribe_ephemeral(
             runs and ``flush`` drains the zero-sample final tail
             (PORT-SESS-003).
         factory: The admission/leasing seam; see :class:`SessionFactory`.
-        cadence: Opaque model-typed cadence label for the factory.
         locale: Opaque model-typed locale for the factory.
         finalization_timeout_s: The mandatory finite drain bound
             (ING-LIFE-005).
@@ -248,8 +275,10 @@ async def transcribe_ephemeral(
             ``feed`` call. The serving layer computes it to respect the
             pre-submit bound; the orchestrator does no ms-to-samples or
             cadence math itself.
-        deadline: The transport's remaining time budget in seconds, or
-            ``None``; composed with ``finalization_timeout_s`` here.
+        deadline: The transport's remaining time budget in seconds AT
+            CALL TIME, or ``None``. Captured as an absolute monotonic
+            instant so feeding does not eat into the finalization budget;
+            composed with ``finalization_timeout_s`` fresh at drain time.
 
     Returns:
         The single final transcription result.
@@ -265,32 +294,42 @@ async def transcribe_ephemeral(
         raise ValueError(
             f"submit_bound_samples must be positive, got {submit_bound_samples}"
         )
-    drain_timeout = _compose_deadline(finalization_timeout_s, deadline)
+    if not math.isfinite(finalization_timeout_s) or finalization_timeout_s <= 0:
+        raise ValueError(
+            "finalization_timeout_s must be finite and positive, "
+            f"got {finalization_timeout_s}"
+        )
+    # Anchor the transport deadline to an absolute monotonic instant NOW,
+    # before admission and feeding, so its remaining budget is measured
+    # from call time -- a slow feed shortens finalization's budget rather
+    # than leaving it stale.
+    loop = asyncio.get_running_loop()
+    transport_deadline_at = None if deadline is None else loop.time() + deadline
 
-    # open() is before the lease exists: a raised AdmissionBusyError mints no
-    # lease, so there is nothing to release -- it simply propagates.
-    lease = await factory.open(cadence=cadence, locale=locale)
+    # open_ephemeral is before the lease exists: a raised AdmissionBusyError
+    # mints no lease, so there is nothing to release -- it just propagates.
+    lease = await factory.open_ephemeral(locale=locale)
 
     try:
-        for block in pieces:
-            for start in range(0, len(block), submit_bound_samples):
-                await lease.feed(block[start : start + submit_bound_samples])
-        transcript = await _drain_within_deadline(lease, drain_timeout)
-    except BaseException:
-        # Feed failure, flush failure (incl. FinalizationTimeoutError and
-        # engine TimeoutError), or cancellation: the terminal call is
-        # abort, and the slot is freed after it -- even if abort raises.
         try:
-            await lease.abort()
-        finally:
-            await lease.release()
-        raise
-
-    # Flush drained cleanly within the deadline: finish is the single
-    # terminal call, and release frees the slot after it -- even if
-    # finish raises. finish never runs alongside abort.
-    try:
-        await lease.finish()
+            for block in pieces:
+                for start in range(0, len(block), submit_bound_samples):
+                    await lease.feed(block[start : start + submit_bound_samples])
+            drain_timeout = _remaining_drain_budget(
+                finalization_timeout_s, transport_deadline_at, loop.time()
+            )
+            transcript = await _finalize_within_deadline(lease, drain_timeout)
+        except BaseException:
+            # Any failure -- feed, a raising or timed-out flush/finish, or
+            # cancellation -- recovers through abort; the original failure
+            # dominates (a raising abort must not mask why we aborted).
+            try:
+                await lease.abort()
+            except Exception:
+                pass
+            raise
     finally:
+        # The slot is freed after terminal cleanup (finish on success,
+        # abort on failure) on EVERY path.
         await lease.release()
     return TranscriptionResult(text=transcript)

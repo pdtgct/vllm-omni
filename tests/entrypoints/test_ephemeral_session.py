@@ -7,17 +7,24 @@ GPU-free CPU tier. Drives ``transcribe_ephemeral`` over a fake
 protocols by SHAPE (never importing or subclassing them) and record
 every lifecycle call. Pins:
 
-- exactly one ``TranscriptionResult`` on success; ``finish`` then
-  ``release``, never ``abort`` (PORT-EPH-002);
+- exactly one ``TranscriptionResult`` on success: ``flush`` then
+  ``finish`` then ``release``, no ``abort`` (PORT-EPH-002);
+- the canonical geometry is the factory's, not the caller's -- the
+  orchestrator takes no cadence and drives ``open_ephemeral``
+  (PORT-REGIME-002);
 - the pre-submit slice bound holds for arbitrary clip lengths incl. a
   zero-sample clip, and every sample is fed exactly once (no cadence
   arithmetic in the orchestrator, ING-FE-005/006);
 - error / cancellation / admission-busy / deadline-expiry -> abort +
   release idempotently, NO result (PORT-EPH-002);
+- ``flush`` AND ``finish`` are bounded together, so a stalled ``finish``
+  cannot retain the slot; the finalization budget is evaluated FRESH at
+  drain time so a slow feed cannot leave it stale;
+- a raising or stalled ``finish`` is a session error: abort recovers
+  (finish is attempted, then abort), then release; a raising abort does
+  not mask the original failure; ``release`` runs on every path;
 - an engine-originated ``TimeoutError`` is NOT misclassified as the
   orchestrator's own deadline expiry;
-- ``finish`` and ``abort`` never both run; ``release`` runs on every
-  path even if the terminal call raises;
 - the orchestrator source carries no cadence/chunk arithmetic
   (source-scan, PORT-EPH-001).
 
@@ -68,14 +75,13 @@ SessionFactory = _EPH.SessionFactory
 SessionLease = _EPH.SessionLease
 AdmissionBusyError = _EPH.AdmissionBusyError
 FinalizationTimeoutError = _EPH.FinalizationTimeoutError
-_compose_deadline = _EPH._compose_deadline
+_remaining_drain_budget = _EPH._remaining_drain_budget
 
 pytestmark = [pytest.mark.cpu]
 
 #: A representative pre-submit bound (samples). Numeric here in the
 #: TEST is fine; only the ORCHESTRATOR source must be arithmetic-free.
 _BOUND = 17920
-_CADENCE = "1120ms"
 _LOCALE = "auto"
 
 
@@ -106,6 +112,7 @@ class FakeSessionLease:
         flush_raise: BaseException | None = None,
         flush_hang_s: float | None = None,
         finish_raise: BaseException | None = None,
+        finish_hang_s: float | None = None,
         abort_raise: BaseException | None = None,
     ) -> None:
         self.transcript = transcript
@@ -113,6 +120,7 @@ class FakeSessionLease:
         self._flush_raise = flush_raise
         self._flush_hang_s = flush_hang_s
         self._finish_raise = finish_raise
+        self._finish_hang_s = finish_hang_s
         self._abort_raise = abort_raise
         self.calls: list[str] = []
         self.fed: list[int] = []
@@ -147,6 +155,8 @@ class FakeSessionLease:
     async def finish(self) -> None:
         self.calls.append("finish")
         self.finish_count += 1
+        if self._finish_hang_s is not None:
+            await asyncio.sleep(self._finish_hang_s)
         if self._finish_raise is not None:
             raise self._finish_raise
 
@@ -156,14 +166,28 @@ class FakeSessionLease:
 
 
 class FakeSessionFactory:
-    """Mints one fake lease, or raises ``AdmissionBusyError`` when scripted."""
+    """Mints one fake lease, or raises ``AdmissionBusyError`` when scripted.
+
+    Exposes BOTH factory entry points so it conforms to the protocol by
+    shape; the orchestrator drives ``open_ephemeral`` (canonical
+    geometry, no cadence). ``opened_ephemeral`` records the ephemeral
+    leases; ``opened`` records realtime ones -- the orchestrator must
+    never touch the latter.
+    """
 
     def __init__(
         self, lease: FakeSessionLease | None = None, *, busy: bool = False
     ) -> None:
         self._lease = lease if lease is not None else FakeSessionLease()
         self._busy = busy
+        self.opened_ephemeral: list[str] = []
         self.opened: list[tuple[str, str]] = []
+
+    async def open_ephemeral(self, *, locale: str) -> FakeSessionLease:
+        self.opened_ephemeral.append(locale)
+        if self._busy:
+            raise AdmissionBusyError("shared pool full")
+        return self._lease
 
     async def open(self, *, cadence: str, locale: str) -> FakeSessionLease:
         self.opened.append((cadence, locale))
@@ -184,7 +208,6 @@ def _call(
         transcribe_ephemeral(
             pieces,
             factory=factory,
-            cadence=_CADENCE,
             locale=_LOCALE,
             finalization_timeout_s=finalization_timeout_s,
             submit_bound_samples=submit_bound_samples,
@@ -225,20 +248,33 @@ def test_success_yields_exactly_one_result_finish_then_release() -> None:
     assert lease.calls[-3:] == ["flush", "finish", "release"]
 
 
-def test_opaque_cadence_and_locale_pass_through_untouched() -> None:
-    # @spec PORT-EPH-004
+def test_canonical_geometry_is_the_factorys_not_the_callers() -> None:
+    # @spec PORT-EPH-001, PORT-REGIME-002
+    # The orchestrator takes NO cadence: it drives open_ephemeral with
+    # locale only, so the canonical 1120-ms geometry lives once in the
+    # model-aware factory and no transport can pick the wrong cadence.
     factory = FakeSessionFactory()
     _run(
         transcribe_ephemeral(
             [_block(1)],
             factory=factory,
-            cadence="weird-cadence",
             locale="xx-YY",
             finalization_timeout_s=5.0,
             submit_bound_samples=_BOUND,
         )
     )
-    assert factory.opened == [("weird-cadence", "xx-YY")]
+    assert factory.opened_ephemeral == ["xx-YY"]
+    assert factory.opened == []  # the realtime entry is never used here
+
+
+def test_transcribe_ephemeral_takes_no_cadence_parameter() -> None:
+    # @spec PORT-EPH-001
+    # A cadence kwarg must be a hard error, not silently accepted: the
+    # canonical geometry is not the orchestrator's to choose.
+    import inspect
+
+    params = inspect.signature(transcribe_ephemeral).parameters
+    assert "cadence" not in params
 
 
 # ---- slice bound: arbitrary lengths, every sample fed once (ING-FE-005/006) ---
@@ -344,25 +380,17 @@ def test_admission_busy_propagates_with_nothing_leased() -> None:
 # ---- finish never alongside abort; release always runs ------------------------
 
 
-def test_finish_raising_still_releases_and_never_aborts() -> None:
+def test_raising_abort_does_not_mask_the_original_failure() -> None:
     # @spec PORT-EPH-002
-    lease = FakeSessionLease(finish_raise=RuntimeError("finish boom"))
-    factory = FakeSessionFactory(lease)
-    with pytest.raises(RuntimeError, match="finish boom"):
-        _call(factory, [_block(_BOUND)])
-    assert lease.finish_count == 1
-    assert lease.abort_count == 0  # finish never runs alongside abort
-    assert lease.release_count == 1  # release runs even if finish raises
-
-
-def test_abort_raising_still_releases() -> None:
-    # @spec PORT-EPH-002
+    # The original error (why we aborted) dominates; a raising abort is
+    # suppressed so it cannot mask the real failure, and release still
+    # runs after the best-effort abort.
     lease = FakeSessionLease(
         feed_raise=RuntimeError("feed boom"),
         abort_raise=RuntimeError("abort boom"),
     )
     factory = FakeSessionFactory(lease)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="feed boom"):
         _call(factory, [_block(_BOUND)])
     assert lease.abort_count == 1
     assert lease.finish_count == 0
@@ -372,14 +400,56 @@ def test_abort_raising_still_releases() -> None:
 # ---- deadline composition (A2: serving layer owns deadlines) ------------------
 
 
-def test_compose_deadline_takes_the_earlier_bound() -> None:
+def test_remaining_drain_budget_is_evaluated_fresh() -> None:
     # @spec PORT-EPH-001
-    assert _compose_deadline(5.0, None) == 5.0
-    assert _compose_deadline(5.0, 2.0) == 2.0  # transport deadline is earlier
-    assert _compose_deadline(1.5, 9.0) == 1.5  # finalization bound is earlier
+    # No transport deadline: the mandatory bound is used verbatim.
+    assert _remaining_drain_budget(5.0, None, 100.0) == 5.0
+    # Transport deadline at t=102 (absolute), now t=100: 2 s remain, and
+    # that is earlier than the 5 s mandatory bound -> 2.0.
+    assert _remaining_drain_budget(5.0, 102.0, 100.0) == 2.0
+    # The mandatory bound is earlier than the transport's remaining time.
+    assert _remaining_drain_budget(1.5, 109.0, 100.0) == 1.5
+    # STALE-BUDGET REGRESSION: feeding advanced the clock from 100 to 108
+    # against a transport deadline at 102 -> the budget is now NEGATIVE
+    # (already out of time), not the original 2 s. Composition happens at
+    # finalization, not before the feeds.
+    assert _remaining_drain_budget(5.0, 102.0, 108.0) == -6.0
+
+
+def test_non_finite_finalization_bound_is_rejected() -> None:
+    # @spec PORT-EPH-002
     for bad in (0.0, -1.0, float("inf"), float("nan")):
+        factory = FakeSessionFactory()
         with pytest.raises(ValueError):
-            _compose_deadline(bad, None)
+            _call(factory, [_block(1)], finalization_timeout_s=bad)
+
+
+def test_stalled_finish_past_deadline_aborts_no_result() -> None:
+    # @spec PORT-EPH-002
+    # The R1-in-its-new-home regression: flush drains cleanly but finish
+    # hangs. finish is now UNDER the same deadline as flush, so a stalled
+    # finish can no longer retain the slot -- it times out, aborts, and
+    # releases, emitting no result.
+    lease = FakeSessionLease(finish_hang_s=10.0)
+    factory = FakeSessionFactory(lease)
+    with pytest.raises(FinalizationTimeoutError):
+        _call(factory, [_block(_BOUND)], finalization_timeout_s=0.02)
+    assert "flush" in lease.calls  # flush completed
+    assert lease.abort_count == 1  # ...then the stalled finish was aborted
+    assert lease.release_count == 1
+
+
+def test_raising_finish_aborts_and_releases_no_result() -> None:
+    # @spec PORT-EPH-002
+    # PORT-EPH-002 requires abort on a session error; a raising finish is
+    # a session error, so abort recovery runs (not release-without-abort).
+    lease = FakeSessionLease(finish_raise=RuntimeError("finish boom"))
+    factory = FakeSessionFactory(lease)
+    with pytest.raises(RuntimeError, match="finish boom"):
+        _call(factory, [_block(_BOUND)])
+    assert lease.finish_count == 1  # finish was attempted
+    assert lease.abort_count == 1  # ...and its failure triggered abort
+    assert lease.release_count == 1  # released after cleanup
 
 
 def test_hanging_flush_past_composed_deadline_aborts_no_result() -> None:
