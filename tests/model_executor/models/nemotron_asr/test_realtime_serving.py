@@ -17,6 +17,7 @@ import asyncio
 import importlib.util
 import sys
 import types
+from collections.abc import AsyncIterator, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -66,7 +67,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 PARK_ID = 13089  # placeholder eos in these tests; real value from config
 
 
-def _run(coro):
+def _run(coro: Coroutine[Any, Any, Any]) -> Any:
     loop = asyncio.get_event_loop_policy().new_event_loop()
     try:
         return loop.run_until_complete(coro)
@@ -75,7 +76,9 @@ def _run(coro):
         loop.close()
 
 
-async def _collect_yields(chunks_of_samples, park_after_each=True):
+async def _collect_yields(
+    chunks_of_samples: list[int], park_after_each: bool = True
+) -> list[dict[str, Any]]:
     """Drive buffer_realtime_audio with synthetic PCM.
 
     Feeds each ndarray into audio_stream; echoes the park id on
@@ -84,7 +87,7 @@ async def _collect_yields(chunks_of_samples, park_after_each=True):
     """
     import numpy as np
 
-    async def audio_stream():
+    async def audio_stream() -> AsyncIterator[Any]:
         for n in chunks_of_samples:
             yield np.zeros(n, dtype=np.float32)
 
@@ -104,7 +107,7 @@ async def _collect_yields(chunks_of_samples, park_after_each=True):
 # ---- one yield per admitted chunk (PORT-SESS-001/002) --------------------------
 
 
-def test_one_yield_per_chunk_at_the_admitted_config():
+def test_one_yield_per_chunk_at_the_admitted_config() -> None:
     # 560 ms chunks at 16 kHz = 8960 samples per chunk: feeding exactly
     # three chunks' worth of audio yields three cadence CHUNKs plus the
     # explicit zero-sample final-tail transaction (PORT-SESS-003).
@@ -116,7 +119,7 @@ def test_one_yield_per_chunk_at_the_admitted_config():
     assert tail[5] == 3
 
 
-def test_ragged_appends_rechunk_to_the_admitted_size():
+def test_ragged_appends_rechunk_to_the_admitted_size() -> None:
     # The wire cadence is the client's; the yield cadence is the
     # admitted chunk's. 2 × 13440 samples = 3 × 8960 plus the explicit
     # zero-sample final-tail transaction.
@@ -124,7 +127,7 @@ def test_ragged_appends_rechunk_to_the_admitted_size():
     assert len(yields) == 4
 
 
-def test_subchunk_tail_is_processed_as_is_never_padded():
+def test_subchunk_tail_is_processed_as_is_never_padded() -> None:
     # Finalize with a 4480-sample residual (half a chunk): the tail
     # yields as-is. Even a sub-8-mel-frame residual is represented by
     # an explicit final-tail transaction; the frontend may commit zero
@@ -137,7 +140,7 @@ def test_subchunk_tail_is_processed_as_is_never_padded():
     assert tail[3] == 1
 
 
-def test_zero_audio_still_emits_one_final_tail_transaction():
+def test_zero_audio_still_emits_one_final_tail_transaction() -> None:
     yields = _run(_collect_yields([]))
     assert len(yields) == 1
     envelope = yields[0]["multi_modal_data"]["audio"]
@@ -148,14 +151,14 @@ def test_zero_audio_still_emits_one_final_tail_transaction():
     )
 
 
-def test_next_chunk_holds_until_park_echo():
+def test_next_chunk_holds_until_park_echo() -> None:
     # With no park echo on input_stream, the generator must not yield
     # chunk 2 (buffer-until-drained) — bounded wait, then assert only
     # chunk 1 emerged.
     import numpy as np
 
-    async def scenario():
-        async def audio_stream():
+    async def scenario() -> None:
+        async def audio_stream() -> AsyncIterator[Any]:
             yield np.zeros(8960, dtype=np.float32)
             yield np.zeros(8960, dtype=np.float32)
 
@@ -171,10 +174,42 @@ def test_next_chunk_holds_until_park_echo():
     _run(scenario())
 
 
+def test_locale_update_is_stamped_at_the_next_mint() -> None:
+    # PORT-LID-001: the last valid update ordered before CHUNK-carrier
+    # mint is stamped into that immutable carrier. A live per-session
+    # config view (ING-VEH-007) mutates the selection between chunks;
+    # the change appears at the NEXT mint, never retroactively.
+    import numpy as np
+
+    async def scenario() -> None:
+        config = SimpleNamespace(nemotron_prompt_index=2)
+
+        async def audio_stream() -> AsyncIterator[Any]:
+            yield np.zeros(8960, dtype=np.float32)
+            yield np.zeros(8960, dtype=np.float32)
+
+        input_stream: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(audio_stream(), input_stream, config)
+        first = (await agen.__anext__())["multi_modal_data"]["audio"]
+        assert first[4] == 2.0
+        config.nemotron_prompt_index = 7
+        input_stream.put_nowait([PARK_ID])
+        second = (await agen.__anext__())["multi_modal_data"]["audio"]
+        assert second[4] == 7.0
+        assert first[4] == 2.0  # the earlier carrier is immutable
+        config.nemotron_prompt_index = 3
+        input_stream.put_nowait([PARK_ID])
+        tail = (await agen.__anext__())["multi_modal_data"]["audio"]
+        assert tail[3] == 1.0
+        assert tail[4] == 3.0  # final-tail takes the current selection
+
+    _run(scenario())
+
+
 # ---- the yield shape (PORT-INT-003 / D-BU-1) -----------------------------------
 
 
-def test_yield_carries_the_placeholder_token():
+def test_yield_carries_the_placeholder_token() -> None:
     # The yield must be TokensPrompt-shaped — prompt_token_ids=[
     # placeholder] + multi_modal_data audio — not a bare
     # multi_modal_data dict (invalid on the real render path). One
@@ -182,8 +217,8 @@ def test_yield_carries_the_placeholder_token():
     # construction; the id comes from the config.
     import numpy as np
 
-    async def scenario():
-        async def audio_stream():
+    async def scenario() -> None:
+        async def audio_stream() -> AsyncIterator[Any]:
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
@@ -201,12 +236,12 @@ def test_yield_carries_the_placeholder_token():
 # ---- the replay-echo guard (PORT-DEC-007's active half) ------------------------
 
 
-def test_echo_guard_passes_on_faithful_feedback():
+def test_echo_guard_passes_on_faithful_feedback() -> None:
     ids = torch.tensor([5, 7, 13088], dtype=torch.long)
     verify_replay_echo(ids.clone(), ids)  # no raise
 
 
-def test_echo_guard_aborts_loudly_on_corruption():
+def test_echo_guard_aborts_loudly_on_corruption() -> None:
     # An exclusion mask (or any hostile param) that redirects the
     # argmax shows up as observed != forced on the NEXT step — the one
     # place the model has authority to reject (the α3 sampler negative
@@ -220,7 +255,7 @@ def test_echo_guard_aborts_loudly_on_corruption():
 # ---- compute_logits row alignment (PORT-DEC-002, Q5) ---------------------------
 
 
-def test_compute_logits_reads_rows_by_batch_position():
+def test_compute_logits_reads_rows_by_batch_position() -> None:
     # The engine gathers last-scheduled-token rows in batch order and
     # hands them to compute_logits — the carrier is read by ROW
     # POSITION. Permuting the rows must permute the outputs
