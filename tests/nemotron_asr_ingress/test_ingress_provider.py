@@ -15,6 +15,7 @@ from nemotron_asr_ingress.events import AdmissionOutcome
 from nemotron_asr_ingress.provider import (
     InProcessProvider,
     RemoteGate,
+    RemoteLease,
     RemoteProvider,
     select_provider,
 )
@@ -106,7 +107,7 @@ def test_remote_gate_never_queues() -> None:
 async def test_no_upstream_connection_for_a_rejected_session() -> None:
     upstream = FakeUpstream(acks=[AdmissionOutcome.ADMITTED])
     provider, _ = make_remote(upstream, watermark=1)
-    assert await provider.open_session() is AdmissionOutcome.ADMITTED
+    assert isinstance(await provider.open_session(), RemoteLease)
     assert upstream.connects == [URL]
     assert await provider.open_session() is AdmissionOutcome.BUSY
     # The rejection opened nothing upstream and awaited no ack.
@@ -125,17 +126,17 @@ async def test_admitted_is_reported_only_after_the_upstream_ack() -> None:
 
     async def await_admission(connection: Any) -> AdmissionOutcome:
         order.append("ack")
-        # While the ack is being awaited, nothing is registered yet:
-        # the local count is only a projection, never an admission.
-        assert provider.connections == []
         return AdmissionOutcome.ADMITTED
 
     provider = RemoteProvider(
         url=URL, gate=gate, connect=connect, await_admission=await_admission
     )
-    assert await provider.open_session() is AdmissionOutcome.ADMITTED
+    lease = await provider.open_session()
+    # The lease exists only after the authoritative ack: the local
+    # count is a projection, never an admission.
+    assert isinstance(lease, RemoteLease)
     assert order == ["connect", "ack"]
-    assert provider.connections == ["connection"]
+    assert lease.connection == "connection"
 
 
 # @spec ING-ADM-003
@@ -146,11 +147,11 @@ async def test_busy_ack_releases_the_count_and_disposes() -> None:
     provider, gate = make_remote(upstream, watermark=1)
     assert await provider.open_session() is AdmissionOutcome.BUSY
     assert upstream.closed == ["connection-1"]
-    assert provider.connections == []
     assert gate.active == 0
     # The released count admits a follow-up open below the bound.
-    assert await provider.open_session() is AdmissionOutcome.ADMITTED
-    assert provider.connections == ["connection-2"]
+    lease = await provider.open_session()
+    assert isinstance(lease, RemoteLease)
+    assert lease.connection == "connection-2"
 
 
 # @spec ING-ADM-003
@@ -199,24 +200,85 @@ async def test_ack_failure_disposes_releases_and_reraises() -> None:
     with pytest.raises(OSError, match="mid-ack"):
         await provider.open_session()
     assert closed == ["connection"]
-    assert provider.connections == []
     assert gate.active == 0
 
 
 # @spec ING-ADM-003
-async def test_close_session_releases_the_count_and_disposes() -> None:
+async def test_lease_close_releases_the_count_and_disposes() -> None:
     upstream = FakeUpstream(
         acks=[AdmissionOutcome.ADMITTED, AdmissionOutcome.ADMITTED]
     )
     provider, gate = make_remote(upstream, watermark=1)
-    assert await provider.open_session() is AdmissionOutcome.ADMITTED
-    (connection,) = provider.connections
-    provider.close_session(connection)
-    assert provider.connections == []
-    assert upstream.closed == [connection]
+    lease = await provider.open_session()
+    assert isinstance(lease, RemoteLease)
+    await lease.close()
+    assert upstream.closed == [lease.connection]
     assert gate.active == 0
     # The freed slot admits again below the bound.
-    assert await provider.open_session() is AdmissionOutcome.ADMITTED
+    assert isinstance(await provider.open_session(), RemoteLease)
+
+
+# @spec ING-ADM-003
+async def test_lease_close_is_idempotent() -> None:
+    upstream = FakeUpstream(acks=[AdmissionOutcome.ADMITTED])
+    provider, gate = make_remote(upstream, watermark=1)
+    lease = await provider.open_session()
+    assert isinstance(lease, RemoteLease)
+    await lease.close()
+    # A second close is a no-op: one disposal, one release — never a
+    # double-free of the gate count.
+    await lease.close()
+    assert upstream.closed == [lease.connection]
+    assert gate.active == 0
+
+
+# @spec ING-ADM-003
+async def test_lease_awaits_an_awaitable_close_seam() -> None:
+    gate = RemoteGate(watermark=1)
+    closed: list[Any] = []
+
+    async def close(connection: Any) -> None:
+        closed.append(connection)
+
+    async def admit(connection: Any) -> AdmissionOutcome:
+        return AdmissionOutcome.ADMITTED
+
+    provider = RemoteProvider(
+        url=URL,
+        gate=gate,
+        connect=lambda url: "connection",
+        await_admission=admit,
+        close=close,
+    )
+    lease = await provider.open_session()
+    assert isinstance(lease, RemoteLease)
+    await lease.close()
+    assert closed == ["connection"]
+    assert gate.active == 0
+
+
+# @spec ING-ADM-003
+async def test_busy_ack_awaits_an_awaitable_close_seam() -> None:
+    gate = RemoteGate(watermark=1)
+    closed: list[Any] = []
+
+    async def close(connection: Any) -> None:
+        closed.append(connection)
+
+    async def deny(connection: Any) -> AdmissionOutcome:
+        return AdmissionOutcome.BUSY
+
+    provider = RemoteProvider(
+        url=URL,
+        gate=gate,
+        connect=lambda url: "connection",
+        await_admission=deny,
+        close=close,
+    )
+    assert await provider.open_session() is AdmissionOutcome.BUSY
+    # The awaitable disposal ran to completion before BUSY returned.
+    assert closed == ["connection"]
+    assert gate.active == 0
 
 
 # @spec ING-ADM-003

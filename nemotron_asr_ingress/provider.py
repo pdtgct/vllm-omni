@@ -9,6 +9,7 @@ that cannot see engine-side eviction, so it never queues (ledger A11,
 ING-ADM-003).
 """
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
@@ -66,11 +67,58 @@ class InProcessProvider:
         self.values: dict[str, Any] = dict(values)
 
 
+class RemoteLease:
+    """One admitted upstream session, owned by whoever holds it.
+
+    Admission hands the connection to exactly one owner instead of
+    parking it on a shared registry: the lease is the only handle,
+    and ``close`` is the only release path — idempotent, so a
+    teardown raced by an error path frees the gate count exactly
+    once (ING-ADM-003).
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        dispose: Callable[[Any], Awaitable[None]],
+        gate: RemoteGate,
+    ) -> None:
+        """Take ownership of one admitted, counted connection."""
+        self._connection = connection
+        self._dispose = dispose
+        self._gate = gate
+        self._closed = False
+
+    @property
+    def connection(self) -> Any:
+        """The owned upstream connection."""
+        return self._connection
+
+    @property
+    def closed(self) -> bool:
+        """Whether the lease has been released."""
+        return self._closed
+
+    async def close(self) -> None:
+        """Dispose the connection and free the count, exactly once.
+
+        A repeated close is a no-op. The count is released even if
+        disposal raises — a failed close must not strand a slot.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._dispose(self._connection)
+        finally:
+            self._gate.release()
+
+
 class RemoteProvider:
     """Session-core binding over the vLLM realtime dialect.
 
     The local counter is only a conservative fast-fail projection
-    (ING-ADM-003): ``ADMITTED`` is reported ONLY on the upstream
+    (ING-ADM-003): admission is reported ONLY on the upstream
     provider's authoritative acknowledgement, awaited through the
     injected ``await_admission`` seam. Every negative or failure path
     releases the projected count and disposes the connection — the
@@ -88,18 +136,29 @@ class RemoteProvider:
         gate: RemoteGate,
         connect: Callable[[str], Any],
         await_admission: Callable[[Any], Awaitable[AdmissionOutcome]],
-        close: Callable[[Any], None] | None = None,
+        close: Callable[[Any], Any] | None = None,
     ) -> None:
-        """Bind the upstream endpoint behind the fast-fail gate."""
+        """Bind the upstream endpoint behind the fast-fail gate.
+
+        ``close`` may be sync or return an awaitable (a real
+        WebSocket closure normally awaits); both are honored.
+        """
         self.url = url
         self._gate = gate
         self._connect = connect
         self._await_admission = await_admission
         self._close = close
-        self.connections: list[Any] = []
 
-    async def open_session(self) -> AdmissionOutcome:
-        """Project first; ``ADMITTED`` only on the upstream ack.
+    async def open_session(self) -> AdmissionOutcome | RemoteLease:
+        """Project first; a lease only on the upstream ack.
+
+        Returns the :class:`RemoteLease` owning the connection when
+        the upstream acknowledges admission, and a bare
+        ``AdmissionOutcome`` otherwise — the union keeps the two
+        answers structurally distinct: a negative outcome carries
+        nothing to close, so no half-alive lease can exist, and the
+        admitted path has exactly one owner for the connection
+        (no shared registry to desynchronize).
 
         ``BUSY`` at the local bound opens nothing. Below it, the
         upstream request opens and the authoritative admitted/busy
@@ -114,25 +173,21 @@ class RemoteProvider:
             connection = self._connect(self.url)
             outcome = await self._await_admission(connection)
         except BaseException:
-            self._dispose(connection)
+            if connection is not None:
+                await self._dispose(connection)
             self._gate.release()
             raise
         if outcome is not AdmissionOutcome.ADMITTED:
-            self._dispose(connection)
+            await self._dispose(connection)
             self._gate.release()
             return AdmissionOutcome.BUSY
-        self.connections.append(connection)
-        return AdmissionOutcome.ADMITTED
+        return RemoteLease(connection, self._dispose, self._gate)
 
-    def close_session(self, connection: Any) -> None:
-        """Release one admitted session: dispose and free the count."""
-        self.connections.remove(connection)
-        self._dispose(connection)
-        self._gate.release()
-
-    def _dispose(self, connection: Any) -> None:
-        if connection is not None and self._close is not None:
-            self._close(connection)
+    async def _dispose(self, connection: Any) -> None:
+        if self._close is not None:
+            result = self._close(connection)
+            if inspect.isawaitable(result):
+                await result
 
 
 def _pod_side_connect(url: str) -> Any:

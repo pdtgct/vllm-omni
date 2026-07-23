@@ -1077,3 +1077,31 @@ async def test_idle_stream_aborts_while_the_read_is_blocked() -> None:
     assert harness.gate.active == 0
     (transcriber,) = harness.transcribers
     assert transcriber.aborted
+
+
+# @spec ING-FE-005
+async def test_pump_cancel_while_blocked_on_a_full_queue() -> None:
+    # Regression: cancelling _pump while it is blocked putting into a
+    # full queue (consumer gone, one item unconsumed) must complete
+    # promptly and must NOT force the end sentinel onto the queue —
+    # an awaited put from the cancelled path would deadlock the
+    # canceller, which awaits the pump in the servicer's finally.
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+
+    async def two_requests() -> AsyncIterator[Any]:
+        yield "first"
+        yield "second"
+
+    pump = asyncio.create_task(RivaAsrServicer._pump(two_requests(), queue))
+    while queue.empty():  # first item enqueued, pump blocks on second
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    pump.cancel()
+    (result,) = await asyncio.wait_for(
+        asyncio.gather(pump, return_exceptions=True), timeout=2.0
+    )
+    assert isinstance(result, asyncio.CancelledError)
+    # The unconsumed item is all the queue holds: no sentinel rode
+    # the cancelled path.
+    assert queue.get_nowait() == "first"
+    assert queue.empty()
