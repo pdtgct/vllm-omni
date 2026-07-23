@@ -7,11 +7,14 @@ cache-aware execution with cross-chunk state on spec pages, reached
 through ``SupportsRealtime``. Single-shot transcription is the same
 machinery driven as one ephemeral 1120-ms session by the serving-layer
 orchestrator (PORT-REGIME-002) — never a full-context pass, which
-survives only as an EVAL-tier parity probe (PORT-EPH-003). No
-transcription surface is wired at this pin: the class does not
-advertise ``supports_transcription`` and the omni engine cannot report
-the task, so PORT-REGIME-003's ``SupportsTranscription`` obligation
-lands with the transcriptions adapter.
+survives only as an EVAL-tier parity probe (PORT-EPH-003). The class
+now carries the ``SupportsTranscription`` classmethods the serving
+adapter's eager base ``__init__`` needs (PORT-REGIME-003) but
+deliberately does NOT set the ``supports_transcription`` classvar: the
+task stays off by default (RFC-1 brief §D, round-5 decision 3) — the
+transcription adapter is constructed only by the flag-guarded
+api_server wiring, and the engine-side task set comes from
+``declared_tasks``, which no stage declares.
 
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
 audio runs featurizer -> encoder -> LID -> the complete greedy
@@ -24,10 +27,12 @@ declaratively per update by ``pipeline.py sampling_constraints`` and
 actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
@@ -219,10 +224,10 @@ def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
 
 
 def load_core_from_dump(
-    dump_dir,
+    dump_dir: str | Path,
     *,
     device: torch.device,
-    att_context=(56, 13),
+    att_context: tuple[int, int] = (56, 13),
     policy: PrecisionPolicy = FP32_BRINGUP,
 ) -> tuple[NemotronASRCore, dict]:
     """Assemble the core from the offline conversion dump.
@@ -233,7 +238,6 @@ def load_core_from_dump(
     from the referee dump meanwhile.
     """
     import json
-    from pathlib import Path
 
     from safetensors.torch import load_file
 
@@ -396,6 +400,12 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     #: Engine logit width: tokenizer vocab + the park special token
     #: (checkpoint default; __init__ re-reads it from the config).
     num_logits = 13090
+    #: Read EAGERLY by the serving adapter's base ``__init__``
+    #: (``OpenAISpeechToText``): the model has no Whisper-style
+    #: timestamp tokens, so verbose segments are unsupported. NOTE:
+    #: ``supports_transcription`` is deliberately NOT set — the task
+    #: stays off by default (RFC-1 brief §D).
+    supports_segment_timestamp = False
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
         """Build the core from the config and register the state pages.
@@ -629,6 +639,116 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             audio_stream, input_stream, model_config
         ):
             yield update
+
+    @classmethod
+    def get_speech_to_text_config(
+        cls, model_config: Any, task_type: Any
+    ) -> SpeechToTextConfig:
+        """The serving adapter's eagerly-read config (RFC-1 brief §D).
+
+        ``OpenAISpeechToText.__init__`` calls this at construction. The
+        sample rate is the published frontend constant (never a copied
+        literal). Window chunking is DISABLED (``max_audio_clip_s`` and
+        ``min_energy_split_window_size`` both ``None``): single-shot
+        transcription is ONE ephemeral streaming session over the whole
+        clip (PORT-REGIME-002), never overlap-split windows — the
+        session's segmenter owns all cadence work (ING-FE-006).
+
+        Args:
+            model_config: The vLLM ``ModelConfig`` (unused; the values
+                are checkpoint-published constants).
+            task_type: ``"transcribe"``/``"translate"`` (unused; the
+                model does not translate and the adapter rejects
+                translation controls by name).
+
+        Returns:
+            The speech-to-text config the adapter's base machinery
+            resamples and bounds against.
+        """
+        return SpeechToTextConfig(
+            sample_rate=float(FRONTEND_CONSTANTS["sample_rate"]),
+            max_audio_clip_s=None,
+            min_energy_split_window_size=None,
+        )
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: Any) -> Any:
+        """Unreachable under the Nemotron adapter — raises by design.
+
+        The ONLY caller in core is the base
+        ``_preprocess_speech_to_text`` (vllm speech_to_text
+        ``base/serving.py``), which the Nemotron serving adapter never
+        invokes: its overridden ``create_transcription`` delegates
+        execution to ``transcribe_ephemeral`` over the streaming
+        session (``serving_nemotron_transcription``), where prompts are
+        minted by the session's own segmenter, not from a single-pass
+        STT parameter bundle.
+
+        Raises:
+            NotImplementedError: Always — naming the delegated path so
+                a future stock-path caller fails loudly, never with a
+                wrong prompt.
+        """
+        raise NotImplementedError(
+            "NemotronASRForRNNT builds no stock single-pass STT prompt; "
+            "the /v1/audio/transcriptions surface delegates to "
+            "vllm_omni.entrypoints.ephemeral_session.transcribe_ephemeral "
+            "via the serving_nemotron_transcription adapter "
+            "(PORT-REGIME-002)"
+        )
+
+    @classmethod
+    def validate_language(
+        cls, language: Any, model_config: Any = None
+    ) -> str:
+        """Resolve a request language to a checkpoint locale.
+
+        The gate the serving adapter calls (RFC-1 brief §C): ``None``
+        resolves to the checkpoint's language-identification locale
+        (``DEFAULT_LOCALE``, "auto" — a valid selection), and
+        membership is checked against the VALIDATED prompt dictionary —
+        the same authority ``session.py`` admissions use (PORT-LID-001).
+        The ``model_config`` keyword is this model's extension of the
+        ``SupportsTranscription`` signature (the protocol's ISO-639-1
+        classvar table cannot express a checkpoint-published locale
+        set); calls without it pass through unchecked and the session
+        factory's ``from_model_config`` gate re-validates at admission.
+
+        Args:
+            language: The raw request language, or ``None``.
+            model_config: The vLLM ``ModelConfig`` (or bare hf config)
+                carrying ``prompt_dictionary``; ``None`` skips the
+                membership check.
+
+        Returns:
+            The resolved locale string.
+
+        Raises:
+            ValueError: When the locale is not in the served
+                checkpoint's prompt dictionary.
+        """
+        from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (  # noqa: E501
+            validate_prompt_dictionary,
+        )
+        from vllm_omni.model_executor.models.nemotron_asr.session import (
+            DEFAULT_LOCALE,
+        )
+
+        locale = DEFAULT_LOCALE if language is None else str(language)
+        if model_config is None:
+            return locale
+        hf = getattr(model_config, "hf_config", model_config)
+        prompts = validate_prompt_dictionary(
+            getattr(hf, "prompt_dictionary", None),
+            getattr(hf, "num_prompts", None),
+        )
+        if locale not in prompts:
+            raise ValueError(
+                f"{locale!r} is not a locale of the served checkpoint's "
+                f"prompt_dictionary; valid locales: {sorted(prompts)} "
+                "(PORT-LID-001)"
+            )
+        return locale
 
     def prepare_row_plan_context(
         self,
