@@ -36,10 +36,10 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Coroutine, Iterable
 
     import numpy as np
     import numpy.typing as npt
@@ -217,7 +217,15 @@ async def _finalize_within_deadline(
     helper never aborts or releases: any failure (expiry, or a raising
     flush/finish) leaves the terminal handling to the caller, which
     aborts then releases.
+
+    A NON-POSITIVE budget is rejected BEFORE any terminal step runs:
+    ``asyncio.timeout(0)`` only cancels at the next scheduling point, so
+    an immediately-completing ``flush``/``finish`` (an async callee that
+    never yields) could otherwise return success AFTER the deadline had
+    already expired.
     """
+    if drain_timeout <= 0:
+        raise FinalizationTimeoutError(drain_timeout)
     try:
         async with asyncio.timeout(drain_timeout) as bound:
             transcript = await lease.flush()
@@ -227,6 +235,62 @@ async def _finalize_within_deadline(
         if bound.expired():
             raise FinalizationTimeoutError(drain_timeout) from None
         raise
+
+
+async def _best_effort_step(
+    step: Coroutine[Any, Any, None], bound: float
+) -> bool:
+    """Run one cleanup step: bounded, cancellation-safe, never raising.
+
+    Returns True if an OUTER cancellation was observed while the step
+    ran (the caller re-delivers it after ALL cleanup steps finish, so
+    cancellation can never skip a later step such as ``release``). A
+    step that outruns ``bound`` is cancelled and drained; a step that
+    raises is suppressed (a secondary cleanup failure must not mask the
+    primary error).
+    """
+    task = asyncio.ensure_future(step)
+    cancelled = False
+    try:
+        await asyncio.wait_for(asyncio.shield(task), bound)
+    except asyncio.CancelledError:
+        # Outer cancellation (wait_for's own expiry raises TimeoutError,
+        # never CancelledError, so this is unambiguous): give the step
+        # its bound, then report the cancellation to the caller.
+        cancelled = True
+        try:
+            await asyncio.wait_for(task, bound)
+        except BaseException:
+            pass
+    except BaseException:
+        # Timeout (the step outran its bound) or a step failure: cancel
+        # and drain so nothing leaks; the primary error dominates.
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+    return cancelled
+
+
+async def _terminal_cleanup(
+    lease: SessionLease, bound: float, *, run_abort: bool
+) -> None:
+    """Best-effort ``abort`` (optional) then ``release``, both bounded.
+
+    Every step runs even if an earlier one hangs, fails, or the caller
+    is cancelled mid-cleanup: a stalled ``abort`` cannot retain the
+    slot, and cancellation cannot skip ``release``. An observed outer
+    cancellation is re-delivered AFTER both steps so the task still
+    honors it; step failures are suppressed (the caller preserves the
+    primary error).
+    """
+    cancelled = False
+    if run_abort:
+        cancelled = await _best_effort_step(lease.abort(), bound)
+    cancelled = await _best_effort_step(lease.release(), bound) or cancelled
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 async def transcribe_ephemeral(
@@ -311,25 +375,29 @@ async def transcribe_ephemeral(
     lease = await factory.open_ephemeral(locale=locale)
 
     try:
-        try:
-            for block in pieces:
-                for start in range(0, len(block), submit_bound_samples):
-                    await lease.feed(block[start : start + submit_bound_samples])
-            drain_timeout = _remaining_drain_budget(
-                finalization_timeout_s, transport_deadline_at, loop.time()
-            )
-            transcript = await _finalize_within_deadline(lease, drain_timeout)
-        except BaseException:
-            # Any failure -- feed, a raising or timed-out flush/finish, or
-            # cancellation -- recovers through abort; the original failure
-            # dominates (a raising abort must not mask why we aborted).
-            try:
-                await lease.abort()
-            except Exception:
-                pass
-            raise
-    finally:
-        # The slot is freed after terminal cleanup (finish on success,
-        # abort on failure) on EVERY path.
-        await lease.release()
+        for block in pieces:
+            for start in range(0, len(block), submit_bound_samples):
+                await lease.feed(block[start : start + submit_bound_samples])
+        drain_timeout = _remaining_drain_budget(
+            finalization_timeout_s, transport_deadline_at, loop.time()
+        )
+        transcript = await _finalize_within_deadline(lease, drain_timeout)
+    except BaseException:
+        # Any failure -- feed, a raising/stalled/timed-out flush or
+        # finish, admission-adjacent errors, or cancellation -- recovers
+        # through the BOUNDED cleanup: best-effort abort then release,
+        # each under finalization_timeout_s, cancellation-safe (release
+        # can never be skipped), step failures suppressed so the primary
+        # error below dominates. An outer cancellation observed during
+        # cleanup is re-delivered by _terminal_cleanup itself.
+        await _terminal_cleanup(
+            lease, finalization_timeout_s, run_abort=True
+        )
+        raise
+    # Success: finish already ran inside the deadline. Free the slot with
+    # the same bounded best-effort release -- a hanging or raising
+    # release must neither stall the caller nor invent a failure after a
+    # clean finalization (the slot accounting is our own; its failure is
+    # a secondary condition, suppressed and documented).
+    await _terminal_cleanup(lease, finalization_timeout_s, run_abort=False)
     return TranscriptionResult(text=transcript)

@@ -739,6 +739,17 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
+# Typed topology keys that ``StageConfig.to_omegaconf`` must never let a
+# legacy ``extras``/``yaml_extras`` overlay silently overwrite: the typed
+# field is validated (``_normalize_declared_tasks``) before it lands in
+# ``config_dict``, and an overlay bypasses that validation (e.g. a bare
+# ``"transcription"`` string would be iterated into single-character
+# "tasks" by a downstream ``tuple(...)`` conversion). Scoped strictly to
+# ``declared_tasks``: other keys may still legitimately rely on overlay
+# semantics for legacy configs.
+_EXTRAS_RESERVED_KEYS = frozenset({"declared_tasks"})
+
+
 def _normalize_declared_tasks(value: Any) -> tuple[str, ...]:
     """Validate and coerce a stage's ``declared_tasks`` into a tuple of str.
 
@@ -1023,7 +1034,17 @@ class StageConfig:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
 
         # Pass through extra YAML fields (default_sampling_params,
-        # output_connectors, input_connectors, tts_args, etc.)
+        # output_connectors, input_connectors, tts_args, etc.). Reject any
+        # typed topology key smuggled in via extras: an overlay would
+        # silently replace the validated value above (e.g. ``declared_tasks``)
+        # rather than raising, bypassing its normalization/validation.
+        reserved_conflicts = _EXTRAS_RESERVED_KEYS & self.yaml_extras.keys()
+        if reserved_conflicts:
+            raise ValueError(
+                f"yaml_extras/extras cannot set {sorted(reserved_conflicts)!r}: "
+                "declare it as typed configuration on "
+                "StagePipelineConfig/StageConfig, not extras."
+            )
         config_dict.update(self.yaml_extras)
 
         return create_config(config_dict)

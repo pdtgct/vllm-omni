@@ -41,7 +41,7 @@ import os
 import sys
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -516,3 +516,168 @@ def test_orchestrator_source_has_no_cadence_arithmetic() -> None:
         f"orchestrator source contains cadence/chunk arithmetic: {present}; "
         "PORT owns cadence segmentation (ING-FE-006)"
     )
+
+
+# ---- round-5: expired deadlines and bounded cleanup (PORT-EPH-002) ------------
+
+
+class InstantLease:
+    """A lease whose every method completes WITHOUT yielding — the exact
+    shape that slips past asyncio.timeout(0), which only cancels at the
+    next scheduling point."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def feed(self, samples: Any) -> list[str]:
+        self.calls.append("feed")
+        return []
+
+    async def flush(self) -> str:
+        self.calls.append("flush")
+        return "late-success"
+
+    async def update_locale(self, locale: str) -> None:
+        self.calls.append("update_locale")
+
+    async def abort(self) -> None:
+        self.calls.append("abort")
+
+    async def finish(self) -> None:
+        self.calls.append("finish")
+
+    async def release(self) -> None:
+        self.calls.append("release")
+
+
+def test_already_expired_deadline_never_returns_success() -> None:
+    # @spec PORT-EPH-002
+    # The transport was already out of time at entry. Even with a lease
+    # whose flush/finish complete instantly (never yielding), no result
+    # may be returned: a non-positive budget is rejected BEFORE any
+    # terminal step, and the session is aborted and released.
+    lease = InstantLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    with pytest.raises(FinalizationTimeoutError):
+        _call(factory, [], deadline=-1.0)
+    assert "flush" not in lease.calls  # finalization never started
+    assert "finish" not in lease.calls
+    assert "abort" in lease.calls
+    assert lease.calls[-1] == "release"
+
+
+def test_zero_remaining_budget_never_returns_success() -> None:
+    # @spec PORT-EPH-002
+    # deadline=0.0: the absolute instant is "now", so the budget computed
+    # after feeding is <= 0 — same rejection, instant-completing lease.
+    lease = InstantLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    with pytest.raises(FinalizationTimeoutError):
+        _call(factory, [_block(1)], deadline=0.0)
+    assert "finish" not in lease.calls
+    assert "abort" in lease.calls
+    assert lease.calls[-1] == "release"
+
+
+def test_negative_budget_helper_is_rejected_before_any_step() -> None:
+    # @spec PORT-EPH-002
+    lease = InstantLease()
+    with pytest.raises(FinalizationTimeoutError):
+        _run(_EPH._finalize_within_deadline(cast(Any, lease), 0.0))
+    assert lease.calls == []  # neither flush nor finish ever ran
+
+
+def test_hanging_abort_cannot_retain_the_slot() -> None:
+    # @spec PORT-EPH-002
+    # Failure path with an abort that would hang forever: cleanup is
+    # bounded, so the call still completes (primary error preserved) and
+    # release still runs.
+    class HangingAbortLease(InstantLease):
+        async def feed(self, samples: Any) -> list[str]:
+            self.calls.append("feed")
+            raise RuntimeError("feed boom")
+
+        async def abort(self) -> None:
+            self.calls.append("abort")
+            await asyncio.sleep(30.0)
+
+    lease = HangingAbortLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    with pytest.raises(RuntimeError, match="feed boom"):
+        _call(factory, [_block(1)], finalization_timeout_s=0.05)
+    assert "abort" in lease.calls
+    assert lease.calls[-1] == "release"  # release ran despite the hang
+
+
+def test_release_failure_never_masks_the_primary_error() -> None:
+    # @spec PORT-EPH-002
+    class RaisingReleaseLease(InstantLease):
+        async def flush(self) -> str:
+            self.calls.append("flush")
+            raise RuntimeError("primary flush boom")
+
+        async def release(self) -> None:
+            self.calls.append("release")
+            raise RuntimeError("secondary release boom")
+
+    lease = RaisingReleaseLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    with pytest.raises(RuntimeError, match="primary flush boom"):
+        _call(factory, [_block(1)])
+    assert "abort" in lease.calls
+    assert "release" in lease.calls
+
+
+def test_release_failure_after_clean_finish_is_suppressed() -> None:
+    # @spec PORT-EPH-002
+    # Slot accounting is our own object; its failure after a clean
+    # finalization is secondary — the result stands (documented policy).
+    class RaisingReleaseLease(InstantLease):
+        async def release(self) -> None:
+            self.calls.append("release")
+            raise RuntimeError("secondary release boom")
+
+    lease = RaisingReleaseLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    result = _call(factory, [_block(1)], finalization_timeout_s=5.0)
+    assert result.text == "late-success"
+    assert "finish" in lease.calls
+    assert "abort" not in lease.calls
+
+
+def test_cancellation_during_cleanup_cannot_skip_release() -> None:
+    # @spec PORT-EPH-002
+    # The caller cancels while abort is mid-hang: release must still run,
+    # and the task must end cancelled (the cancellation is re-delivered
+    # after cleanup, never swallowed on the success-less path).
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class SlowAbortLease(InstantLease):
+            async def feed(self, samples: Any) -> list[str]:
+                self.calls.append("feed")
+                raise RuntimeError("feed boom")
+
+            async def abort(self) -> None:
+                self.calls.append("abort")
+                started.set()
+                await asyncio.sleep(0.5)
+
+        lease = SlowAbortLease()
+        factory = FakeSessionFactory(cast(Any, lease))
+        task = asyncio.ensure_future(
+            transcribe_ephemeral(
+                [_block(1)],
+                factory=factory,
+                locale=_LOCALE,
+                finalization_timeout_s=5.0,
+                submit_bound_samples=_BOUND,
+            )
+        )
+        await started.wait()  # cleanup (abort) is in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert "release" in lease.calls  # cancellation did not skip it
+
+    _run(scenario())

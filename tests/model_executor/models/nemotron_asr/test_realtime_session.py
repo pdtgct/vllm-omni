@@ -408,7 +408,10 @@ def test_fail_makes_later_operations_reject() -> None:
         ledger.acknowledge_piece(160)
     with pytest.raises(RuntimeError, match="terminally failed"):
         ledger.complete_next("x")
-    with pytest.raises(RuntimeError, match="terminally failed"):
+    # next_piece() raises the ORIGINAL failure, not the wrapper: a
+    # terminal failure must dominate, and the consumer sees exactly what
+    # killed the engine.
+    with pytest.raises(RuntimeError, match="dead"):
         _run(ledger.next_piece())
 
 
@@ -421,18 +424,20 @@ def test_fail_is_idempotent() -> None:
         ledger.mint(final_tail=False, admission_ms_mod=1)
 
 
-def test_queued_receipts_drain_before_the_failed_check() -> None:
+def test_fail_dominates_a_previously_queued_receipt() -> None:
     # @spec PORT-RTC-002
-    # A receipt already acknowledged before the failure is still
-    # deliverable to next_piece(); the fail() guard applies only once the
-    # queue is empty (nothing is silently lost that PORT already owned).
+    # A sub-cadence frame queues a receipt with no ticket. If the engine
+    # then dies, that queued receipt must NOT be handed to a consumer as
+    # a successful empty hypothesis: the terminal failure dominates, and
+    # next_piece() raises the ORIGINAL error fail() was given (not the
+    # generic "terminally failed" wrapper).
     async def scenario() -> None:
         ledger = ReceiptLedger(max_pending_carriers=4)
-        ledger.acknowledge_piece(160)  # a receipt is queued
-        ledger.fail(RuntimeError("dead"))
-        receipt = await ledger.next_piece()  # the queued one still drains
-        assert receipt.samples_consumed == 160
-        with pytest.raises(RuntimeError, match="terminally failed"):
-            await ledger.next_piece()  # now empty -> the fail guard bites
+        ledger.acknowledge_piece(160)  # a sub-cadence piece queues a receipt
+        boom = RuntimeError("engine died")
+        ledger.fail(boom)
+        with pytest.raises(RuntimeError, match="engine died") as excinfo:
+            await ledger.next_piece()
+        assert excinfo.value is boom
 
     _run(scenario())

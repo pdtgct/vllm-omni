@@ -693,6 +693,52 @@ class TestDeclaredTasksTypedProducer:
             with pytest.raises(ValueError, match="declared_tasks"):
                 merge_pipeline_deploy(pipeline, deploy)
 
+    def test_extras_conflicting_with_declared_tasks_is_rejected_at_the_overlay(self):
+        """A legacy ``extras={"declared_tasks": ...}`` must not silently
+        overwrite the validated typed value at the ``to_omegaconf`` overlay
+        boundary: it previously replaced the normalized tuple with whatever
+        raw value extras carried, e.g. a bare string that a downstream
+        ``tuple(...)`` conversion would iterate into single-character
+        "tasks"."""
+        for bad_extras_value in ("transcription", ("transcription",)):
+            pipeline = PipelineConfig(
+                model_type="test_declared_tasks_extras_conflict",
+                model_arch="TestModel",
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="ar",
+                        declared_tasks=("transcription",),
+                        extras={"declared_tasks": bad_extras_value},
+                    ),
+                ),
+            )
+            deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            with pytest.raises(ValueError, match="declared_tasks"):
+                stages[0].to_omegaconf()
+
+    def test_extras_without_declared_tasks_still_overlays_as_before(self):
+        """Extras keys other than ``declared_tasks`` are unaffected by the
+        reserved-key guard and continue to overlay onto the OmegaConf dict."""
+        pipeline = PipelineConfig(
+            model_type="test_declared_tasks_extras_unrelated",
+            model_arch="TestModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    declared_tasks=("transcription",),
+                    extras={"some_other_key": "value"},
+                ),
+            ),
+        )
+        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        omega = stages[0].to_omegaconf()
+        assert tuple(omega.declared_tasks) == ("transcription",)
+        assert omega.some_other_key == "value"
+
 
 class TestPipelineConfigNew:
     def test_frozen(self):

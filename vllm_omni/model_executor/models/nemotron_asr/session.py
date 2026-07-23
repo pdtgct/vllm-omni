@@ -262,14 +262,17 @@ class ReceiptLedger:
             The oldest unread piece receipt.
 
         Raises:
-            RuntimeError: If another consumer is already awaiting one, or
-                the ledger has been terminally failed.
-            BaseException: The failure passed to :meth:`fail` if the
-                ledger is failed while this call is awaiting.
+            RuntimeError: If another consumer is already awaiting one.
+            BaseException: The original failure passed to :meth:`fail`,
+                if the ledger has already been (or becomes) terminally
+                failed — checked before any queued receipt is served, so
+                a terminal failure always dominates a stale queued
+                receipt (PORT-RTC-002).
         """
+        if self._failed is not None:
+            raise self._failed
         if self._receipts:
             return self._receipts.popleft()
-        self._reject_if_failed()
         if self._waiter is not None:
             raise RuntimeError(
                 "piece acknowledgement is single-slot: feed calls are "
@@ -317,7 +320,9 @@ class ReceiptLedger:
         frame) or awaiting a :class:`CarrierTicket`'s ``done`` future
         (engine died between mint and park) would hang forever. ``fail``
         fails the piece waiter and every pending ticket with ``error``,
-        and makes later mint/acknowledge/consume calls reject
+        discards any already-queued receipts (a terminal failure must
+        dominate them — a stale queued receipt is not a successful
+        result), and makes later mint/acknowledge/consume calls reject
         (PORT-RTC-002). Idempotent: a second call is a no-op, so the
         binding's success and error paths can both call it defensively.
 
@@ -336,6 +341,7 @@ class ReceiptLedger:
             if not ticket.done.done():
                 ticket.done.set_exception(error)
         self._minted_by_frame.clear()
+        self._receipts.clear()
 
 
 class NemotronRealtimeSession:
