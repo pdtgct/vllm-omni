@@ -38,6 +38,14 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 DEFAULT_CADENCE = "560ms"
 DEFAULT_LOCALE = "auto"
 
+#: The canonical single-shot (ephemeral) geometry (PORT-REGIME-002):
+#: the largest published cadence, so a whole decoded clip flows in the
+#: fewest carriers. It lives HERE, beside DEFAULT_CADENCE, because the
+#: geometry choice is the model's — the model-aware session factory
+#: imports this label and no transport or serving module ever names a
+#: cadence literal of its own.
+EPHEMERAL_CADENCE = "1120ms"
+
 #: Seconds of admitted-cadence audio the ledger will hold as pending
 #: carrier tickets before failing the session. A model-package value:
 #: the backlog bound is RFC-1's own contract and depends on no consumer
