@@ -123,6 +123,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.router_plugins import load_router_plugins
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -508,6 +509,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # OMNI: Third-party routers mount here -- after serving state exists on
+        # app.state and strictly before serve_http accepts connections, so a
+        # failing plugin aborts startup with no partially-mounted route served.
+        load_router_plugins(app)
 
         # Start background processes
         await STORAGE_MANAGER.start()
