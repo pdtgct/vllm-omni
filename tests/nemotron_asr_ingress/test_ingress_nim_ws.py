@@ -618,18 +618,23 @@ def test_multichannel_is_rejected() -> None:
 # ---- audio flow and the delta projection -------------------------------------
 
 
-# @spec ING-NIMWS-004, ING-CORE-005
-async def test_appends_step_chunks_and_emit_deltas() -> None:
+# @spec ING-NIMWS-004, ING-CORE-005, ING-FE-006
+async def test_appends_forward_pieces_whole_and_emit_deltas() -> None:
     adapter, _core, fake, _recorded = make_adapter()
     await configure(adapter)
     # Two chunks arrive split off sample alignment: framing never
-    # shifts the steps the model sees.
+    # shifts the steps the model sees, and every decoded piece hands
+    # to the seam whole — cadence segmentation is PORT's alone
+    # (ING-FE-006), so the pieces carry the raw off-cadence sizes.
     data = pcm16(2 * CHUNK_SAMPLES)
     first = await adapter.on_event(append_event(data[: CHUNK_BYTES + 3]), 1.0)
     second = await adapter.on_event(append_event(data[CHUNK_BYTES + 3 :]), 2.0)
     deltas = [e for e in first + second if e["type"] == DELTA]
     assert [d["delta"] for d in deltas] == ["hey", " there"]
-    assert [len(piece) for piece in fake.fed] == [CHUNK_SAMPLES] * 2
+    assert [len(piece) for piece in fake.fed] == [
+        CHUNK_SAMPLES + 1,
+        CHUNK_SAMPLES - 1,
+    ]
 
 
 # @spec ING-CORE-005
@@ -684,9 +689,10 @@ async def test_commit_is_acked_and_never_forces_a_sub_chunk_step() -> None:
     (ack,) = await adapter.on_event({"type": COMMIT}, 1.1)
     assert ack["type"] == COMMITTED
     assert "item_id" in ack and "previous_item_id" in ack
-    # The adapter still releases (possibly empty) unconditionally, so
-    # feed() sees a zero-sample call here; the invariant that matters
+    # The half-chunk piece reached the seam at append (ING-FE-006);
+    # the commit itself feeds nothing, and the invariant that matters
     # is that no CADENCE chunk completed (ING-NIMWS-005).
+    assert len(fake.fed) == 1
     assert fake.chunks == 0  # the fixed-chunk invariant outranks the hint
     events = await adapter.on_event(
         append_event(pcm16(CHUNK_SAMPLES // 2, start=CHUNK_SAMPLES // 2)), 1.2
@@ -703,9 +709,9 @@ async def test_only_done_triggers_the_tail_flush() -> None:
     assert not fake.flush_called
     events = await adapter.on_event({"type": DONE}, 1.2)
     assert fake.flush_called
-    # flush() is residual-free now; the residual reaches the seam as
-    # its own feed() piece just ahead of the finalize (ING-FE-006).
-    assert len(fake.fed[-1]) == CHUNK_SAMPLES // 2
+    # The half-chunk reached the seam at append (ING-FE-006); done adds
+    # no piece at 16 kHz — it is a signal only, the flush trigger.
+    assert [len(piece) for piece in fake.fed] == [CHUNK_SAMPLES // 2]
     (completed,) = events
     assert completed["type"] == COMPLETED
     assert completed["is_last_result"] is True
@@ -723,22 +729,62 @@ async def test_clear_acks_cleared() -> None:
     assert ack["event_id"]
 
 
-# @spec ING-NIMWS-006
-async def test_clear_drops_only_the_unreleased_tail() -> None:
+# @spec ING-NIMWS-006, ING-FE-006
+async def test_clear_never_drops_forwarded_audio() -> None:
     adapter, _core, fake, _recorded = make_adapter()
     await configure(adapter)
     data = pcm16(CHUNK_SAMPLES + CHUNK_SAMPLES // 2)
     events = await adapter.on_event(append_event(data), 1.0)
     assert [e["type"] for e in events] == [DELTA]  # chunk 1 stepped
+    # The whole piece — sub-cadence residual included — reached the
+    # seam at append (ING-FE-006): clear has no adapter-held audio to
+    # drop, and PORT's accepted residual stands (ING-NIMWS-006).
+    forwarded = CHUNK_SAMPLES + CHUNK_SAMPLES // 2
+    assert sum(len(piece) for piece in fake.fed) == forwarded
     await adapter.on_event({"type": CLEAR}, 1.1)
     (completed,) = await adapter.on_event({"type": DONE}, 1.2)
-    # The un-released half-chunk tail was dropped before DONE: finalize
-    # always flushes regardless (ING-LIFE-010), but nothing new ever
-    # reaches the seam, so the final is the stepped cumulative plus
-    # the universal flush marker.
+    assert sum(len(piece) for piece in fake.fed) == forwarded
     assert fake.flush_called is True
     assert completed["type"] == COMPLETED
     assert completed["transcript"] == "hey [flushed]"
+
+
+# @spec ING-NIMWS-006
+async def test_clear_drops_the_undecoded_byte_remainder() -> None:
+    adapter, _core, fake, _recorded = make_adapter()
+    await configure(adapter)
+    # A partial-sample byte stays undecoded in the front-end
+    # (ING-FE-003) — exactly the wire residual clear may drop.
+    events = await adapter.on_event(
+        append_event(pcm16(CHUNK_SAMPLES) + b"\x7f"), 1.0
+    )
+    assert [e["type"] for e in events] == [DELTA]
+    await adapter.on_event({"type": CLEAR}, 1.1)
+    events = await adapter.on_event(
+        append_event(pcm16(CHUNK_SAMPLES, start=CHUNK_SAMPLES)), 1.2
+    )
+    assert [e["delta"] for e in events if e["type"] == DELTA] == [" there"]
+    # The stray byte died with the clear: the next append decodes on
+    # sample alignment, values intact.
+    expected = (
+        np.arange(CHUNK_SAMPLES, 2 * CHUNK_SAMPLES, dtype=np.float32) / 32768.0
+    )
+    np.testing.assert_allclose(fake.fed[-1], expected)
+
+
+# @spec ING-NIMWS-006, ING-NIMWS-009
+async def test_clear_drops_unresolved_sniff_bytes() -> None:
+    adapter, _core, fake, _recorded = make_adapter()
+    await configure(adapter, input_audio_format=DEFERRED_FORMAT)
+    wav = pcm16_wav(CHUNK_SAMPLES)
+    assert await adapter.on_event(append_event(wav[:10]), 1.0) == []
+    (ack,) = await adapter.on_event({"type": CLEAR}, 1.1)
+    assert ack["type"] == CLEARED
+    # The partial header died with the clear: the stream restarts on a
+    # fresh header and resolves cleanly.
+    events = await adapter.on_event(append_event(wav), 1.2)
+    assert [e["type"] for e in events] == [DELTA]
+    assert fake.chunks == 1
 
 
 # @spec ING-NIMWS-006
@@ -767,9 +813,9 @@ async def test_done_finalizes_with_exactly_one_completed() -> None:
     assert completed["type"] == COMPLETED
     assert completed["is_last_result"] is True
     assert completed["transcript"] == "hey [flushed]"
-    # flush() is residual-free now; the residual reaches the seam as
-    # its own feed() piece just ahead of the finalize (ING-FE-006).
-    assert len(fake.fed[-1]) == 160  # raw, un-padded residual
+    # The piece reached the seam whole at append (ING-FE-006): PORT
+    # owns the sub-cadence residual, and done is a signal only.
+    assert [len(piece) for piece in fake.fed] == [CHUNK_SAMPLES + 160]
 
 
 # @spec ING-LIFE-003
@@ -922,8 +968,8 @@ async def test_none_format_defers_to_the_riff_header() -> None:
     assert await adapter.on_event(append_event(wav[:10]), 1.0) == []
     events = await adapter.on_event(append_event(wav[10:]), 1.1)
     assert [e["type"] for e in events] == [DELTA, DELTA]
-    # Both cadence chunks release to the seam in one adapter-side feed
-    # call (the dialect's own chunk buffer completed two at once).
+    # The whole decoded payload hands to the seam in one piece
+    # (ING-FE-006); PORT's cadence counting completes two chunks.
     assert fake.chunks == 2
     assert sum(len(piece) for piece in fake.fed) == 2 * CHUNK_SAMPLES
     expected = np.arange(CHUNK_SAMPLES, dtype=np.float32) / 32768.0

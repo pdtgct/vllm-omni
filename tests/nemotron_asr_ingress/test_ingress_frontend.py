@@ -170,6 +170,19 @@ def test_a_lone_byte_waits_for_its_other_half() -> None:
 
 
 # @spec ING-FE-003
+def test_discard_partial_sample_drops_only_the_byte_residual() -> None:
+    # The dialect buffer-clear seam (ING-NIMWS-006): the carried
+    # partial-sample bytes drop; decode state realigns on the next
+    # message's first byte, and nothing already decoded is touched.
+    front = AudioFrontEnd("LINEAR_PCM", 16000)
+    assert len(front.feed(pcm16_bytes(4) + b"\x01")) == 4
+    front.discard_partial_sample()
+    out = front.feed(pcm16_bytes(4, start=100))
+    expected = np.arange(100, 104, dtype=np.float32) / 32768.0
+    np.testing.assert_allclose(out, expected, atol=1e-9)
+
+
+# @spec ING-FE-003
 def test_many_arbitrary_splits_decode_identically() -> None:
     whole = pcm16_bytes(500)
     reference = AudioFrontEnd("LINEAR_PCM", 16000).feed(whole)

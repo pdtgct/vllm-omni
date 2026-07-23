@@ -325,6 +325,15 @@ class AudioFrontEnd:
             return samples
         return self._resampler.push(samples)
 
+    def discard_partial_sample(self) -> None:
+        """Drop the carried partial-sample bytes (ING-NIMWS-006).
+
+        The dialect buffer-clear seam: only the undecoded wire
+        residual drops — decoded audio is already forwarded, and
+        resampler state stands (accepted audio is irreversible).
+        """
+        self._byte_tail = b""
+
     def flush(self) -> FloatAudio:
         """Drain the resampler tail at finalize (empty at 16 kHz)."""
         if self._resampler is None:

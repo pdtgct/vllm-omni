@@ -36,11 +36,10 @@ Dialect mechanics honored from the reference and the canonical client:
   ``input_audio_buffer.committed``, never forcing a sub-chunk step
   (ING-NIMWS-005). ``input_audio_buffer.done`` maps to ``finalize``
   and is the only tail-flush trigger. ``input_audio_buffer.clear``
-  drops only the adapter-held un-released buffer tail — the dialect's
-  own ``input_audio_buffer`` object, audio not yet released to the
-  session core — and never rewinds session-core or model state
-  (ING-NIMWS-006, a documented deviation: mid-stream model state is
-  not reversible).
+  drops only what the adapter still holds undecoded — the front-end's
+  partial-sample wire bytes and any unresolved sniff bytes — and
+  never rewinds session-core or model state (ING-NIMWS-006, a
+  documented deviation: mid-stream model state is not reversible).
 - ``partial`` projects as ``conversation.item.input_audio_
   transcription.delta`` — the delta arithmetic from consecutive
   cumulative hypotheses is this adapter's work (ING-CORE-005), and a
@@ -70,12 +69,8 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qs
 
-import numpy as np
-
 from nemotron_asr_ingress import errors
 from nemotron_asr_ingress.core import (
-    SAMPLE_RATE,
-    FloatAudio,
     IngressValues,
     PreRollBuffer,
     SessionCore,
@@ -516,12 +511,12 @@ class NimRealtimeAdapter:
     serving shell owns sockets, the session core owns behavior. The
     adapter owns dialect syntax only: the event mapping
     (ING-NIMWS-004), the delta projection from cumulative hypotheses
-    (ING-CORE-005), the dialect's ``input_audio_buffer`` object —
-    audio decodes through the front-end as it arrives, complete
-    admitted-size chunks release to the core immediately, and the
-    sub-chunk tail stays adapter-held so ``clear`` has something
-    honest to drop (ING-NIMWS-006) — and the RIFF sniff for the
-    canonical client's ``"none"`` format (ING-NIMWS-009).
+    (ING-CORE-005), the front-end decode — every complete-sample
+    piece hands to the core whole as it arrives, no cadence buffer
+    (ING-FE-005/006: PORT alone owns cadence segmentation), so
+    ``clear`` reaches only undecoded bytes (ING-NIMWS-006) — and the
+    RIFF sniff for the canonical client's ``"none"`` format
+    (ING-NIMWS-009).
 
     ``record_session`` receives each admitted session's effective
     provenance — including the conditional ``resampler_identifier``
@@ -545,7 +540,6 @@ class NimRealtimeAdapter:
         self._chunk_ms = chunk_ms
         self._record_session = record_session
         self._pre_roll = PreRollBuffer(core.values.pre_roll_bytes)
-        self._chunk_samples = chunk_ms * (SAMPLE_RATE // 1000)
         self._configured = False
         self._queued = False
         self._close = False
@@ -557,7 +551,6 @@ class NimRealtimeAdapter:
         self._declared_channels = 0
         self._pending_provenance: dict[str, Any] | None = None
         self._session_obj: dict[str, Any] = {}
-        self._tail: FloatAudio = np.zeros(0, dtype=np.float32)
         self._last_cumulative = ""
         self._item_seq = 0
         self._item_id = "msg_0000"
@@ -605,7 +598,6 @@ class NimRealtimeAdapter:
         """
         self._queued = False
         self._pre_roll.discard()
-        self._tail = np.zeros(0, dtype=np.float32)
         self._sniff_buf = b""
         await self._core.close(now)
 
@@ -618,10 +610,10 @@ class NimRealtimeAdapter:
         The mapping (ING-NIMWS-004): ``transcription_session.update``
         -> ``configure`` first / ``update`` later, acked
         ``transcription_session.updated``; ``input_audio_buffer.
-        append`` -> front-end decode into the dialect buffer;
-        ``…commit`` -> advisory ack only (ING-NIMWS-005); ``…clear``
-        -> drop the adapter-held tail, ack ``…cleared``
-        (ING-NIMWS-006); ``…done`` -> release the tail, ``finalize``.
+        append`` -> front-end decode, the piece handed to the core
+        whole; ``…commit`` -> advisory ack only (ING-NIMWS-005);
+        ``…clear`` -> drop the undecoded residual, ack ``…cleared``
+        (ING-NIMWS-006); ``…done`` -> ``finalize``.
         Any other first message is ``protocol_order`` (ING-LIFE-001);
         an unknown event type is an ``error`` event, never silent.
         """
@@ -972,24 +964,28 @@ class NimRealtimeAdapter:
 
     # @spec ING-NIMWS-006
     def _on_clear(self) -> list[dict[str, Any]]:
-        """Drop the adapter-held un-released tail; never rewind.
+        """Drop the undecoded residual only; never rewind.
 
-        Only the dialect's own buffer object drops — the sub-chunk
-        float tail and any unresolved sniff bytes. Stepped chunks,
-        session-core state, and model state stand (the documented
-        deviation: mid-stream model state is not reversible).
+        The drop set is exactly what the adapter still holds: the
+        front-end's partial-sample wire bytes and any unresolved
+        sniff bytes. Decoded pieces hand to the core immediately and
+        this adapter queues none for backpressure, so there are never
+        unaccepted pieces to drop. Forwarded audio, session-core
+        state, and model state stand (the documented deviation:
+        mid-stream model state is not reversible).
         """
         if not self._configured:
             return [self._protocol_order("clear before the session config")]
         if self._core.terminal:
             return [self._session_terminal()]
-        self._tail = np.zeros(0, dtype=np.float32)
+        if self._front is not None:
+            self._front.discard_partial_sample()
         self._sniff_buf = b""
         return [{"event_id": _event_id(), "type": _CLEARED}]
 
     # @spec ING-LIFE-002, ING-LIFE-003
     async def _on_done(self, now: float) -> list[dict[str, Any]]:
-        """Release the tail, flush, finalize: exactly one completed."""
+        """Drain the front-end, finalize: exactly one completed."""
         if not self._configured:
             return [self._protocol_order("done before the session config")]
         if self._core.terminal:
@@ -1002,15 +998,12 @@ class NimRealtimeAdapter:
     # ---- internals -----------------------------------------------------------
 
     async def _finalize_core(self, now: float) -> list[Event]:
-        """Release everything held, drain the front-end, finalize."""
-        parts = [self._tail]
-        self._tail = np.zeros(0, dtype=np.float32)
-        if self._front is not None:
-            parts.append(self._front.flush())
-        tail_audio = np.concatenate(parts)
+        """Drain the front-end's resampler tail, then finalize."""
         events: list[Event] = []
-        if len(tail_audio):
-            events.extend(await self._core.receive_audio(tail_audio, now))
+        if self._front is not None:
+            tail_audio = self._front.flush()
+            if len(tail_audio):
+                events.extend(await self._core.receive_audio(tail_audio, now))
         if self._pending_provenance is not None and not self._recorded:
             # A deferred session that never resolved a format records
             # resampler-less at finalize (gRPC parity, ING-FE-004).
@@ -1018,24 +1011,22 @@ class NimRealtimeAdapter:
         events.extend(await self._core.finalize(now))
         return events
 
+    # @spec ING-FE-006
     async def _feed(self, raw: bytes, now: float) -> list[dict[str, Any]]:
-        """Front-end decode; release complete chunks, hold the tail."""
+        """Front-end decode; hand the piece to the core whole.
+
+        No cadence buffer (ING-FE-005): PORT alone owns accepted
+        residual and cadence segmentation (ING-FE-006). Called
+        unconditionally for uniform event flow; an empty piece (a
+        message below one complete sample) is a no-op at the core and
+        never refreshes the idle lease — only accepted non-empty
+        audio is activity (ING-LIFE-005).
+        """
         front = self._front
         if front is None:  # pragma: no cover — guarded by callers
             raise RuntimeError("audio fed before a format resolved")
         samples = front.feed(raw)
-        if len(samples):
-            self._tail = np.concatenate([self._tail, samples])
-        n_ready = len(self._tail) // self._chunk_samples
-        release = self._tail[: n_ready * self._chunk_samples]
-        self._tail = self._tail[n_ready * self._chunk_samples :]
-        # Called unconditionally for uniform event flow; an empty
-        # release is a no-op at the core and never refreshes the idle
-        # lease — only accepted non-empty audio is activity
-        # (ING-LIFE-005). Un-released tail audio held here is the
-        # dialect's clearable buffer object (ING-NIMWS-005/006), so a
-        # sub-chunk trickle cannot extend residency either.
-        return self._project_all(await self._core.receive_audio(release, now))
+        return self._project_all(await self._core.receive_audio(samples, now))
 
     # @spec ING-NIMWS-009
     async def _sniff(self, raw: bytes, now: float) -> list[dict[str, Any]]:
