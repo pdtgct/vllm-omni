@@ -17,9 +17,9 @@ FALSE, activation silu, scale_input FALSE):
 - centered rel-pos encoding (multi_head_attention.py:1056-1100)
 
 Streaming (per-chunk cache threading over spec pages) is the P3
-re-plumb; this regime runs one window over the whole utterance with
-cross-chunk state dormant (PORT-REGIME-001/002). All source refs
-@ NeMo de242add.
+re-plumb; the probe/bring-up configuration runs one window over the
+whole utterance with cross-chunk state dormant (PORT-REGIME-001). All
+source refs @ NeMo de242add.
 """
 
 import math
@@ -302,10 +302,11 @@ class ConformerLayer(nn.Module):
 
 
 class FastConformerEncoder(nn.Module):
-    """Full-context regime encoder (PORT-REGIME-001/002).
+    """FastConformer encoder (PORT-REGIME-001).
 
-    One attention window over the whole utterance at the configured
-    ``att_context_size``; cross-chunk state pages dormant. The P3
+    Constructed here in the full-context probe/bring-up configuration:
+    one attention window over the whole utterance at the configured
+    ``att_context_size``, cross-chunk state pages dormant. The P3
     streaming path re-plumbs the same layers over paged caches.
     """
 

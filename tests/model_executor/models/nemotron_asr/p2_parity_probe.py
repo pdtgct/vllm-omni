@@ -5,7 +5,8 @@
 Assembles the port pipeline — featurizer -> subsampling/encoder (full
 context [56,13]) -> LID -> greedy label-looping decode — from the
 dumped checkpoint weights and compares against the pinned golden
-matrix's sixth cell (PORT-REGIME-002/003): final transcript identity
+matrix's 1120-ms cadence cell — the matrix has no full-context cell of
+its own (EVAL-PAR-007): final transcript identity
 (blocking) and named-checkpoint tensor diffs (advisory off the golden's
 exact fingerprint, EVAL-PAR-003 — torch builds differ between
 venv-oracle and venv-port).
@@ -41,6 +42,10 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
     PromptConditioner,
     resolve_prompt_index,
 )
+from vllm_omni.model_executor.models.nemotron_asr.precision import (
+    FP32_BRINGUP,
+    PrecisionPolicy,
+)
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
     Joint,
@@ -48,6 +53,91 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     greedy_decode_chunk,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rules import NEMO_RULES
+
+
+@torch.inference_mode()
+def _run_full_context_pipeline(
+    waveform: torch.Tensor,
+    *,
+    featurizer: MelFeaturizer,
+    encoder: FastConformerEncoder,
+    lid: PromptConditioner,
+    predictor: Predictor,
+    joint: Joint,
+    prompt_index: int,
+    policy: PrecisionPolicy = FP32_BRINGUP,
+) -> tuple[list[int], torch.Tensor, torch.Tensor]:
+    """Run the full-context pipeline once; the single copy of it in this file.
+
+    ``transcribe_full_context`` is the thin label-only oracle over this
+    helper, and ``main``'s golden comparison calls this same helper
+    directly (for its encoder taps) rather than re-deriving the
+    sequence — one encoder forward per clip, one place that can drift.
+
+    Returns:
+        ``(labels, encoder_raw, encoder_conditioned)``: greedy-decode
+        label ids, plus the two encoder taps ``main``'s advisory
+        tensor-diff cell compares against the golden matrix.
+    """
+    device = waveform.device
+    lengths = torch.tensor([waveform.shape[1]], device=device)
+    mel, mel_len = featurizer(waveform, lengths)
+    enc, enc_len = encoder(mel, mel_len.to(device))
+    valid = int(enc_len[0])
+    enc_raw = enc[:, :valid]
+    conditioned = lid(enc_raw, prompt_index=prompt_index)
+    state = DecodeState(
+        h=torch.zeros(
+            predictor.rnn.num_layers,
+            1,
+            predictor.rnn.hidden_size,
+            device=device,
+            dtype=policy.dtype_for("lstm_state"),
+        ),
+        c=torch.zeros(
+            predictor.rnn.num_layers,
+            1,
+            predictor.rnn.hidden_size,
+            device=device,
+            dtype=policy.dtype_for("lstm_state"),
+        ),
+        last_label=torch.tensor([predictor.blank_id], device=device),
+    )
+    labels, _ = greedy_decode_chunk(conditioned[0], predictor, joint, state)
+    return labels, enc_raw, conditioned
+
+
+@torch.inference_mode()
+def transcribe_full_context(
+    waveform: torch.Tensor,
+    *,
+    featurizer: MelFeaturizer,
+    encoder: FastConformerEncoder,
+    lid: PromptConditioner,
+    predictor: Predictor,
+    joint: Joint,
+    prompt_index: int,
+    policy: PrecisionPolicy = FP32_BRINGUP,
+) -> list[int]:
+    """Full-context single-shot pipeline over a whole utterance.
+
+    Parity oracle only; not a serving regime — PORT-REGIME-002 is the
+    canonical ephemeral session (PORT-EPH-003 forbids reaching this
+    from any serving or entrypoint module). One window over the whole
+    utterance, cross-chunk state dormant; the complete label-looping
+    decode runs once. Returns emitted label ids.
+    """
+    labels, _, _ = _run_full_context_pipeline(
+        waveform,
+        featurizer=featurizer,
+        encoder=encoder,
+        lid=lid,
+        predictor=predictor,
+        joint=joint,
+        prompt_index=prompt_index,
+        policy=policy,
+    )
+    return labels
 
 
 def _read_wav(path: Path) -> tuple[torch.Tensor, int]:
@@ -118,22 +208,15 @@ def main() -> None:
         meta["prompt_dictionary"], args.target_lang
     )
 
-    with torch.inference_mode():
-        mel, mel_len = featurizer(
-            waveform, torch.tensor([waveform.shape[1]], device=device)
-        )
-        enc_raw, enc_len = encoder(mel, mel_len.to(device))
-        n = int(enc_len[0])
-        enc_raw = enc_raw[:, :n]
-        enc_cond = lid(enc_raw, prompt_index=prompt_index)
-        state0 = DecodeState(
-            h=torch.zeros(2, 1, 640, device=device),
-            c=torch.zeros(2, 1, 640, device=device),
-            last_label=torch.tensor([predictor.blank_id], device=device),
-        )
-        labels, _ = greedy_decode_chunk(
-            enc_cond[0], predictor, joint, state0
-        )
+    labels, enc_raw, enc_cond = _run_full_context_pipeline(
+        waveform,
+        featurizer=featurizer,
+        encoder=encoder,
+        lid=lid,
+        predictor=predictor,
+        joint=joint,
+        prompt_index=prompt_index,
+    )
 
     import sentencepiece as spm
 

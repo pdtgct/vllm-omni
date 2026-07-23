@@ -2,11 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Nemotron cache-aware streaming RNN-T ASR — model class.
 
-Two context regimes over one class (PORT-REGIME-001/003): the
-full-context single-shot regime backs ``/v1/audio/transcriptions``
-(``SupportsTranscription``) and is the serving bring-up baseline; the
-streaming regime (``SupportsRealtime`` + spec pages) rides on top with
-per-chunk state.
+One streaming regime over one class (PORT-REGIME-001): per-chunk
+cache-aware execution with cross-chunk state on spec pages, reached
+through ``SupportsRealtime``. Single-shot transcription is the same
+machinery driven as one ephemeral 1120-ms session by the serving-layer
+orchestrator (PORT-REGIME-002) — never a full-context pass, which
+survives only as an EVAL-tier parity probe (PORT-EPH-003). No
+transcription surface is wired at this pin: the class does not
+advertise ``supports_transcription`` and the omni engine cannot report
+the task, so PORT-REGIME-003's ``SupportsTranscription`` obligation
+lands with the transcriptions adapter.
 
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
 audio runs featurizer -> encoder -> LID -> the complete greedy
@@ -175,35 +180,6 @@ class NemotronASRCore(nn.Module):
             ),
             last_label=torch.tensor([self.blank_id], device=device),
         )
-
-    @torch.inference_mode()
-    def transcribe_full_context(
-        self,
-        waveform: torch.Tensor,
-        *,
-        prompt_index: int,
-    ) -> list[int]:
-        """Full-context single-shot regime (PORT-REGIME-002).
-
-        One window over the whole utterance, cross-chunk state dormant;
-        the complete label-looping decode runs once. Returns emitted
-        label ids (the replay-queue content).
-        """
-        device = waveform.device
-        lengths = torch.tensor([waveform.shape[1]], device=device)
-        mel, mel_len = self.featurizer(waveform, lengths)
-        enc, enc_len = self.encoder(mel, mel_len.to(device))
-        valid = int(enc_len[0])
-        conditioned = self.lid(
-            enc[:, :valid], prompt_index=prompt_index
-        )
-        labels, _ = greedy_decode_chunk(
-            conditioned[0],
-            self.predictor,
-            self.joint,
-            self.fresh_decode_state(device),
-        )
-        return labels
 
     @torch.inference_mode()
     def transcribe_chunk(
