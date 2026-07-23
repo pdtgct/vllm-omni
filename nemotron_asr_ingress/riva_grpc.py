@@ -594,7 +594,10 @@ class RivaAsrServicer:
                 for event in await core.receive_audio(piece, self._clock()):
                     if isinstance(event, SessionError):
                         await self._abort_error(context, event)
-            for event in await core.finalize(self._clock()):
+            events = await core.finalize(
+                self._clock(), timeout_s=self._drain_timeout(context)
+            )
+            for event in events:
                 if isinstance(event, SessionError):
                     await self._abort_error(context, event)
                 if isinstance(event, Final):
@@ -608,6 +611,20 @@ class RivaAsrServicer:
         alternative = response.results.add().alternatives.add()
         alternative.transcript = transcript
         return response
+
+    def _drain_timeout(self, context: Any) -> float:
+        """The earlier of the values bound and the RPC deadline.
+
+        ING-LIFE-005: the ephemeral regime drains under the earlier
+        request deadline when the client set one —
+        ``grpc.aio``'s ``time_remaining()`` answers ``None`` for a
+        deadline-free RPC, leaving the mandatory values bound.
+        """
+        timeout = self._values.finalization_timeout_s
+        remaining = context.time_remaining()
+        if remaining is not None:
+            timeout = min(timeout, remaining)
+        return timeout
 
     async def _resolve_deferred(
         self, sniffed: RiffFormat, recognition: Any, context: Any

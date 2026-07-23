@@ -11,6 +11,8 @@ This module is the durable home for the values every tier shares
 serve imports from ingress, never the reverse.
 """
 
+import asyncio
+import math
 import threading
 import uuid
 from collections.abc import Mapping
@@ -137,8 +139,9 @@ class IngressValues:
     PORT-SESS-005 carves out; ``chunk_buffer_s`` bounds pre-submit
     audio in seconds (ING-FE-005); ``pre_roll_bytes`` bounds the raw
     pre-admission buffer; ``idle_ttl_s`` is the PORT-SESS-005 TTL;
-    ``locales`` is the checkpoint-derived valid locale set
-    (PORT-LID-001).
+    ``finalization_timeout_s`` is the mandatory finite bound on the
+    accepted-finalize drain (ING-LIFE-005); ``locales`` is the
+    checkpoint-derived valid locale set (PORT-LID-001).
     """
 
     watermark: int
@@ -147,7 +150,18 @@ class IngressValues:
     chunk_buffer_s: float
     pre_roll_bytes: int
     idle_ttl_s: float
+    finalization_timeout_s: float
     locales: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """The drain bound is mandatory finite (ING-LIFE-005)."""
+        if not math.isfinite(self.finalization_timeout_s) or (
+            self.finalization_timeout_s <= 0
+        ):
+            raise ValueError(
+                "finalization_timeout_s must be finite and positive, "
+                f"got {self.finalization_timeout_s}"
+            )
 
 
 # @spec ING-FE-005, ING-FE-006
@@ -535,8 +549,10 @@ class SessionCore:
             return rejections + [UpdateAck(honored=honored)]
         return rejections
 
-    # @spec ING-LIFE-002, ING-LIFE-003, ING-LIFE-010
-    async def finalize(self, now: float) -> list[Event]:
+    # @spec ING-LIFE-002, ING-LIFE-003, ING-LIFE-005, ING-LIFE-010
+    async def finalize(
+        self, now: float, timeout_s: float | None = None
+    ) -> list[Event]:
         """Client-driven end of audio; exactly one ``Final``.
 
         ``flush`` is the universal normal-finalization transaction
@@ -546,7 +562,16 @@ class SessionCore:
         return IS the ``Final`` transcript, so labels the tail drain
         emits are never lost. The resident slot is released only
         after terminal engine cleanup (``finish``, or ``abort`` on a
-        failed finalization), never before.
+        failed or expired finalization), never before.
+
+        Accepting finalize disarms the idle backstop, so the drain
+        itself is bounded by the mandatory finite
+        ``finalization_timeout_s`` — or ``timeout_s`` when the caller
+        holds an earlier request deadline (ING-LIFE-005): a stalled
+        engine never retains the resident slot forever. On expiry the
+        drain is cancelled, the transcriber's idempotent ``abort``
+        frees engine state, and the session ends with the named
+        ``finalization_timeout`` error — never a ``Final``.
         """
         if self._terminal:
             return [self._terminal_error()]
@@ -557,19 +582,41 @@ class SessionCore:
                     detail="finalize before the admission outcome",
                 )
             ]
+        drain_timeout = (
+            self.values.finalization_timeout_s if timeout_s is None else timeout_s
+        )
         # Accepting finalize atomically closes audio and locale
         # updates (ING-LIFE-002) and disarms the idle backstop
         # (ING-LIFE-005) — terminal before the drain awaits.
         self._terminal = True
         try:
-            transcript = await self._transcriber.flush()
-            await self._transcriber.finish()
+            # The drain is a genuinely async engine operation, so the
+            # bound is real awaited time, not the explicit-now clock.
+            transcript = await asyncio.wait_for(self._drain(), drain_timeout)
+        except asyncio.TimeoutError:
+            await self._transcriber.abort()
+            self._release_slot()
+            return [
+                SessionError(
+                    code=errors.FINALIZATION_TIMEOUT,
+                    detail=(
+                        "finalization drain exceeded "
+                        f"{drain_timeout} s; engine state aborted"
+                    ),
+                )
+            ]
         except BaseException:
             await self._transcriber.abort()
-            raise
-        finally:
             self._release_slot()
+            raise
+        self._release_slot()
         return [Final(transcript=transcript)]
+
+    async def _drain(self) -> str:
+        """The normal-finalization drain ``finalize`` bounds."""
+        transcript = await self._transcriber.flush()
+        await self._transcriber.finish()
+        return transcript
 
     # @spec ING-LIFE-004
     async def close(self, now: float) -> list[Event]:

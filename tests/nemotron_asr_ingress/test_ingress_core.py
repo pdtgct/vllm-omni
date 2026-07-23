@@ -6,6 +6,9 @@ transcriber whole (PORT alone owns cadence, ING-FE-006); ``flush`` is
 the universal residual-free finalization (ING-LIFE-010 as amended).
 """
 
+import asyncio
+import math
+
 import pytest
 from ingress_helpers import (
     CHUNK_SAMPLES,
@@ -375,6 +378,73 @@ async def test_failed_finalization_aborts_and_releases() -> None:
     assert not fake.finished
     assert gate.active == 0
     assert core.terminal
+
+
+# @spec ING-LIFE-005, ING-ERR-002
+async def test_stalled_drain_expires_with_finalization_timeout() -> None:
+    # A stalled engine must never retain the resident slot forever:
+    # the accepted-finalize drain is bounded, and expiry aborts —
+    # never a Final.
+    core, fake, gate = make_core(
+        values=make_values(finalization_timeout_s=0.05)
+    )
+    stall = asyncio.Event()
+
+    async def hanging_flush() -> str:
+        await stall.wait()
+        return "never"
+
+    fake.flush = hanging_flush
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    events = await core.finalize(now=0.2)
+    assert [type(e) for e in events] == [SessionError]
+    assert isinstance(events[0], SessionError)
+    assert events[0].code == errors.FINALIZATION_TIMEOUT
+    assert not any(isinstance(e, Final) for e in events)
+    assert fake.aborted
+    assert not fake.finished
+    assert gate.active == 0
+    assert core.terminal
+
+
+# @spec ING-LIFE-005
+async def test_finalize_timeout_override_bounds_the_drain() -> None:
+    # The caller's earlier request deadline governs when passed.
+    core, fake, gate = make_core()
+    stall = asyncio.Event()
+
+    async def hanging_flush() -> str:
+        await stall.wait()
+        return "never"
+
+    fake.flush = hanging_flush
+    core.configure(CFG, now=0.0)
+    events = await core.finalize(now=0.1, timeout_s=0.05)
+    assert isinstance(events[0], SessionError)
+    assert events[0].code == errors.FINALIZATION_TIMEOUT
+    assert fake.aborted
+    assert gate.active == 0
+
+
+# @spec ING-LIFE-005
+async def test_fast_drain_is_unaffected_by_the_bound() -> None:
+    core, fake, _ = make_core(
+        values=make_values(finalization_timeout_s=10.0)
+    )
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    events = await core.finalize(now=0.2)
+    assert events == [Final(transcript="hey [flushed]")]
+    assert fake.finished
+    assert not fake.aborted
+
+
+# @spec ING-LIFE-005
+def test_finalization_timeout_must_be_finite_and_positive() -> None:
+    for bad in (0.0, -1.0, math.inf, math.nan):
+        with pytest.raises(ValueError, match="finalization_timeout_s"):
+            make_values(finalization_timeout_s=bad)
 
 
 # @spec ING-ADM-004

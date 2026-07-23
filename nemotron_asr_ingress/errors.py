@@ -14,6 +14,7 @@ from dataclasses import dataclass
 BUSY = "busy"
 ADMISSION_WAIT_TIMEOUT = "admission_wait_timeout"
 IDLE_TIMEOUT = "idle_timeout"
+FINALIZATION_TIMEOUT = "finalization_timeout"
 PROTOCOL_ORDER = "protocol_order"
 INVALID_CONFIG_FIELD = "invalid_config_field"
 UNSUPPORTED_CAPABILITY = "unsupported_capability"
@@ -53,6 +54,9 @@ _CATALOG: dict[str, DialectProjection] = {
         "DEADLINE_EXCEEDED", "error+close", "admission_wait_timeout"
     ),
     IDLE_TIMEOUT: DialectProjection("ABORTED", "error+close", "idle_timeout"),
+    FINALIZATION_TIMEOUT: DialectProjection(
+        "DEADLINE_EXCEEDED", "error+close", "finalization_timeout"
+    ),
     PROTOCOL_ORDER: DialectProjection(
         "FAILED_PRECONDITION", "error+close", "model_not_validated"
     ),

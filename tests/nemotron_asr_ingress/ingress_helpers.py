@@ -100,6 +100,7 @@ def make_values(**overrides: Any) -> IngressValues:
         "chunk_buffer_s": 10.0,
         "pre_roll_bytes": 65536,
         "idle_ttl_s": 60.0,
+        "finalization_timeout_s": 10.0,
         "locales": ("en-US", "es-US", "auto"),
     }
     values.update(overrides)

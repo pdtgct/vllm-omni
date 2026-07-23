@@ -7,6 +7,7 @@ ALL_CODES = (
     errors.BUSY,
     errors.ADMISSION_WAIT_TIMEOUT,
     errors.IDLE_TIMEOUT,
+    errors.FINALIZATION_TIMEOUT,
     errors.PROTOCOL_ORDER,
     errors.INVALID_CONFIG_FIELD,
     errors.UNSUPPORTED_CAPABILITY,
@@ -36,19 +37,24 @@ def test_catalog_covers_every_code_with_every_dialect_column() -> None:
 
 
 # @spec ING-ERR-002
-def test_capacity_codes_are_three_distinct_codes() -> None:
-    three = {
+def test_capacity_codes_are_four_distinct_codes() -> None:
+    # Capacity, queued wait, inactivity, and a stalled accepted-
+    # finalize drain are never conflated (ING-ERR-002).
+    four = {
         errors.BUSY,
         errors.ADMISSION_WAIT_TIMEOUT,
         errors.IDLE_TIMEOUT,
+        errors.FINALIZATION_TIMEOUT,
     }
-    assert len(three) == 3
+    assert len(four) == 4
     table = catalog()
     assert table[errors.BUSY].grpc_status == "RESOURCE_EXHAUSTED"
     assert (
         table[errors.ADMISSION_WAIT_TIMEOUT].grpc_status == "DEADLINE_EXCEEDED"
     )
     assert table[errors.IDLE_TIMEOUT].grpc_status == "ABORTED"
+    assert table[errors.FINALIZATION_TIMEOUT].grpc_status == "DEADLINE_EXCEEDED"
+    assert table[errors.FINALIZATION_TIMEOUT].nim == "error+close"
 
 
 # @spec ING-ERR-001

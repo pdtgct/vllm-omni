@@ -9,6 +9,7 @@ server is the ING-2 pod exit gate, not a local test.
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,11 +57,16 @@ class FakeContext:
     def __init__(self) -> None:
         self.code: grpc.StatusCode | None = None
         self.details: str | None = None
+        self.remaining: float | None = None
 
     def abort(self, code: grpc.StatusCode, details: str) -> None:
         self.code = code
         self.details = details
         raise AbortError(details)
+
+    def time_remaining(self) -> float | None:
+        """``None`` = no RPC deadline (the ``grpc.aio`` contract)."""
+        return self.remaining
 
 
 class FakeTime:
@@ -91,7 +97,9 @@ class Harness:
 
 
 def make_servicer(
-    idle_tick_s: float = 1.0, **value_overrides: Any
+    idle_tick_s: float = 1.0,
+    transcriber_factory: Callable[[], FakeTranscriber] | None = None,
+    **value_overrides: Any,
 ) -> Harness:
     values = make_values(**value_overrides)
     gate = make_gate(values)
@@ -101,8 +109,11 @@ def make_servicer(
         # ``core = None`` invites the servicer's assembly-seam backref,
         # so the fake resolves the ADMITTED cadence from its session
         # core exactly like the real kernel binding does.
-        transcriber = FakeTranscriber(chunk_samples=None)
-        transcriber.core = None
+        if transcriber_factory is not None:
+            transcriber = transcriber_factory()
+        else:
+            transcriber = FakeTranscriber(chunk_samples=None)
+            transcriber.core = None
         transcribers.append(transcriber)
         return transcriber
 
@@ -904,6 +915,61 @@ async def test_recognize_unknown_locale_aborts_naming_the_field() -> None:
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "language_code" in harness.context.details
+
+
+class HangingFlushTranscriber(FakeTranscriber):
+    """A stalled engine: ``flush`` awaits a never-set event."""
+
+    def __init__(self) -> None:
+        super().__init__(chunk_samples=None)
+        self.core = None
+        self.stall = asyncio.Event()
+
+    async def flush(self) -> str:
+        await self.stall.wait()
+        transcript: str = await super().flush()
+        return transcript
+
+
+# @spec ING-LIFE-005, ING-ERR-002
+async def test_recognize_bounds_the_drain_with_the_values_timeout() -> None:
+    # A deadline-free RPC (time_remaining() is None) still drains
+    # under the mandatory values bound — never forever.
+    harness = make_servicer(
+        transcriber_factory=HangingFlushTranscriber,
+        finalization_timeout_s=0.05,
+    )
+    request = rasr.RecognizeRequest(
+        config=recognition_config(), audio=pcm16(64)
+    )
+    with pytest.raises(AbortError):
+        await harness.servicer.Recognize(request, harness.context)
+    assert harness.context.code == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert harness.context.details is not None
+    assert errors.FINALIZATION_TIMEOUT in harness.context.details
+    (transcriber,) = harness.transcribers
+    assert transcriber.aborted
+    assert not transcriber.finished
+    assert harness.gate.active == 0
+
+
+# @spec ING-LIFE-005
+async def test_recognize_drains_under_the_earlier_rpc_deadline() -> None:
+    # values bound 10 s, RPC deadline 0.05 s: the earlier of the two
+    # governs the drain (ING-LIFE-005's ephemeral-regime clause).
+    harness = make_servicer(transcriber_factory=HangingFlushTranscriber)
+    harness.context.remaining = 0.05
+    request = rasr.RecognizeRequest(
+        config=recognition_config(), audio=pcm16(64)
+    )
+    started = time.monotonic()
+    with pytest.raises(AbortError):
+        await harness.servicer.Recognize(request, harness.context)
+    assert time.monotonic() - started < 2.0  # not the 10-s values bound
+    assert harness.context.code == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert harness.context.details is not None
+    assert errors.FINALIZATION_TIMEOUT in harness.context.details
+    assert harness.gate.active == 0
 
 
 # ---- ING-GRPC-004/006: GetRivaSpeechRecognitionConfig -----------------------
