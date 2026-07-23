@@ -28,8 +28,13 @@ LOCALES = {"en-US": 2, "es-US": 7}
 WAIT_S = 2.0
 
 
-def _load_real_segmenter() -> Any:
-    """Load streaming.buffer_stream engine-free (no vllm imports)."""
+def _load_real_streaming() -> Any:
+    """Load the streaming MODULE engine-free (no vllm imports).
+
+    Each call re-executes streaming.py into a fresh module object, so a
+    test may monkeypatch module globals (e.g. ``_admission_ms_mod``)
+    without leaking into segmenters loaded by other tests.
+    """
     base = "vllm_omni.model_executor.models.nemotron_asr"
     pkg = (
         Path(__file__).resolve().parents[2]
@@ -53,7 +58,12 @@ def _load_real_segmenter() -> Any:
         sys.modules[f"{base}.{mod}"] = module
         spec.loader.exec_module(module)
         loaded[mod] = module
-    return loaded["streaming"].buffer_stream
+    return loaded["streaming"]
+
+
+def _load_real_segmenter() -> Any:
+    """Load streaming.buffer_stream engine-free (no vllm imports)."""
+    return _load_real_streaming().buffer_stream
 
 
 def make_output(ids: list[int], text: str = "", stage_id: int = 0) -> Any:
@@ -132,6 +142,8 @@ class FakeEngine:
         self.aborted: list[str] = []
         self.script = script
         self.stop_after = stop_after
+        # Progress marker for clocks tied to engine output (F6/R4).
+        self.started_output = False
 
     async def generate(
         self, prompts: AsyncIterator[Any], request_id: str
@@ -144,6 +156,7 @@ class FakeEngine:
             else:
                 outs = [make_output([7, PARK], text=f" w{index}")]
             for out in outs:
+                self.started_output = True
                 yield out
             index += 1
             if self.stop_after is not None and index >= self.stop_after:
@@ -451,24 +464,46 @@ async def test_real_segmenter_paces_and_stamps_locale_per_mint() -> None:
 async def test_real_segmenter_burst_is_stamped_as_one_frame() -> None:
     # The F6 pin: a burst spanning two cadences reaches buffer_stream
     # as ONE frame, so BOTH chunks are sliced and stamped in one
-    # synchronous pass before the first park is awaited — the
-    # sequence numbers prove both envelopes were minted from the same
-    # burst delivery.
-    buffer_stream = _load_real_segmenter()
+    # synchronous pass before the first park is awaited. The clock is
+    # tied to engine progress — it jumps to LATE once the engine first
+    # yields — so a pre-chunking path that stamped chunk 2 only after
+    # chunk 1's park (behind the first engine output) would read LATE
+    # in the second envelope. Both admission stamps reading BASE pins
+    # the pre-park stamping property itself (PORT-SESS-001), not just
+    # the (0, 1) sequence numbers the old path also produced.
+    streaming = _load_real_streaming()
     engine = FakeEngine()
-    transcriber, _, _ = make_transcriber(engine, segment=buffer_stream)
-    hyps = await asyncio.wait_for(
-        transcriber.feed(chunk_audio(2.0)), WAIT_S
-    )
-    assert hyps == [" w0", " w0 w1"]
-    first = engine.prompts[0]["rendered"]["multi_modal_data"]["audio"]
-    second = engine.prompts[1]["rendered"]["multi_modal_data"]["audio"]
-    assert (first[5], second[5]) == (0.0, 1.0)  # chunk sequence
-    final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
-    assert final == " w0 w1 w2"
-    tail = engine.prompts[2]["rendered"]["multi_modal_data"]["audio"]
-    assert tail[1] == 0.0  # exact boundary -> zero-sample final tail
-    assert tail[3] == 1.0
+    base_stamp, late_stamp = 111, 999_777
+
+    def engine_tied_clock() -> int:
+        return late_stamp if engine.started_output else base_stamp
+
+    real_clock = streaming._admission_ms_mod
+    streaming._admission_ms_mod = engine_tied_clock
+    try:
+        transcriber, _, _ = make_transcriber(
+            engine, segment=streaming.buffer_stream
+        )
+        hyps = await asyncio.wait_for(
+            transcriber.feed(chunk_audio(2.0)), WAIT_S
+        )
+        assert hyps == [" w0", " w0 w1"]
+        first = engine.prompts[0]["rendered"]["multi_modal_data"]["audio"]
+        second = engine.prompts[1]["rendered"]["multi_modal_data"]["audio"]
+        # BOTH admission stamps pre-date the first engine output.
+        assert (first[6], second[6]) == (
+            float(base_stamp),
+            float(base_stamp),
+        )
+        assert (first[5], second[5]) == (0.0, 1.0)  # chunk sequence
+        final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
+        assert final == " w0 w1 w2"
+        tail = engine.prompts[2]["rendered"]["multi_modal_data"]["audio"]
+        assert tail[1] == 0.0  # exact boundary -> zero-sample final tail
+        assert tail[3] == 1.0
+        assert tail[6] == float(late_stamp)  # stamped after engine output
+    finally:
+        streaming._admission_ms_mod = real_clock
 
 
 async def test_real_segmenter_zero_audio_session() -> None:
