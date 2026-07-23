@@ -142,6 +142,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.engine_input_source = metadata.engine_input_source
             self.final_output = metadata.final_output
             self.final_output_type = metadata.final_output_type
+            self.declared_tasks = getattr(metadata, "declared_tasks", ())
             self.default_sampling_params = metadata.default_sampling_params
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func

@@ -29,6 +29,7 @@ class StageClient(Protocol):
     model_stage: str | None
     final_output: bool
     final_output_type: FinalOutputModalityType | None
+    declared_tasks: tuple[str, ...]
     default_sampling_params: OmniSamplingParams
     prompt_expand_func: Any | None
     requires_multimodal_data: bool
