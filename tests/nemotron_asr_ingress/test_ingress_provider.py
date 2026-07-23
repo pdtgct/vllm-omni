@@ -304,3 +304,52 @@ def test_remote_gate_enforces_the_same_watermark_value() -> None:
     gate = RemoteGate(watermark=int(values["watermark"]))
     assert gate.request() is AdmissionOutcome.ADMITTED
     assert gate.request() is AdmissionOutcome.BUSY
+
+
+# @spec ING-ADM-003
+async def test_raising_disposer_never_strands_the_count_on_busy_ack() -> None:
+    # A raising close seam on the negative-ack path must still release
+    # the projected count — else the provider is permanently BUSY.
+    upstream = FakeUpstream(
+        acks=[AdmissionOutcome.BUSY, AdmissionOutcome.ADMITTED]
+    )
+    gate = RemoteGate(watermark=1)
+
+    def raising_close(connection: str) -> None:
+        raise RuntimeError("socket close failed")
+
+    provider = RemoteProvider(
+        url=URL,
+        gate=gate,
+        connect=upstream.connect,
+        await_admission=upstream.await_admission,
+        close=raising_close,
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        await provider.open_session()
+    assert gate.active == 0
+    lease = await provider.open_session()  # capacity genuinely free
+    assert isinstance(lease, RemoteLease)
+
+
+# @spec ING-ADM-003
+async def test_raising_async_disposer_never_strands_the_count_on_ack_failure() -> None:
+    gate = RemoteGate(watermark=1)
+    upstream = FakeUpstream()
+
+    async def failing_ack(connection: str) -> AdmissionOutcome:
+        raise OSError("upstream vanished")
+
+    async def raising_async_close(connection: str) -> None:
+        raise RuntimeError("async close failed")
+
+    provider = RemoteProvider(
+        url=URL,
+        gate=gate,
+        connect=upstream.connect,
+        await_admission=failing_ack,
+        close=raising_async_close,
+    )
+    with pytest.raises(RuntimeError, match="async close failed"):
+        await provider.open_session()
+    assert gate.active == 0

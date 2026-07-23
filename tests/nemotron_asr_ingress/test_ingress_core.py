@@ -478,3 +478,25 @@ def test_gate_holds_the_residency_cap_under_concurrent_configures() -> None:
         thread.join()
     assert violations == []
     assert gate.active == 0
+
+
+# @spec ING-LIFE-005
+async def test_engine_timeout_error_is_not_misprojected_as_expiry() -> None:
+    # A TimeoutError raised BY the drain (an engine-originated failure)
+    # is a failed finalization, never this deadline's expiry: it must
+    # propagate through the failure path, not project
+    # finalization_timeout.
+    core, fake, gate = make_core()
+
+    async def flush_raises_timeout() -> str:
+        raise TimeoutError("engine deadline inside the drain")
+
+    fake.flush = flush_raises_timeout
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    with pytest.raises(TimeoutError, match="inside the drain"):
+        await core.finalize(now=0.2)
+    assert fake.aborted
+    assert not fake.finished
+    assert gate.active == 0
+    assert core.terminal

@@ -173,13 +173,19 @@ class RemoteProvider:
             connection = self._connect(self.url)
             outcome = await self._await_admission(connection)
         except BaseException:
-            if connection is not None:
-                await self._dispose(connection)
-            self._gate.release()
+            try:
+                if connection is not None:
+                    await self._dispose(connection)
+            finally:
+                # A raising disposer must never strand the projected
+                # count (ING-ADM-003): released on every negative path.
+                self._gate.release()
             raise
         if outcome is not AdmissionOutcome.ADMITTED:
-            await self._dispose(connection)
-            self._gate.release()
+            try:
+                await self._dispose(connection)
+            finally:
+                self._gate.release()
             return AdmissionOutcome.BUSY
         return RemoteLease(connection, self._dispose, self._gate)
 

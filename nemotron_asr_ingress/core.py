@@ -592,10 +592,17 @@ class SessionCore:
         try:
             # The drain is a genuinely async engine operation, so the
             # bound is real awaited time, not the explicit-now clock.
-            transcript = await asyncio.wait_for(self._drain(), drain_timeout)
-        except asyncio.TimeoutError:
+            # asyncio.timeout (not wait_for) so THIS deadline's expiry
+            # is distinguishable from a TimeoutError the drain itself
+            # raises — an engine-originated timeout is a FAILED
+            # finalization, never projected as finalization_timeout.
+            async with asyncio.timeout(drain_timeout) as drain_bound:
+                transcript = await self._drain()
+        except TimeoutError:
             await self._transcriber.abort()
             self._release_slot()
+            if not drain_bound.expired():
+                raise
             return [
                 SessionError(
                     code=errors.FINALIZATION_TIMEOUT,
