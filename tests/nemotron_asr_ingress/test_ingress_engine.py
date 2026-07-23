@@ -4,7 +4,8 @@ ING-VEH-004/007/008 + ING-LIFE-010 at the compute seam: the engine
 arrives as injected callables (GPU-free), and the integration cases
 drive the REAL segmenter (``streaming.buffer_stream``, loaded
 engine-free via importlib) against a fake engine to prove the
-park-echo pacing loop and the per-mint locale stamp end to end.
+park-echo pacing loop, whole-piece burst delivery (ING-FE-006), and
+the per-mint locale stamp end to end.
 """
 
 import asyncio
@@ -22,6 +23,7 @@ import pytest
 from nemotron_asr_ingress.engine import EngineTranscriber, SessionConfigView
 
 PARK = 13089
+CHUNK = 8960
 LOCALES = {"en-US": 2, "es-US": 7}
 WAIT_S = 2.0
 
@@ -62,11 +64,14 @@ def make_output(ids: list[int], text: str = "", stage_id: int = 0) -> Any:
 
 
 class FakeSegmenter:
-    """Contract double: one prompt per frame + a final marker, with the
-    segmenter's own hold-until-park discipline (PORT-SESS-001)."""
+    """Contract double mirroring the real segmenter's shape: frames
+    buffer and slice at the admitted cadence, one prompt per completed
+    CHUNK plus a final marker, with the segmenter's own
+    hold-until-park discipline (PORT-SESS-001)."""
 
-    def __init__(self) -> None:
+    def __init__(self, chunk_samples: int = CHUNK) -> None:
         self.config: Any = None
+        self._chunk_samples = chunk_samples
 
     def __call__(
         self,
@@ -83,26 +88,30 @@ class FakeSegmenter:
         input_stream: "asyncio.Queue[list[int]]",
         model_config: Any,
     ) -> AsyncIterator[dict[str, Any]]:
+        held = 0
         yielded = False
         async for frame in audio_stream:
-            if yielded:
-                await self._hold(input_stream)
-            yield {
-                "chunk": frame,
-                "prompt_index": getattr(
-                    model_config, "nemotron_prompt_index", 0
-                ),
-                "final": False,
-            }
-            yielded = True
+            held += len(frame)
+            while held >= self._chunk_samples:
+                held -= self._chunk_samples
+                if yielded:
+                    await self._hold(input_stream)
+                yield self._prompt(model_config, final=False)
+                yielded = True
         if yielded:
             await self._hold(input_stream)
-        yield {
-            "chunk": None,
+        yield self._prompt(model_config, final=True, residual=held)
+
+    @staticmethod
+    def _prompt(
+        model_config: Any, *, final: bool, residual: int = 0
+    ) -> dict[str, Any]:
+        return {
             "prompt_index": getattr(
                 model_config, "nemotron_prompt_index", 0
             ),
-            "final": True,
+            "final": final,
+            "residual": residual,
         }
 
     @staticmethod
@@ -116,10 +125,13 @@ class FakeSegmenter:
 class FakeEngine:
     """Consumes rendered prompts; emits scripted outputs per prompt."""
 
-    def __init__(self, script: Any = None) -> None:
+    def __init__(
+        self, script: Any = None, stop_after: int | None = None
+    ) -> None:
         self.prompts: list[Any] = []
         self.aborted: list[str] = []
         self.script = script
+        self.stop_after = stop_after
 
     async def generate(
         self, prompts: AsyncIterator[Any], request_id: str
@@ -134,6 +146,8 @@ class FakeEngine:
             for out in outs:
                 yield out
             index += 1
+            if self.stop_after is not None and index >= self.stop_after:
+                return
 
     async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
@@ -143,7 +157,7 @@ def make_view(**overrides: Any) -> SessionConfigView:
     values: dict[str, Any] = {
         "park_token_id": PARK,
         "nemotron_prompt_index": LOCALES["en-US"],
-        "nemotron_chunk_samples": 8960,
+        "nemotron_chunk_samples": CHUNK,
     }
     values.update(overrides)
     return SessionConfigView(SimpleNamespace(base_marker="base"), **values)
@@ -173,6 +187,10 @@ def make_transcriber(
         request_id="rt-test-1",
     )
     return transcriber, seg, the_view
+
+
+def chunk_audio(n_chunks: float = 1.0) -> Any:
+    return np.zeros(int(n_chunks * CHUNK), dtype=np.float32)
 
 
 # ---- the config view (ING-VEH-007) ---------------------------------------------
@@ -210,23 +228,34 @@ def test_park_id_is_required_at_construction() -> None:
         )
 
 
-# ---- step: cumulative hypothesis, one park per chunk ---------------------------
+# ---- feed: whole pieces in, one hypothesis per completed CHUNK -----------------
 
 
-async def test_step_returns_cumulative_hypothesis_per_chunk() -> None:
+async def test_feed_returns_one_cumulative_hypothesis_per_chunk() -> None:
     engine = FakeEngine()
     transcriber, _, _ = make_transcriber(engine)
-    first = await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    assert first == " w0"
-    second = await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    assert second == " w0 w1"
+    first = await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert first == [" w0"]
+    second = await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert second == [" w0 w1"]
 
 
-async def test_step_includes_all_deltas_through_its_park() -> None:
+async def test_multi_chunk_piece_reaches_the_segmenter_whole() -> None:
+    # ING-FE-006 / PORT-SESS-001: a burst is ONE frame to the
+    # segmenter — both hypotheses come back from one feed call.
+    engine = FakeEngine()
+    transcriber, _, _ = make_transcriber(engine)
+    hyps = await asyncio.wait_for(
+        transcriber.feed(chunk_audio(2.5)), WAIT_S
+    )
+    assert hyps == [" w0", " w0 w1"]
+    sub_chunk = await asyncio.wait_for(
+        transcriber.feed(chunk_audio(0.25)), WAIT_S
+    )
+    assert sub_chunk == []  # no cadence completed, nothing to await
+
+
+async def test_feed_includes_all_deltas_through_its_park() -> None:
     def script(prompt: Any, index: int) -> list[Any]:
         return [
             make_output([5], text=" early"),
@@ -235,39 +264,55 @@ async def test_step_includes_all_deltas_through_its_park() -> None:
 
     engine = FakeEngine(script=script)
     transcriber, _, _ = make_transcriber(engine)
-    text = await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    assert text == " early parked"
+    hyps = await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert hyps == [" early parked"]
 
 
-async def test_step_holds_until_the_park_and_abort_unblocks() -> None:
+async def test_feed_holds_until_the_park_and_abort_unblocks() -> None:
     def script(prompt: Any, index: int) -> list[Any]:
         return [make_output([5], text=" unparked")]
 
     engine = FakeEngine(script=script)
     transcriber, _, _ = make_transcriber(engine)
-    task = asyncio.ensure_future(
-        transcriber.step(np.zeros(8960, dtype=np.float32))
-    )
+    task = asyncio.ensure_future(transcriber.feed(chunk_audio()))
     done, _ = await asyncio.wait([task], timeout=0.2)
-    assert not done  # no park -> the step must not resolve
+    assert not done  # no park -> the feed must not resolve
     await transcriber.abort()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert engine.aborted == ["rt-test-1"]
 
 
-async def test_engine_error_fails_the_step_loudly() -> None:
+async def test_engine_error_fails_the_feed_loudly() -> None:
     def script(prompt: Any, index: int) -> list[Any]:
         raise RuntimeError("engine fell over")
 
     engine = FakeEngine(script=script)
     transcriber, _, _ = make_transcriber(engine)
     with pytest.raises(RuntimeError, match="engine fell over"):
-        await asyncio.wait_for(
-            transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-        )
+        await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+
+
+async def test_feed_after_generation_ended_raises_never_hangs() -> None:
+    # The consumer ends after the first prompt (engine died mid
+    # stream): the next feed must refuse loudly, never append a
+    # waiter no consumer will resolve.
+    engine = FakeEngine(stop_after=1)
+    transcriber, _, _ = make_transcriber(engine)
+    first = await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert first == [" w0"]
+    await asyncio.wait_for(transcriber._task, WAIT_S)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="ended before"):
+        await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+
+
+async def test_flush_after_generation_ended_raises_never_hangs() -> None:
+    engine = FakeEngine(stop_after=1)
+    transcriber, _, _ = make_transcriber(engine)
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    await asyncio.wait_for(transcriber._task, WAIT_S)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="ended before"):
+        await asyncio.wait_for(transcriber.flush(), WAIT_S)
 
 
 # ---- flush / finish / abort lifecycle (ING-LIFE-010) ---------------------------
@@ -284,41 +329,44 @@ async def test_flush_returns_the_final_transcript() -> None:
 
     engine = FakeEngine(script=script)
     transcriber, _, _ = make_transcriber(engine)
-    await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    final = await asyncio.wait_for(
-        transcriber.flush(np.zeros(1279, dtype=np.float32)), WAIT_S
-    )
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert await asyncio.wait_for(
+        transcriber.feed(chunk_audio(0.25)), WAIT_S
+    ) == []
+    final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
     # flush waits for STREAM END, not just the park: trailing output
     # after the final park still lands in the final transcript.
-    assert final == " w0 w1 fin post"
-    assert len(engine.prompts) == 3  # chunk, residual, final marker
+    assert final == " w0 fin post"
+    assert len(engine.prompts) == 2  # one chunk + the final marker
+    assert engine.prompts[-1]["rendered"]["residual"] == CHUNK // 4
+
+
+async def test_feed_after_flush_raises() -> None:
+    engine = FakeEngine()
+    transcriber, _, _ = make_transcriber(engine)
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    await asyncio.wait_for(transcriber.flush(), WAIT_S)
+    with pytest.raises(RuntimeError, match="closed"):
+        await transcriber.feed(chunk_audio())
 
 
 async def test_finish_after_flush_is_a_noop() -> None:
     engine = FakeEngine()
     transcriber, _, _ = make_transcriber(engine)
-    await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    await asyncio.wait_for(
-        transcriber.flush(np.zeros(1279, dtype=np.float32)), WAIT_S
-    )
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    await asyncio.wait_for(transcriber.flush(), WAIT_S)
     await asyncio.wait_for(transcriber.finish(), WAIT_S)
     await asyncio.wait_for(transcriber.finish(), WAIT_S)  # idempotent
     assert engine.aborted == []
 
 
 async def test_finish_without_flush_closes_gracefully() -> None:
-    # The ING-LIFE-003 skip-flush path: finalize with an empty residual
-    # calls finish() alone. The open generation must end via the
-    # explicit final-tail transaction (PORT-SESS-003), NOT an abort.
+    # Defense in depth: should a caller ever skip flush, the open
+    # generation still ends via the explicit final-tail transaction
+    # (PORT-SESS-003), never an abort.
     engine = FakeEngine()
     transcriber, _, _ = make_transcriber(engine)
-    await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
     await asyncio.wait_for(transcriber.finish(), WAIT_S)
     assert engine.aborted == []
     assert len(engine.prompts) == 2  # chunk + final marker
@@ -352,9 +400,7 @@ async def test_view_goes_to_the_segmenter_only() -> None:
     transcriber, seg, _ = make_transcriber(
         engine, view=view, rendered=rendered
     )
-    await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
+    await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
     assert seg.config is view  # the segmenter sees exactly the view
     # render sees minted prompts, never the view (ING-VEH-008)
     assert rendered and all(p is not view for p in rendered)
@@ -377,24 +423,23 @@ async def test_real_segmenter_paces_and_stamps_locale_per_mint() -> None:
     buffer_stream = _load_real_segmenter()
     engine = FakeEngine()
     transcriber, _, view = make_transcriber(engine, segment=buffer_stream)
-    first = await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
-    )
-    assert first == " w0"
+    first = await asyncio.wait_for(transcriber.feed(chunk_audio()), WAIT_S)
+    assert first == [" w0"]
     envelope = engine.prompts[0]["rendered"]["multi_modal_data"]["audio"]
     assert envelope[4] == float(LOCALES["en-US"])
 
     await transcriber.update_locale("es-US")
     second = await asyncio.wait_for(
-        transcriber.step(np.zeros(8960, dtype=np.float32)), WAIT_S
+        transcriber.feed(chunk_audio()), WAIT_S
     )
-    assert second == " w0 w1"
+    assert second == [" w0 w1"]
     envelope = engine.prompts[1]["rendered"]["multi_modal_data"]["audio"]
     assert envelope[4] == float(LOCALES["es-US"])  # next-mint stamp
 
-    final = await asyncio.wait_for(
-        transcriber.flush(np.zeros(1279, dtype=np.float32)), WAIT_S
-    )
+    assert await asyncio.wait_for(
+        transcriber.feed(np.zeros(1279, dtype=np.float32)), WAIT_S
+    ) == []
+    final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
     assert final == " w0 w1 w2"
     tail = engine.prompts[2]["rendered"]["multi_modal_data"]["audio"]
     assert tail[1] == 1279.0  # the residual rides the final tail as-is
@@ -403,15 +448,38 @@ async def test_real_segmenter_paces_and_stamps_locale_per_mint() -> None:
     assert len(engine.prompts) == 3
 
 
-async def test_real_segmenter_residual_only_session() -> None:
+async def test_real_segmenter_burst_is_stamped_as_one_frame() -> None:
+    # The F6 pin: a burst spanning two cadences reaches buffer_stream
+    # as ONE frame, so BOTH chunks are sliced and stamped in one
+    # synchronous pass before the first park is awaited — the
+    # sequence numbers prove both envelopes were minted from the same
+    # burst delivery.
     buffer_stream = _load_real_segmenter()
     engine = FakeEngine()
     transcriber, _, _ = make_transcriber(engine, segment=buffer_stream)
-    final = await asyncio.wait_for(
-        transcriber.flush(np.zeros(1279, dtype=np.float32)), WAIT_S
+    hyps = await asyncio.wait_for(
+        transcriber.feed(chunk_audio(2.0)), WAIT_S
     )
+    assert hyps == [" w0", " w0 w1"]
+    first = engine.prompts[0]["rendered"]["multi_modal_data"]["audio"]
+    second = engine.prompts[1]["rendered"]["multi_modal_data"]["audio"]
+    assert (first[5], second[5]) == (0.0, 1.0)  # chunk sequence
+    final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
+    assert final == " w0 w1 w2"
+    tail = engine.prompts[2]["rendered"]["multi_modal_data"]["audio"]
+    assert tail[1] == 0.0  # exact boundary -> zero-sample final tail
+    assert tail[3] == 1.0
+
+
+async def test_real_segmenter_zero_audio_session() -> None:
+    # ING-LIFE-003 through the engine seam: flush with nothing fed
+    # still runs the one zero-sample final-tail transaction.
+    buffer_stream = _load_real_segmenter()
+    engine = FakeEngine()
+    transcriber, _, _ = make_transcriber(engine, segment=buffer_stream)
+    final = await asyncio.wait_for(transcriber.flush(), WAIT_S)
     assert final == " w0"
-    assert len(engine.prompts) == 1  # one final-tail transaction only
+    assert len(engine.prompts) == 1
     tail = engine.prompts[0]["rendered"]["multi_modal_data"]["audio"]
-    assert tail[1] == 1279.0
+    assert tail[1] == 0.0
     assert tail[3] == 1.0

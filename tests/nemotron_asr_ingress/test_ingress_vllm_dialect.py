@@ -129,7 +129,7 @@ async def test_watermark_full_answers_busy_at_session_update() -> None:
     adapter, fake, _ = make_adapter(gate=gate, values=values)
     events = await adapter.on_event(update_event(), now=0.0)
     assert error_codes(events) == ["busy"]
-    assert fake.steps == []
+    assert fake.fed == []
 
 
 # @spec ING-CORE-004, ING-ADM-001
@@ -163,15 +163,15 @@ async def test_pre_roll_overflow_is_fatal_to_the_unadmitted_attempt() -> None:
     assert await adapter.on_event(update_event(), now=0.0) == []  # queued
     events = await adapter.on_event(append_event(pcm_chunk()), now=0.1)
     assert error_codes(events) == ["buffer_overflow"]
-    assert fake.steps == []
+    assert fake.fed == []
 
 
 # @spec ING-FE-006
 async def test_append_decodes_base64_pcm16_to_float32() -> None:
     adapter, fake, _ = make_adapter()
     await admit(adapter)  # one full chunk of 16384
-    assert len(fake.steps) == 1
-    np.testing.assert_allclose(fake.steps[0], np.float32(0.5))
+    assert fake.chunks == 1
+    np.testing.assert_allclose(fake.fed[0], np.float32(0.5))
 
 
 # @spec ING-CORE-005
@@ -206,7 +206,9 @@ async def test_final_commit_produces_transcription_done() -> None:
     )
     done = [e for e in events if e["type"] == "transcription.done"]
     assert len(done) == 1
-    assert done[0]["text"] == fake.cumulative()
+    # finalize always flushes (ING-LIFE-010): the final transcript
+    # carries the fake's flush marker even at an exact chunk boundary.
+    assert done[0]["text"] == fake.cumulative() + " [flushed]"
 
 
 # @spec ING-ERR-004
@@ -277,12 +279,26 @@ def test_adapter_rejects_the_reserved_queued_outcome() -> None:
 # @spec ING-CORE-002
 async def test_session_update_extensions_default_to_upstream_semantics() -> None:
     # Without the additive fields the admitted config is the LLD's
-    # surface-1 default: 560 ms chunks, target_lang auto.
-    adapter, fake, _ = make_adapter()
+    # surface-1 default: 560 ms chunks, target_lang auto. The fake
+    # resolves its own cadence from the admitted config (the same
+    # backref the kernel-side transcriber uses, SessionCore.config) so
+    # a wrongly-resolved default (e.g. 80 ms) would under-count this
+    # single 560 ms append as many completed chunks instead of one.
+    values = make_values()
+    gate = make_gate(values)
+    fake = FakeTranscriber(chunk_samples=None)
+    core = SessionCore(
+        gate=gate,
+        transcriber=fake,
+        values=values,
+        provenance=PROVENANCE,
+    )
+    fake.core = core
+    adapter = VllmRealtimeAdapter(core, model_name=MODEL)
     await adapter.on_event({"type": "session.update", "model": MODEL}, now=0.0)
     chunk_560ms = 560 * 16
     await adapter.on_event(append_event(pcm_chunk(n=chunk_560ms)), now=0.1)
-    assert [len(chunk) for chunk in fake.steps] == [chunk_560ms]
+    assert fake.chunks == 1
 
 
 # ---- admission-at-session.update ordering (Phase-6 note, Pete) -----------
@@ -329,7 +345,7 @@ async def test_admitted_precedes_every_delta_on_the_queued_release() -> None:
     types = [e["type"] for e in events]
     assert types.index("session.admitted") == 0
     assert "transcription.delta" in types
-    assert [len(chunk) for chunk in fake.steps] == [CHUNK_SAMPLES]
+    assert fake.chunks == 1
 
 
 # @spec ING-ADM-005
@@ -340,7 +356,7 @@ async def test_held_finalize_replays_after_admission_in_order() -> None:
     await adapter.on_event(
         {"type": "input_audio_buffer.commit", "final": True}, now=0.2
     )
-    assert fake.steps == []  # nothing processed pre-admission
+    assert fake.fed == []  # nothing processed pre-admission
     await occupant.close(now=0.3)
 
     events = await adapter.poll(now=0.4)
@@ -360,7 +376,7 @@ async def test_wait_timeout_discards_the_pre_roll() -> None:
 
     events = await adapter.poll(now=5.2)
     assert error_codes(events) == ["admission_wait_timeout"]
-    assert fake.steps == []
+    assert fake.fed == []
 
 
 class SilentTranscriber:
@@ -370,10 +386,10 @@ class SilentTranscriber:
         self.flush_called = False
         self.finished = False
 
-    async def step(self, chunk: "np.typing.NDArray[np.float32]") -> str:
-        return ""
+    async def feed(self, samples: "np.typing.NDArray[np.float32]") -> list[str]:
+        return []
 
-    async def flush(self, residual: "np.typing.NDArray[np.float32]") -> str:
+    async def flush(self) -> str:
         self.flush_called = True
         return ""
 
@@ -437,7 +453,7 @@ async def test_on_disconnect_while_queued_frees_the_queue_slot() -> None:
     assert await adapter.on_event(update_event(), now=0.0) == []
     await adapter.on_event(append_event(pcm_chunk()), now=0.1)  # pre-rolled
     await adapter.on_disconnect(now=0.2)
-    assert fake.steps == []
+    assert fake.fed == []
     # The queue slot freed: the next attempt queues rather than busy.
     late, _, _ = make_core(gate=gate, values=values)
     assert late.configure(Configure(), now=0.3) == []

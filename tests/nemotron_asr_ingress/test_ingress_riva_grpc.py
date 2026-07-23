@@ -8,13 +8,13 @@ servicer unchanged. The python-clients conformance run against a live
 server is the ING-2 pod exit gate, not a local test.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import grpc
 import numpy as np
-import numpy.typing as npt
 import pytest
 from ingress_helpers import (
     PROVENANCE,
@@ -63,17 +63,6 @@ class FakeContext:
         raise AbortError(details)
 
 
-class FakeOffline:
-    """Records the full-context single-shot seam's calls."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[npt.NDArray[np.float32], str]] = []
-
-    async def transcribe(self, audio: Any, target_lang: str) -> str:
-        self.calls.append((np.asarray(audio, dtype=np.float32), target_lang))
-        return "offline transcript"
-
-
 class FakeTime:
     """Injected clock + sleep so no test ever waits."""
 
@@ -96,23 +85,27 @@ class Harness:
     gate: InProcessGate
     values: IngressValues
     transcribers: list[FakeTranscriber]
-    offline: FakeOffline
     recorded: list[Mapping[str, Any]]
     time: FakeTime
     context: FakeContext = field(default_factory=FakeContext)
 
 
-def make_servicer(**value_overrides: Any) -> Harness:
+def make_servicer(
+    idle_tick_s: float = 1.0, **value_overrides: Any
+) -> Harness:
     values = make_values(**value_overrides)
     gate = make_gate(values)
     transcribers: list[FakeTranscriber] = []
 
     def factory() -> FakeTranscriber:
-        transcriber = FakeTranscriber()
+        # ``core = None`` invites the servicer's assembly-seam backref,
+        # so the fake resolves the ADMITTED cadence from its session
+        # core exactly like the real kernel binding does.
+        transcriber = FakeTranscriber(chunk_samples=None)
+        transcriber.core = None
         transcribers.append(transcriber)
         return transcriber
 
-    offline = FakeOffline()
     recorded: list[Mapping[str, Any]] = []
     time = FakeTime()
     servicer = RivaAsrServicer(
@@ -120,11 +113,11 @@ def make_servicer(**value_overrides: Any) -> Harness:
         values=values,
         provenance=PROVENANCE,
         make_transcriber=factory,
-        offline=offline,
         model_name=MODEL,
         chunk_ms=CHUNK_MS,
         clock=time.clock,
         sleep=time.sleep,
+        idle_tick_s=idle_tick_s,
         record_session=recorded.append,
     )
     return Harness(
@@ -132,7 +125,6 @@ def make_servicer(**value_overrides: Any) -> Harness:
         gate=gate,
         values=values,
         transcribers=transcribers,
-        offline=offline,
         recorded=recorded,
         time=time,
     )
@@ -477,7 +469,7 @@ async def test_interim_results_carry_the_cumulative_hypothesis() -> None:
     assert got[-1] == ("hey there [flushed]", True)
     assert [is_final for _, is_final in got].count(True) == 1
     (transcriber,) = harness.transcribers
-    assert all(len(chunk) == CHUNK_SAMPLES for chunk in transcriber.steps)
+    assert transcriber.chunks == 2
     assert transcriber.flush_called
 
 
@@ -503,7 +495,10 @@ async def test_half_close_with_zero_audio_yields_one_empty_final() -> None:
     got = transcripts(responses)
     assert got == [("", True)]
     (transcriber,) = harness.transcribers
-    assert not transcriber.flush_called  # PORT's tail never runs on nothing
+    # flush is universal (ING-LIFE-010 as amended): the zero-sample
+    # final-tail transaction runs even for a zero-audio session.
+    assert transcriber.flush_called
+    assert transcriber.finished
 
 
 # @spec ING-ADM-001, ING-ERR-001
@@ -567,8 +562,8 @@ async def test_mulaw_8k_session_feeds_exact_16k_chunks() -> None:
     ]
     responses = await run_stream(harness, requests)
     (transcriber,) = harness.transcribers
-    assert all(len(chunk) == CHUNK_SAMPLES for chunk in transcriber.steps)
-    assert len(transcriber.steps) >= 1
+    assert sum(len(piece) for piece in transcriber.fed) == CHUNK_SAMPLES
+    assert transcriber.chunks == 1
     assert transcripts(responses)[-1][1] is True
 
 
@@ -620,7 +615,7 @@ async def test_queued_admission_admits_when_a_slot_frees() -> None:
     )
     got = transcripts(responses)
     assert got[-1][1] is True
-    assert got[-1][0] == "hey"
+    assert got[-1][0] == "hey [flushed]"
 
 
 # @spec ING-ADM-002, ING-ERR-002
@@ -637,21 +632,22 @@ async def test_admission_wait_timeout_aborts_deadline_exceeded() -> None:
 
 
 # @spec ING-CORE-001
-async def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
+async def test_a_core_wanting_transcriber_is_bound_before_first_feed() -> None:
     # The per-session assembly the β script does by hand (serve_ws:
     # lazy.core = session_core): a transcriber exposing `core` reads
     # the admitted config from its session core, so the servicer must
     # wire the backref before any audio steps.
     class CoreWantingTranscriber(FakeTranscriber):
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(chunk_samples=None)
             self.core: Any = None
-            self.core_at_first_step: Any = None
+            self.core_at_first_feed: Any = None
 
-        async def step(self, chunk: Any) -> str:
-            if self.core_at_first_step is None:
-                self.core_at_first_step = self.core
-            return await super().step(chunk)
+        async def feed(self, samples: Any) -> list[str]:
+            if self.core_at_first_feed is None:
+                self.core_at_first_feed = self.core
+            hypotheses: list[str] = await super().feed(samples)
+            return hypotheses
 
     values = make_values()
     gate = make_gate(values)
@@ -661,7 +657,6 @@ async def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
         values=values,
         provenance=PROVENANCE,
         make_transcriber=lambda: bound,
-        offline=FakeOffline(),
         model_name=MODEL,
         chunk_ms=CHUNK_MS,
     )
@@ -676,7 +671,7 @@ async def test_a_core_wanting_transcriber_is_bound_before_first_step() -> None:
         )
     ]
     assert transcripts(responses)[-1][1] is True
-    core = bound.core_at_first_step
+    core = bound.core_at_first_feed
     assert core is not None
     assert core.config is not None
     assert core.config.chunk_ms == CHUNK_MS
@@ -706,12 +701,10 @@ async def test_canonical_shape_streams_a_pcm16_wav() -> None:
     got = transcripts(responses)
     assert got[-1] == ("hey there [flushed]", True)
     (transcriber,) = harness.transcribers
-    assert all(len(chunk) == CHUNK_SAMPLES for chunk in transcriber.steps)
+    assert transcriber.chunks == 2
     # The header was stripped, never decoded as audio: every data
     # sample (and nothing else) reached the seam.
-    assert transcriber.flushed is not None
-    total = sum(len(c) for c in transcriber.steps) + len(transcriber.flushed)
-    assert total == n_samples
+    assert sum(len(piece) for piece in transcriber.fed) == n_samples
 
 
 # @spec ING-GRPC-007
@@ -728,10 +721,10 @@ async def test_a_header_split_across_messages_still_resolves() -> None:
         ],
     )
     got = transcripts(responses)
-    assert got[-1] == ("hey", True)
+    assert got[-1] == ("hey [flushed]", True)
     (transcriber,) = harness.transcribers
-    assert len(transcriber.steps) == 1
-    assert len(transcriber.steps[0]) == CHUNK_SAMPLES
+    assert transcriber.chunks == 1
+    assert sum(len(piece) for piece in transcriber.fed) == CHUNK_SAMPLES
 
 
 # @spec ING-GRPC-007, ING-FE-004
@@ -743,7 +736,7 @@ async def test_canonical_mulaw_wav_resamples_and_records_provenance() -> None:
     )
     assert transcripts(responses)[-1][1] is True
     (transcriber,) = harness.transcribers
-    assert all(len(chunk) == CHUNK_SAMPLES for chunk in transcriber.steps)
+    assert transcriber.chunks == 1
     (provenance,) = harness.recorded
     assert provenance["resampler_identifier"] == RESAMPLER_ID
 
@@ -793,7 +786,8 @@ async def test_deferred_zero_audio_session_finalizes_empty() -> None:
 
 # @spec ING-GRPC-003, ING-GRPC-007
 async def test_recognize_accepts_the_canonical_wav_shape() -> None:
-    n_samples = 3 * CHUNK_SAMPLES + 21
+    # 14 * 1280 = one canonical 1120-ms cadence, plus a residual.
+    n_samples = 14 * CHUNK_SAMPLES + 21
     harness = make_servicer()
     request = rasr.RecognizeRequest(
         config=recognition_config(
@@ -802,9 +796,10 @@ async def test_recognize_accepts_the_canonical_wav_shape() -> None:
         audio=pcm16_wav(n_samples),
     )
     response = await harness.servicer.Recognize(request, harness.context)
-    assert response.results[0].alternatives[0].transcript
-    ((clip, _),) = harness.offline.calls
-    assert len(clip) == n_samples  # header stripped, data intact
+    assert response.results[0].alternatives[0].transcript == "hey [flushed]"
+    (transcriber,) = harness.transcribers
+    # Header stripped, data intact: every sample reached the session.
+    assert sum(len(piece) for piece in transcriber.fed) == n_samples
 
 
 # @spec ING-GRPC-003, ING-GRPC-007
@@ -818,8 +813,8 @@ async def test_recognize_canonical_alaw_wav_reaches_the_seam_at_16k() -> None:
         audio=riff_wav(6, payload, rate=8000, bits=8, with_fact=True),
     )
     await harness.servicer.Recognize(request, harness.context)
-    ((clip, _),) = harness.offline.calls
-    assert len(clip) == 2 * len(payload)
+    (transcriber,) = harness.transcribers
+    assert sum(len(piece) for piece in transcriber.fed) == 2 * len(payload)
 
 
 # @spec ING-GRPC-006
@@ -833,21 +828,42 @@ def test_config_response_states_the_verbatim_deviation() -> None:
 # ---- ING-GRPC-003: Recognize ------------------------------------------------
 
 
-# @spec ING-GRPC-003
-async def test_recognize_is_a_full_context_single_shot() -> None:
+# @spec ING-GRPC-003, PORT-REGIME-001
+async def test_recognize_runs_one_canonical_ephemeral_session() -> None:
+    # Wire-unary, engine-canonical: the clip drives the SAME session
+    # engine as realtime execution at the canonical 1120-ms cadence,
+    # through final-tail, FLUSH, and idempotent release — never a
+    # bypassing single-shot (ING-GRPC-003).
     harness = make_servicer()
-    n_samples = 5 * CHUNK_SAMPLES + 17  # deliberately not chunk-shaped
+    n_samples = 15 * CHUNK_SAMPLES + 17  # one 1120-ms cadence + residual
     request = rasr.RecognizeRequest(
         config=recognition_config(), audio=pcm16(n_samples)
     )
     response = await harness.servicer.Recognize(request, harness.context)
     transcript = response.results[0].alternatives[0].transcript
-    assert transcript == "offline transcript"
-    # One whole-clip call on the offline seam; never a chunked session.
-    ((clip, target_lang),) = harness.offline.calls
-    assert len(clip) == n_samples
-    assert target_lang == "en-US"
-    assert harness.transcribers == []
+    assert transcript == "hey [flushed]"
+    (transcriber,) = harness.transcribers
+    assert transcriber.core is not None  # the assembly seam is wired
+    assert transcriber.core.config.chunk_ms == 1120
+    assert sum(len(piece) for piece in transcriber.fed) == n_samples
+    assert transcriber.chunks == 1
+    assert transcriber.flush_called
+    assert transcriber.finished
+    assert harness.gate.active == 0  # released after terminal cleanup
+
+
+# @spec ING-GRPC-003, ING-ADM-001
+async def test_recognize_uses_the_shared_admission_pool() -> None:
+    harness = make_servicer(watermark=1, admission_queue=0)
+    assert harness.gate.request("other-session", now=0.0) is not None
+    request = rasr.RecognizeRequest(
+        config=recognition_config(), audio=pcm16(CHUNK_SAMPLES)
+    )
+    with pytest.raises(AbortError):
+        await harness.servicer.Recognize(request, harness.context)
+    assert harness.context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert harness.context.details is not None
+    assert errors.BUSY in harness.context.details
 
 
 # @spec ING-GRPC-003, ING-FE-004
@@ -858,8 +874,9 @@ async def test_recognize_telephony_input_reaches_the_seam_at_16k() -> None:
         audio=bytes(range(256)) * 4,
     )
     await harness.servicer.Recognize(request, harness.context)
-    ((clip, _),) = harness.offline.calls
-    assert len(clip) == 2 * 256 * 4  # resampled to 16 kHz, whole clip
+    (transcriber,) = harness.transcribers
+    # Resampled to 16 kHz; the whole clip reached the session.
+    assert sum(len(piece) for piece in transcriber.fed) == 2 * 256 * 4
 
 
 # @spec ING-GRPC-005
@@ -873,7 +890,7 @@ async def test_recognize_dispositions_the_config_too() -> None:
     assert harness.context.code == grpc.StatusCode.INVALID_ARGUMENT
     assert harness.context.details is not None
     assert "profanity_filter" in harness.context.details
-    assert harness.offline.calls == []
+    assert harness.transcribers == []  # rejected before any session
 
 
 # @spec ING-GRPC-005
@@ -923,3 +940,74 @@ def test_config_response_builder_states_the_punctuation_deviation() -> None:
     parameters = dict(response.model_config[0].parameters)
     (punctuation_key,) = [key for key in parameters if "punctuation" in key]
     assert "intrinsic" in parameters[punctuation_key]
+
+
+# ---- ING-LIFE-004/005/006: lifecycle under blocked reads --------------------
+
+
+# @spec ING-LIFE-004
+async def test_cancel_while_queued_releases_the_gate_entry() -> None:
+    # A freed slot goes to the queue head, never a newcomer — so a
+    # stranded queued entry would block admission forever. Cancelling
+    # the RPC mid-queue must release the entry (the admission wait
+    # sits INSIDE the lifecycle cleanup scope).
+    harness = make_servicer(watermark=1, admission_queue=1)
+    assert harness.gate.request("other-session", now=0.0) is not None
+
+    async def yielding_sleep(dt: float) -> None:
+        await asyncio.sleep(0)  # queued forever: time never advances
+
+    harness.servicer._sleep = yielding_sleep
+    hang = asyncio.Event()
+
+    async def requests() -> Any:
+        yield config_request()
+        await hang.wait()
+
+    agen = aiter(harness.servicer.StreamingRecognize(requests(), harness.context))
+    consume = asyncio.ensure_future(anext(agen))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not consume.done()  # still queued behind the held slot
+    consume.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consume
+    await agen.aclose()  # type: ignore[attr-defined]
+    hang.set()
+    # The queued entry is gone: after the holder releases, a newcomer
+    # admits immediately — nothing is stranded at the queue head.
+    harness.gate.release("other-session")
+    from nemotron_asr_ingress.events import AdmissionOutcome
+
+    assert (
+        harness.gate.request("probe", now=1.0) is AdmissionOutcome.ADMITTED
+    )
+
+
+# @spec ING-LIFE-005, ING-LIFE-006
+async def test_idle_stream_aborts_while_the_read_is_blocked() -> None:
+    # An admitted client that goes silent (no half-close, no audio)
+    # must lose its slot to the idle-TTL backstop even though the
+    # request read is blocked: the read races the lifecycle tick.
+    harness = make_servicer(idle_tick_s=0.01, idle_ttl_s=60.0)
+    hang = asyncio.Event()
+
+    async def requests() -> Any:
+        yield config_request()
+        await hang.wait()
+
+    agen = aiter(harness.servicer.StreamingRecognize(requests(), harness.context))
+    consume = asyncio.ensure_future(anext(agen))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    harness.time.t = 61.0  # the client has now been idle past the TTL
+    with pytest.raises((AbortError, StopAsyncIteration)):
+        await asyncio.wait_for(consume, timeout=2.0)
+    await agen.aclose()  # type: ignore[attr-defined]
+    hang.set()
+    assert harness.context.code == grpc.StatusCode.ABORTED
+    assert harness.context.details is not None
+    assert errors.IDLE_TIMEOUT in harness.context.details
+    assert harness.gate.active == 0
+    (transcriber,) = harness.transcribers
+    assert transcriber.aborted

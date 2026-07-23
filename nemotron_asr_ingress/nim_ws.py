@@ -1029,8 +1029,12 @@ class NimRealtimeAdapter:
         n_ready = len(self._tail) // self._chunk_samples
         release = self._tail[: n_ready * self._chunk_samples]
         self._tail = self._tail[n_ready * self._chunk_samples :]
-        # Always called — an all-tail append still touches the idle
-        # clock (the wire receive happened, ING-LIFE-005).
+        # Called unconditionally for uniform event flow; an empty
+        # release is a no-op at the core and never refreshes the idle
+        # lease — only accepted non-empty audio is activity
+        # (ING-LIFE-005). Un-released tail audio held here is the
+        # dialect's clearable buffer object (ING-NIMWS-005/006), so a
+        # sub-chunk trickle cannot extend residency either.
         return self._project_all(await self._core.receive_audio(release, now))
 
     # @spec ING-NIMWS-009

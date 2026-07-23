@@ -7,7 +7,7 @@ entry point (ING-VEH-004): it drives the model's realtime segmenter seam
 configuration view (ING-VEH-007), renders each minted prompt through an
 injected callable backed by the engine's own renderer and the REAL
 process model config (ING-VEH-008), and watches the output stream for
-each CHUNK's park token to satisfy ``step``'s cumulative-hypothesis
+each CHUNK's park token to satisfy ``feed``'s cumulative-hypothesis
 contract. Everything engine-coupled arrives injected, so this module
 stays sans-IO and GPU-free-testable; the real wiring lives in the
 serve-tier bootstrap, outside this package.
@@ -78,11 +78,12 @@ class EngineTranscriber:
     background consumer drains the generation's outputs, echoes every
     token batch onto the segmenter's ``input_stream`` (feeding its
     hold-until-park backpressure), accumulates the cumulative
-    hypothesis, and resolves the oldest pending ``step`` on each park
-    (one park per admitted CHUNK, PORT-SESS-001). ``flush`` and the
-    skip-flush ``finish`` both end the session through the explicit
-    final-tail transaction (PORT-SESS-003) — ``abort`` alone is the
-    non-normal teardown (ING-LIFE-010).
+    hypothesis, and resolves the oldest pending ``feed`` waiter per park
+    (one park per admitted CHUNK, PORT-SESS-001). ``flush`` ends the
+    session through the explicit final-tail transaction
+    (PORT-SESS-003) and ``finish`` after it is a no-op — though it
+    still closes gracefully if ``flush`` never ran — while ``abort``
+    alone is the non-normal teardown (ING-LIFE-010).
     """
 
     def __init__(
@@ -100,9 +101,15 @@ class EngineTranscriber:
         if park is None:
             raise ValueError(
                 "config_view must carry park_token_id: the park is the "
-                "step/CHUNK synchronization signal (PORT-SESS-001)"
+                "feed/CHUNK synchronization signal (PORT-SESS-001)"
             )
         self._park_id = int(park)
+        # The same attribute (and default) the segmenter itself reads,
+        # so park counting and cadence slicing can never disagree.
+        self._chunk_samples = int(
+            getattr(config_view, "nemotron_chunk_samples", 8960)
+        )
+        self._fed = 0
         self._segment = segment
         self._render = render
         self._generate = generate
@@ -121,26 +128,53 @@ class EngineTranscriber:
         self._audio_closed = False
         self._aborted = False
 
-    async def step(self, chunk: FloatAudio) -> str:
-        """Advance one admitted-config CHUNK; await its own park."""
-        self._ensure_started()
-        waiter: asyncio.Future[str] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._waiters.append(waiter)
-        self._audio.put_nowait(chunk)
-        return await waiter
+    async def feed(self, samples: FloatAudio) -> list[str]:
+        """Advance one accepted piece; await each completed CHUNK's park.
 
-    async def flush(self, residual: FloatAudio) -> str:
-        """Finalize with the raw residual; return the final transcript.
-
-        Waits for the generation to END (not merely the final park), so
-        any output the engine emits while draining the final-tail still
-        lands in the final transcript.
+        The piece reaches the segmenter as ONE frame, so every cadence
+        it completes is stamped at true completion time before any
+        park is awaited (PORT-SESS-001, ING-FE-006); the hypotheses
+        come back one per completed CHUNK, in cadence order.
         """
         self._ensure_started()
-        if len(residual):
-            self._audio.put_nowait(residual)
+        self._require_live()
+        completed_before = self._fed // self._chunk_samples
+        self._fed += len(samples)
+        n_chunks = self._fed // self._chunk_samples - completed_before
+        loop = asyncio.get_running_loop()
+        waiters = [loop.create_future() for _ in range(n_chunks)]
+        self._waiters.extend(waiters)
+        if len(samples):
+            self._audio.put_nowait(samples)
+        results: list[str] = []
+        try:
+            for waiter in waiters:
+                results.append(await waiter)
+        finally:
+            # A mid-burst failure leaves later waiters failed too;
+            # retrieve their exceptions so none surfaces as noise.
+            for waiter in waiters:
+                if waiter.done() and not waiter.cancelled():
+                    waiter.exception()
+        return results
+
+    async def flush(self) -> str:
+        """Drain the final-tail transaction; return the final transcript.
+
+        Residual-free (ING-FE-006): the segmenter already holds the
+        accepted remainder and mints the explicit final-tail — the
+        zero-sample transaction included — when the audio stream
+        closes. Waits for the generation to END (not merely the final
+        park), so any output the engine emits while draining the tail
+        still lands in the final transcript.
+        """
+        self._ensure_started()
+        if self._aborted:
+            raise RuntimeError("the session was aborted")
+        if self._done.is_set() and not self._audio_closed:
+            raise self._error or RuntimeError(
+                "generation ended before the session's normal finalization"
+            )
         await self._drain()
         return self._text
 
@@ -187,6 +221,23 @@ class EngineTranscriber:
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(
                 self._consume()
+            )
+
+    def _require_live(self) -> None:
+        """Refuse feeds the consumer can no longer answer (never hang).
+
+        A waiter appended after the audio closed or the generation
+        ended would wait forever: the consumer resolves nothing past
+        those points. Raise the stored engine error, or name the
+        state, instead.
+        """
+        if self._aborted:
+            raise RuntimeError("the session was aborted")
+        if self._audio_closed:
+            raise RuntimeError("audio is closed; the session is finalizing")
+        if self._done.is_set():
+            raise self._error or RuntimeError(
+                "generation ended before the session's normal finalization"
             )
 
     async def _drain(self) -> None:

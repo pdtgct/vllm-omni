@@ -46,7 +46,7 @@ dialect has for the catalog's stable codes.
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Any, Literal, NoReturn, Protocol, cast
+from typing import Any, Literal, NoReturn, cast
 
 import grpc
 import numpy as np
@@ -55,7 +55,7 @@ from riva.client.proto import riva_audio_pb2 as raud
 
 from nemotron_asr_ingress import errors
 from nemotron_asr_ingress.core import (
-    FloatAudio,
+    SAMPLE_RATE,
     IngressValues,
     InProcessGate,
     SessionCore,
@@ -301,17 +301,11 @@ def build_config_response(values: IngressValues, model_name: str) -> Any:
     return response
 
 
-class OfflineTranscriber(Protocol):
-    """The full-context single-shot seam ``Recognize`` drives.
+#: ING-GRPC-003's canonical ephemeral cadence for wire-unary Recognize.
+_RECOGNIZE_CHUNK_MS = 1120
 
-    PORT owns the regime (PORT-REGIME-001..003); the servicer hands it
-    the whole decoded 16 kHz clip exactly once — never a chunked
-    session (ING-GRPC-003).
-    """
-
-    async def transcribe(self, audio: FloatAudio, target_lang: str) -> str:
-        """Transcribe one whole clip in the full-context regime."""
-        ...
+#: Marks the request pump's clean end on the read queue.
+_STREAM_END = object()
 
 
 # @spec ING-GRPC-001, ING-CORE-001
@@ -342,12 +336,12 @@ class RivaAsrServicer:
         values: IngressValues,
         provenance: Mapping[str, Any],
         make_transcriber: Callable[[], Transcriber],
-        offline: OfflineTranscriber,
         model_name: str,
         chunk_ms: int = 560,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         poll_s: float = 0.05,
+        idle_tick_s: float = 1.0,
         record_session: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         """Bind the shared gate, the values, and the compute seams.
@@ -355,22 +349,29 @@ class RivaAsrServicer:
         ``chunk_ms`` is the server-side admitted chunk config for
         streaming sessions (the Riva dialect has no client chunk-size
         field; the value rides ENV like every other tunable);
-        ``poll_s`` is the queued-admission poll cadence; ``sleep`` is
-        an async sleep (default :func:`asyncio.sleep`) so a queued
+        ``poll_s`` is the queued-admission poll cadence;
+        ``idle_tick_s`` is the blocked-read lifecycle tick — how often
+        an idle stream's read wait yields to ``core.poll`` so the
+        idle-TTL backstop actually runs (ING-LIFE-005/006); ``sleep``
+        is an async sleep (default :func:`asyncio.sleep`) so a queued
         admission wait never blocks the event loop or a worker thread.
         """
         if poll_s <= 0:
             raise ValueError(f"poll_s must be positive, got {poll_s}")
+        if idle_tick_s <= 0:
+            raise ValueError(
+                f"idle_tick_s must be positive, got {idle_tick_s}"
+            )
         self._gate = gate
         self._values = values
         self._provenance = provenance
         self._make_transcriber = make_transcriber
-        self._offline = offline
         self._model_name = model_name
         self._chunk_ms = chunk_ms
         self._clock = clock
         self._sleep = sleep
         self._poll_s = poll_s
+        self._idle_tick_s = idle_tick_s
         self._record_session = record_session
 
     # @spec ING-GRPC-002, ING-LIFE-001
@@ -428,14 +429,36 @@ class RivaAsrServicer:
             # SessionCore.config seam — and here the servicer is the
             # assembler.
             cast(Any, transcriber).core = core
-        await self._admit_or_abort(core, recognition, context)
-        if front is not None:
-            recorded = self._record(provenance, front)
-
         interim = streaming_config.interim_results
         sniff_buf = b""
+        read_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+        pump = asyncio.create_task(self._pump(request_iterator, read_queue))
         try:
-            async for request in request_iterator:
+            # Admission sits INSIDE the cleanup scope: an RPC
+            # cancelled while queued must release its gate entry
+            # (core.close handles the queued case), never strand the
+            # queue head (ING-LIFE-004).
+            await self._admit_or_abort(core, recognition, context)
+            if front is not None:
+                recorded = self._record(provenance, front)
+            while True:
+                try:
+                    request = await asyncio.wait_for(
+                        read_queue.get(), timeout=self._idle_tick_s
+                    )
+                except asyncio.TimeoutError:
+                    # The lifecycle backstop runs while the read is
+                    # blocked (ING-LIFE-005/006): an idle client must
+                    # not hold its resident slot forever.
+                    for event in await core.poll(self._clock()):
+                        if isinstance(event, SessionError):
+                            await self._abort_error(context, event)
+                    continue
+                if request is _STREAM_END:
+                    # Re-raises a transport-iterator failure; a clean
+                    # half-close returns None.
+                    await pump
+                    break
                 await self._reject_runtime_config(request, context)
                 if request.WhichOneof("streaming_request") != "audio_content":
                     await self._abort(
@@ -485,17 +508,54 @@ class RivaAsrServicer:
             ):
                 yield response
         finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
             if not core.terminal:
                 # An abort or a cancelled RPC is a detected end: free
                 # the slot now, never leave it to the idle TTL
-                # (ING-LIFE-004).
+                # (ING-LIFE-004). Covers the queued-admission case
+                # too — close releases an unanswered gate entry.
                 await core.close(self._clock())
+
+    @staticmethod
+    async def _pump(
+        request_iterator: AsyncIterator[Any], queue: "asyncio.Queue[Any]"
+    ) -> None:
+        """Move requests onto a queue so the read can race the
+        lifecycle tick without cancelling a transport read mid-flight;
+        ``maxsize=1`` preserves read-side flow control (ING-FE-005).
+
+        The end sentinel rides only the non-cancelled paths: on
+        cancellation the consumer is already gone, and an awaited put
+        from a cancelled task against a full queue would deadlock the
+        canceller.
+        """
+        error: BaseException | None = None
+        try:
+            async for request in request_iterator:
+                await queue.put(request)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            error = exc
+        await queue.put(_STREAM_END)
+        if error is not None:
+            raise error
 
     # @spec ING-GRPC-003, ING-GRPC-007
     async def Recognize(  # noqa: N802 — grpc method names are fixed
         self, request: Any, context: Any
     ) -> Any:
-        """One full-context single-shot; one ``RecognizeResponse``."""
+        """Wire-unary; internally one canonical ephemeral session.
+
+        The whole decoded clip drives the SAME session engine as
+        realtime execution (ING-GRPC-003, PORT-REGIME-001..003):
+        shared-pool admission, the canonical 1120-ms cadence,
+        final-tail, FLUSH, and idempotent release. Interim
+        hypotheses simply are not projected on the unary wire. The
+        clip is fed in bound-sized slices so the pre-submit bound
+        (ING-FE-005) holds for any file length.
+        """
         await self._dispose_or_abort(request.config, context)
         payload = request.audio
         if request.config.encoding == raud.ENCODING_UNSPECIFIED:
@@ -514,8 +574,36 @@ class RivaAsrServicer:
                 request.config.sample_rate_hertz,
             )
         clip = np.concatenate([front.feed(payload), front.flush()])
-        target_lang = request.config.language_code or "auto"
-        transcript = await self._offline.transcribe(clip, target_lang)
+        transcriber = self._make_transcriber()
+        core = SessionCore(
+            gate=self._gate,
+            transcriber=transcriber,
+            values=self._values,
+            provenance=dict(self._provenance),
+        )
+        if hasattr(transcriber, "core"):
+            cast(Any, transcriber).core = core
+        chunk_samples = _RECOGNIZE_CHUNK_MS * (SAMPLE_RATE // 1000)
+        transcript: str | None = None
+        try:
+            await self._admit_or_abort(
+                core, request.config, context, chunk_ms=_RECOGNIZE_CHUNK_MS
+            )
+            for start in range(0, len(clip), chunk_samples):
+                piece = clip[start : start + chunk_samples]
+                for event in await core.receive_audio(piece, self._clock()):
+                    if isinstance(event, SessionError):
+                        await self._abort_error(context, event)
+            for event in await core.finalize(self._clock()):
+                if isinstance(event, SessionError):
+                    await self._abort_error(context, event)
+                if isinstance(event, Final):
+                    transcript = event.transcript
+        finally:
+            if not core.terminal:
+                await core.close(self._clock())
+        if transcript is None:
+            raise AssertionError("finalize emitted no Final")
         response = rasr.RecognizeResponse()
         alternative = response.results.add().alternatives.add()
         alternative.transcript = transcript
@@ -588,7 +676,11 @@ class RivaAsrServicer:
         return build_config_response(self._values, self._model_name)
 
     async def _admit_or_abort(
-        self, core: SessionCore, recognition: Any, context: Any
+        self,
+        core: SessionCore,
+        recognition: Any,
+        context: Any,
+        chunk_ms: int | None = None,
     ) -> None:
         """Run the admission handshake; abort on any negative outcome.
 
@@ -599,7 +691,7 @@ class RivaAsrServicer:
         (ING-VEH-002): each wait yields control via ``await``.
         """
         config = Configure(
-            chunk_ms=self._chunk_ms,
+            chunk_ms=self._chunk_ms if chunk_ms is None else chunk_ms,
             target_lang=recognition.language_code or "auto",
         )
         answers = core.configure(config, self._clock())

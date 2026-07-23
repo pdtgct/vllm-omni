@@ -351,12 +351,12 @@ async def test_queued_admission_defers_ack_and_replays_pre_roll_after_it() -> No
     assert await configure(second, now=0.0) == []  # queued: the ack is deferred
     # Pre-roll: audio sent ahead of the outcome is held, not processed.
     assert await second.on_event(append_event(pcm16(CHUNK_SAMPLES)), 0.1) == []
-    assert fake2.steps == []
+    assert fake2.fed == []
     assert await second.poll(0.2) == []  # still waiting
     await first.on_event({"type": DONE}, 0.3)  # frees the slot
     events = await second.poll(0.4)
     assert types(events) == [UPDATED, DELTA]
-    assert len(fake2.steps) == 1  # the held chunk replayed post-admission
+    assert fake2.chunks == 1  # the held chunk replayed post-admission
 
 
 # @spec ING-ADM-002, ING-ERR-002
@@ -383,7 +383,7 @@ async def test_pre_roll_overflow_is_fatal_buffer_overflow() -> None:
     error = only_error(await second.on_event(append_event(pcm16(256)), 0.1))
     assert error["error"]["code"] == errors.BUFFER_OVERFLOW
     assert second.should_close
-    assert fake2.steps == []  # nothing half-processed
+    assert fake2.fed == []  # nothing half-processed
     assert recorded2 == []
     assert core2.terminal
 
@@ -629,18 +629,18 @@ async def test_appends_step_chunks_and_emit_deltas() -> None:
     second = await adapter.on_event(append_event(data[CHUNK_BYTES + 3 :]), 2.0)
     deltas = [e for e in first + second if e["type"] == DELTA]
     assert [d["delta"] for d in deltas] == ["hey", " there"]
-    assert [len(step) for step in fake.steps] == [CHUNK_SAMPLES] * 2
+    assert [len(piece) for piece in fake.fed] == [CHUNK_SAMPLES] * 2
 
 
 # @spec ING-CORE-005
 async def test_a_chunk_that_adds_nothing_emits_no_delta() -> None:
     adapter, _core, fake, _recorded = make_adapter()
 
-    async def silent_step(chunk: Any) -> str:
-        fake.steps.append(chunk)
-        return "hey"  # cumulative never grows after the first chunk
+    async def silent_feed(samples: Any) -> list[str]:
+        fake.fed.append(samples)
+        return ["hey"]  # cumulative never grows after the first chunk
 
-    fake.step = silent_step  # type: ignore[method-assign]
+    fake.feed = silent_feed
     await configure(adapter)
     first = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
     second = await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 2.0)
@@ -684,7 +684,10 @@ async def test_commit_is_acked_and_never_forces_a_sub_chunk_step() -> None:
     (ack,) = await adapter.on_event({"type": COMMIT}, 1.1)
     assert ack["type"] == COMMITTED
     assert "item_id" in ack and "previous_item_id" in ack
-    assert fake.steps == []  # the fixed-chunk invariant outranks the hint
+    # The adapter still releases (possibly empty) unconditionally, so
+    # feed() sees a zero-sample call here; the invariant that matters
+    # is that no CADENCE chunk completed (ING-NIMWS-005).
+    assert fake.chunks == 0  # the fixed-chunk invariant outranks the hint
     events = await adapter.on_event(
         append_event(pcm16(CHUNK_SAMPLES // 2, start=CHUNK_SAMPLES // 2)), 1.2
     )
@@ -697,10 +700,12 @@ async def test_only_done_triggers_the_tail_flush() -> None:
     await configure(adapter)
     await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES // 2)), 1.0)
     await adapter.on_event({"type": COMMIT}, 1.1)
-    assert fake.flush_called is False
+    assert not fake.flush_called
     events = await adapter.on_event({"type": DONE}, 1.2)
-    assert fake.flush_called is True
-    assert fake.flushed is not None and len(fake.flushed) == CHUNK_SAMPLES // 2
+    assert fake.flush_called
+    # flush() is residual-free now; the residual reaches the seam as
+    # its own feed() piece just ahead of the finalize (ING-FE-006).
+    assert len(fake.fed[-1]) == CHUNK_SAMPLES // 2
     (completed,) = events
     assert completed["type"] == COMPLETED
     assert completed["is_last_result"] is True
@@ -727,11 +732,13 @@ async def test_clear_drops_only_the_unreleased_tail() -> None:
     assert [e["type"] for e in events] == [DELTA]  # chunk 1 stepped
     await adapter.on_event({"type": CLEAR}, 1.1)
     (completed,) = await adapter.on_event({"type": DONE}, 1.2)
-    # The un-released half-chunk tail was dropped: nothing to flush,
-    # and the final is the stepped cumulative.
-    assert fake.flush_called is False
+    # The un-released half-chunk tail was dropped before DONE: finalize
+    # always flushes regardless (ING-LIFE-010), but nothing new ever
+    # reaches the seam, so the final is the stepped cumulative plus
+    # the universal flush marker.
+    assert fake.flush_called is True
     assert completed["type"] == COMPLETED
-    assert completed["transcript"] == "hey"
+    assert completed["transcript"] == "hey [flushed]"
 
 
 # @spec ING-NIMWS-006
@@ -741,7 +748,7 @@ async def test_clear_never_rewinds_session_core_or_model_state() -> None:
     await adapter.on_event(append_event(pcm16(CHUNK_SAMPLES)), 1.0)
     await adapter.on_event({"type": CLEAR}, 1.1)
     assert fake.aborted is False
-    assert len(fake.steps) == 1  # the stepped chunk stands
+    assert fake.chunks == 1  # the stepped chunk stands
     events = await adapter.on_event(
         append_event(pcm16(CHUNK_SAMPLES, start=CHUNK_SAMPLES)), 1.2
     )
@@ -760,10 +767,9 @@ async def test_done_finalizes_with_exactly_one_completed() -> None:
     assert completed["type"] == COMPLETED
     assert completed["is_last_result"] is True
     assert completed["transcript"] == "hey [flushed]"
-    # Ride-along fix: `fake.flushed or ()` is ambiguous on a numpy
-    # array (masked by NotImplementedError pre-implementation).
-    assert fake.flushed is not None
-    assert len(fake.flushed) == 160  # raw, un-padded residual
+    # flush() is residual-free now; the residual reaches the seam as
+    # its own feed() piece just ahead of the finalize (ING-FE-006).
+    assert len(fake.fed[-1]) == 160  # raw, un-padded residual
 
 
 # @spec ING-LIFE-003
@@ -774,7 +780,8 @@ async def test_zero_audio_done_completes_empty_not_error() -> None:
     assert completed["type"] == COMPLETED
     assert completed["transcript"] == ""
     assert completed["is_last_result"] is True
-    assert fake.flush_called is False  # skip-flush on nothing
+    # Universal flush (ING-LIFE-010): always called, zero fed -> empty.
+    assert fake.flush_called is True
 
 
 # @spec ING-ERR-004, ING-LIFE-002
@@ -915,9 +922,12 @@ async def test_none_format_defers_to_the_riff_header() -> None:
     assert await adapter.on_event(append_event(wav[:10]), 1.0) == []
     events = await adapter.on_event(append_event(wav[10:]), 1.1)
     assert [e["type"] for e in events] == [DELTA, DELTA]
-    assert [len(step) for step in fake.steps] == [CHUNK_SAMPLES] * 2
+    # Both cadence chunks release to the seam in one adapter-side feed
+    # call (the dialect's own chunk buffer completed two at once).
+    assert fake.chunks == 2
+    assert sum(len(piece) for piece in fake.fed) == 2 * CHUNK_SAMPLES
     expected = np.arange(CHUNK_SAMPLES, dtype=np.float32) / 32768.0
-    np.testing.assert_allclose(fake.steps[0], expected)
+    np.testing.assert_allclose(fake.fed[0][:CHUNK_SAMPLES], expected)
 
 
 # @spec ING-NIMWS-009
@@ -952,7 +962,7 @@ async def test_declared_format_is_never_overridden_by_a_header() -> None:
     events = await adapter.on_event(append_event(wav), 1.0)
     # The declared format wins: the WAV header decodes as audio bytes.
     assert [e["type"] for e in events] == [DELTA]
-    assert len(fake.steps[0]) == CHUNK_SAMPLES
+    assert len(fake.fed[0]) == CHUNK_SAMPLES
 
 
 # ---- wire hygiene and the canonical rehearsal --------------------------------

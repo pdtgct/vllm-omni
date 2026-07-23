@@ -30,23 +30,52 @@ PROVENANCE: dict[str, Any] = {
 
 
 class FakeTranscriber:
-    """Records the PORT-seam calls; returns scripted hypotheses."""
+    """Records the PORT-seam calls; returns scripted hypotheses.
 
-    def __init__(self) -> None:
-        self.steps: list[npt.NDArray[np.float32]] = []
-        self.flushed: npt.NDArray[np.float32] | None = None
+    Owns cadence counting exactly like the real seam (ING-FE-006):
+    ``feed`` takes arbitrary pieces and returns one cumulative
+    hypothesis per admitted-config CHUNK the piece completed;
+    ``flush`` is residual-free and marks the final-tail drain with
+    ``" [flushed]"`` (empty session -> empty final, ING-LIFE-003).
+    """
+
+    def __init__(self, chunk_samples: int | None = CHUNK_SAMPLES) -> None:
+        # None resolves lazily from the ``core`` assembly-seam backref
+        # (SessionCore.config) at first feed — the same place the real
+        # kernel binding reads the ADMITTED cadence.
+        self._chunk_samples_arg = chunk_samples
+        self.core: Any = None
+        self.fed: list[npt.NDArray[np.float32]] = []
+        self.fed_samples = 0
+        self.chunks = 0
         self.flush_called = False
         self.locales: list[str] = []
         self.aborted = False
         self.finished = False
 
-    async def step(self, chunk: npt.NDArray[np.float32]) -> str:
-        self.steps.append(chunk)
-        return " ".join(WORDS[: min(len(self.steps), len(WORDS))])
+    @property
+    def _chunk_samples(self) -> int:
+        if self._chunk_samples_arg is not None:
+            return self._chunk_samples_arg
+        config = getattr(self.core, "config", None)
+        if config is not None:
+            return int(config.chunk_ms) * 16
+        return CHUNK_SAMPLES
 
-    async def flush(self, residual: npt.NDArray[np.float32]) -> str:
+    async def feed(self, samples: npt.NDArray[np.float32]) -> list[str]:
+        self.fed.append(samples)
+        before = self.fed_samples // self._chunk_samples
+        self.fed_samples += len(samples)
+        hypotheses = []
+        for _ in range(self.fed_samples // self._chunk_samples - before):
+            self.chunks += 1
+            hypotheses.append(self.cumulative())
+        return hypotheses
+
+    async def flush(self) -> str:
         self.flush_called = True
-        self.flushed = residual
+        if self.fed_samples == 0:
+            return ""
         return self.cumulative() + " [flushed]"
 
     async def update_locale(self, target_lang: str) -> None:
@@ -59,7 +88,7 @@ class FakeTranscriber:
         self.finished = True
 
     def cumulative(self) -> str:
-        return " ".join(WORDS[: min(len(self.steps), len(WORDS))])
+        return " ".join(WORDS[: min(self.chunks, len(WORDS))])
 
 
 def make_values(**overrides: Any) -> IngressValues:

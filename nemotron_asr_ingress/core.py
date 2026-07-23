@@ -77,17 +77,22 @@ class Transcriber(Protocol):
     remote-dialect or offline implementation may still complete
     immediately, but the seam is colored async throughout so no
     caller bridges a thread or a queue to reach it (ING-VEH-004,
-    ING-VEH-005). ``step`` consumes one exact admitted-config chunk
-    and returns the cumulative hypothesis; ``flush`` consumes the raw
-    un-padded sub-chunk residual (PORT-SESS-003 owns the tail
-    transform) and returns the final transcript; ``update_locale``
-    forwards a validated mid-session locale (PORT-LID-003 applies it
-    at the next chunk boundary); ``abort`` frees engine state
-    immediately on a non-normal end (client close, detected
-    disconnect, idle-TTL); ``finish`` frees engine state on the
-    normal end of a session, called exactly once by every
-    ``finalize`` -- including the skip-flush path where ``flush``
-    never runs (ING-LIFE-003) -- so an implementation holding a live
+    ING-VEH-005). ``feed`` consumes one arbitrary-size accepted piece
+    -- handed to PORT's sole segmenter whole, so ready-unit
+    timestamps reflect true cadence-completion times (PORT-SESS-001,
+    ING-FE-006) -- and returns the cumulative hypothesis for each
+    admitted-config CHUNK the piece completed (possibly none);
+    ``flush`` is the universal normal-finalization transaction
+    (ING-LIFE-010 as amended): a residual-free signal -- PORT already
+    holds the accepted residual (ING-FE-006) -- that drains the
+    explicit final-tail, the zero-sample transaction included
+    (PORT-SESS-003), and returns the final transcript;
+    ``update_locale`` forwards a validated mid-session locale
+    (PORT-LID-003 applies it at the next chunk boundary); ``abort``
+    frees engine state immediately on a non-normal end (client close,
+    detected disconnect, idle-TTL); ``finish`` frees engine state on
+    the normal end of a session, called exactly once by every
+    ``finalize`` after ``flush``, so an implementation holding a live
     resource (e.g. an open engine generation) always gets exactly one
     terminal call on every path, success or not (ING-VEH-004).
     Deliberately not named to match ``SessionCore.close`` (the
@@ -95,12 +100,12 @@ class Transcriber(Protocol):
     would otherwise cross.
     """
 
-    async def step(self, chunk: FloatAudio) -> str:
-        """Advance one chunk; return the cumulative hypothesis."""
+    async def feed(self, samples: FloatAudio) -> list[str]:
+        """Advance one accepted piece; one hypothesis per CHUNK done."""
         ...
 
-    async def flush(self, residual: FloatAudio) -> str:
-        """Finalize with the raw residual; return the final transcript."""
+    async def flush(self) -> str:
+        """Drain the final-tail; return the final transcript."""
         ...
 
     async def update_locale(self, target_lang: str) -> None:
@@ -129,8 +134,8 @@ class IngressValues:
     ``watermark`` is W (PORT-STATE-004 residency cap);
     ``admission_queue`` is the in-process gate's bounded queue length
     (0 = fast-fail); ``admission_wait_s`` is the ING-owned wait bound
-    PORT-SESS-005 carves out; ``chunk_buffer_s`` bounds the re-chunk
-    buffer in seconds of audio; ``pre_roll_bytes`` bounds the raw
+    PORT-SESS-005 carves out; ``chunk_buffer_s`` bounds pre-submit
+    audio in seconds (ING-FE-005); ``pre_roll_bytes`` bounds the raw
     pre-admission buffer; ``idle_ttl_s`` is the PORT-SESS-005 TTL;
     ``locales`` is the checkpoint-derived valid locale set
     (PORT-LID-001).
@@ -146,16 +151,19 @@ class IngressValues:
 
 
 # @spec ING-FE-005, ING-FE-006
-class ChunkBuffer:
-    """Bounded re-chunk buffer: float32 in, exact admitted chunks out.
+class SubmitBound:
+    """ING's bounded pre-submit accounting (ING-FE-005).
 
-    The single implementation of ING-FE-005/006's buffering: arbitrary
-    -size decoded audio accumulates; exact ``chunk_samples`` chunks pop
-    out; whatever remains at finalize is the raw un-padded residual.
+    PORT alone owns cadence segmentation, the accepted residual, and
+    final-tail arithmetic (ING-FE-006), so no samples are stored here:
+    the bound is enforced on counts — the carried sub-chunk remainder
+    plus the incoming piece — before the piece is handed to the
+    segmenter whole. No adapter or core tier maintains a cadence
+    buffer.
     """
 
     def __init__(self, chunk_samples: int, max_seconds: float) -> None:
-        """Bound the buffer at ``max_seconds`` of 16 kHz audio."""
+        """Bound outstanding pre-submit audio at ``max_seconds``."""
         if chunk_samples <= 0:
             raise ValueError(
                 f"chunk_samples must be positive, got {chunk_samples}"
@@ -164,38 +172,14 @@ class ChunkBuffer:
             raise ValueError(f"max_seconds must be positive, got {max_seconds}")
         self._chunk_samples = chunk_samples
         self._max_samples = int(max_seconds * SAMPLE_RATE)
-        self._parts: list[FloatAudio] = []
-        self._held = 0
+        self._carried = 0
 
-    def append(self, samples: FloatAudio) -> bool:
-        """Accumulate; return ``False`` when the bound would be exceeded."""
-        if self._held + len(samples) > self._max_samples:
+    def admit(self, n_samples: int) -> bool:
+        """Accept a piece into the bound; ``False`` = overflow, drop whole."""
+        if self._carried + n_samples > self._max_samples:
             return False
-        if len(samples):
-            self._parts.append(np.asarray(samples, dtype=np.float32))
-            self._held += len(samples)
+        self._carried = (self._carried + n_samples) % self._chunk_samples
         return True
-
-    def pop_chunks(self) -> list[FloatAudio]:
-        """Drain every complete admitted-size chunk, in order."""
-        n_ready = self._held // self._chunk_samples
-        if n_ready == 0:
-            return []
-        joined = np.concatenate(self._parts)
-        chunks = [
-            joined[i * self._chunk_samples : (i + 1) * self._chunk_samples]
-            for i in range(n_ready)
-        ]
-        rest = joined[n_ready * self._chunk_samples :]
-        self._parts = [rest] if len(rest) else []
-        self._held = len(rest)
-        return chunks
-
-    def residual(self) -> FloatAudio:
-        """The sub-chunk remainder, raw and un-padded."""
-        if not self._parts:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(self._parts)
 
 
 PreRollItem = tuple[
@@ -391,7 +375,7 @@ class SessionCore:
         self._queued = False
         self._slot_held = False
         self._terminal = False
-        self._buffer: ChunkBuffer | None = None
+        self._bound: SubmitBound | None = None
         self._idle: IdleClock | None = None
         self._chunk_index = 0
         self._cumulative = ""
@@ -457,30 +441,39 @@ class SessionCore:
 
     # @spec ING-CORE-005, ING-FE-006
     async def receive_audio(self, samples: FloatAudio, now: float) -> list[Event]:
-        """Accumulate decoded audio; step every ready chunk."""
+        """Hand the accepted piece to PORT's segmenter whole.
+
+        The piece is never pre-chunked here (ING-FE-006: PORT alone
+        owns cadence segmentation), so the segmenter can timestamp
+        every cadence the piece completes at true completion time
+        (PORT-SESS-001). The idle lease refreshes only on successful
+        non-empty acceptance — rejected overflow and empty releases
+        never extend residency (ING-LIFE-005).
+        """
         if self._terminal:
             return [self._terminal_error()]
-        if self._buffer is None or self._idle is None:
+        if self._bound is None or self._idle is None:
             return [
                 SessionError(
                     code=errors.PROTOCOL_ORDER,
                     detail="audio before the admission outcome",
                 )
             ]
-        self._idle.touch(now)
-        events: list[Event] = []
-        if not self._buffer.append(samples):
-            events.append(
+        if not self._bound.admit(len(samples)):
+            return [
                 SessionError(
                     code=errors.BUFFER_OVERFLOW,
                     detail=(
-                        "re-chunk buffer bound exceeded "
+                        "pre-submit bound exceeded "
                         f"({self.values.chunk_buffer_s} s); audio dropped"
                     ),
                 )
-            )
-        for chunk in self._buffer.pop_chunks():
-            self._cumulative = await self._transcriber.step(chunk)
+            ]
+        if len(samples):
+            self._idle.touch(now)
+        events: list[Event] = []
+        for hypothesis in await self._transcriber.feed(samples):
+            self._cumulative = hypothesis
             events.append(
                 Partial(
                     cumulative=self._cumulative, chunk_index=self._chunk_index
@@ -501,7 +494,9 @@ class SessionCore:
                     detail="update before the admission outcome",
                 )
             ]
-        self._idle.touch(now)
+        # Never touches the idle lease: only accepted application
+        # audio refreshes residency (ING-LIFE-005) — a stream of
+        # config updates, valid or rejected, is not activity.
         rejections: list[Event] = []
         honored: dict[str, Any] = {}
         for key, value in fields.items():
@@ -540,32 +535,40 @@ class SessionCore:
             return rejections + [UpdateAck(honored=honored)]
         return rejections
 
-    # @spec ING-LIFE-002, ING-LIFE-003
+    # @spec ING-LIFE-002, ING-LIFE-003, ING-LIFE-010
     async def finalize(self, now: float) -> list[Event]:
-        """Client-driven end of audio; exactly one ``Final``."""
+        """Client-driven end of audio; exactly one ``Final``.
+
+        ``flush`` is the universal normal-finalization transaction
+        (ING-LIFE-010 as amended): always called, residual-free —
+        PORT holds the accepted residual and drains the explicit
+        final-tail, the zero-sample transaction included — and its
+        return IS the ``Final`` transcript, so labels the tail drain
+        emits are never lost. The resident slot is released only
+        after terminal engine cleanup (``finish``, or ``abort`` on a
+        failed finalization), never before.
+        """
         if self._terminal:
             return [self._terminal_error()]
-        if self._buffer is None:
+        if self._bound is None:
             return [
                 SessionError(
                     code=errors.PROTOCOL_ORDER,
                     detail="finalize before the admission outcome",
                 )
             ]
-        residual = self._buffer.residual()
-        if len(residual):
-            transcript = await self._transcriber.flush(residual)
-        else:
-            # Skip-flush: PORT's tail transform never runs on nothing
-            # (ING-LIFE-003); an empty session finalizes to "".
-            transcript = self._cumulative
+        # Accepting finalize atomically closes audio and locale
+        # updates (ING-LIFE-002) and disarms the idle backstop
+        # (ING-LIFE-005) — terminal before the drain awaits.
         self._terminal = True
-        self._release_slot()
-        # Unconditional, flush-or-not: the one terminal call every
-        # transcriber gets on the normal end of a session (never
-        # skipped alongside flush -- see the Transcriber.finish
-        # docstring for why the skip-flush path still needs this).
-        await self._transcriber.finish()
+        try:
+            transcript = await self._transcriber.flush()
+            await self._transcriber.finish()
+        except BaseException:
+            await self._transcriber.abort()
+            raise
+        finally:
+            self._release_slot()
         return [Final(transcript=transcript)]
 
     # @spec ING-LIFE-004
@@ -634,7 +637,7 @@ class SessionCore:
         if config is None:
             raise RuntimeError("admission finished without a configure")
         chunk_samples = config.chunk_ms * (SAMPLE_RATE // 1000)
-        self._buffer = ChunkBuffer(
+        self._bound = SubmitBound(
             chunk_samples=chunk_samples,
             max_seconds=self.values.chunk_buffer_s,
         )

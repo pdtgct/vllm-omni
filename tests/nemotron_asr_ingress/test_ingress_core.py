@@ -1,10 +1,11 @@
-"""Session-core lifecycle, chunking, and terminal semantics.
+"""Session-core lifecycle, pass-through audio, and terminal semantics.
 
-ING-CORE-005, ING-ERR-004, ING-LIFE-002..009, ING-FE-005/006 — all at
-the sans-IO seam, driven with explicit time.
+ING-CORE-005, ING-ERR-004, ING-LIFE-002..010, ING-FE-005/006 — all at
+the sans-IO seam, driven with explicit time. Pieces reach the
+transcriber whole (PORT alone owns cadence, ING-FE-006); ``flush`` is
+the universal residual-free finalization (ING-LIFE-010 as amended).
 """
 
-import numpy as np
 import pytest
 from ingress_helpers import (
     CHUNK_SAMPLES,
@@ -14,7 +15,7 @@ from ingress_helpers import (
 )
 
 from nemotron_asr_ingress import errors
-from nemotron_asr_ingress.core import ChunkBuffer
+from nemotron_asr_ingress.core import SubmitBound
 from nemotron_asr_ingress.events import (
     Configure,
     Final,
@@ -27,15 +28,20 @@ CFG = Configure(chunk_ms=80, target_lang="en-US")
 
 
 # @spec ING-FE-006, ING-CORE-001
-async def test_transcriber_receives_exact_admitted_chunks() -> None:
+async def test_transcriber_receives_pieces_whole_never_rechunked() -> None:
     core, fake, _ = make_core()
     core.configure(CFG, now=0.0)
-    # Odd-size pieces spanning 3 chunk boundaries plus a residual.
+    # Odd-size pieces spanning 3 chunk boundaries plus a residual: the
+    # pieces reach the seam exactly as accepted (PORT alone segments,
+    # ING-FE-006), and one hypothesis comes back per completed CHUNK.
     total = 3 * CHUNK_SAMPLES + CHUNK_SAMPLES // 2
+    sizes = []
     for start in range(0, total, 700):
         n = min(700, total - start)
+        sizes.append(n)
         await core.receive_audio(audio(n, start=start), now=0.1)
-    assert [len(chunk) for chunk in fake.steps] == [CHUNK_SAMPLES] * 3
+    assert [len(piece) for piece in fake.fed] == sizes
+    assert fake.chunks == 3
 
 
 # @spec ING-CORE-005
@@ -48,20 +54,20 @@ async def test_partials_carry_the_cumulative_hypothesis() -> None:
     assert [p.chunk_index for p in partials] == [0, 1]
 
 
-# @spec ING-FE-006
-async def test_finalize_hands_the_residual_raw_and_unpadded() -> None:
+# @spec ING-FE-006, ING-LIFE-010
+async def test_finalize_is_a_residual_free_signal() -> None:
     core, fake, _ = make_core()
     core.configure(CFG, now=0.0)
     residual_len = CHUNK_SAMPLES // 2
     clip = audio(CHUNK_SAMPLES + residual_len)
     await core.receive_audio(clip, now=0.1)
-    await core.finalize(now=0.2)
+    events = await core.finalize(now=0.2)
+    # The residual already reached PORT inside the accepted piece;
+    # finalize carries no audio (ING-FE-006) and the Final transcript
+    # IS flush's return — tail-drain output is never lost.
     assert fake.flush_called
-    assert fake.flushed is not None
-    # Exactly the leftover samples, exactly their values, no padding:
-    # the tail transform is PORT-SESS-003's, never the front-end's.
-    assert len(fake.flushed) == residual_len
-    np.testing.assert_array_equal(fake.flushed, clip[CHUNK_SAMPLES:])
+    assert sum(len(piece) for piece in fake.fed) == len(clip)
+    assert events == [Final(transcript="hey [flushed]")]
     assert fake.finished
 
 
@@ -86,7 +92,7 @@ async def test_audio_after_finalize_answers_session_terminal() -> None:
     assert isinstance(answer[0], SessionError)
     assert answer[0].code == errors.SESSION_TERMINAL
     # Nothing reached the engine after finalize acceptance.
-    assert fake.steps == []
+    assert fake.fed == []
 
 
 # @spec ING-ERR-004
@@ -106,12 +112,11 @@ async def test_zero_audio_finalize_is_a_valid_degenerate_session() -> None:
     core.configure(CFG, now=0.0)
     events = await core.finalize(now=0.1)
     assert events == [Final(transcript="")]
-    # Skip-flush: PORT's tail transform is never invoked with nothing.
-    assert not fake.flush_called
+    # flush is universal (ING-LIFE-010 as amended): the zero-sample
+    # final-tail transaction runs even for a zero-audio session
+    # (ING-LIFE-003) and finish() follows exactly once.
+    assert fake.flush_called
     assert core.terminal
-    # But finish() still runs -- a transcriber holding a live resource
-    # (e.g. an open engine generation, ING-VEH-004) gets exactly one
-    # terminal call on every finalize path, flushed or not.
     assert fake.finished
 
 
@@ -193,9 +198,9 @@ async def test_admission_fixed_field_update_is_rejected_with_continuation() -> N
     assert isinstance(err, SessionError)
     assert err.code == errors.CONFIG_CHANGE_REJECTED
     assert "chunk_ms" in err.fields
-    # Still chunking at the admitted config.
+    # Still advancing at the admitted config.
     await core.receive_audio(audio(CHUNK_SAMPLES), now=0.2)
-    assert [len(chunk) for chunk in fake.steps] == [CHUNK_SAMPLES]
+    assert fake.chunks == 1
 
 
 # @spec ING-LIFE-009
@@ -238,24 +243,20 @@ def test_unknown_locale_at_admission_rejects_without_a_slot() -> None:
 
 
 # @spec ING-FE-005, ING-FE-006
-def test_chunk_buffer_pops_exact_chunks_across_odd_splits() -> None:
-    buffer = ChunkBuffer(chunk_samples=CHUNK_SAMPLES, max_seconds=10.0)
-    total = 2 * CHUNK_SAMPLES + 37
-    clip = audio(total)
-    for start in range(0, total, 501):
-        assert buffer.append(clip[start : start + 501])
-    chunks = buffer.pop_chunks()
-    assert [len(chunk) for chunk in chunks] == [CHUNK_SAMPLES] * 2
-    np.testing.assert_array_equal(
-        np.concatenate(chunks + [buffer.residual()]), clip
-    )
+def test_submit_bound_counts_and_carries_the_subchunk_remainder() -> None:
+    # Counting only — no samples are stored (PORT holds the audio);
+    # the carried remainder plus the piece is what the bound sees.
+    bound = SubmitBound(chunk_samples=100, max_seconds=1.0)  # 16000
+    assert bound.admit(250)  # carried remainder becomes 50
+    assert bound.admit(15950)  # 50 + 15950 == 16000, exactly at bound
+    assert not bound.admit(16001)
 
 
 # @spec ING-FE-005
-def test_chunk_buffer_refuses_growth_past_its_bound() -> None:
-    buffer = ChunkBuffer(chunk_samples=CHUNK_SAMPLES, max_seconds=0.25)
-    assert buffer.append(audio(4000))
-    assert not buffer.append(audio(1))
+def test_submit_bound_refuses_growth_past_its_bound() -> None:
+    bound = SubmitBound(chunk_samples=CHUNK_SAMPLES, max_seconds=0.25)
+    assert bound.admit(4000)
+    assert not bound.admit(4000)
 
 
 # @spec ING-LIFE-002
@@ -264,10 +265,10 @@ async def test_no_input_after_final_reaches_the_engine() -> None:
     core.configure(CFG, now=0.0)
     await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
     await core.finalize(now=0.2)
-    steps_at_final = len(fake.steps)
+    fed_at_final = len(fake.fed)
     await core.receive_audio(audio(CHUNK_SAMPLES), now=0.3)
     await core.update({"target_lang": "es-US"}, now=0.4)
-    assert len(fake.steps) == steps_at_final
+    assert len(fake.fed) == fed_at_final
     assert fake.locales == []
 
 
@@ -280,9 +281,9 @@ async def test_zero_audio_finalize_still_frees_the_slot() -> None:
     assert gate.active == 0
 
 
-def test_chunk_buffer_bound_must_be_positive() -> None:
+def test_submit_bound_must_be_positive() -> None:
     with pytest.raises(ValueError):
-        ChunkBuffer(chunk_samples=CHUNK_SAMPLES, max_seconds=0.0)
+        SubmitBound(chunk_samples=CHUNK_SAMPLES, max_seconds=0.0)
 
 
 def test_ingress_core_is_the_durable_home_for_shared_values() -> None:
@@ -299,6 +300,81 @@ def test_ingress_core_is_the_durable_home_for_shared_values() -> None:
     clock = IdleClock(ttl_s=1.0, now=0.0)
     assert not clock.expired(0.5)
     assert clock.expired(1.5)
+
+
+# @spec ING-LIFE-005
+async def test_rejected_overflow_never_refreshes_the_idle_lease() -> None:
+    values = make_values(idle_ttl_s=60.0, chunk_buffer_s=0.25)
+    core, _, _ = make_core(values=values)
+    core.configure(CFG, now=0.0)
+    events = await core.receive_audio(audio(8000), now=50.0)  # rejected
+    assert [e.code for e in events if isinstance(e, SessionError)] == [
+        errors.BUFFER_OVERFLOW
+    ]
+    (expired,) = await core.poll(now=61.0)
+    assert isinstance(expired, SessionError)
+    assert expired.code == errors.IDLE_TIMEOUT
+
+
+# @spec ING-LIFE-005
+async def test_updates_never_refresh_the_idle_lease() -> None:
+    values = make_values(idle_ttl_s=60.0)
+    core, _, _ = make_core(values=values)
+    core.configure(CFG, now=0.0)
+    await core.update({"target_lang": "es-US"}, now=50.0)  # honored
+    await core.update({"target_lang": "xx-XX"}, now=55.0)  # rejected
+    (expired,) = await core.poll(now=61.0)
+    assert isinstance(expired, SessionError)
+    assert expired.code == errors.IDLE_TIMEOUT
+
+
+# @spec ING-LIFE-005
+async def test_empty_pieces_never_refresh_the_idle_lease() -> None:
+    values = make_values(idle_ttl_s=60.0)
+    core, _, _ = make_core(values=values)
+    core.configure(CFG, now=0.0)
+    assert await core.receive_audio(audio(0), now=50.0) == []
+    (expired,) = await core.poll(now=61.0)
+    assert isinstance(expired, SessionError)
+    assert expired.code == errors.IDLE_TIMEOUT
+
+
+# @spec ING-LIFE-010
+async def test_slot_release_follows_terminal_engine_cleanup() -> None:
+    core, fake, gate = make_core()
+    active_at_finish: list[int] = []
+    original_finish = fake.finish
+
+    async def observing_finish() -> None:
+        active_at_finish.append(gate.active)
+        await original_finish()
+
+    fake.finish = observing_finish
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    await core.finalize(now=0.2)
+    # The slot was still held when the terminal engine cleanup ran —
+    # capacity is never re-admitted over live engine state.
+    assert active_at_finish == [1]
+    assert gate.active == 0
+
+
+# @spec ING-LIFE-010
+async def test_failed_finalization_aborts_and_releases() -> None:
+    core, fake, gate = make_core()
+
+    async def failing_flush() -> str:
+        raise RuntimeError("final-tail drain failed")
+
+    fake.flush = failing_flush
+    core.configure(CFG, now=0.0)
+    await core.receive_audio(audio(CHUNK_SAMPLES), now=0.1)
+    with pytest.raises(RuntimeError, match="drain failed"):
+        await core.finalize(now=0.2)
+    assert fake.aborted
+    assert not fake.finished
+    assert gate.active == 0
+    assert core.terminal
 
 
 # @spec ING-ADM-004
