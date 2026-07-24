@@ -275,26 +275,41 @@ NEMOTRON_MAX_SESSIONS_ENV = "VLLM_OMNI_NEMOTRON_TRANSCRIPTION_MAX_SESSIONS"
 _NEMOTRON_MAX_SESSIONS_DEFAULT = 8
 
 
-def _nemotron_transcription_opt_in(engine_client: Any) -> bool:
+def _nemotron_transcription_opt_in(vllm_config: Any) -> bool:
     """Whether the EXPERIMENTAL Nemotron transcription surface is on.
 
     True only when the env flag is set AND the served model is the
     Nemotron ASR architecture. The env check runs FIRST so that with
     the flag off (the default) no Nemotron module is ever imported.
+
+    Reads architectures from the RESOLVED ``vllm_config`` (fetched async
+    from the stage subprocess via ``_get_vllm_config``), NOT from
+    ``engine_client.model_config`` — in vllm-omni's multi-process
+    architecture the API-server process holds only a null model-config
+    placeholder, so a synchronous read there sees no architectures.
     """
     flag = os.getenv(NEMOTRON_TRANSCRIPTION_ENV, "").strip().lower()
     if flag not in ("1", "true", "yes"):
         return False
-    model_config = getattr(engine_client, "model_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
-    architectures = tuple(getattr(hf_config, "architectures", None) or ())
+    architectures = frozenset(getattr(hf_config, "architectures", None) or ())
     if not architectures:
         return False
     from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
         ARCHITECTURE as _NEMOTRON_ASR_ARCHITECTURE,
+        MODEL_CLASS_NAME as _NEMOTRON_ASR_CLASS_NAME,
     )
 
-    return _NEMOTRON_ASR_ARCHITECTURE in architectures
+    # vLLM may present either the config's architecture string or the
+    # registry-bound class name (it rewrites architectures to the
+    # resolved class during engine init), so admit either. (The
+    # transcription route mounts from the model's SupportsTranscription
+    # surface regardless; this gate only decides whether the ephemeral
+    # adapter replaces the stock handler.)
+    return not architectures.isdisjoint(
+        {_NEMOTRON_ASR_ARCHITECTURE, _NEMOTRON_ASR_CLASS_NAME}
+    )
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -537,8 +552,13 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # the engine never declares the task, so the transcriptions +
         # translations routes only mount when the flag adds it here.
         # Handler construction (and the translation trap) happens in
-        # omni_init_app_state.
-        if "transcription" not in supported_tasks and _nemotron_transcription_opt_in(engine_client):
+        # omni_init_app_state. The opt-in reads the async-resolved
+        # vllm_config (the API-server process has only a null
+        # model-config placeholder — see _nemotron_transcription_opt_in).
+        _nemotron_vllm_config = await _get_vllm_config(engine_client)
+        if "transcription" not in supported_tasks and _nemotron_transcription_opt_in(
+            _nemotron_vllm_config
+        ):
             supported_tasks = (*supported_tasks, "transcription")
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
@@ -1094,7 +1114,7 @@ async def omni_init_app_state(
         if "transcription" in supported_tasks
         else None
     )
-    if _nemotron_transcription_opt_in(engine_client):
+    if _nemotron_transcription_opt_in(vllm_config):
         # EXPERIMENTAL, disabled by default (RFC-1 brief §B/§D): the
         # Nemotron adapter replaces the stock transcription handler and
         # delegates to the ephemeral orchestrator. ONE app-scope

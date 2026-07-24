@@ -23,6 +23,14 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 #: ``architectures[0]``. Imported, never re-spelled.
 ARCHITECTURE = "Nemotron3_5AsrForRNNT"
 
+#: The resolved model-class name the registry binds ``ARCHITECTURE`` to.
+#: vLLM rewrites ``hf_config.architectures`` to this class name during
+#: engine init, so a post-init consumer (e.g. the transcription opt-in)
+#: sees this, NOT ``ARCHITECTURE``. Any architecture match must admit
+#: both. Single source of truth — the registry imports it, never
+#: re-spells it.
+MODEL_CLASS_NAME = "NemotronASRForRNNT"
+
 MODEL_TYPE = "nemotron_asr"
 
 #: The raw chunk-envelope carrier width: header slots plus the largest

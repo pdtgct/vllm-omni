@@ -406,9 +406,29 @@ def test_wiring_imports_nemotron_only_behind_the_flag() -> None:
 
 
 def _adapter_module() -> Any:
-    """Import the adapter module (requires vllm; pod tier)."""
-    import importlib
+    """Import the adapter module (requires vllm; pod tier).
 
+    A GPU-free sibling test in this file stubs parent packages in
+    ``sys.modules`` for file-path loading; on the pod that would leave
+    the real ``vllm_omni.entrypoints[.openai]`` shadowed by a
+    ``__path__``-less stub, so the real package import fails with "is
+    not a package". Evict any stub (an entry with no real ``__file__``)
+    on the chain first, then import for real.
+    """
+    import importlib
+    import sys
+
+    for name in (
+        "vllm_omni.entrypoints.openai.serving_nemotron_transcription",
+        "vllm_omni.entrypoints.openai.nemotron_transcription_rules",
+        "vllm_omni.entrypoints.nemotron_session",
+        "vllm_omni.entrypoints.openai",
+        "vllm_omni.entrypoints",
+        "vllm_omni",
+    ):
+        mod = sys.modules.get(name)
+        if mod is not None and not getattr(mod, "__file__", None):
+            del sys.modules[name]
     return importlib.import_module(
         "vllm_omni.entrypoints.openai.serving_nemotron_transcription"
     )

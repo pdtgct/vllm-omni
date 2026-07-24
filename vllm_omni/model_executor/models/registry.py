@@ -7,6 +7,7 @@ from vllm.model_executor.models.registry import (
 
 from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
     ARCHITECTURE as NEMOTRON_ASR_ARCHITECTURE,
+    MODEL_CLASS_NAME as NEMOTRON_ASR_CLASS_NAME,
 )
 
 _OMNI_MODELS = {
@@ -19,7 +20,7 @@ _OMNI_MODELS = {
     NEMOTRON_ASR_ARCHITECTURE: (
         "nemotron_asr",
         "nemotron_asr",
-        "NemotronASRForRNNT",
+        NEMOTRON_ASR_CLASS_NAME,
     ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
