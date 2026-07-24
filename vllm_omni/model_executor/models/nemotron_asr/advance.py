@@ -586,8 +586,7 @@ def make_table_resolver(
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
             raise ValueError(
-                "graph-covered decode requires exact padded runner "
-                "authority; the Phase 6c resolver is eager-only"
+                "graph-covered decode requires exact padded runner authority; the Phase 6c resolver is eager-only"
             )
         batch = min(max(request.execution_batch_size, 1), max_batch)
         arm = compiled_t[request.geometry][batch]
@@ -1437,9 +1436,7 @@ class HostStaging:
         # within a call — which is exactly what a single shared slot
         # could not guarantee, and why the per-bucket vector used to
         # fall back to the un-pooled (pin_memory-per-call) _h2d path.
-        self._bucket_arena = torch.empty(
-            (len(CADENCES), self.capacity), dtype=torch.int64, pin_memory=pin
-        )
+        self._bucket_arena = torch.empty((len(CADENCES), self.capacity), dtype=torch.int64, pin_memory=pin)
 
     def stage(
         self,
@@ -2327,7 +2324,14 @@ def advance_model_rows(
     status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
     status |= ((~is_chunk_dev) & pending & (ids_dev != expected)).to(torch.int32) * ROW_STATUS_ECHO_MISMATCH
     status |= (is_chunk_dev & (pending | (remaining > 0))).to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
-    status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized))).to(
+    # The AR park echo: under async scheduling the engine's in-flight
+    # frame legally feeds an emitted park token back as the next input
+    # (the label twin of this row is ROLE_REPLAY, armed at commit). A
+    # non-chunk park-token row on a drained, unarmed, live session is
+    # therefore a sanctioned no-op FLUSH — validated downstream as
+    # emit-park-change-nothing — not a protocol violation.
+    park_echo = (~is_chunk_dev) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == park_id)
+    status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized)) & (~park_echo)).to(
         torch.int32
     ) * ROW_STATUS_SESSION_PROTOCOL
     status |= (book[:, BOOK_GEOMETRY].long() != plan_geom_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
@@ -2358,11 +2362,7 @@ def advance_model_rows(
         # this call — allocation-free without the overwrite race a
         # single shared bucket slot would carry. Falls back to the
         # un-pooled _h2d path (probes/CPU) when no staging is given.
-        rows_dev = (
-            staging.stage_bucket(g, pos_t, device)
-            if staging is not None
-            else _h2d(pos_t, device)
-        )
+        rows_dev = staging.stage_bucket(g, pos_t, device) if staging is not None else _h2d(pos_t, device)
         blocks_dev = didx.index_select(0, rows_dev)
         fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
         cadence = 8 * (lookaheads[g] + 1)
@@ -2465,9 +2465,9 @@ def advance_model_rows(
                 (
                     int(rows_dev.shape[0]),
                     int(
-                        core.encoder.pre_encode.output_lengths(
-                            torch.tensor([int(state.mel_tail.shape[2]) + cadence])
-                        )[0]
+                        core.encoder.pre_encode.output_lengths(torch.tensor([int(state.mel_tail.shape[2]) + cadence]))[
+                            0
+                        ]
                     ),
                     int(state.channel[0].shape[2]),
                 ),

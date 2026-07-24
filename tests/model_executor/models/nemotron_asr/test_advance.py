@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ROW_STATUS_ECHO_MISMATCH,
     ROW_STATUS_PROMPT_MISMATCH,
     ROW_STATUS_QUEUE_NOT_DRAINED,
+    ROW_STATUS_SESSION_PROTOCOL,
     AdvanceResult,
     ChunkBatch,
     DecodeRequest,
@@ -878,6 +879,68 @@ def test_flush_only_batch_never_calls_advance_session(
         plan,
     )
     assert int(read_decision_carrier(out)[0]) == PARK_ID
+
+
+def test_park_echo_row_is_a_clean_flush_not_a_protocol_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-004 — under async scheduling the engine's
+    # one-step-lookahead frame is already in
+    # flight when the model parks, so it legally feeds the just-emitted
+    # park token back as the NEXT row's input even though the
+    # scheduler discarded that frame's output. A non-chunk park-token
+    # row on a drained, unarmed, NOT-YET-finalized session is the label
+    # twin of the ROLE_REPLAY echo — a benign no-op FLUSH, never a
+    # session-protocol violation.
+    def _recorder(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("advance_session must not run for the park echo")
+
+    monkeypatch.setattr(advance_mod, "advance_session", _recorder)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    # Drained/unarmed book, frontend NOT finalized — the async-lookahead
+    # park echo, distinct from the already-legal finalized-flush case
+    # covered above.
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    before = _clone_pools(pools)
+    plan = _plan(decodes=[1])
+    status = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PARK_ID], dtype=torch.long),
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
+    )
+    assert int(read_decision_carrier(out)[0]) == PARK_ID
+    assert len(status.staged) == 1
+    assert int(status.staged[0][0]) == 0  # clean: exempted from SESSION_PROTOCOL
+    _assert_pools_equal(pools, before)
+
+
+def test_non_park_token_on_drained_unfinalized_session_still_flags_protocol() -> None:
+    # @spec PORT-ADV-004 — guard-strength counter-case: the park-echo
+    # exemption is scoped to the park token EXACTLY. Any other label id
+    # arriving on the same drained/unarmed/not-finalized session is
+    # still the protocol violation this bit exists to catch (there is
+    # no legal reason a decode-only row with an empty queue would ever
+    # feed back a non-park id).
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    plan = _plan(decodes=[1])
+    status = _CommitRecorder()
+    _call(
+        core,
+        pools,
+        torch.tensor([3], dtype=torch.long),  # a legal label, not the park id
+        torch.zeros(1, CARRIER_HIDDEN),
+        plan,
+        commit_sink=status,
+    )
+    assert len(status.staged) == 1
+    assert int(status.staged[0][0]) & ROW_STATUS_SESSION_PROTOCOL
 
 
 def test_mixed_batch_calls_advance_session_with_only_chunk_rows(

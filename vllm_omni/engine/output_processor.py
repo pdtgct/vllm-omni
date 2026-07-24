@@ -1,4 +1,5 @@
 from dataclasses import fields as dataclass_fields
+from enum import Enum
 from typing import Any
 
 import torch
@@ -85,6 +86,14 @@ def _cat_tensors(
         return tensors[-1]
     # CONCAT_DIM0 / APPEND_LIST / default
     return torch.cat(tensors, dim=0)
+
+
+class StreamingTerminalDisposition(Enum):
+    """Queue-less output-processor result for a terminal streaming update."""
+
+    PARKED_COMPLETE = "parked_complete"
+    CORE_REQUIRED = "core_required"
+    UNKNOWN = "unknown"
 
 
 def _modality_to_type_string(modality: OutputModality) -> str:
@@ -566,6 +575,26 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
         self.external_req_ids[req_state.external_req_id].append(request_id)
+
+    # @spec PORT-INT-008
+    def apply_terminal_update(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+    ) -> StreamingTerminalDisposition:
+        """Apply a terminal streaming update and preserve its synchronous result."""
+        if request.resumable:
+            raise ValueError("terminal streaming update must set resumable=False")
+
+        req_state = self.request_states.get(request.request_id)
+        if req_state is None:
+            return StreamingTerminalDisposition.UNKNOWN
+
+        parked = req_state.input_chunk_queue is None
+        self._update_streaming_request_state(req_state, request, prompt)
+        if parked:
+            return StreamingTerminalDisposition.PARKED_COMPLETE
+        return StreamingTerminalDisposition.CORE_REQUIRED
 
     def remove_request(self, request_id: str) -> None:
         """Rollback one previously registered request if it was never submitted."""

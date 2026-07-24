@@ -117,11 +117,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         pcm16 = (clipped * 32767.0).astype(np.int16)
         return base64.b64encode(pcm16.tobytes()).decode("utf-8")
 
+    # @spec ING-LIFE-011
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
-    ):
+    ) -> None:
         request_id = f"rt-{self.connection_id}-{uuid4()}"
         sent_audio = False
         audio_done_sent = False
@@ -182,19 +183,26 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if not self._is_connected:
                     break
 
-            usage = UsageInfo(
-                prompt_tokens=prompt_token_ids_len,
-                completion_tokens=completion_tokens_len,
-                total_tokens=prompt_token_ids_len + completion_tokens_len,
-            )
-            await self.send(TranscriptionDone(text=full_text, usage=usage))
+            if self._is_connected:
+                usage = UsageInfo(
+                    prompt_tokens=prompt_token_ids_len,
+                    completion_tokens=completion_tokens_len,
+                    total_tokens=prompt_token_ids_len + completion_tokens_len,
+                )
+                await self.send(TranscriptionDone(text=full_text, usage=usage))
 
-            if sent_audio:
-                await self.send_json({"type": "response.audio.done", "has_audio": True})
-                audio_done_sent = True
+                if sent_audio:
+                    await self.send_json(
+                        {
+                            "type": "response.audio.done",
+                            "has_audio": True,
+                        }
+                    )
+                    audio_done_sent = True
         except Exception as e:
             logger.exception("Error in generation: %s", e)
-            await self.send_error(str(e), "processing_error")
+            if self._is_connected:
+                await self.send_error(str(e), "processing_error")
         finally:
             # Always send terminal event so clients don't hang forever.
             if self._is_connected and not audio_done_sent:

@@ -14,6 +14,10 @@ import numpy as np
 import pytest
 import torch
 from vllm.engine.protocol import StreamingInput
+from vllm.entrypoints.speech_to_text.realtime.protocol import (
+    TranscriptionDelta,
+    TranscriptionDone,
+)
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -103,8 +107,25 @@ class _RecordingStreamingEngine:
         self.updates.append(kwargs)
 
 
+class _StreamingTestAsyncOmni(AsyncOmni):
+    """Test double: ``AsyncOmni.model_config`` is a read-only ``@property``
+    (async_omni.py) that derives its value from ``self.engine``/
+    ``self.vllm_config`` — irrelevant plumbing for these input-stream unit
+    tests. Override it here with a plain settable property so the fixture
+    can stamp a stand-in config directly, instead of reconstructing the
+    engine/stage-config chain the real property reads."""
+
+    @property
+    def model_config(self):  # type: ignore[override]
+        return self._test_model_config
+
+    @model_config.setter
+    def model_config(self, value):  # type: ignore[override]
+        self._test_model_config = value
+
+
 def _streaming_omni() -> tuple[AsyncOmni, _RecordingStreamingEngine, Any]:
-    omni = object.__new__(AsyncOmni)
+    omni = object.__new__(_StreamingTestAsyncOmni)
     engine = _RecordingStreamingEngine()
     request_state = SimpleNamespace(
         queue=asyncio.Queue(),
@@ -208,3 +229,139 @@ async def test_explicit_flush_precedes_successful_end_of_input_marker() -> None:
     assert engine.updates[0]["resumable"] is True
     assert engine.updates[1]["prompt"]["prompt_token_ids"] == [0]
     assert engine.updates[1]["resumable"] is False
+
+
+class _RealtimeGenerationEngine:
+    default_sampling_params_list = [_streaming_params()]
+
+    def __init__(
+        self,
+        outputs: list[Any],
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.outputs = outputs
+        self.error = error
+
+    def generate(self, **_kwargs: Any) -> AsyncGenerator[Any, None]:
+        async def _outputs() -> AsyncGenerator[Any, None]:
+            for output in self.outputs:
+                yield output
+            if self.error is not None:
+                raise self.error
+
+        return _outputs()
+
+
+def _generation_output(text: str, token_ids: list[int]) -> Any:
+    return SimpleNamespace(
+        stage_id=0,
+        outputs=[
+            SimpleNamespace(
+                text=text,
+                token_ids=token_ids,
+            )
+        ],
+        prompt_token_ids=[1],
+        multimodal_output=None,
+    )
+
+
+def _realtime_generation_connection(
+    engine: _RealtimeGenerationEngine,
+) -> tuple[
+    RealtimeConnection,
+    list[Any],
+    list[dict[str, Any]],
+    list[tuple[str, str]],
+]:
+    connection = RealtimeConnection.__new__(RealtimeConnection)
+    connection.connection_id = "test"
+    connection.engine = engine
+    connection._is_connected = True
+    connection.audio_queue = asyncio.Queue()
+
+    sent_events: list[Any] = []
+    sent_json: list[dict[str, Any]] = []
+    sent_errors: list[tuple[str, str]] = []
+
+    async def _send(event: Any) -> None:
+        sent_events.append(event)
+
+    async def _send_json(payload: dict[str, Any]) -> None:
+        sent_json.append(payload)
+
+    async def _send_error(message: str, error_type: str) -> None:
+        sent_errors.append((message, error_type))
+
+    connection.send = _send  # type: ignore[method-assign]
+    connection.send_json = _send_json  # type: ignore[method-assign]
+    connection.send_error = _send_error  # type: ignore[method-assign]
+    return connection, sent_events, sent_json, sent_errors
+
+
+async def _empty_streaming_input() -> AsyncGenerator[Any, None]:
+    if False:
+        yield None
+
+
+# @spec ING-LIFE-011
+@pytest.mark.asyncio
+async def test_successful_empty_terminal_output_emits_one_done_after_deltas() -> None:
+    engine = _RealtimeGenerationEngine(
+        [
+            _generation_output("hello", [7]),
+            _generation_output("", []),
+        ]
+    )
+    connection, sent_events, _sent_json, sent_errors = _realtime_generation_connection(engine)
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert [type(event) for event in sent_events] == [
+        TranscriptionDelta,
+        TranscriptionDone,
+    ]
+    assert sent_events[0].delta == "hello"
+    assert sent_events[1].text == "hello"
+    assert sent_errors == []
+
+
+# @spec ING-LIFE-011
+@pytest.mark.asyncio
+async def test_generation_error_emits_processing_error_without_done() -> None:
+    engine = _RealtimeGenerationEngine(
+        [_generation_output("partial", [7])],
+        error=RuntimeError("terminal lifecycle divergence"),
+    )
+    connection, sent_events, _sent_json, sent_errors = _realtime_generation_connection(engine)
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert [type(event) for event in sent_events] == [TranscriptionDelta]
+    assert sent_errors == [
+        ("terminal lifecycle divergence", "processing_error"),
+    ]
+
+
+# @spec ING-LIFE-011
+@pytest.mark.asyncio
+async def test_disconnected_generation_emits_no_terminal_event() -> None:
+    engine = _RealtimeGenerationEngine([])
+    connection, sent_events, sent_json, sent_errors = _realtime_generation_connection(engine)
+    connection._is_connected = False
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert sent_events == []
+    assert sent_json == []
+    assert sent_errors == []

@@ -31,10 +31,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-_PKG = (
-    Path(__file__).resolve().parents[4]
-    / "vllm_omni/model_executor/models/nemotron_asr"
-)
+_PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/nemotron_asr"
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
@@ -49,7 +46,10 @@ def _load_chain() -> dict[str, Any]:
             sys.modules[name] = types.ModuleType(name)
     loaded: dict[str, Any] = {}
     for mod in (
-        "manifests", "configuration_nemotron_asr", "session", "streaming",
+        "manifests",
+        "configuration_nemotron_asr",
+        "session",
+        "streaming",
     ):
         dotted = f"{_BASE}.{mod}"
         # Reuse-if-present: other test files chain-load these canonical
@@ -204,9 +204,7 @@ def test_exact_checkpoint_locale_wins_over_iso_expansion() -> None:
         "en-GB": 3,
         "EN_us": 4,
     }
-    session = NemotronRealtimeSession.from_model_config(
-        _hf(prompt_dictionary=prompts), locale="EN_us"
-    )
+    session = NemotronRealtimeSession.from_model_config(_hf(prompt_dictionary=prompts), locale="EN_us")
     assert session.prompt_index == prompts["EN_us"]
 
 
@@ -214,9 +212,7 @@ def test_exact_checkpoint_locale_wins_over_iso_expansion() -> None:
 def test_ambiguous_iso_code_requires_explicit_checkpoint_locale() -> None:
     prompts = {"auto": 0, "en-US": 2, "en-GB": 3}
     with pytest.raises(ValueError, match="ambiguous.*explicit"):
-        NemotronRealtimeSession.from_model_config(
-            _hf(prompt_dictionary=prompts), locale="en"
-        )
+        NemotronRealtimeSession.from_model_config(_hf(prompt_dictionary=prompts), locale="en")
 
 
 # @spec PORT-RTC-001, PORT-LID-001
@@ -226,9 +222,7 @@ def test_factory_reuses_the_published_prompt_dictionary_validator() -> None:
     with pytest.raises(ValueError):
         NemotronRealtimeSession.from_model_config(_hf(num_prompts=0))
     with pytest.raises(ValueError):
-        NemotronRealtimeSession.from_model_config(
-            _hf(prompt_dictionary={"auto": 999})
-        )
+        NemotronRealtimeSession.from_model_config(_hf(prompt_dictionary={"auto": 999}))
     with pytest.raises(ValueError):
         NemotronRealtimeSession.from_model_config(_hf(prompt_dictionary={}))
 
@@ -276,16 +270,25 @@ def test_tickets_are_minted_in_carrier_order() -> None:
         queue: asyncio.Queue = asyncio.Queue()
         agen = buffer_stream(_audio(8_960 * 3), queue, session)
         sequences = []
+        flush_seen = False
         async for prompt in agen:
+            if "multi_modal_data" not in prompt:
+                # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003: the
+                # terminal model-level FLUSH is a bare carrier — token
+                # [0], no multi_modal_data key — submitted after the
+                # final-tail transaction has committed.
+                assert prompt == {"prompt_token_ids": [0]}
+                flush_seen = True
+                queue.put_nowait([PARK_ID])
+                continue
             envelope = prompt["multi_modal_data"]["audio"]
             sequences.append(int(envelope[5]))
             queue.put_nowait([PARK_ID])
         assert sequences == [0, 1, 2, 3]
+        assert flush_seen
         minted = [t.sequence for t in ledger.pending]
         assert minted == [0, 1, 2, 3]
-        assert [t.final_tail for t in ledger.pending] == [
-            False, False, False, True
-        ]
+        assert [t.final_tail for t in ledger.pending] == [False, False, False, True]
 
     _run(scenario())
 
