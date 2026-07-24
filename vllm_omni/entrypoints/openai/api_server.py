@@ -123,7 +123,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
-from vllm_omni.entrypoints.openai.router_plugins import load_router_plugins
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -258,43 +257,6 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     if hasattr(engine_client, "get_vllm_config"):
         return await engine_client.get_vllm_config()
     return getattr(engine_client, "vllm_config", None)
-
-
-#: EXPERIMENTAL opt-in for the Nemotron /v1/audio/transcriptions adapter
-#: (RFC-1 brief §D, round-5 decision 3). The engine never declares the
-#: "transcription" task for this model (no stage declares it), so this
-#: flag is the ONLY way the route mounts and the adapter is constructed.
-#: Default OFF: zero behavior change, no Nemotron imports executed.
-#: Stays experimental until provider-owned reservation lands (brief §B).
-NEMOTRON_TRANSCRIPTION_ENV = "VLLM_OMNI_EXPERIMENTAL_NEMOTRON_TRANSCRIPTION"
-#: Cap for the app-scope ServingConcurrencyLimiter (load shedding only —
-#: NOT residency, NOT PORT-STATE-004 compliance; see the limiter's
-#: docstring disclaimers). One limiter instance is shared by every
-#: transport constructed at app-state init.
-NEMOTRON_MAX_SESSIONS_ENV = "VLLM_OMNI_NEMOTRON_TRANSCRIPTION_MAX_SESSIONS"
-_NEMOTRON_MAX_SESSIONS_DEFAULT = 8
-
-
-def _nemotron_transcription_opt_in(engine_client: Any) -> bool:
-    """Whether the EXPERIMENTAL Nemotron transcription surface is on.
-
-    True only when the env flag is set AND the served model is the
-    Nemotron ASR architecture. The env check runs FIRST so that with
-    the flag off (the default) no Nemotron module is ever imported.
-    """
-    flag = os.getenv(NEMOTRON_TRANSCRIPTION_ENV, "").strip().lower()
-    if flag not in ("1", "true", "yes"):
-        return False
-    model_config = getattr(engine_client, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = tuple(getattr(hf_config, "architectures", None) or ())
-    if not architectures:
-        return False
-    from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
-        ARCHITECTURE as _NEMOTRON_ASR_ARCHITECTURE,
-    )
-
-    return _NEMOTRON_ASR_ARCHITECTURE in architectures
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -533,14 +495,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             if not hasattr(engine_client, "get_supported_tasks"):
                 supported_tasks = ("generate",)
 
-        # EXPERIMENTAL Nemotron transcription opt-in (RFC-1 brief §D):
-        # the engine never declares the task, so the transcriptions +
-        # translations routes only mount when the flag adds it here.
-        # Handler construction (and the translation trap) happens in
-        # omni_init_app_state.
-        if "transcription" not in supported_tasks and _nemotron_transcription_opt_in(engine_client):
-            supported_tasks = (*supported_tasks, "transcription")
-
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
 
@@ -554,11 +508,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
-
-        # OMNI: Third-party routers mount here -- after serving state exists on
-        # app.state and strictly before serve_http accepts connections, so a
-        # failing plugin aborts startup with no partially-mounted route served.
-        load_router_plugins(app)
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -1094,37 +1043,6 @@ async def omni_init_app_state(
         if "transcription" in supported_tasks
         else None
     )
-    if _nemotron_transcription_opt_in(engine_client):
-        # EXPERIMENTAL, disabled by default (RFC-1 brief §B/§D): the
-        # Nemotron adapter replaces the stock transcription handler and
-        # delegates to the ephemeral orchestrator. ONE app-scope
-        # ServingConcurrencyLimiter is constructed here and injected —
-        # every transport shares this instance; it is load shedding
-        # only, never residency (its docstring carries the DECIDED
-        # disclaimers).
-        from vllm_omni.entrypoints.nemotron_session import ServingConcurrencyLimiter
-        from vllm_omni.entrypoints.openai.serving_nemotron_transcription import (
-            NemotronServingTranscription,
-        )
-
-        max_sessions = int(
-            os.getenv(NEMOTRON_MAX_SESSIONS_ENV, str(_NEMOTRON_MAX_SESSIONS_DEFAULT))
-        )
-        state.nemotron_serving_limiter = ServingConcurrencyLimiter(max_concurrent=max_sessions)
-        state.openai_serving_transcription = NemotronServingTranscription(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            limiter=state.nemotron_serving_limiter,
-            enable_force_include_usage=args.enable_force_include_usage,
-        )
-        # The translation trap (brief §D): advertising "transcription"
-        # mounts BOTH routes (vllm speech_to_text/factories.py), and the
-        # stock translation path is wrong for this model. An EXPLICIT
-        # None makes the route raise NotImplementedError, which the
-        # app's generic exception handler maps to a named 501 body —
-        # never the stock path.
-        state.openai_serving_translation = None
     state.anthropic_serving_messages = (
         AnthropicServingMessages(
             engine_client,

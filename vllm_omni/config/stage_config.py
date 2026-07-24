@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import re
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -214,10 +214,6 @@ class StagePipelineConfig:
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
-    # Generic capability list: task names this stage declares itself able to
-    # serve (PORT-CAP-001). Validated/normalized in ``merge_pipeline_deploy``,
-    # not here, since this dataclass has no other field validation to match.
-    declared_tasks: tuple[str, ...] = ()
     owns_tokenizer: bool = False
     requires_multimodal_data: bool = False
     hf_config_name: str | None = None
@@ -739,37 +735,6 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
-# Typed topology keys that ``StageConfig.to_omegaconf`` must never let a
-# legacy ``extras``/``yaml_extras`` overlay silently overwrite: the typed
-# field is validated (``_normalize_declared_tasks``) before it lands in
-# ``config_dict``, and an overlay bypasses that validation (e.g. a bare
-# ``"transcription"`` string would be iterated into single-character
-# "tasks" by a downstream ``tuple(...)`` conversion). Scoped strictly to
-# ``declared_tasks``: other keys may still legitimately rely on overlay
-# semantics for legacy configs.
-_EXTRAS_RESERVED_KEYS = frozenset({"declared_tasks"})
-
-
-def _normalize_declared_tasks(value: Any) -> tuple[str, ...]:
-    """Validate and coerce a stage's ``declared_tasks`` into a tuple of str.
-
-    Generic capability-advertisement input (PORT-CAP-001): any sequence of
-    non-empty task-name strings. A bare string is rejected rather than
-    silently iterated into single-character "tasks". An absent/empty
-    declaration reproduces today's behavior (an empty tuple, i.e. no change
-    to the advertised task set).
-    """
-    if not value:
-        return ()
-    if isinstance(value, str) or not isinstance(value, Sequence):
-        raise ValueError(f"declared_tasks must be a sequence of non-empty strings, got {value!r}")
-    tasks = tuple(value)
-    for task in tasks:
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError(f"declared_tasks entries must be non-empty strings, got {task!r} in {tasks!r}")
-    return tasks
-
-
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
 # engine args during merge. These live at top level of the deploy YAML.
 _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
@@ -931,7 +896,6 @@ def merge_pipeline_deploy(
                 custom_process_input_func=input_proc,
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
-                declared_tasks=_normalize_declared_tasks(ps.declared_tasks),
                 worker_type=worker_type,
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
@@ -958,12 +922,6 @@ class StageConfig:
     custom_process_input_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None
-    # Generic capability list: task names this stage declares itself able to
-    # serve (PORT-CAP-001), unioned into the engine's advertised task set by
-    # ``extract_stage_metadata``. Normalized by ``merge_pipeline_deploy``
-    # when populated from ``StagePipelineConfig``; an empty tuple here
-    # reproduces today's behavior exactly.
-    declared_tasks: tuple[str, ...] = ()
     worker_type: str | None = None
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
@@ -1026,7 +984,6 @@ class StageConfig:
             "engine_input_source": self.input_sources,  # Legacy field name
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
-            "declared_tasks": self.declared_tasks,
             "is_comprehension": self.is_comprehension,
         }
 
@@ -1034,17 +991,7 @@ class StageConfig:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
 
         # Pass through extra YAML fields (default_sampling_params,
-        # output_connectors, input_connectors, tts_args, etc.). Reject any
-        # typed topology key smuggled in via extras: an overlay would
-        # silently replace the validated value above (e.g. ``declared_tasks``)
-        # rather than raising, bypassing its normalization/validation.
-        reserved_conflicts = _EXTRAS_RESERVED_KEYS & self.yaml_extras.keys()
-        if reserved_conflicts:
-            raise ValueError(
-                f"yaml_extras/extras cannot set {sorted(reserved_conflicts)!r}: "
-                "declare it as typed configuration on "
-                "StagePipelineConfig/StageConfig, not extras."
-            )
+        # output_connectors, input_connectors, tts_args, etc.).
         config_dict.update(self.yaml_extras)
 
         return create_config(config_dict)

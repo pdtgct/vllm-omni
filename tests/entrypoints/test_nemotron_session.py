@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The transport-neutral Nemotron session module (RFC-1 brief §A/§B).
+"""The transport-neutral Nemotron session module.
 
-GPU-free CPU tier. Drives the concrete engine binding —
-``ServingConcurrencyLimiter`` + ``NemotronSessionFactory`` +
-``NemotronSessionLease`` — over a FAKE ``AsyncOmni`` (scripted
+GPU-free CPU tier. Drives ``NemotronSessionFactory`` and
+``NemotronSessionLease`` over a FAKE ``AsyncOmni`` (scripted
 ``generate`` output stream, recorded ``abort``) while the segmenter,
 session, and receipt ledger are the REAL modules loaded through the
 importlib chain. Pins:
@@ -20,17 +19,14 @@ importlib chain. Pins:
   explicit zero-sample final-tail transaction;
 - the prototype's liveness guards survive the ledger port: feed after
   flush/abort/generation-end raises, never hangs (ING-LIFE-010);
-- limiter cap -> ``AdmissionBusyError``; release frees exactly once;
-  no slot leak on a post-acquire factory failure; the limiter
-  docstring carries the three DECIDED disclaimers (round-5, brief §B);
-- the factory mints the canonical ephemeral geometry (the model
-  package's ``EPHEMERAL_CADENCE``) without the caller naming it
-  (PORT-REGIME-002);
+- ``feed`` notifies exact piece acceptance before carrier completion;
+- the factory accepts explicit cadence/locale model controls and
+  installs no serving counter or implicit single-shot geometry;
 - ``update_locale`` delegates to ``session.select_prompt`` (the one
   validator, PORT-LID-001) and the next mint stamps the new index;
 - structural protocol conformance: the concrete factory/lease satisfy
   the ``SessionFactory``/``SessionLease`` runtime protocols WITHOUT
-  importing them in the module's runtime path (PORT-EPH-004);
+  importing endpoint-specific protocols (PORT-RTC-007);
 - source-scan: no cadence/chunk arithmetic in the binding.
 
 Loader-runnable: every module is loaded by file path under its
@@ -43,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import re
 import sys
 import types
 from collections.abc import Awaitable, Coroutine
@@ -86,9 +81,7 @@ def _load_chain() -> dict[str, Any]:
 
     utils = types.ModuleType("vllm_omni.entrypoints.utils")
 
-    def coerce_param_message_types(
-        params: list[Any], is_streaming: bool
-    ) -> list[Any]:
+    def coerce_param_message_types(params: list[Any], is_streaming: bool) -> list[Any]:
         _COERCE_CALLS.append((list(params), is_streaming))
         return list(params)
 
@@ -105,11 +98,6 @@ def _load_chain() -> dict[str, Any]:
         ),
         (f"{_MODEL_BASE}.session", _MODEL_PKG / "session.py", "session"),
         (f"{_MODEL_BASE}.streaming", _MODEL_PKG / "streaming.py", "streaming"),
-        (
-            "vllm_omni.entrypoints.ephemeral_session",
-            _ENTRYPOINTS / "ephemeral_session.py",
-            "ephemeral_session",
-        ),
         (
             "vllm_omni.entrypoints.nemotron_session",
             _MODULE_PATH,
@@ -138,18 +126,13 @@ def _load_chain() -> dict[str, Any]:
 
 _M = _load_chain()
 _NS = _M["nemotron_session"]
-ServingConcurrencyLimiter = _NS.ServingConcurrencyLimiter
 NemotronSessionFactory = _NS.NemotronSessionFactory
 NemotronSessionLease = _NS.NemotronSessionLease
-_EPH = _M["ephemeral_session"]
-AdmissionBusyError = _EPH.AdmissionBusyError
-SessionFactory = _EPH.SessionFactory
-SessionLease = _EPH.SessionLease
+SessionFactory = _NS.SessionFactory
+SessionLease = _NS.SessionLease
 _SESSION = _M["session"]
 NemotronRealtimeSession = _SESSION.NemotronRealtimeSession
-EPHEMERAL_CADENCE = _SESSION.EPHEMERAL_CADENCE
 DEFAULT_CADENCE = _SESSION.DEFAULT_CADENCE
-CADENCES = _M["manifests"].CADENCES
 RAW_SAMPLES_PER_CHUNK = _M["manifests"].RAW_SAMPLES_PER_CHUNK
 
 pytestmark = [pytest.mark.cpu]
@@ -217,9 +200,7 @@ class FakeAsyncOmni:
     maps each consumed rendered prompt to output batches.
     """
 
-    def __init__(
-        self, *, script: Any = None, stop_after: int | None = None
-    ) -> None:
+    def __init__(self, *, script: Any = None, stop_after: int | None = None) -> None:
         self.model_config = SimpleNamespace(hf_config=_hf())
         self.renderer: Any = None
         self.default_sampling_params_list = (SimpleNamespace(tag="default"),)
@@ -230,9 +211,7 @@ class FakeAsyncOmni:
         self.request_ids: list[str] = []
         self.sampling: Any = None
 
-    async def generate(
-        self, *, prompt: Any, request_id: str, sampling_params_list: Any
-    ) -> Any:
+    async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
         self.request_ids.append(request_id)
         self.sampling = sampling_params_list
         index = 0
@@ -258,118 +237,46 @@ def _make_lease(
     *,
     cadence: str = _CADENCE,
     locale: str = _LOCALE,
-    limiter: Any = None,
 ) -> tuple[Any, Any]:
-    limiter = limiter or ServingConcurrencyLimiter(max_concurrent=4)
-    limiter.acquire()
-    session = NemotronRealtimeSession.from_model_config(
-        _hf(), cadence=cadence, locale=locale, with_ledger=True
-    )
+    session = NemotronRealtimeSession.from_model_config(_hf(), cadence=cadence, locale=locale, with_ledger=True)
     lease = NemotronSessionLease(
         engine=engine,
         session=session,
-        limiter=limiter,
         request_id="rt-test-1",
         render=_passthrough_render,
     )
-    return lease, limiter
+    return lease, None
 
 
-# ---- ServingConcurrencyLimiter (round-5 DECIDED, brief §B) ---------------------
+# ---- factory: caller-selected model controls, no parallel gate ----------------
 
 
-# @spec PORT-EPH-005
-def test_limiter_sheds_at_cap_and_frees_exactly_once() -> None:
-    limiter = ServingConcurrencyLimiter(max_concurrent=2)
-    limiter.acquire()
-    limiter.acquire()
-    with pytest.raises(AdmissionBusyError):
-        limiter.acquire()
-    limiter.release()
-    limiter.acquire()  # freed slot is reusable
-    limiter.release()
-    limiter.release()
-    # Double-release guard: nothing held -> loud protocol error, and the
-    # count can never go negative (which would silently widen the cap).
-    with pytest.raises(RuntimeError, match="release"):
-        limiter.release()
-    with pytest.raises(ValueError):
-        ServingConcurrencyLimiter(max_concurrent=0)
-
-
-# @spec PORT-EPH-005
-def test_limiter_docstring_carries_the_three_decided_disclaimers() -> None:
-    doc = ServingConcurrencyLimiter.__doc__ or ""
-    assert "load shedding" in doc.lower()
-    assert "ADMITTED" in doc
-    assert "residency" in doc.lower()
-    assert "PORT-STATE-004" in doc
-    # The owed engine work is named, so nobody mistakes this for it.
-    assert "reservation" in doc.lower()
-
-
-# ---- factory: admission + canonical geometry (PORT-REGIME-002) -----------------
-
-
-# @spec PORT-EPH-004, PORT-REGIME-002
-def test_open_ephemeral_mints_canonical_cadence_without_caller_naming_it() -> None:
-    assert EPHEMERAL_CADENCE in CADENCES
+# @spec PORT-RTC-001, PORT-RTC-003, PORT-LID-001, PORT-SESS-002
+def test_open_realtime_validates_caller_cadence_and_locale() -> None:
     engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(
-        engine=engine, limiter=ServingConcurrencyLimiter(max_concurrent=2)
-    )
-    lease = _run(factory.open_ephemeral(locale=_LOCALE))
-    geometry = lease.session.geometry
-    assert geometry.cadence == EPHEMERAL_CADENCE
-    assert geometry.chunk_samples == RAW_SAMPLES_PER_CHUNK[EPHEMERAL_CADENCE]
+    factory = NemotronSessionFactory(engine=engine)
+    lease = _run(factory.open(cadence=_CADENCE, locale="en-US"))
+    assert lease.session.geometry.cadence == _CADENCE
+    assert lease.session.prompt_index == PROMPTS["en-US"]
     assert lease.session.ledger is not None
     _run(lease.release())
 
 
-# @spec PORT-EPH-004, PORT-LID-001, PORT-SESS-002
-def test_open_realtime_admits_caller_cadence_and_locale() -> None:
+# @spec PORT-RTC-001, PORT-RTC-003
+def test_factory_rejects_unknown_controls_without_minting_a_lease() -> None:
     engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(
-        engine=engine, limiter=ServingConcurrencyLimiter(max_concurrent=2)
-    )
-    lease = _run(factory.open(cadence=_CADENCE, locale="en-US"))
-    assert lease.session.geometry.cadence == _CADENCE
-    assert lease.session.prompt_index == PROMPTS["en-US"]
-    _run(lease.release())
-
-
-# @spec PORT-EPH-005
-def test_factory_sheds_when_limiter_full_and_frees_on_release() -> None:
-    engine = FakeAsyncOmni()
-    limiter = ServingConcurrencyLimiter(max_concurrent=1)
-    factory = NemotronSessionFactory(engine=engine, limiter=limiter)
-    lease = _run(factory.open_ephemeral(locale=_LOCALE))
-    with pytest.raises(AdmissionBusyError):
-        _run(factory.open_ephemeral(locale=_LOCALE))
-    _run(lease.release())
-    lease2 = _run(factory.open_ephemeral(locale=_LOCALE))  # slot came back
-    _run(lease2.release())
-
-
-# @spec PORT-EPH-004, PORT-EPH-005
-def test_factory_releases_slot_on_post_acquire_failure() -> None:
-    engine = FakeAsyncOmni()
-    limiter = ServingConcurrencyLimiter(max_concurrent=1)
-    factory = NemotronSessionFactory(engine=engine, limiter=limiter)
+    factory = NemotronSessionFactory(engine=engine)
     with pytest.raises(ValueError, match="locale"):
-        _run(factory.open_ephemeral(locale="not-a-locale"))
-    # The failed open leaked nothing: the single slot is still free.
-    lease = _run(factory.open_ephemeral(locale=_LOCALE))
-    _run(lease.release())
+        _run(factory.open(cadence=_CADENCE, locale="not-a-locale"))
+    with pytest.raises(ValueError, match="cadence"):
+        _run(factory.open(cadence="not-a-cadence", locale=_LOCALE))
 
 
 def test_factory_leases_get_distinct_request_ids() -> None:
     engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(
-        engine=engine, limiter=ServingConcurrencyLimiter(max_concurrent=2)
-    )
-    a = _run(factory.open_ephemeral(locale=_LOCALE))
-    b = _run(factory.open_ephemeral(locale=_LOCALE))
+    factory = NemotronSessionFactory(engine=engine)
+    a = _run(factory.open(cadence=_CADENCE, locale=_LOCALE))
+    b = _run(factory.open(cadence=_CADENCE, locale=_LOCALE))
     assert a.request_id != b.request_id
     _run(a.release())
     _run(b.release())
@@ -418,6 +325,49 @@ def test_feed_burst_returns_hypotheses_in_cadence_order() -> None:
     _run(scenario())
 
 
+# @spec PORT-RTC-004, ING-FE-005
+def test_feed_notifies_piece_acceptance_before_carrier_completion() -> None:
+    """The callback releases transport credit at receipt, not at park."""
+
+    async def scenario() -> None:
+        allow_park = asyncio.Event()
+        accepted = asyncio.Event()
+        accepted_samples: list[int] = []
+
+        class PausedEngine(FakeAsyncOmni):
+            async def generate(
+                self,
+                *,
+                prompt: Any,
+                request_id: str,
+                sampling_params_list: Any,
+            ) -> Any:
+                self.request_ids.append(request_id)
+                self.sampling = sampling_params_list
+                async for item in prompt:
+                    self.prompts.append(item)
+                    await allow_park.wait()
+                    yield _out([7, PARK_ID], text=" accepted")
+
+        def on_accepted(sample_count: int) -> None:
+            accepted_samples.append(sample_count)
+            accepted.set()
+
+        lease, _ = _make_lease(PausedEngine())
+        feed = asyncio.create_task(lease.feed(_audio(_CHUNK), on_accepted=on_accepted))
+
+        await _wait(accepted.wait())
+        assert accepted_samples == [_CHUNK]
+        assert not feed.done(), "carrier completion must still be waiting on park"
+
+        allow_park.set()
+        assert await _wait(feed) == [" accepted"]
+        await _wait(lease.abort())
+        await lease.release()
+
+    _run(scenario())
+
+
 def test_feed_coerces_engine_default_sampling_for_streaming() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -436,10 +386,25 @@ def test_feed_coerces_engine_default_sampling_for_streaming() -> None:
     _run(scenario())
 
 
+# @spec PORT-RTC-003
+def test_factory_opens_selected_cadence_without_a_parallel_limiter() -> None:
+    async def scenario() -> None:
+        factory = NemotronSessionFactory(engine=FakeAsyncOmni())
+        assert not hasattr(factory, "open_ephemeral")
+
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+        assert lease.session.geometry.cadence == _CADENCE
+        assert lease.session.prompt_index == PROMPTS["en-US"]
+        await lease.release()
+        await lease.release()
+
+    _run(scenario())
+
+
 # ---- flush: drain to stream end (PORT-SESS-003) --------------------------------
 
 
-# @spec PORT-SESS-003, PORT-EPH-002
+# @spec PORT-SESS-003, PORT-RTC-005
 def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -455,7 +420,7 @@ def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     _run(scenario())
 
 
-# @spec PORT-SESS-003, PORT-EPH-002
+# @spec PORT-SESS-003, PORT-RTC-005
 def test_flush_without_feed_runs_zero_sample_final_tail() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -488,7 +453,7 @@ def test_finish_without_flush_closes_gracefully() -> None:
 # ---- failure propagation: ledger.fail carries the ORIGINAL error ---------------
 
 
-# @spec PORT-RTC-002, PORT-EPH-002
+# @spec PORT-RTC-002, PORT-RTC-006
 def test_engine_failure_releases_blocked_feed_with_original_error() -> None:
     def boom(item: Any, index: int) -> list[Any]:
         raise ValueError("engine exploded")
@@ -509,7 +474,7 @@ def test_engine_failure_releases_blocked_feed_with_original_error() -> None:
     _run(scenario())
 
 
-# @spec PORT-RTC-002, PORT-EPH-002
+# @spec PORT-RTC-002, PORT-RTC-006
 def test_premature_stream_end_fails_pending_feed() -> None:
     def silent(item: Any, index: int) -> list[Any]:
         return []  # consumes the prompt, never emits the park
@@ -530,7 +495,7 @@ def test_premature_stream_end_fails_pending_feed() -> None:
 # ---- liveness guards (ING-LIFE-010, preserved from the prototype) --------------
 
 
-# @spec PORT-EPH-002, ING-LIFE-010
+# @spec PORT-RTC-005, PORT-RTC-006
 def test_feed_after_flush_raises_instead_of_hanging() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -543,7 +508,7 @@ def test_feed_after_flush_raises_instead_of_hanging() -> None:
     _run(scenario())
 
 
-# @spec PORT-EPH-002, ING-LIFE-010
+# @spec PORT-RTC-005, PORT-RTC-006
 def test_feed_and_flush_after_abort_raise() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -600,23 +565,16 @@ def test_abort_before_any_feed_is_safe() -> None:
     _run(scenario())
 
 
-# ---- release: the limiter slot, exactly once, idempotent -----------------------
+# ---- release: retained future-reservation seam, idempotent ---------------------
 
 
-# @spec PORT-EPH-002, PORT-EPH-005
-def test_release_frees_limiter_slot_exactly_once() -> None:
+# @spec PORT-RTC-003, PORT-RTC-005
+def test_release_is_idempotent_without_a_parallel_reservation() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
-        limiter = ServingConcurrencyLimiter(max_concurrent=1)
-        lease, _ = _make_lease(engine, limiter=limiter)
-        with pytest.raises(AdmissionBusyError):
-            limiter.acquire()
+        lease, _ = _make_lease(engine)
         await lease.release()
-        await lease.release()  # idempotent: frees once, never twice
-        limiter.acquire()  # exactly one slot came back
-        with pytest.raises(AdmissionBusyError):
-            limiter.acquire()
-        limiter.release()
+        await lease.release()
 
     _run(scenario())
 
@@ -687,9 +645,7 @@ def test_render_factory_mirrors_core_parse_render_wrap(
     monkeypatch.setitem(sys.modules, "vllm.engine.protocol", protocol)
     preprocess = types.ModuleType("vllm.renderers.inputs.preprocess")
     preprocess.parse_model_prompt = parse_model_prompt  # type: ignore[attr-defined]
-    monkeypatch.setitem(
-        sys.modules, "vllm.renderers.inputs.preprocess", preprocess
-    )
+    monkeypatch.setitem(sys.modules, "vllm.renderers.inputs.preprocess", preprocess)
 
     engine = FakeAsyncOmni()
     engine.renderer = FakeRenderer()
@@ -701,42 +657,32 @@ def test_render_factory_mirrors_core_parse_render_wrap(
     assert result.prompt == ("engine-input", ("parsed", {"prompt": "p0"}))
 
 
-# ---- structural protocol conformance (PORT-EPH-004) ----------------------------
+# ---- structural protocol conformance (PORT-RTC-007) ----------------------------
 
 
-# @spec PORT-EPH-004
+# @spec PORT-RTC-007
 def test_concrete_factory_and_lease_satisfy_protocols_by_shape() -> None:
     engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(
-        engine=engine, limiter=ServingConcurrencyLimiter(max_concurrent=1)
-    )
+    factory = NemotronSessionFactory(engine=engine)
     assert isinstance(factory, SessionFactory)
     lease, _ = _make_lease(engine)
     assert isinstance(lease, SessionLease)
     _run(lease.release())
 
 
-# @spec PORT-EPH-004
-def test_runtime_path_never_imports_the_protocols() -> None:
+# @spec PORT-RTC-007
+def test_runtime_path_imports_no_endpoint_contract() -> None:
     source = _MODULE_PATH.read_text()
-    # AdmissionBusyError is the ONE sanctioned ephemeral_session import;
-    # the protocols are satisfied by shape, never imported (PORT-EPH-004).
-    assert re.search(
-        r"from vllm_omni\.entrypoints\.ephemeral_session import[^\n]*"
-        r"\bAdmissionBusyError\b",
-        source,
-    )
-    for line in source.splitlines():
-        if "import" not in line:
-            continue
-        assert "SessionFactory" not in line, line
-        assert "SessionLease" not in line, line
+    assert "ephemeral_session" not in source
+    assert "AdmissionBusyError" not in source
+    assert "class SessionFactory(Protocol)" in source
+    assert "class SessionLease(Protocol)" in source
 
 
 # ---- source-scan: the binding holds no cadence arithmetic (ING-FE-006) ---------
 
 
-# @spec PORT-EPH-004, ING-FE-006
+# @spec PORT-RTC-004, ING-FE-006
 def test_binding_source_has_no_cadence_arithmetic() -> None:
     source = _MODULE_PATH.read_text()
     banned = (

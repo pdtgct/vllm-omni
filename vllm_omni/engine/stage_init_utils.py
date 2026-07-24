@@ -344,10 +344,6 @@ class StageMetadata:
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
-    # Generic capability list: task names this stage declares itself able to
-    # serve, unioned into the engine's advertised task set. Empty by default,
-    # so a stage that declares nothing changes nothing.
-    declared_tasks: tuple[str, ...] = ()
 
 
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
@@ -373,7 +369,6 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
     final_output: bool = getattr(stage_config, "final_output", False)
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
-    declared_tasks: tuple[str, ...] = tuple(getattr(stage_config, "declared_tasks", ()) or ())
 
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
@@ -414,7 +409,6 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
-            declared_tasks=declared_tasks,
         )
 
     engine_output_type = getattr(engine_args, "engine_output_type", None)
@@ -435,7 +429,6 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
-        declared_tasks=declared_tasks,
     )
 
 

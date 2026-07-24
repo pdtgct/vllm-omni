@@ -2,17 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Nemotron cache-aware streaming RNN-T ASR — model class.
 
-One streaming regime over one class (PORT-REGIME-001): per-chunk
+One realtime regime over one class (PORT-REGIME-001/003): per-chunk
 cache-aware execution with cross-chunk state on spec pages, reached
-through ``SupportsRealtime``. Single-shot transcription is the same
-machinery driven as one ephemeral 1120-ms session by the serving-layer
-orchestrator (PORT-REGIME-002) — never a full-context pass, which
-survives only as an EVAL-tier parity probe (PORT-EPH-003). The class
-implements the complete ``SupportsTranscription`` capability surface
-the serving adapter needs (PORT-REGIME-003). Capability conformance and
-route exposure are independent: no stage declares the transcription
-task by default, and the adapter is constructed only by the explicit
-experimental api-server opt-in (RFC-1 brief §D, round-5 decision 3).
+through ``SupportsRealtime``. RFC-1 deliberately does not implement
+``SupportsTranscription`` or mount a file-bearing OpenAI speech route.
+The full-context path survives only as an EVAL-tier parity probe.
 
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
 audio runs featurizer -> encoder -> LID -> the complete greedy
@@ -25,13 +19,11 @@ declaratively per update by ``pipeline.py sampling_constraints`` and
 actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
-from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import torch
 from torch import nn
-from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
@@ -113,12 +105,11 @@ _WIN_LENGTH = 400
 
 
 class NemotronASRCore(nn.Module):
-    """The assembled pipeline shared by both regimes.
+    """The assembled cache-aware streaming pipeline.
 
-    Engine-facing classes (offline transcription / realtime) wrap this
-    core; probes drive it directly. Weight names follow the converted
-    tree (rules.py): ``featurizer.* / encoder.* / lid.* / predictor.* /
-    joint.*``.
+    The realtime engine-facing class wraps this core; probes drive it
+    directly. Weight names follow the converted tree (rules.py):
+    ``featurizer.* / encoder.* / lid.* / predictor.* / joint.*``.
     """
 
     def __init__(
@@ -145,12 +136,8 @@ class NemotronASRCore(nn.Module):
         # served path passes hf_config.n_layers and the dump loader
         # derives it from the converted tensors, so the encoder depth
         # always matches the weights (and the published state manifest).
-        self.encoder = FastConformerEncoder(
-            n_layers=n_layers, att_context=att_context
-        )
-        self.lid = PromptConditioner(
-            enc_hidden=enc_hidden, num_prompts=num_prompts
-        )
+        self.encoder = FastConformerEncoder(n_layers=n_layers, att_context=att_context)
+        self.lid = PromptConditioner(enc_hidden=enc_hidden, num_prompts=num_prompts)
         self.predictor = Predictor(
             vocab_size=vocab_size,
             pred_hidden=pred_hidden,
@@ -192,9 +179,7 @@ class NemotronASRCore(nn.Module):
         state: DecodeState,
     ) -> tuple[list[int], DecodeState]:
         """One streaming chunk-step's decode (D-b queue fill)."""
-        return greedy_decode_chunk(
-            chunk_conditioned, self.predictor, self.joint, state
-        )
+        return greedy_decode_chunk(chunk_conditioned, self.predictor, self.joint, state)
 
 
 def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
@@ -263,22 +248,11 @@ def load_core_from_dump(
     )
     # fb/window enter via the constructor (checkpoint-buffer rule);
     # exclude them here — NeMo's fb carries a leading batch dim.
-    loadable = {
-        k: v
-        for k, v in converted.items()
-        if k not in ("featurizer.fb", "featurizer.window")
-    }
+    loadable = {k: v for k, v in converted.items() if k not in ("featurizer.fb", "featurizer.window")}
     missing, unexpected = core.load_state_dict(loadable, strict=False)
-    real_missing = [
-        m
-        for m in missing
-        if not m.endswith(("fb", "window", "pe"))
-    ]
+    real_missing = [m for m in missing if not m.endswith(("fb", "window", "pe"))]
     if real_missing or unexpected:
-        raise ValueError(
-            f"core load mismatch: missing={real_missing} "
-            f"unexpected={unexpected}"
-        )
+        raise ValueError(f"core load mismatch: missing={real_missing} unexpected={unexpected}")
     apply_policy_dtypes(core)
     core.to(device).eval()
     return core, meta
@@ -320,10 +294,7 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
     arm = getattr(hf_config, "decode_dispatch_arm", None)
     table_path = getattr(hf_config, "decode_dispatch_table", None)
     if arm and table_path:
-        raise ValueError(
-            "declare decode_dispatch_arm OR decode_dispatch_table, "
-            "not both"
-        )
+        raise ValueError("declare decode_dispatch_arm OR decode_dispatch_table, not both")
     if not arm and not table_path:
         raise ValueError(
             "the served config must declare decode_dispatch_arm or "
@@ -341,21 +312,12 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
         "compact-eager": decode_compact_active,
     }
     if arm not in arms:
-        raise ValueError(
-            f"unknown decode_dispatch_arm {arm!r} "
-            f"(known: {sorted(arms)})"
-        )
+        raise ValueError(f"unknown decode_dispatch_arm {arm!r} (known: {sorted(arms)})")
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
-            raise ValueError(
-                "graph-covered decode requires an exact padded runner "
-                "binding; Phase 6c is eager-only"
-            )
-        if (
-            request.ready_decode_buckets > 1
-            and arm not in SYNC_FREE_ARMS
-        ):
+            raise ValueError("graph-covered decode requires an exact padded runner binding; Phase 6c is eager-only")
+        if request.ready_decode_buckets > 1 and arm not in SYNC_FREE_ARMS:
             return ResolvedDecode(
                 arm="dense-eager",
                 decode_fn=arms["dense-eager"],
@@ -390,14 +352,8 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     #: Keep the raw input ids alongside ``inputs_embeds`` — the only
     #: chunk-vs-replay signal at forward (D-BUc-2); read at the runner.
     requires_raw_input_tokens = True
-    supports_realtime = True
     # @spec PORT-REGIME-003
-    supports_transcription = True
-    #: Checkpoint locales are dynamic and authoritative; this static
-    #: ISO table is intentionally empty and ``validate_language``
-    #: resolves against the served prompt dictionary instead.
-    supported_languages: ClassVar[Mapping[str, str]] = {}
-    supports_transcription_only = False
+    supports_realtime = True
     #: Secondary framework guard only — the omni realtime route reads
     #: the pipeline's explicit ``max_tokens`` (see pipeline.py); this
     #: classvar is the core-route value (PORT-INT-002), worst case
@@ -406,12 +362,6 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     #: Engine logit width: tokenizer vocab + the park special token
     #: (checkpoint default; __init__ re-reads it from the config).
     num_logits = 13090
-    #: Read EAGERLY by the serving adapter's base ``__init__``
-    #: (``OpenAISpeechToText``): the model has no Whisper-style
-    #: timestamp tokens, so verbose segments are unsupported. NOTE:
-    #: Task exposure remains independently disabled by default through
-    #: stage ``declared_tasks`` + the experimental API-server opt-in.
-    supports_segment_timestamp = False
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
         """Build the core from the config and register the state pages.
@@ -433,9 +383,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             getattr(hf_config, "prompt_dictionary", None),
             getattr(hf_config, "num_prompts", None),
         )
-        reject_unsupported_outer_graph_mode(
-            getattr(vllm_config, "compilation_config", None)
-        )
+        reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         decode_resolver = build_decode_resolver(hf_config)
         self.config = hf_config
         # The engine samples over the full logit width (labels + minted
@@ -462,9 +410,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         # built at hf_config.n_layers, so this matches the published
         # state manifest for any checkpoint depth, not just 24.
         n_layers = len(self.core.encoder.layers)
-        self._state_pages = self._build_state_pages(
-            n_layers, hf_config, policy
-        )
+        self._state_pages = self._build_state_pages(n_layers, hf_config, policy)
         register_state_pages(vllm_config, self._state_pages)
         # Categorize the pages so forward can gather the bound pools by
         # kind (window/conv/lstm/replay); the ordering matches
@@ -475,12 +421,8 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         self._conv_pages = [p for k, p in paired if k == "conv"]
         self._lstm_page = next(p for k, p in paired if k == "lstm")
         self._replay_page = next(p for k, p in paired if k == "replay")
-        self._frontend_buffer_page = next(
-            p for k, p in paired if k == "frontend_buffer"
-        )
-        self._frontend_counter_page = next(
-            p for k, p in paired if k == "frontend_counter"
-        )
+        self._frontend_buffer_page = next(p for k, p in paired if k == "frontend_buffer")
+        self._frontend_counter_page = next(p for k, p in paired if k == "frontend_counter")
         # The pre-encode overlap dropped from non-first chunks
         # (drop_extra); session-first chunks use 0. (The legacy
         # run_forward_step path this mirrored was deleted at Task 7 once
@@ -501,15 +443,11 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             blank_id=self.core.blank_id,
         )
         self._decode_resolver = decode_resolver
-        self._max_num_seqs = int(
-            vllm_config.scheduler_config.max_num_seqs
-        )
+        self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
 
-    def _build_state_pages(
-        self, n_layers: int, cfg: Any, policy: PrecisionPolicy
-    ) -> list[Any]:
+    def _build_state_pages(self, n_layers: int, cfg: Any, policy: PrecisionPolicy) -> list[Any]:
         """The five page kinds under F4-compliant prefixes."""
         pages: list[Any] = []
         for kind, prefix in state_page_prefixes(n_layers):
@@ -559,9 +497,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                     )
                 )
             elif kind == "frontend_counter":
-                pages.append(
-                    FrontendCounterPage(prefix=prefix, policy=policy)
-                )
+                pages.append(FrontendCounterPage(prefix=prefix, policy=policy))
         return pages
 
     def load_weights(self, weights: Any) -> set[str]:
@@ -577,9 +513,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         the model never degrades to unconditioned transcription
         (PORT-WGT-003). Returns the set of loaded parameter names.
         """
-        expected: dict[str, torch.Tensor] = dict(
-            self.core.named_parameters()
-        )
+        expected: dict[str, torch.Tensor] = dict(self.core.named_parameters())
         expected.update(self.core.named_buffers())
         # Require only the PERSISTENT state (params + persistent buffers,
         # i.e. state_dict) from the checkpoint; derived buffers registered
@@ -590,33 +524,24 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         consumed: set[str] = set()
         for name, tensor in weights:
             if name not in expected:
-                raise ValueError(
-                    f"unexpected weight {name!r}: not in the model's "
-                    "parameter/buffer set"
-                )
+                raise ValueError(f"unexpected weight {name!r}: not in the model's parameter/buffer set")
             target = expected[name]
             if tuple(target.shape) != tuple(tensor.shape):
                 raise ValueError(
-                    f"shape mismatch for {name!r}: expected "
-                    f"{tuple(target.shape)}, got {tuple(tensor.shape)}"
+                    f"shape mismatch for {name!r}: expected {tuple(target.shape)}, got {tuple(tensor.shape)}"
                 )
             with torch.no_grad():
                 target.copy_(tensor)
             consumed.add(name)
         missing = required - consumed
-        lid_missing = sorted(
-            n for n in missing if LID_REQUIRED_PATTERN.search(n)
-        )
+        lid_missing = sorted(n for n in missing if LID_REQUIRED_PATTERN.search(n))
         if lid_missing:
             raise ValueError(
                 f"LID weights absent ({lid_missing}); the model never "
                 "degrades to unconditioned transcription (PORT-WGT-003)"
             )
         if missing:
-            raise ValueError(
-                f"{len(missing)} expected weights not provided, e.g. "
-                f"{sorted(missing)[:3]}"
-            )
+            raise ValueError(f"{len(missing)} expected weights not provided, e.g. {sorted(missing)[:3]}")
         # Return MODEL-qualified names: the weights load into ``self.core``,
         # so the engine's post-load audit (``track_weights_loading`` diffs
         # against ``model.named_parameters()``) expects the ``core.`` prefix
@@ -641,118 +566,8 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             buffer_stream,
         )
 
-        async for update in buffer_stream(
-            audio_stream, input_stream, model_config
-        ):
+        async for update in buffer_stream(audio_stream, input_stream, model_config):
             yield update
-
-    @classmethod
-    def get_speech_to_text_config(
-        cls, model_config: Any, task_type: Any
-    ) -> SpeechToTextConfig:
-        """The serving adapter's eagerly-read config (RFC-1 brief §D).
-
-        ``OpenAISpeechToText.__init__`` calls this at construction. The
-        sample rate is the published frontend constant (never a copied
-        literal). Window chunking is DISABLED (``max_audio_clip_s`` and
-        ``min_energy_split_window_size`` both ``None``): single-shot
-        transcription is ONE ephemeral streaming session over the whole
-        clip (PORT-REGIME-002), never overlap-split windows — the
-        session's segmenter owns all cadence work (ING-FE-006).
-
-        Args:
-            model_config: The vLLM ``ModelConfig`` (unused; the values
-                are checkpoint-published constants).
-            task_type: ``"transcribe"``/``"translate"`` (unused; the
-                model does not translate and the adapter rejects
-                translation controls by name).
-
-        Returns:
-            The speech-to-text config the adapter's base machinery
-            resamples and bounds against.
-        """
-        return SpeechToTextConfig(
-            sample_rate=float(FRONTEND_CONSTANTS["sample_rate"]),
-            max_audio_clip_s=None,
-            min_energy_split_window_size=None,
-        )
-
-    @classmethod
-    def get_generation_prompt(cls, stt_params: Any) -> Any:
-        """Unreachable under the Nemotron adapter — raises by design.
-
-        The ONLY caller in core is the base
-        ``_preprocess_speech_to_text`` (vllm speech_to_text
-        ``base/serving.py``), which the Nemotron serving adapter never
-        invokes: its overridden ``create_transcription`` delegates
-        execution to ``transcribe_ephemeral`` over the streaming
-        session (``serving_nemotron_transcription``), where prompts are
-        minted by the session's own segmenter, not from a single-pass
-        STT parameter bundle.
-
-        Raises:
-            NotImplementedError: Always — naming the delegated path so
-                a future stock-path caller fails loudly, never with a
-                wrong prompt.
-        """
-        raise NotImplementedError(
-            "NemotronASRForRNNT builds no stock single-pass STT prompt; "
-            "the /v1/audio/transcriptions surface delegates to "
-            "vllm_omni.entrypoints.ephemeral_session.transcribe_ephemeral "
-            "via the serving_nemotron_transcription adapter "
-            "(PORT-REGIME-002)"
-        )
-
-    @classmethod
-    def validate_language(
-        cls, language: Any, model_config: Any = None
-    ) -> str:
-        """Resolve a request language to a checkpoint locale.
-
-        The gate the serving adapter calls (RFC-1 brief §C): ``None``
-        resolves to the checkpoint's language-identification locale
-        (``DEFAULT_LOCALE``, "auto" — a valid selection), and
-        membership is checked against the VALIDATED prompt dictionary —
-        the same authority ``session.py`` admissions use (PORT-LID-001).
-        Exact checkpoint locales win; an ISO-639-1 code maps only when
-        one checkpoint locale has that prefix, while an ambiguous code
-        requires an explicit locale. The ``model_config`` keyword is
-        this model's extension of the ``SupportsTranscription``
-        signature (the protocol's static ISO table cannot express a
-        checkpoint-published locale set); calls without it normalize
-        casing only and the session factory re-validates at admission.
-
-        Args:
-            language: The raw request language, or ``None``.
-            model_config: The vLLM ``ModelConfig`` (or bare hf config)
-                carrying ``prompt_dictionary``; ``None`` skips the
-                membership check.
-
-        Returns:
-            The resolved locale string.
-
-        Raises:
-            ValueError: When the locale is not in the served
-                checkpoint's prompt dictionary.
-        """
-        from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (  # noqa: E501
-            validate_prompt_dictionary,
-        )
-        from vllm_omni.model_executor.models.nemotron_asr.session import (
-            DEFAULT_LOCALE,
-            normalize_locale_tag,
-            resolve_checkpoint_locale,
-        )
-
-        locale = DEFAULT_LOCALE if language is None else str(language)
-        if model_config is None:
-            return normalize_locale_tag(locale)
-        hf = getattr(model_config, "hf_config", model_config)
-        prompts = validate_prompt_dictionary(
-            getattr(hf, "prompt_dictionary", None),
-            getattr(hf, "num_prompts", None),
-        )
-        return resolve_checkpoint_locale(locale, prompts)
 
     def prepare_row_plan_context(
         self,
@@ -777,10 +592,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         import time
 
         if self._commit_sink is not None and self._commit_sink.has_staged:
-            raise RuntimeError(
-                "previous model transaction status was not consumed at "
-                "the runner output boundary"
-            )
+            raise RuntimeError("previous model transaction status was not consumed at the runner output boundary")
         rows: list[ObservedRow] = []
         for i, req_id in enumerate(req_ids):
             if int(num_scheduled_tokens[i]) != 1:
@@ -804,38 +616,19 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             scheduled = scheduled_encoder_inputs.get(req_id)
             if scheduled:
                 if len(scheduled) != 1:
-                    raise ValueError(
-                        f"request {req_id!r} scheduled "
-                        f"{len(scheduled)} envelopes in one step"
-                    )
+                    raise ValueError(f"request {req_id!r} scheduled {len(scheduled)} envelopes in one step")
                 feature = state.mm_features[scheduled[0]]
                 item = feature.data
                 if item is None:
-                    raise ValueError(
-                        f"request {req_id!r} scheduled an envelope "
-                        "with no kwargs payload"
-                    )
+                    raise ValueError(f"request {req_id!r} scheduled an envelope with no kwargs payload")
                 payload = item["audio"].data
-                env = (
-                    payload
-                    if isinstance(payload, torch.Tensor)
-                    else torch.as_tensor(payload)
-                )
+                env = payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
                 if env.device.type != "cpu":
-                    raise ValueError(
-                        "envelope payload must be host-resident at "
-                        "the hook"
-                    )
+                    raise ValueError("envelope payload must be host-resident at the hook")
                 env = env.reshape(-1)
                 if int(env.shape[0]) < ENVELOPE_HEADER_SLOTS:
-                    raise ValueError(
-                        f"request {req_id!r} envelope is smaller than "
-                        "its header"
-                    )
-                header = tuple(
-                    float(v)
-                    for v in env[:ENVELOPE_HEADER_SLOTS].tolist()
-                )
+                    raise ValueError(f"request {req_id!r} envelope is smaller than its header")
+                header = tuple(float(v) for v in env[:ENVELOPE_HEADER_SLOTS].tolist())
             rows.append(
                 ObservedRow(
                     request_id=str(req_id),
@@ -878,10 +671,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         )
 
         if not self._window_pages[0].kv_cache:
-            raise ValueError(
-                "resident pools are not bound — warmup runs after "
-                "cache allocation, before admission"
-            )
+            raise ValueError("resident pools are not bound — warmup runs after cache allocation, before admission")
         if self._window_pages[0].kv_cache[0].device.type != "cuda":
             return
         warmup_advance_model_rows_scatter(
@@ -897,9 +687,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             frontend_counter_pool=self._frontend_counter_page.kv_cache[0],
         )
 
-    def _ensure_commit_sink(
-        self, device: torch.device
-    ) -> BoundedCommitSink:
+    def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         """The serving composite sink, constructed at first use (the
         pinned status staging needs the bound compute device)."""
         if self._commit_sink is None:
@@ -931,9 +719,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         if sink is None or not sink.has_staged:
             return {}, set()
         reports, _records, lease_ok = sink.collect()
-        return resolve_status_reports(
-            self._registry, reports, lease_ok=lease_ok
-        )
+        return resolve_status_reports(self._registry, reports, lease_ok=lease_ok)
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         """Envelope pass-through → one carrier row per chunk (Task 5).
@@ -955,23 +741,13 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         hidden = int(self.config.hidden_size)
         rows = []
         for chunk in audios:
-            env = (
-                chunk
-                if isinstance(chunk, torch.Tensor)
-                else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
-            )
+            env = chunk if isinstance(chunk, torch.Tensor) else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
             env = env.reshape(-1).to(dtype=torch.float32)
             n = int(env.shape[0])
             if n < ENVELOPE_HEADER_SLOTS:
-                raise ValueError(
-                    f"envelope carries {n} values — smaller than its "
-                    f"{ENVELOPE_HEADER_SLOTS}-slot header"
-                )
+                raise ValueError(f"envelope carries {n} values — smaller than its {ENVELOPE_HEADER_SLOTS}-slot header")
             if n > hidden:
-                raise ValueError(
-                    f"envelope carries {n} values — wider than the "
-                    f"configured carrier width {hidden}"
-                )
+                raise ValueError(f"envelope carries {n} values — wider than the configured carrier width {hidden}")
             row = torch.zeros(hidden, dtype=torch.float32)
             row[:n] = env
             rows.append(row.to(device))
@@ -1005,11 +781,15 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         hidden = self.config.hidden_size
         if multimodal_embeddings is None or is_multimodal is None:
             return torch.zeros(
-                input_ids.shape[0], hidden,
-                dtype=torch.float32, device=input_ids.device,
+                input_ids.shape[0],
+                hidden,
+                dtype=torch.float32,
+                device=input_ids.device,
             )
         return merge_mm_embeddings(
-            input_ids, multimodal_embeddings, is_multimodal,
+            input_ids,
+            multimodal_embeddings,
+            is_multimodal,
             hidden_size=hidden,
         )
 
@@ -1049,8 +829,10 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         if md is None:
             # V1 profiling: compute-shaped, no page IO (hazard 4).
             return torch.zeros(
-                inputs_embeds.shape[0], inputs_embeds.shape[1],
-                dtype=inputs_embeds.dtype, device=inputs_embeds.device,
+                inputs_embeds.shape[0],
+                inputs_embeds.shape[1],
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
             )
         # All five page kinds share one uniform group → one metadata
         # object; the batch is decode-then-prefill ordered (BU-c2).
@@ -1091,9 +873,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             staging=self._ensure_host_staging(),
         )
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata: Any = None
-    ) -> torch.Tensor:
+    def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any = None) -> torch.Tensor:
         """Forced-logits rows from the hidden-row decision carrier.
 
         The engine's ``logits_indices`` gather hands this exactly the

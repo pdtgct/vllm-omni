@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Full-context probe boundary and regime-tag pins (PORT-EPH-003).
+"""Full-context probe boundary and realtime-only regime pins.
 
 Source-level pins (``Path.read_text`` — no imports, so these run on any
-loader): the full-context single-shot pipeline lives only in the
-EVAL-tier probe, no shipped module reaches it, and no shipped docstring
-claims PORT-REGIME-002 for it. PORT-REGIME-002 is the ephemeral
-1120-ms session; full context is a parity oracle.
+loader): the full-context pipeline lives only in the EVAL-tier probe,
+no shipped module reaches it, and RFC-1 exposes realtime only.
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ def _shipped_sources() -> list[Path]:
 
 
 def test_full_context_pipeline_is_defined_only_in_the_probe_tier() -> None:
-    # @spec PORT-EPH-003
+    # @spec PORT-REGIME-003
     probe_src = _PROBE.read_text()
     assert "def transcribe_full_context(" in probe_src
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
@@ -45,7 +43,7 @@ def test_full_context_pipeline_is_defined_only_in_the_probe_tier() -> None:
 
 
 def test_no_shipped_module_reaches_the_full_context_probe() -> None:
-    # @spec PORT-EPH-003
+    # @spec PORT-REGIME-003
     # The scan covers every shipped module, which strictly contains the
     # serving and entrypoint tiers the spec names.
     sources = _shipped_sources()
@@ -56,32 +54,29 @@ def test_no_shipped_module_reaches_the_full_context_probe() -> None:
         for symbol in _PROBE_SYMBOLS
         if symbol in path.read_text()
     ]
-    assert not offenders, (
-        "full-context probe reachable from shipped code: " f"{offenders}"
-    )
+    assert not offenders, f"full-context probe reachable from shipped code: {offenders}"
 
 
 def test_probe_marks_the_full_context_pipeline_as_a_parity_oracle() -> None:
-    # @spec PORT-EPH-003
+    # @spec PORT-REGIME-003
     # Whitespace-normalized and case-folded: the marking is a wrapped
     # docstring line that may open a sentence.
     probe_src = " ".join(_PROBE.read_text().lower().split())
-    assert (
-        "parity oracle only; not a serving regime — port-regime-002 is "
-        "the canonical ephemeral session" in probe_src
-    )
+    assert "eval oracle only; not an rfc-1 serving regime" in probe_src
 
 
 def test_model_module_docstring_does_not_claim_full_context_serving() -> None:
-    # @spec PORT-REGIME-002
+    # @spec PORT-REGIME-003
     model_src = (_NEMOTRON_ASR_DIR / "nemotron_asr.py").read_text()
     head = model_src[: model_src.index('"""', model_src.index('"""') + 3)]
     assert "full-context single-shot regime backs" not in head
-    assert "ephemeral" in head
+    compact = head.replace("``", "").replace(" ", "").lower()
+    assert "supportsrealtime" in compact
+    assert "supportstranscription" in compact
 
 
 def test_encoder_does_not_tag_full_context_as_port_regime_002() -> None:
-    # @spec PORT-REGIME-002
+    # @spec PORT-REGIME-001
     encoder_src = (_NEMOTRON_ASR_DIR / "encoder.py").read_text()
     tagged = re.findall(r"PORT-REGIME-[\d/]+", encoder_src)
     assert tagged, "encoder.py must still carry its regime tag"
@@ -101,7 +96,7 @@ def _function_source(src: str, name: str) -> str:
 
 
 def test_probe_has_exactly_one_full_context_pipeline_implementation() -> None:
-    # @spec PORT-EPH-003
+    # @spec PORT-REGIME-003
     # A second `DecodeState(...)` construction is exactly what a second,
     # hand-inlined copy of the featurizer -> encoder -> LID -> decode
     # sequence would add — the two prior copies diverged on it (one
@@ -116,7 +111,7 @@ def test_probe_has_exactly_one_full_context_pipeline_implementation() -> None:
 
 
 def test_main_reaches_the_relocated_oracles_helper() -> None:
-    # @spec PORT-EPH-003
+    # @spec PORT-REGIME-003
     # `main`'s golden comparison must execute the same private helper
     # `transcribe_full_context` delegates to, not a separately
     # hand-inlined copy of the same sequence.

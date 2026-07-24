@@ -70,14 +70,10 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class StageRuntimeInfo:
-    # declared_tasks is a generic capability list: task names the stage
-    # advertises, unioned into the engine's supported-task set. Empty by
-    # default, so a stage that declares nothing derives as before.
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     stage_type: str
     model_stage: str | None = None
-    declared_tasks: tuple[str, ...] = ()
 
 
 @dataclass

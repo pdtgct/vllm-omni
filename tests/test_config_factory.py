@@ -9,7 +9,6 @@ import inspect
 import warnings
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +27,6 @@ from vllm_omni.config.stage_config import (
     StageType,
     _apply_platform_overrides,
     _deep_merge_stage,
-    _normalize_declared_tasks,
     _resolve_scheduler,
     build_stage_runtime_overrides,
     load_deploy_config,
@@ -37,8 +35,6 @@ from vllm_omni.config.stage_config import (
     strip_parent_engine_args,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
-from vllm_omni.engine.stage_init_utils import extract_stage_metadata
-from vllm_omni.engine.task_advertisement import derive_supported_tasks
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -576,168 +572,6 @@ class TestStagePipelineConfig:
         assert s.sampling_constraints == {}
         assert s.engine_output_type is None
         assert s.scheduler_cls is None
-        assert s.declared_tasks == ()
-
-
-class TestNormalizeDeclaredTasks:
-    """Unit tests for the ``_normalize_declared_tasks`` merge-boundary helper
-    (PORT-CAP-001 producer side)."""
-
-    def test_accepts_empty_or_absent_and_returns_empty_tuple(self):
-        assert _normalize_declared_tasks(None) == ()
-        assert _normalize_declared_tasks(()) == ()
-        assert _normalize_declared_tasks([]) == ()
-
-    def test_coerces_a_list_of_strings_to_a_tuple(self):
-        assert _normalize_declared_tasks(["alpha", "beta"]) == ("alpha", "beta")
-
-    def test_rejects_a_bare_string(self):
-        """A bare string is a ``Sequence`` too; must not silently iterate into
-        single-character "tasks"."""
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks("transcription")
-
-    def test_rejects_a_non_sequence(self):
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks(5)
-
-    def test_rejects_empty_or_blank_entries(self):
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks(("",))
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks(("   ",))
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks(("ok", ""))
-
-    def test_rejects_a_non_string_entry(self):
-        with pytest.raises(ValueError, match="declared_tasks"):
-            _normalize_declared_tasks((1,))
-
-
-class TestDeclaredTasksTypedProducer:
-    """Producer-side test for the typed ``declared_tasks`` field (PORT-CAP-001).
-
-    Exercises the real typed merge path end-to-end -- ``StagePipelineConfig``
-    through ``merge_pipeline_deploy`` -> ``StageConfig.to_omegaconf()`` ->
-    ``extract_stage_metadata`` -> ``derive_supported_tasks`` -- with no
-    ``SimpleNamespace`` stand-in. Before this, only the untyped YAML/``extras``
-    passthrough could reach the advertised task set; the typed dataclasses had
-    no ``declared_tasks`` field at all.
-    """
-
-    def test_no_declaration_reproduces_todays_behavior(self):
-        """Absent declared_tasks on the typed path must not change anything."""
-        pipeline = PipelineConfig(
-            model_type="test_declared_tasks_default",
-            model_arch="TestModel",
-            stages=(StagePipelineConfig(stage_id=0, model_stage="ar"),),
-        )
-        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
-
-        stages = merge_pipeline_deploy(pipeline, deploy)
-        assert stages[0].declared_tasks == ()
-
-        omega = stages[0].to_omegaconf()
-        assert tuple(omega.declared_tasks) == ()
-
-        metadata = extract_stage_metadata(omega)
-        assert metadata.declared_tasks == ()
-        assert derive_supported_tasks([metadata], has_comprehension_stage=False) == ("generate",)
-
-    def test_declared_task_flows_through_the_typed_merge_path(self):
-        """A stage-declared task on ``StagePipelineConfig`` reaches the
-        engine's advertised set through the real (non-SimpleNamespace)
-        producer chain."""
-        pipeline = PipelineConfig(
-            model_type="test_declared_tasks_flow",
-            model_arch="TestModel",
-            stages=(
-                StagePipelineConfig(
-                    stage_id=0,
-                    model_stage="ar",
-                    execution_type=StageExecutionType.LLM_AR,
-                    declared_tasks=("transcription",),
-                ),
-            ),
-        )
-        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
-
-        stages = merge_pipeline_deploy(pipeline, deploy)
-        assert stages[0].declared_tasks == ("transcription",)
-
-        omega = stages[0].to_omegaconf()
-        assert tuple(omega.declared_tasks) == ("transcription",)
-
-        metadata = extract_stage_metadata(omega)
-        assert metadata.declared_tasks == ("transcription",)
-        assert derive_supported_tasks([metadata], has_comprehension_stage=False) == ("transcription",)
-
-    def test_bad_declaration_is_rejected_at_the_merge_boundary(self):
-        """Validation runs on the real producer path, not just the helper."""
-        # Deliberately malformed inputs (wrong element type / bare string /
-        # non-sequence) to prove the runtime guard, not the static type.
-        bad_values: tuple[Any, ...] = (("",), ("   ",), ("ok", ""), (1,), "transcription", 5)
-        for bad_tasks in bad_values:
-            pipeline = PipelineConfig(
-                model_type="test_declared_tasks_bad",
-                model_arch="TestModel",
-                stages=(
-                    StagePipelineConfig(
-                        stage_id=0,
-                        model_stage="ar",
-                        declared_tasks=bad_tasks,
-                    ),
-                ),
-            )
-            deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
-            with pytest.raises(ValueError, match="declared_tasks"):
-                merge_pipeline_deploy(pipeline, deploy)
-
-    def test_extras_conflicting_with_declared_tasks_is_rejected_at_the_overlay(self):
-        """A legacy ``extras={"declared_tasks": ...}`` must not silently
-        overwrite the validated typed value at the ``to_omegaconf`` overlay
-        boundary: it previously replaced the normalized tuple with whatever
-        raw value extras carried, e.g. a bare string that a downstream
-        ``tuple(...)`` conversion would iterate into single-character
-        "tasks"."""
-        for bad_extras_value in ("transcription", ("transcription",)):
-            pipeline = PipelineConfig(
-                model_type="test_declared_tasks_extras_conflict",
-                model_arch="TestModel",
-                stages=(
-                    StagePipelineConfig(
-                        stage_id=0,
-                        model_stage="ar",
-                        declared_tasks=("transcription",),
-                        extras={"declared_tasks": bad_extras_value},
-                    ),
-                ),
-            )
-            deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
-            stages = merge_pipeline_deploy(pipeline, deploy)
-            with pytest.raises(ValueError, match="declared_tasks"):
-                stages[0].to_omegaconf()
-
-    def test_extras_without_declared_tasks_still_overlays_as_before(self):
-        """Extras keys other than ``declared_tasks`` are unaffected by the
-        reserved-key guard and continue to overlay onto the OmegaConf dict."""
-        pipeline = PipelineConfig(
-            model_type="test_declared_tasks_extras_unrelated",
-            model_arch="TestModel",
-            stages=(
-                StagePipelineConfig(
-                    stage_id=0,
-                    model_stage="ar",
-                    declared_tasks=("transcription",),
-                    extras={"some_other_key": "value"},
-                ),
-            ),
-        )
-        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
-        stages = merge_pipeline_deploy(pipeline, deploy)
-        omega = stages[0].to_omegaconf()
-        assert tuple(omega.declared_tasks) == ("transcription",)
-        assert omega.some_other_key == "value"
 
 
 class TestPipelineConfigNew:

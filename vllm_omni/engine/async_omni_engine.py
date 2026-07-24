@@ -56,7 +56,6 @@ from vllm_omni.engine.stage_runtime import (
     StageRuntimeInfo,
     create_stage_runtime,
 )
-from vllm_omni.engine.task_advertisement import derive_supported_tasks
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -390,14 +389,15 @@ class AsyncOmniEngine:
                 final_output_type=client.final_output_type,
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
-                declared_tasks=tuple(getattr(client, "declared_tasks", ())),
             )
             for client in self.stage_clients
         ]
-        self.supported_tasks = derive_supported_tasks(
-            self.stage_metadata,
-            has_comprehension_stage=any(getattr(client, "is_comprehension", False) for client in self.stage_clients),
-        )
+        supported_tasks: set[str] = set()
+        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
+            supported_tasks.add("generate")
+        if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
+            supported_tasks.add("speech")
+        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(
         self,

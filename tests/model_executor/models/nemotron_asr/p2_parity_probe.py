@@ -119,13 +119,13 @@ def transcribe_full_context(
     prompt_index: int,
     policy: PrecisionPolicy = FP32_BRINGUP,
 ) -> list[int]:
-    """Full-context single-shot pipeline over a whole utterance.
+    """Full-context parity pipeline over a whole utterance.
 
-    Parity oracle only; not a serving regime — PORT-REGIME-002 is the
-    canonical ephemeral session (PORT-EPH-003 forbids reaching this
-    from any serving or entrypoint module). One window over the whole
-    utterance, cross-chunk state dormant; the complete label-looping
-    decode runs once. Returns emitted label ids.
+    EVAL oracle only; not an RFC-1 serving regime. Shipped code must
+    not reach this helper: the served model exposes only cache-aware
+    realtime execution. One window covers the whole utterance with
+    cross-chunk state dormant; the complete label-looping decode runs
+    once. Returns emitted label ids.
     """
     labels, _, _ = _run_full_context_pipeline(
         waveform,
@@ -144,9 +144,7 @@ def _read_wav(path: Path) -> tuple[torch.Tensor, int]:
     with wave.open(str(path), "rb") as handle:
         assert handle.getsampwidth() == 2 and handle.getnchannels() == 1
         rate = handle.getframerate()
-        pcm = np.frombuffer(
-            handle.readframes(handle.getnframes()), dtype=np.int16
-        )
+        pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16)
     return torch.from_numpy(pcm.astype(np.float32) / 32768.0), rate
 
 
@@ -172,27 +170,15 @@ def main() -> None:
     )
     encoder = FastConformerEncoder(att_context=(56, 13))
     lid = PromptConditioner(enc_hidden=1024, num_prompts=128)
-    predictor = Predictor(
-        vocab_size=vocab, pred_hidden=640, pred_rnn_layers=2
-    )
-    joint = Joint(
-        enc_hidden=1024, pred_hidden=640, joint_hidden=640, vocab_size=vocab
-    )
+    predictor = Predictor(vocab_size=vocab, pred_hidden=640, pred_rnn_layers=2)
+    joint = Joint(enc_hidden=1024, pred_hidden=640, joint_hidden=640, vocab_size=vocab)
 
     def load_into(module: torch.nn.Module, prefix: str) -> None:
-        sub = {
-            k[len(prefix) :]: v
-            for k, v in converted.items()
-            if k.startswith(prefix)
-        }
+        sub = {k[len(prefix) :]: v for k, v in converted.items() if k.startswith(prefix)}
         missing, unexpected = module.load_state_dict(sub, strict=False)
-        real_missing = [
-            m for m in missing if not m.endswith(("fb", "window", "pe"))
-        ]
+        real_missing = [m for m in missing if not m.endswith(("fb", "window", "pe"))]
         if real_missing or unexpected:
-            raise SystemExit(
-                f"{prefix}: missing={real_missing} unexpected={unexpected}"
-            )
+            raise SystemExit(f"{prefix}: missing={real_missing} unexpected={unexpected}")
 
     load_into(encoder, "encoder.")
     load_into(lid, "lid.")
@@ -204,9 +190,7 @@ def main() -> None:
     waveform, rate = _read_wav(args.clip)
     assert rate == 16000
     waveform = waveform.unsqueeze(0).to(device)
-    prompt_index = resolve_prompt_index(
-        meta["prompt_dictionary"], args.target_lang
-    )
+    prompt_index = resolve_prompt_index(meta["prompt_dictionary"], args.target_lang)
 
     labels, enc_raw, enc_cond = _run_full_context_pipeline(
         waveform,
@@ -228,9 +212,7 @@ def main() -> None:
     golden_final = manifest["final_transcript"]
     print(f"GOLDEN final  : {golden_final!r}")
 
-    with safe_open(
-        str(args.golden_set / "tensors.safetensors"), framework="pt"
-    ) as handle:
+    with safe_open(str(args.golden_set / "tensors.safetensors"), framework="pt") as handle:
         golden_raw = handle.get_tensor("encoder_raw/00000")
         golden_cond = handle.get_tensor("encoder_conditioned/00000")
 

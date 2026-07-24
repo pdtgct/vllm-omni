@@ -38,14 +38,6 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 DEFAULT_CADENCE = "560ms"
 DEFAULT_LOCALE = "auto"
 
-#: The canonical single-shot (ephemeral) geometry (PORT-REGIME-002):
-#: the largest published cadence, so a whole decoded clip flows in the
-#: fewest carriers. It lives HERE, beside DEFAULT_CADENCE, because the
-#: geometry choice is the model's — the model-aware session factory
-#: imports this label and no transport or serving module ever names a
-#: cadence literal of its own.
-EPHEMERAL_CADENCE = "1120ms"
-
 #: Seconds of admitted-cadence audio the ledger will hold as pending
 #: carrier tickets before failing the session. A model-package value:
 #: the backlog bound is RFC-1's own contract and depends on no consumer
@@ -55,9 +47,7 @@ LEDGER_BACKLOG_S = 30.0
 _SAMPLE_RATE_HZ: int = int(FRONTEND_CONSTANTS["sample_rate"])
 #: Geometry ids follow manifests.CADENCES order (PORT-SESS-002: the
 #: geometry is admission-selected, never invented).
-_GEOMETRY_ID_BY_CADENCE = {
-    label: index for index, label in enumerate(CADENCES)
-}
+_GEOMETRY_ID_BY_CADENCE = {label: index for index, label in enumerate(CADENCES)}
 
 
 # @spec PORT-LID-001, PORT-REGIME-003
@@ -76,9 +66,7 @@ def normalize_locale_tag(locale: str) -> str:
 
 
 # @spec PORT-LID-001, PORT-REGIME-003
-def resolve_checkpoint_locale(
-    locale: str, prompts: dict[str, int]
-) -> str:
+def resolve_checkpoint_locale(locale: str, prompts: dict[str, int]) -> str:
     """Resolve a request locale through the checkpoint prompt authority.
 
     Exact checkpoint keys win. Otherwise locale casing is normalized;
@@ -102,9 +90,7 @@ def resolve_checkpoint_locale(
         return stripped
 
     candidate = normalize_locale_tag(stripped)
-    normalized_matches = [
-        key for key in prompts if normalize_locale_tag(key) == candidate
-    ]
+    normalized_matches = [key for key in prompts if normalize_locale_tag(key) == candidate]
     if len(normalized_matches) == 1:
         return normalized_matches[0]
     if len(normalized_matches) > 1:
@@ -114,11 +100,7 @@ def resolve_checkpoint_locale(
         )
 
     if len(candidate) == 2 and candidate.isalpha():
-        iso_matches = [
-            key
-            for key in prompts
-            if normalize_locale_tag(key).split("-", 1)[0] == candidate
-        ]
+        iso_matches = [key for key in prompts if normalize_locale_tag(key).split("-", 1)[0] == candidate]
         if len(iso_matches) == 1:
             return iso_matches[0]
         if len(iso_matches) > 1:
@@ -253,8 +235,7 @@ class ReceiptLedger:
         """Raise once the ledger has been terminally failed."""
         if self._failed is not None:
             raise RuntimeError(
-                "the receipt ledger was terminally failed; no further "
-                "mint/acknowledge/consume is valid (PORT-RTC-002)"
+                "the receipt ledger was terminally failed; no further mint/acknowledge/consume is valid (PORT-RTC-002)"
             ) from self._failed
 
     @property
@@ -500,15 +481,11 @@ class NemotronRealtimeSession:
         ledger = None
         if with_ledger:
             if max_pending_carriers is None:
-                max_pending_carriers = math.ceil(
-                    LEDGER_BACKLOG_S / geometry.seconds
-                )
+                max_pending_carriers = math.ceil(LEDGER_BACKLOG_S / geometry.seconds)
             ledger = ReceiptLedger(max_pending_carriers=max_pending_carriers)
         return cls(
             geometry=geometry,
-            park_token_id=_require_token_id(
-                getattr(hf, "eos_token_id", None), "eos_token_id"
-            ),
+            park_token_id=_require_token_id(getattr(hf, "eos_token_id", None), "eos_token_id"),
             audio_chunk_token_id=_require_token_id(
                 getattr(hf, "audio_chunk_token_id", None),
                 "audio_chunk_token_id",
