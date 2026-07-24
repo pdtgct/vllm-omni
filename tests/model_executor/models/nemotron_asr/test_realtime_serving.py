@@ -25,10 +25,7 @@ from typing import Any
 import pytest
 import torch
 
-_PKG = (
-    Path(__file__).resolve().parents[4]
-    / "vllm_omni/model_executor/models/nemotron_asr"
-)
+_PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/nemotron_asr"
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
@@ -43,9 +40,18 @@ def _load_chain() -> dict[str, Any]:
             sys.modules[name] = types.ModuleType(name)
     loaded: dict[str, Any] = {}
     for mod in (
-        "precision", "masks", "featurizer", "encoder", "lid",
-        "manifests", "frontend", "rnnt_cell", "rnnt",
-        "configuration_nemotron_asr", "session", "streaming",
+        "precision",
+        "masks",
+        "featurizer",
+        "encoder",
+        "lid",
+        "manifests",
+        "frontend",
+        "rnnt_cell",
+        "rnnt",
+        "configuration_nemotron_asr",
+        "session",
+        "streaming",
     ):
         dotted = f"{_BASE}.{mod}"
         # Reuse-if-present: sibling test files chain-load these same
@@ -105,9 +111,7 @@ def _run(coro: Coroutine[Any, Any, Any]) -> Any:
         loop.close()
 
 
-async def _collect_yields(
-    chunks_of_samples: list[int], park_after_each: bool = True
-) -> list[dict[str, Any]]:
+async def _collect_yields(chunks_of_samples: list[int], park_after_each: bool = True) -> list[dict[str, Any]]:
     """Drive buffer_realtime_audio with synthetic PCM.
 
     Feeds each ndarray into audio_stream; echoes the park id on
@@ -122,9 +126,7 @@ async def _collect_yields(
 
     input_stream: asyncio.Queue = asyncio.Queue()
     yields = []
-    agen = buffer_stream(
-        audio_stream(), input_stream, _session()
-    )
+    agen = buffer_stream(audio_stream(), input_stream, _session())
     async for prompt in agen:
         yields.append(prompt)
         if park_after_each:
@@ -138,21 +140,23 @@ async def _collect_yields(
 def test_one_yield_per_chunk_at_the_admitted_config() -> None:
     # 560 ms chunks at 16 kHz = 8960 samples per chunk: feeding exactly
     # three chunks' worth of audio yields three cadence CHUNKs plus the
-    # explicit zero-sample final-tail transaction (PORT-SESS-003).
+    # explicit zero-sample final-tail and FLUSH transactions.
     yields = _run(_collect_yields([8960, 8960, 8960]))
-    assert len(yields) == 4
-    tail = yields[-1]["multi_modal_data"]["audio"]
+    assert len(yields) == 5
+    tail = yields[-2]["multi_modal_data"]["audio"]
     assert tail[1] == 0
     assert tail[3] == 1
     assert tail[5] == 3
+    assert yields[-1]["prompt_token_ids"] != [PLACEHOLDER_ID]
+    assert "multi_modal_data" not in yields[-1]
 
 
 def test_ragged_appends_rechunk_to_the_admitted_size() -> None:
     # The wire cadence is the client's; the yield cadence is the
     # admitted chunk's. 2 × 13440 samples = 3 × 8960 plus the explicit
-    # zero-sample final-tail transaction.
+    # zero-sample final-tail and FLUSH transactions.
     yields = _run(_collect_yields([13440, 13440]))
-    assert len(yields) == 4
+    assert len(yields) == 5
 
 
 def test_subchunk_tail_is_processed_as_is_never_padded() -> None:
@@ -160,23 +164,60 @@ def test_subchunk_tail_is_processed_as_is_never_padded() -> None:
     # yields as-is. Even a sub-8-mel-frame residual is represented by
     # an explicit final-tail transaction; the frontend may commit zero
     # frames while finalization still advances atomically.
-    assert len(_run(_collect_yields([8960, 4480]))) == 2
+    assert len(_run(_collect_yields([8960, 4480]))) == 3
     yields = _run(_collect_yields([8960, 1279]))
-    assert len(yields) == 2
-    tail = yields[-1]["multi_modal_data"]["audio"]
+    assert len(yields) == 3
+    tail = yields[-2]["multi_modal_data"]["audio"]
     assert tail[1] == 1279
     assert tail[3] == 1
 
 
 def test_zero_audio_still_emits_one_final_tail_transaction() -> None:
     yields = _run(_collect_yields([]))
-    assert len(yields) == 1
+    assert len(yields) == 2
     envelope = yields[0]["multi_modal_data"]["audio"]
     assert envelope[1] == 0
     assert envelope[3] == 1
-    assert envelope.shape[0] == len(
-        _MODULES["manifests"].ENVELOPE_HEADER_FIELDS
-    )
+    assert envelope.shape[0] == len(_MODULES["manifests"].ENVELOPE_HEADER_FIELDS)
+    assert yields[1]["prompt_token_ids"] != [PLACEHOLDER_ID]
+    assert "multi_modal_data" not in yields[1]
+
+
+# @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003
+def test_final_tail_must_park_before_explicit_flush() -> None:
+    import numpy as np
+
+    async def scenario() -> None:
+        async def audio_stream() -> AsyncIterator[Any]:
+            yield np.zeros(1279, dtype=np.float32)
+
+        input_stream: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(audio_stream(), input_stream, _session())
+        tail = await agen.__anext__()
+        envelope = tail["multi_modal_data"]["audio"]
+        assert envelope[3] == 1.0
+
+        flush_task = asyncio.create_task(agen.__anext__())
+        await asyncio.sleep(0)
+        if flush_task.done():
+            with pytest.raises(StopAsyncIteration):
+                await flush_task
+            pytest.fail("FLUSH was absent instead of waiting for final-tail park")
+
+        input_stream.put_nowait([PARK_ID])
+        flush = await asyncio.wait_for(flush_task, timeout=2)
+        assert len(flush["prompt_token_ids"]) == 1
+        assert flush["prompt_token_ids"] != [PLACEHOLDER_ID]
+        assert "multi_modal_data" not in flush
+
+        end_task = asyncio.create_task(agen.__anext__())
+        await asyncio.sleep(0)
+        assert not end_task.done()
+        input_stream.put_nowait([PARK_ID])
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(end_task, timeout=2)
+
+    _run(scenario())
 
 
 def test_next_chunk_holds_until_park_echo() -> None:
@@ -191,9 +232,7 @@ def test_next_chunk_holds_until_park_echo() -> None:
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
-        agen = buffer_stream(
-            audio_stream(), input_stream, _session()
-        )
+        agen = buffer_stream(audio_stream(), input_stream, _session())
         first = await asyncio.wait_for(agen.__anext__(), timeout=2)
         assert first is not None
         with pytest.raises(asyncio.TimeoutError):
@@ -252,9 +291,7 @@ def test_yield_carries_the_placeholder_token() -> None:
             yield np.zeros(8960, dtype=np.float32)
 
         input_stream: asyncio.Queue = asyncio.Queue()
-        agen = buffer_stream(
-            audio_stream(), input_stream, _session()
-        )
+        agen = buffer_stream(audio_stream(), input_stream, _session())
         prompt = await agen.__anext__()
         assert prompt["prompt_token_ids"] == [PLACEHOLDER_ID]
         assert "audio" in prompt["multi_modal_data"]

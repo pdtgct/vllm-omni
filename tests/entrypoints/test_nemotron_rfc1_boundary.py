@@ -12,6 +12,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _OMNI = _ROOT / "vllm_omni"
 _MODEL = _OMNI / "model_executor/models/nemotron_asr"
 _ENTRYPOINTS = _OMNI / "entrypoints"
+_STAGE_CONFIG = _OMNI / "model_executor/stage_configs/nemotron_asr.yaml"
 
 
 def test_nemotron_model_exposes_realtime_without_file_transcription() -> None:
@@ -87,3 +88,13 @@ def test_session_binding_has_no_ephemeral_cadence_or_admission_counter() -> None
     assert "EPHEMERAL_CADENCE" not in model_session
     assert "class NemotronSessionFactory" in binding
     assert "class NemotronSessionLease" in binding
+
+
+def test_nemotron_stage_config_pins_supported_bringup_lane() -> None:
+    """PORT-INT-007: the supported Omni stage owns safe parity defaults."""
+    config = _STAGE_CONFIG.read_text()
+
+    assert "scheduler_cls: OmniARScheduler" in config
+    assert "dtype: float32" in config
+    assert "enforce_eager: true" in config
+    assert "enable_prefix_caching: false" in config

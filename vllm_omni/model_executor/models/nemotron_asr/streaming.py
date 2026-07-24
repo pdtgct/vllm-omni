@@ -29,6 +29,10 @@ from vllm_omni.model_executor.models.nemotron_asr.session import (
 
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
+# Any non-placeholder token reaches ``advance_model_rows`` as a
+# non-CHUNK control. Token zero matches AsyncOmni's request-lifecycle
+# marker while remaining a separate, resumable PORT update here.
+_FLUSH_TOKEN_ID = 0
 
 
 def _admission_ms_mod() -> int:
@@ -112,9 +116,7 @@ async def buffer_stream(
 
     sequence = 0
 
-    def prompt(
-        chunk: np.ndarray, *, final_tail: bool, admission_ms_mod: int
-    ) -> dict[str, Any]:
+    def prompt(chunk: np.ndarray, *, final_tail: bool, admission_ms_mod: int) -> dict[str, Any]:
         # TokensPrompt shape: one placeholder token per chunk
         # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
         # invalid on the real render path. The mm payload is the minted
@@ -171,9 +173,7 @@ async def buffer_stream(
             chunk, admission_ms_mod = ready.popleft()
             if yielded:
                 await hold_until_park()
-            yield prompt(
-                chunk, final_tail=False, admission_ms_mod=admission_ms_mod
-            )
+            yield prompt(chunk, final_tail=False, admission_ms_mod=admission_ms_mod)
             yielded = True
     # Finalization is an explicit protocol transaction even when the
     # residual is shorter than the frontend's minimum commit or is
@@ -185,3 +185,14 @@ async def buffer_stream(
     if ledger is not None:
         ledger.mint(final_tail=True, admission_ms_mod=tail_stamp)
     yield prompt(buffer, final_tail=True, admission_ms_mod=tail_stamp)
+    # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003
+    # The engine's later non-resumable end marker closes the request
+    # without guaranteeing a model step. PORT therefore submits its
+    # model-level FLUSH explicitly, after the final-tail transaction
+    # has committed at legal park.
+    await hold_until_park()
+    yield {"prompt_token_ids": [_FLUSH_TOKEN_ID]}
+    # The generic AsyncOmni end marker is queued only after this
+    # model-level barrier has itself committed. Otherwise a lifecycle
+    # close could overtake an accepted-but-unprocessed FLUSH.
+    await hold_until_park()

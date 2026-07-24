@@ -475,6 +475,7 @@ class AsyncOmni(EngineClient, OmniBase):
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
+            input_failed = False
             try:
                 async for chunk in input_stream:
                     chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
@@ -510,6 +511,7 @@ class AsyncOmni(EngineClient, OmniBase):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                input_failed = True
                 status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
@@ -520,7 +522,12 @@ class AsyncOmni(EngineClient, OmniBase):
                     )
                 )
             finally:
-                if not cancelled:
+                # @spec PORT-REGIME-005
+                # The non-resumable marker is valid only after normal
+                # input exhaustion. On render/preprocess/submission
+                # failure it would either fabricate a fresh [0] request
+                # or hide the causal error behind a terminal update.
+                if not cancelled and not input_failed:
                     # Send empty final request to indicate that inputs have
                     # finished. Don't send if canceled (session was aborted).
                     final_sampling_params_list = list(sampling_params_list)

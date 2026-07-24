@@ -143,6 +143,7 @@ class NemotronSessionLease:
         self._error: BaseException | None = None
         self._ended = False
         self._audio_closed = False
+        self._flush_parked = False
         self._aborted = False
         self._released = False
 
@@ -301,7 +302,16 @@ class NemotronSessionLease:
                     self._input_stream.put_nowait(ids)
                 self._text += first.text or ""
                 if self._park_id in ids:
-                    self._ledger.complete_next(self._text)
+                    if self._ledger.pending:
+                        self._ledger.complete_next(self._text)
+                    elif self._audio_closed and not self._flush_parked:
+                        # @spec PORT-RTC-002, PORT-RTC-005
+                        # Explicit FLUSH has no carrier ticket. Its park
+                        # is the terminal barrier after the final-tail
+                        # ticket has already completed.
+                        self._flush_parked = True
+                    else:
+                        raise RuntimeError("park arrived without a carrier ticket or terminal FLUSH (PORT-RTC-002)")
             self._ended = True
         except Exception as error:
             self._error = error
@@ -309,7 +319,7 @@ class NemotronSessionLease:
             self._done.set()
             if self._error is not None:
                 self._ledger.fail(self._error)
-            elif not self._audio_closed or self._ledger.pending:
+            elif not self._audio_closed or self._ledger.pending or not self._flush_parked:
                 self._ledger.fail(RuntimeError("generation ended before the session's normal finalization"))
 
 

@@ -8,5 +8,10 @@ stages:
     scheduler_cls: OmniARScheduler
     engine_args:
       model_arch: Nemotron3_5AsrForRNNT
+      # @spec PORT-INT-007: safe parity-lane defaults belong to the
+      # configured Omni stage, not top-level flags that it overrides.
+      dtype: float32
+      enforce_eager: true
+      enable_prefix_caching: false
     default_sampling_params:
       temperature: 0.0

@@ -189,6 +189,8 @@ def _out(ids: list[int], text: str = "") -> Any:
 
 
 def _default_script(item: Any, index: int) -> list[Any]:
+    if "multi_modal_data" not in item:
+        return [_out([PARK_ID])]
     return [_out([7, PARK_ID], text=f" w{index}")]
 
 
@@ -404,15 +406,17 @@ def test_factory_opens_selected_cadence_without_a_parallel_limiter() -> None:
 # ---- flush: drain to stream end (PORT-SESS-003) --------------------------------
 
 
-# @spec PORT-SESS-003, PORT-RTC-005
+# @spec PORT-DEC-009, PORT-SESS-003, PORT-RTC-002, PORT-RTC-005
 def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
         lease, _ = _make_lease(engine)
         assert await _wait(lease.feed(_audio(_CHUNK))) == [" w0"]
         assert await _wait(lease.flush()) == " w0 w1"
-        # Two prompts reached the engine: the cadence and the final tail.
-        assert len(engine.prompts) == 2
+        # FLUSH follows the cadence and final tail, but mints no ticket
+        # and contributes no transcript text.
+        assert len(engine.prompts) == 3
+        assert "multi_modal_data" not in engine.prompts[-1]
         await _wait(lease.finish())  # no-op after flush
         assert engine.aborted == []
         await lease.release()
@@ -420,17 +424,18 @@ def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     _run(scenario())
 
 
-# @spec PORT-SESS-003, PORT-RTC-005
+# @spec PORT-DEC-009, PORT-SESS-003, PORT-RTC-002, PORT-RTC-005
 def test_flush_without_feed_runs_zero_sample_final_tail() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
         lease, _ = _make_lease(engine)
         assert await _wait(lease.flush()) == " w0"
-        assert len(engine.prompts) == 1
+        assert len(engine.prompts) == 2
         envelope = engine.prompts[0]["multi_modal_data"]["audio"]
         # Envelope header: [version, n_samples, ...] — the explicit
         # zero-sample final-tail transaction (PORT-SESS-003).
         assert envelope[1] == 0.0
+        assert "multi_modal_data" not in engine.prompts[1]
         await lease.release()
 
     _run(scenario())
@@ -443,7 +448,7 @@ def test_finish_without_flush_closes_gracefully() -> None:
         await _wait(lease.feed(_audio(_CHUNK)))
         await _wait(lease.finish())
         # Graceful end: the final-tail transaction ran, no engine abort.
-        assert len(engine.prompts) == 2
+        assert len(engine.prompts) == 3
         assert engine.aborted == []
         await lease.release()
 

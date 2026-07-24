@@ -4,11 +4,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import AsyncGenerator
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
+from vllm.engine.protocol import StreamingInput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -84,3 +89,122 @@ class TestAsyncOmniStreamingParamsValidation:
         p = SamplingParams(n=1, stop=["\n"], output_kind=RequestOutputKind.DELTA)
         with pytest.raises(ValueError, match="Input streaming"):
             AsyncOmni._validate_streaming_input_sampling_params(p)
+
+
+class _RecordingStreamingEngine:
+    def __init__(self) -> None:
+        self.initial: list[dict[str, Any]] = []
+        self.updates: list[dict[str, Any]] = []
+
+    async def add_request_async(self, **kwargs: Any) -> None:
+        self.initial.append(kwargs)
+
+    async def add_streaming_update_async(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+
+
+def _streaming_omni() -> tuple[AsyncOmni, _RecordingStreamingEngine, Any]:
+    omni = object.__new__(AsyncOmni)
+    engine = _RecordingStreamingEngine()
+    request_state = SimpleNamespace(
+        queue=asyncio.Queue(),
+        input_stream_task=None,
+    )
+    omni.engine = engine
+    omni.model_config = SimpleNamespace(is_encoder_decoder=False)
+    omni.request_states = {"rt-test": request_state}
+    return omni, engine, request_state
+
+
+def _streaming_params() -> SamplingParams:
+    return SamplingParams(
+        n=1,
+        stop=[],
+        output_kind=RequestOutputKind.DELTA,
+    )
+
+
+# @spec PORT-REGIME-005
+@pytest.mark.asyncio
+async def test_input_error_before_first_carrier_submits_no_terminal_row() -> None:
+    async def broken_input() -> AsyncGenerator[StreamingInput, None]:
+        raise RuntimeError("carrier render failed")
+        yield StreamingInput(prompt={"prompt_token_ids": [13089]})  # pragma: no cover
+
+    omni, engine, request_state = _streaming_omni()
+    task = await omni._add_streaming_input_request(
+        request_id="rt-test",
+        input_stream=broken_input(),
+        sampling_params_list=[_streaming_params()],
+        final_stage_id=0,
+        final_output_stage_ids=[0],
+        arrival_time=0.0,
+    )
+    await task
+
+    error = request_state.queue.get_nowait()
+    assert error.error == "carrier render failed"
+    assert engine.initial == []
+    assert engine.updates == []
+
+
+# @spec PORT-REGIME-005, PORT-RTC-006
+@pytest.mark.asyncio
+async def test_input_error_after_admission_submits_no_synthetic_finalization() -> None:
+    first_prompt = {"prompt_token_ids": [13089]}
+
+    async def broken_input() -> AsyncGenerator[StreamingInput, None]:
+        yield StreamingInput(prompt=first_prompt)
+        raise RuntimeError("second carrier render failed")
+
+    omni, engine, request_state = _streaming_omni()
+    task = await omni._add_streaming_input_request(
+        request_id="rt-test",
+        input_stream=broken_input(),
+        sampling_params_list=[_streaming_params()],
+        final_stage_id=0,
+        final_output_stage_ids=[0],
+        arrival_time=0.0,
+    )
+    await task
+
+    error = request_state.queue.get_nowait()
+    assert error.error == "second carrier render failed"
+    assert len(engine.initial) == 1
+    assert engine.initial[0]["prompt"] is first_prompt
+    assert engine.initial[0]["resumable"] is True
+    assert engine.updates == []
+
+
+# @spec PORT-DEC-009, PORT-REGIME-004
+@pytest.mark.asyncio
+async def test_explicit_flush_precedes_successful_end_of_input_marker() -> None:
+    carrier = {
+        "prompt_token_ids": [13089],
+        "multi_modal_data": {"audio": np.zeros(8, dtype=np.float32)},
+    }
+    flush = {"prompt_token_ids": [0]}
+
+    async def complete_input() -> AsyncGenerator[StreamingInput, None]:
+        yield StreamingInput(prompt=carrier)
+        yield StreamingInput(prompt=flush)
+
+    omni, engine, request_state = _streaming_omni()
+    task = await omni._add_streaming_input_request(
+        request_id="rt-test",
+        input_stream=complete_input(),
+        sampling_params_list=[_streaming_params()],
+        final_stage_id=0,
+        final_output_stage_ids=[0],
+        arrival_time=0.0,
+    )
+    await task
+
+    assert request_state.queue.empty()
+    assert len(engine.initial) == 1
+    assert engine.initial[0]["prompt"] is carrier
+    assert engine.initial[0]["resumable"] is True
+    assert engine.updates[0]["prompt"] == flush
+    assert engine.updates[0]["resumable"] is True
+    assert engine.updates[1]["prompt"]["prompt_token_ids"] == [0]
+    assert engine.updates[1]["resumable"] is False
