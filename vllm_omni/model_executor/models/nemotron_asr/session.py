@@ -60,6 +60,81 @@ _GEOMETRY_ID_BY_CADENCE = {
 }
 
 
+# @spec PORT-LID-001, PORT-REGIME-003
+def normalize_locale_tag(locale: str) -> str:
+    """Normalize one BCP-47-shaped locale tag without resolving it."""
+    parts = locale.strip().replace("_", "-").split("-")
+    normalized = [parts[0].lower()]
+    for part in parts[1:]:
+        if len(part) == 4 and part.isalpha():
+            normalized.append(part.title())
+        elif len(part) == 2 and part.isalpha():
+            normalized.append(part.upper())
+        else:
+            normalized.append(part.lower())
+    return "-".join(normalized)
+
+
+# @spec PORT-LID-001, PORT-REGIME-003
+def resolve_checkpoint_locale(
+    locale: str, prompts: dict[str, int]
+) -> str:
+    """Resolve a request locale through the checkpoint prompt authority.
+
+    Exact checkpoint keys win. Otherwise locale casing is normalized;
+    a two-letter ISO-639-1 code maps only when exactly one checkpoint
+    locale has that language prefix. Ambiguous codes require an
+    explicit checkpoint locale.
+
+    Args:
+        locale: Request locale or ISO-639-1 language code.
+        prompts: Validated checkpoint prompt dictionary.
+
+    Returns:
+        The exact checkpoint locale key.
+
+    Raises:
+        ValueError: If the locale is unknown or an ISO code is
+            ambiguous.
+    """
+    stripped = locale.strip()
+    if stripped in prompts:
+        return stripped
+
+    candidate = normalize_locale_tag(stripped)
+    normalized_matches = [
+        key for key in prompts if normalize_locale_tag(key) == candidate
+    ]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+    if len(normalized_matches) > 1:
+        raise ValueError(
+            f"{locale!r} is ambiguous after locale normalization; use "
+            f"an explicit checkpoint locale from {sorted(normalized_matches)}"
+        )
+
+    if len(candidate) == 2 and candidate.isalpha():
+        iso_matches = [
+            key
+            for key in prompts
+            if normalize_locale_tag(key).split("-", 1)[0] == candidate
+        ]
+        if len(iso_matches) == 1:
+            return iso_matches[0]
+        if len(iso_matches) > 1:
+            raise ValueError(
+                f"ISO-639-1 code {candidate!r} is ambiguous for this "
+                "checkpoint; use an explicit checkpoint locale from "
+                f"{sorted(iso_matches)}"
+            )
+
+    raise ValueError(
+        f"{locale!r} is not a locale of the served checkpoint's "
+        f"prompt_dictionary; valid locales: {sorted(prompts)} "
+        "(PORT-LID-001)"
+    )
+
+
 def _require_token_id(value: object, name: str) -> int:
     """Return a checkpoint token id, failing closed on absence.
 
@@ -352,6 +427,7 @@ class ReceiptLedger:
         self._receipts.clear()
 
 
+# @spec PORT-RTC-001, PORT-LID-001
 class NemotronRealtimeSession:
     """One realtime ASR session's model-local contract (PORT-RTC-001).
 
@@ -399,7 +475,8 @@ class NemotronRealtimeSession:
             model_config: The vLLM ``ModelConfig`` wrapper, or a bare
                 ``NemotronASRConfig`` (test paths).
             cadence: A :data:`manifests.CADENCES` label.
-            locale: A locale in the checkpoint's ``prompt_dictionary``.
+            locale: An exact checkpoint locale or an unambiguous
+                ISO-639-1 code.
             with_ledger: Whether to arm the receipt ledger.
             max_pending_carriers: Override for the ledger's backlog
                 bound; the default is :data:`LEDGER_BACKLOG_S` of
@@ -410,7 +487,8 @@ class NemotronRealtimeSession:
 
         Raises:
             ValueError: On any missing or invalid configuration value,
-                an unknown cadence, or an unknown admission locale.
+                an unknown cadence, or an unknown/ambiguous admission
+                locale.
         """
         hf = getattr(model_config, "hf_config", model_config)
         geometry = AdmittedGeometry.from_cadence(cadence)
@@ -418,12 +496,7 @@ class NemotronRealtimeSession:
             getattr(hf, "prompt_dictionary", None),
             getattr(hf, "num_prompts", None),
         )
-        if locale not in prompts:
-            raise ValueError(
-                f"{locale!r} is not a locale of the served checkpoint's "
-                "prompt_dictionary; admission resolves target_lang "
-                "through that authority alone (PORT-LID-001)"
-            )
+        resolved_locale = resolve_checkpoint_locale(locale, prompts)
         ledger = None
         if with_ledger:
             if max_pending_carriers is None:
@@ -441,7 +514,7 @@ class NemotronRealtimeSession:
                 "audio_chunk_token_id",
             ),
             prompts=prompts,
-            prompt_index=prompts[locale],
+            prompt_index=prompts[resolved_locale],
             ledger=ledger,
         )
 
@@ -474,22 +547,18 @@ class NemotronRealtimeSession:
         """Select the session-control prompt for a locale.
 
         Args:
-            locale: A locale of the checkpoint's validated
-                ``prompt_dictionary``.
+            locale: An exact checkpoint locale or an unambiguous
+                ISO-639-1 code.
 
         Returns:
             The selected conditioning row.
 
         Raises:
-            ValueError: If the locale is unknown — the update alone is
-                rejected and the prior selection stands (PORT-LID-001).
+            ValueError: If the locale is unknown or ambiguous — the
+                update alone is rejected and the prior selection
+                stands (PORT-LID-001).
         """
-        index = self._prompts.get(locale)
-        if index is None:
-            raise ValueError(
-                f"{locale!r} is not a locale of the served checkpoint's "
-                "prompt_dictionary; the update is rejected and the prior "
-                "selection stands (PORT-LID-001)"
-            )
+        resolved_locale = resolve_checkpoint_locale(locale, self._prompts)
+        index = self._prompts[resolved_locale]
         self._prompt_index = index
         return index

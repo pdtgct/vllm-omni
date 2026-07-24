@@ -34,6 +34,7 @@ loader path alongside the model package's ``session.py``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -47,6 +48,8 @@ if TYPE_CHECKING:
     #: One contiguous block of decoded float32 PCM. Type-parity with the
     #: seam's ``feed`` argument; the orchestrator only ever slices it.
     FloatSamples = npt.NDArray[np.float32]
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -237,39 +240,80 @@ async def _finalize_within_deadline(
         raise
 
 
+def _observe_cleanup_result(
+    task: asyncio.Task[None], step_name: str
+) -> None:
+    """Retrieve and log a detached or completed cleanup result."""
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except BaseException:
+        logger.exception(
+            "Could not retrieve %s cleanup result", step_name
+        )
+        return
+    if error is not None:
+        logger.warning(
+            "%s cleanup failed: %s",
+            step_name,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+# @spec PORT-EPH-002
 async def _best_effort_step(
-    step: Coroutine[Any, Any, None], bound: float
+    step: Coroutine[Any, Any, None],
+    bound: float,
+    *,
+    step_name: str,
 ) -> bool:
     """Run one cleanup step: bounded, cancellation-safe, never raising.
 
     Returns True if an OUTER cancellation was observed while the step
     ran (the caller re-delivers it after ALL cleanup steps finish, so
     cancellation can never skip a later step such as ``release``). A
-    step that outruns ``bound`` is cancelled and drained; a step that
-    raises is suppressed (a secondary cleanup failure must not mask the
-    primary error).
+    step that outruns ``bound`` is cancelled but NOT awaited through an
+    unbounded cancellation handshake: it is detached with a done
+    callback that retrieves/logs any later exception. A step that
+    raises is logged and suppressed (a secondary cleanup failure must
+    not mask the primary error).
     """
     task = asyncio.ensure_future(step)
     cancelled = False
+    finished = False
     try:
-        await asyncio.wait_for(asyncio.shield(task), bound)
+        done, _ = await asyncio.wait({task}, timeout=bound)
+        finished = task in done
     except asyncio.CancelledError:
-        # Outer cancellation (wait_for's own expiry raises TimeoutError,
-        # never CancelledError, so this is unambiguous): give the step
-        # its bound, then report the cancellation to the caller.
+        # Outer cancellation never cancels ``task``: asyncio.wait only
+        # stops this wait. Give the cleanup step its finite bound, then
+        # report cancellation so the caller re-delivers it after every
+        # cleanup step (especially release) has run.
         cancelled = True
         try:
-            await asyncio.wait_for(task, bound)
-        except BaseException:
-            pass
-    except BaseException:
-        # Timeout (the step outran its bound) or a step failure: cancel
-        # and drain so nothing leaks; the primary error dominates.
+            done, _ = await asyncio.wait({task}, timeout=bound)
+            finished = task in done
+        except asyncio.CancelledError:
+            # A repeated outer cancellation still cannot skip release.
+            cancelled = True
+
+    if finished or task.done():
+        _observe_cleanup_result(task, step_name)
+    else:
+        logger.warning(
+            "%s cleanup exceeded %.3f s; cancelling without waiting "
+            "for its cancellation handshake",
+            step_name,
+            bound,
+        )
         task.cancel()
-        try:
-            await task
-        except BaseException:
-            pass
+        task.add_done_callback(
+            lambda completed: _observe_cleanup_result(
+                completed, step_name
+            )
+        )
     return cancelled
 
 
@@ -287,12 +331,20 @@ async def _terminal_cleanup(
     """
     cancelled = False
     if run_abort:
-        cancelled = await _best_effort_step(lease.abort(), bound)
-    cancelled = await _best_effort_step(lease.release(), bound) or cancelled
+        cancelled = await _best_effort_step(
+            lease.abort(), bound, step_name="abort"
+        )
+    cancelled = (
+        await _best_effort_step(
+            lease.release(), bound, step_name="release"
+        )
+        or cancelled
+    )
     if cancelled:
         raise asyncio.CancelledError()
 
 
+# @spec PORT-EPH-001, PORT-EPH-002, ING-FE-005
 async def transcribe_ephemeral(
     pieces: Iterable[FloatSamples],
     *,

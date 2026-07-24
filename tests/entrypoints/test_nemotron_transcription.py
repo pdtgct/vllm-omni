@@ -16,7 +16,7 @@ orchestrator module only), loaded by file path with stubbed parents:
   decode is pinned greedy, PORT-DEC-005) each draw a NAMED rejection,
   never silent acceptance;
 - language normalization: ``None``/empty -> ``"auto"`` (brief §C);
-  everything else passes through to the checkpoint-locale gate;
+  locale casing/ISO resolution happens at the checkpoint-locale gate;
 - orchestrator error mapping: ``AdmissionBusyError`` -> the shared
   named capacity error (HTTP 429, PORT-STATE-004);
   ``FinalizationTimeoutError`` -> 504; anything else is NOT mapped
@@ -25,9 +25,9 @@ orchestrator module only), loaded by file path with stubbed parents:
   imports ``nemotron_asr_ingress`` (Tenet 3); it passes
   ``deadline=None`` (HTTP carries no transport deadline); the model
   file gains the three ``SupportsTranscription`` classmethods but NOT
-  the ``supports_transcription`` classvar (task stays off by default,
-  round-5 decision 3); the api_server wiring is flag-guarded and traps
-  translation to an explicit ``None`` handler.
+  the complete ``SupportsTranscription`` protocol markers while task
+  exposure stays independently flag-guarded; the api_server wiring
+  traps translation to an explicit ``None`` handler.
 
 Pod tier (``vllm`` present; skipped here): the engine-coupled adapter
 module itself — delegation to the real orchestrator over a fake
@@ -133,6 +133,7 @@ def _run(coro: Coroutine[Any, Any, Any]) -> Any:
 # ---- rejection table: the honest subset (brief §C adapter checklist) -----------
 
 
+# @spec PORT-INT-006
 def test_json_and_text_formats_accepted() -> None:
     assert first_rejection(response_format="json") is None
     assert first_rejection(response_format="text") is None
@@ -147,6 +148,7 @@ def test_other_response_formats_draw_named_rejection(fmt: str) -> None:
     assert rejection.status_code == 400
 
 
+# @spec PORT-INT-006
 def test_stream_true_draws_named_rejection() -> None:
     rejection = first_rejection(stream=True)
     assert rejection is not None
@@ -188,6 +190,23 @@ def test_to_language_draws_named_rejection() -> None:
     assert rejection.param == "to_language"
 
 
+# @spec PORT-INT-006
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("length_penalty", 1.1),
+        ("include_stop_str_in_output", True),
+        ("vllm_xargs", {"custom": "value"}),
+    ],
+)
+def test_other_unhonored_controls_draw_named_rejection(
+    knob: str, value: Any
+) -> None:
+    rejection = first_rejection(**{knob: value})
+    assert rejection is not None
+    assert rejection.param == knob
+
+
 @pytest.mark.parametrize(
     ("knob", "value"),
     [
@@ -214,25 +233,47 @@ def test_non_default_sampling_knobs_draw_named_rejection(
 
 def test_request_defaults_pass_the_whole_table() -> None:
     assert first_rejection() is None
+    assert first_rejection(vllm_xargs={}) is None
 
 
 # ---- language normalization (brief §C: None -> "auto") -------------------------
 
 
+# @spec PORT-LID-001, PORT-REGIME-003
 def test_normalize_language_maps_missing_to_auto() -> None:
     assert normalize_language(None) == "auto"
     assert normalize_language("") == "auto"
     assert normalize_language("  ") == "auto"
 
 
-def test_normalize_language_passes_locales_through() -> None:
+# @spec PORT-LID-001, PORT-REGIME-003
+def test_normalize_language_preserves_exact_locale_for_model_gate() -> None:
     assert normalize_language("en-US") == "en-US"
+    assert normalize_language("EN_us") == "EN_us"
+    assert normalize_language(" zh-hant-tw ") == "zh-hant-tw"
     assert normalize_language("auto") == "auto"
+
+
+# @spec ING-FE-005
+@pytest.mark.parametrize("raw", ["0", "-1", "inf", "-inf", "nan", "nope"])
+def test_positive_finite_env_parser_rejects_invalid_values(raw: str) -> None:
+    with pytest.raises(ValueError, match="TEST_BOUND"):
+        _RULES.parse_positive_finite_env(
+            name="TEST_BOUND", raw=raw
+        )
+
+
+# @spec ING-FE-005
+def test_positive_finite_env_parser_accepts_positive_finite_value() -> None:
+    assert _RULES.parse_positive_finite_env(
+        name="TEST_BOUND", raw="2.5"
+    ) == 2.5
 
 
 # ---- orchestrator error mapping (PORT-STATE-004 shared capacity error) ---------
 
 
+# @spec PORT-EPH-005, PORT-INT-006
 def test_admission_busy_maps_to_named_429() -> None:
     mapped = map_orchestrator_error(AdmissionBusyError("pool full"))
     assert mapped is not None
@@ -298,10 +339,19 @@ def test_adapter_consumes_the_rules_sibling() -> None:
     assert "nemotron_transcription_rules" in _ADAPTER_PATH.read_text()
 
 
+def test_adapter_reads_submit_bound_from_validated_env() -> None:
+    # @spec ING-FE-005
+    source = _ADAPTER_PATH.read_text()
+    assert "VLLM_OMNI_NEMOTRON_SUBMIT_BOUND_S" in source
+    assert "parse_positive_finite_env" in source
+    assert "_SUBMIT_BOUND_S =" not in source
+
+
 # ---- source-scans: model classmethods (pod-gated file, ruff/mypy only) ---------
 
 
-def test_model_gains_supports_transcription_classmethods() -> None:
+def test_model_implements_complete_supports_transcription_surface() -> None:
+    # @spec PORT-REGIME-003
     source = _MODEL_PATH.read_text()
     for method in (
         "def get_speech_to_text_config",
@@ -311,14 +361,12 @@ def test_model_gains_supports_transcription_classmethods() -> None:
         assert method in source, method
     # The eager base __init__ reads this classvar (base/serving.py:122).
     assert "supports_segment_timestamp" in source
-
-
-def test_model_does_not_set_the_supports_transcription_classvar() -> None:
-    # DECIDED (round-5, brief §D): the task stays off by default; the
-    # adapter is constructed by the flag-guarded api_server wiring, not
-    # by the capability classvar.
-    source = _MODEL_PATH.read_text()
-    assert not re.search(r"^\s*supports_transcription\s*[:=]", source, re.M)
+    for marker in (
+        "supports_transcription = True",
+        "supported_languages",
+        "supports_transcription_only = False",
+    ):
+        assert marker in source
 
 
 # ---- source-scans: guarded opt-in wiring (api_server is vllm-coupled) ----------
@@ -335,6 +383,13 @@ def test_wiring_is_flag_guarded_and_traps_translation() -> None:
     )
     assert "serving_nemotron_transcription" in source
     assert "ServingConcurrencyLimiter" in source
+    # Capability conformance and route exposure remain independent:
+    # the model implements SupportsTranscription, while this explicit
+    # opt-in is still what advertises/mounts the experimental route.
+    assert re.search(
+        r'supported_tasks\s*=\s*\(\*supported_tasks, "transcription"\)',
+        source,
+    )
 
 
 def test_wiring_imports_nemotron_only_behind_the_flag() -> None:
@@ -488,6 +543,8 @@ def _request(**overrides: Any) -> SimpleNamespace:
         "to_language": None,
         "use_beam_search": False,
         "n": 1,
+        "length_penalty": 1.0,
+        "include_stop_str_in_output": False,
         "temperature": 0.0,
         "top_p": None,
         "top_k": None,
@@ -497,11 +554,13 @@ def _request(**overrides: Any) -> SimpleNamespace:
         "repetition_penalty": None,
         "presence_penalty": 0.0,
         "max_completion_tokens": None,
+        "vllm_xargs": None,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
 
+# @spec PORT-INT-006, PORT-REGIME-002
 @pod
 def test_adapter_delegates_to_orchestrator_with_auto_locale() -> None:
     factory = _FakeFactory()
@@ -523,6 +582,7 @@ def test_adapter_delegates_to_orchestrator_with_auto_locale() -> None:
     assert factory.lease.calls[-1] == "release"
 
 
+# @spec PORT-EPH-005, PORT-INT-006
 @pod
 def test_adapter_maps_admission_busy_to_shared_429() -> None:
     async def scenario() -> Any:
@@ -536,6 +596,7 @@ def test_adapter_maps_admission_busy_to_shared_429() -> None:
     assert response.error.type == "TooManyRequestsError"
 
 
+# @spec PORT-EPH-002, PORT-INT-006
 @pod
 def test_adapter_maps_finalization_timeout_to_504_and_aborts() -> None:
     factory = _FakeFactory(_FakeLease(hang_flush=True))
@@ -591,6 +652,7 @@ def test_adapter_rejects_unknown_language_with_named_400() -> None:
     assert factory.opened == []
 
 
+# @spec PORT-EPH-002, PORT-INT-006
 @pod
 def test_client_cancellation_propagates_and_aborts() -> None:
     factory = _FakeFactory(_FakeLease(hang_feed=True))

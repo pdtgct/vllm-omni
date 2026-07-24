@@ -8,13 +8,11 @@ through ``SupportsRealtime``. Single-shot transcription is the same
 machinery driven as one ephemeral 1120-ms session by the serving-layer
 orchestrator (PORT-REGIME-002) — never a full-context pass, which
 survives only as an EVAL-tier parity probe (PORT-EPH-003). The class
-now carries the ``SupportsTranscription`` classmethods the serving
-adapter's eager base ``__init__`` needs (PORT-REGIME-003) but
-deliberately does NOT set the ``supports_transcription`` classvar: the
-task stays off by default (RFC-1 brief §D, round-5 decision 3) — the
-transcription adapter is constructed only by the flag-guarded
-api_server wiring, and the engine-side task set comes from
-``declared_tasks``, which no stage declares.
+implements the complete ``SupportsTranscription`` capability surface
+the serving adapter needs (PORT-REGIME-003). Capability conformance and
+route exposure are independent: no stage declares the transcription
+task by default, and the adapter is constructed only by the explicit
+experimental api-server opt-in (RFC-1 brief §D, round-5 decision 3).
 
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
 audio runs featurizer -> encoder -> LID -> the complete greedy
@@ -27,8 +25,9 @@ declaratively per update by ``pipeline.py sampling_constraints`` and
 actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -392,6 +391,13 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     #: chunk-vs-replay signal at forward (D-BUc-2); read at the runner.
     requires_raw_input_tokens = True
     supports_realtime = True
+    # @spec PORT-REGIME-003
+    supports_transcription = True
+    #: Checkpoint locales are dynamic and authoritative; this static
+    #: ISO table is intentionally empty and ``validate_language``
+    #: resolves against the served prompt dictionary instead.
+    supported_languages: ClassVar[Mapping[str, str]] = {}
+    supports_transcription_only = False
     #: Secondary framework guard only — the omni realtime route reads
     #: the pipeline's explicit ``max_tokens`` (see pipeline.py); this
     #: classvar is the core-route value (PORT-INT-002), worst case
@@ -403,8 +409,8 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
     #: Read EAGERLY by the serving adapter's base ``__init__``
     #: (``OpenAISpeechToText``): the model has no Whisper-style
     #: timestamp tokens, so verbose segments are unsupported. NOTE:
-    #: ``supports_transcription`` is deliberately NOT set — the task
-    #: stays off by default (RFC-1 brief §D).
+    #: Task exposure remains independently disabled by default through
+    #: stage ``declared_tasks`` + the experimental API-server opt-in.
     supports_segment_timestamp = False
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
@@ -708,11 +714,13 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         (``DEFAULT_LOCALE``, "auto" — a valid selection), and
         membership is checked against the VALIDATED prompt dictionary —
         the same authority ``session.py`` admissions use (PORT-LID-001).
-        The ``model_config`` keyword is this model's extension of the
-        ``SupportsTranscription`` signature (the protocol's ISO-639-1
-        classvar table cannot express a checkpoint-published locale
-        set); calls without it pass through unchecked and the session
-        factory's ``from_model_config`` gate re-validates at admission.
+        Exact checkpoint locales win; an ISO-639-1 code maps only when
+        one checkpoint locale has that prefix, while an ambiguous code
+        requires an explicit locale. The ``model_config`` keyword is
+        this model's extension of the ``SupportsTranscription``
+        signature (the protocol's static ISO table cannot express a
+        checkpoint-published locale set); calls without it normalize
+        casing only and the session factory re-validates at admission.
 
         Args:
             language: The raw request language, or ``None``.
@@ -732,23 +740,19 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         )
         from vllm_omni.model_executor.models.nemotron_asr.session import (
             DEFAULT_LOCALE,
+            normalize_locale_tag,
+            resolve_checkpoint_locale,
         )
 
         locale = DEFAULT_LOCALE if language is None else str(language)
         if model_config is None:
-            return locale
+            return normalize_locale_tag(locale)
         hf = getattr(model_config, "hf_config", model_config)
         prompts = validate_prompt_dictionary(
             getattr(hf, "prompt_dictionary", None),
             getattr(hf, "num_prompts", None),
         )
-        if locale not in prompts:
-            raise ValueError(
-                f"{locale!r} is not a locale of the served checkpoint's "
-                f"prompt_dictionary; valid locales: {sorted(prompts)} "
-                "(PORT-LID-001)"
-            )
-        return locale
+        return resolve_checkpoint_locale(locale, prompts)
 
     def prepare_row_plan_context(
         self,

@@ -91,6 +91,7 @@ from vllm_omni.entrypoints.openai.nemotron_transcription_rules import (
     first_rejection,
     map_orchestrator_error,
     normalize_language,
+    parse_positive_finite_env,
 )
 
 if TYPE_CHECKING:
@@ -109,28 +110,30 @@ _FINALIZATION_TIMEOUT_S_DEFAULT = 30.0
 #: NOT a cadence: the model's segmenter owns all cadence arithmetic
 #: (ING-FE-006). Samples are derived from the model's own
 #: ``asr_config.sample_rate`` at construction.
-_SUBMIT_BOUND_S = 10.0
+SUBMIT_BOUND_ENV = "VLLM_OMNI_NEMOTRON_SUBMIT_BOUND_S"
+_SUBMIT_BOUND_S_DEFAULT = 10.0
 
 
 def _finalization_timeout_s() -> float:
     """The configured finalization bound, validated positive-finite."""
-    raw = os.getenv(
-        FINALIZATION_TIMEOUT_ENV, str(_FINALIZATION_TIMEOUT_S_DEFAULT)
+    return parse_positive_finite_env(
+        name=FINALIZATION_TIMEOUT_ENV,
+        raw=os.getenv(
+            FINALIZATION_TIMEOUT_ENV, str(_FINALIZATION_TIMEOUT_S_DEFAULT)
+        ),
     )
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"{FINALIZATION_TIMEOUT_ENV}={raw!r} is not a number"
-        ) from exc
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(
-            f"{FINALIZATION_TIMEOUT_ENV} must be finite and positive, "
-            f"got {value}"
-        )
-    return value
 
 
+# @spec ING-FE-005
+def _submit_bound_s() -> float:
+    """The configured pre-submit bound, validated positive-finite."""
+    return parse_positive_finite_env(
+        name=SUBMIT_BOUND_ENV,
+        raw=os.getenv(SUBMIT_BOUND_ENV, str(_SUBMIT_BOUND_S_DEFAULT)),
+    )
+
+
+# @spec PORT-INT-006, PORT-REGIME-002, ING-FE-005
 class NemotronServingTranscription(OpenAIServingTranscription):
     """``OpenAIServingTranscription`` with a delegated execution leg.
 
@@ -184,7 +187,7 @@ class NemotronServingTranscription(OpenAIServingTranscription):
         )
         self._finalization_timeout_s = _finalization_timeout_s()
         self._submit_bound_samples = max(
-            1, int(self.asr_config.sample_rate * _SUBMIT_BOUND_S)
+            1, int(self.asr_config.sample_rate * _submit_bound_s())
         )
 
     async def create_transcription(
@@ -215,6 +218,9 @@ class NemotronServingTranscription(OpenAIServingTranscription):
             timestamp_granularities=request.timestamp_granularities,
             use_beam_search=request.use_beam_search,
             n=request.n,
+            length_penalty=request.length_penalty,
+            include_stop_str_in_output=request.include_stop_str_in_output,
+            vllm_xargs=request.vllm_xargs,
             hotwords=request.hotwords,
             prompt=request.prompt,
             to_language=request.to_language,
@@ -322,4 +328,5 @@ class NemotronServingTranscription(OpenAIServingTranscription):
 __all__ = [
     "FINALIZATION_TIMEOUT_ENV",
     "NemotronServingTranscription",
+    "SUBMIT_BOUND_ENV",
 ]

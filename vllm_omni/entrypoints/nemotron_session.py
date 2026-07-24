@@ -110,6 +110,7 @@ def _streaming_sampling_params(engine: Any) -> list[Any]:
     return coerced
 
 
+# @spec PORT-EPH-005
 class ServingConcurrencyLimiter:
     """App-scope counting load shedder over concurrent serving leases.
 
@@ -186,6 +187,7 @@ class ServingConcurrencyLimiter:
         self._live -= 1
 
 
+# @spec PORT-EPH-002, PORT-EPH-004, PORT-RTC-002
 class NemotronSessionLease:
     """The concrete engine-bound session lease.
 
@@ -518,6 +520,7 @@ class NemotronSessionLease:
                 )
 
 
+# @spec PORT-EPH-004, PORT-EPH-005, PORT-REGIME-002
 class NemotronSessionFactory:
     """The concrete, model-aware session factory.
 

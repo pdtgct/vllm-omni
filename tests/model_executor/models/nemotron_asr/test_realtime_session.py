@@ -183,6 +183,42 @@ def test_factory_fails_closed_on_an_unknown_locale() -> None:
         _session(locale="xx-XX")
 
 
+# @spec PORT-RTC-001, PORT-LID-001, PORT-REGIME-003
+def test_factory_resolves_unambiguous_iso_code_to_checkpoint_locale() -> None:
+    session = _session(locale="en")
+    assert session.prompt_index == PROMPTS["en-US"]
+
+
+# @spec PORT-RTC-001, PORT-LID-001, PORT-REGIME-003
+def test_factory_normalizes_checkpoint_locale_casing() -> None:
+    session = _session(locale="EN_us")
+    assert session.prompt_index == PROMPTS["en-US"]
+
+
+# @spec PORT-RTC-001, PORT-LID-001, PORT-REGIME-003
+def test_exact_checkpoint_locale_wins_over_iso_expansion() -> None:
+    prompts = {
+        "auto": 0,
+        "en": 1,
+        "en-US": 2,
+        "en-GB": 3,
+        "EN_us": 4,
+    }
+    session = NemotronRealtimeSession.from_model_config(
+        _hf(prompt_dictionary=prompts), locale="EN_us"
+    )
+    assert session.prompt_index == prompts["EN_us"]
+
+
+# @spec PORT-RTC-001, PORT-LID-001, PORT-REGIME-003
+def test_ambiguous_iso_code_requires_explicit_checkpoint_locale() -> None:
+    prompts = {"auto": 0, "en-US": 2, "en-GB": 3}
+    with pytest.raises(ValueError, match="ambiguous.*explicit"):
+        NemotronRealtimeSession.from_model_config(
+            _hf(prompt_dictionary=prompts), locale="en"
+        )
+
+
 # @spec PORT-RTC-001, PORT-LID-001
 def test_factory_reuses_the_published_prompt_dictionary_validator() -> None:
     # Admission validation IS configuration_nemotron_asr's validator:
@@ -217,6 +253,8 @@ def test_prompt_index_is_written_only_through_select_prompt() -> None:
         session.prompt_index = 4
     assert session.select_prompt("de-DE") == PROMPTS["de-DE"]
     assert session.prompt_index == PROMPTS["de-DE"]
+    assert session.select_prompt("EN") == PROMPTS["en-US"]
+    assert session.prompt_index == PROMPTS["en-US"]
 
 
 # @spec PORT-LID-001

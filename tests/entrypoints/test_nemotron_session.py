@@ -278,6 +278,7 @@ def _make_lease(
 # ---- ServingConcurrencyLimiter (round-5 DECIDED, brief §B) ---------------------
 
 
+# @spec PORT-EPH-005
 def test_limiter_sheds_at_cap_and_frees_exactly_once() -> None:
     limiter = ServingConcurrencyLimiter(max_concurrent=2)
     limiter.acquire()
@@ -296,6 +297,7 @@ def test_limiter_sheds_at_cap_and_frees_exactly_once() -> None:
         ServingConcurrencyLimiter(max_concurrent=0)
 
 
+# @spec PORT-EPH-005
 def test_limiter_docstring_carries_the_three_decided_disclaimers() -> None:
     doc = ServingConcurrencyLimiter.__doc__ or ""
     assert "load shedding" in doc.lower()
@@ -309,6 +311,7 @@ def test_limiter_docstring_carries_the_three_decided_disclaimers() -> None:
 # ---- factory: admission + canonical geometry (PORT-REGIME-002) -----------------
 
 
+# @spec PORT-EPH-004, PORT-REGIME-002
 def test_open_ephemeral_mints_canonical_cadence_without_caller_naming_it() -> None:
     assert EPHEMERAL_CADENCE in CADENCES
     engine = FakeAsyncOmni()
@@ -323,6 +326,7 @@ def test_open_ephemeral_mints_canonical_cadence_without_caller_naming_it() -> No
     _run(lease.release())
 
 
+# @spec PORT-EPH-004, PORT-LID-001, PORT-SESS-002
 def test_open_realtime_admits_caller_cadence_and_locale() -> None:
     engine = FakeAsyncOmni()
     factory = NemotronSessionFactory(
@@ -334,6 +338,7 @@ def test_open_realtime_admits_caller_cadence_and_locale() -> None:
     _run(lease.release())
 
 
+# @spec PORT-EPH-005
 def test_factory_sheds_when_limiter_full_and_frees_on_release() -> None:
     engine = FakeAsyncOmni()
     limiter = ServingConcurrencyLimiter(max_concurrent=1)
@@ -346,6 +351,7 @@ def test_factory_sheds_when_limiter_full_and_frees_on_release() -> None:
     _run(lease2.release())
 
 
+# @spec PORT-EPH-004, PORT-EPH-005
 def test_factory_releases_slot_on_post_acquire_failure() -> None:
     engine = FakeAsyncOmni()
     limiter = ServingConcurrencyLimiter(max_concurrent=1)
@@ -372,6 +378,7 @@ def test_factory_leases_get_distinct_request_ids() -> None:
 # ---- feed: real ledger tickets over the real segmenter (F6/R2) -----------------
 
 
+# @spec PORT-RTC-002, ING-FE-006
 def test_feed_returns_one_cumulative_hypothesis_per_completed_cadence() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -384,6 +391,7 @@ def test_feed_returns_one_cumulative_hypothesis_per_completed_cadence() -> None:
     _run(scenario())
 
 
+# @spec PORT-RTC-002, ING-FE-006
 def test_feed_sub_cadence_piece_returns_no_hypothesis() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -397,6 +405,7 @@ def test_feed_sub_cadence_piece_returns_no_hypothesis() -> None:
     _run(scenario())
 
 
+# @spec PORT-RTC-002, ING-FE-006
 def test_feed_burst_returns_hypotheses_in_cadence_order() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -430,6 +439,7 @@ def test_feed_coerces_engine_default_sampling_for_streaming() -> None:
 # ---- flush: drain to stream end (PORT-SESS-003) --------------------------------
 
 
+# @spec PORT-SESS-003, PORT-EPH-002
 def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -445,6 +455,7 @@ def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
     _run(scenario())
 
 
+# @spec PORT-SESS-003, PORT-EPH-002
 def test_flush_without_feed_runs_zero_sample_final_tail() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -477,6 +488,7 @@ def test_finish_without_flush_closes_gracefully() -> None:
 # ---- failure propagation: ledger.fail carries the ORIGINAL error ---------------
 
 
+# @spec PORT-RTC-002, PORT-EPH-002
 def test_engine_failure_releases_blocked_feed_with_original_error() -> None:
     def boom(item: Any, index: int) -> list[Any]:
         raise ValueError("engine exploded")
@@ -497,6 +509,7 @@ def test_engine_failure_releases_blocked_feed_with_original_error() -> None:
     _run(scenario())
 
 
+# @spec PORT-RTC-002, PORT-EPH-002
 def test_premature_stream_end_fails_pending_feed() -> None:
     def silent(item: Any, index: int) -> list[Any]:
         return []  # consumes the prompt, never emits the park
@@ -517,6 +530,7 @@ def test_premature_stream_end_fails_pending_feed() -> None:
 # ---- liveness guards (ING-LIFE-010, preserved from the prototype) --------------
 
 
+# @spec PORT-EPH-002, ING-LIFE-010
 def test_feed_after_flush_raises_instead_of_hanging() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -529,6 +543,7 @@ def test_feed_after_flush_raises_instead_of_hanging() -> None:
     _run(scenario())
 
 
+# @spec PORT-EPH-002, ING-LIFE-010
 def test_feed_and_flush_after_abort_raise() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -588,6 +603,7 @@ def test_abort_before_any_feed_is_safe() -> None:
 # ---- release: the limiter slot, exactly once, idempotent -----------------------
 
 
+# @spec PORT-EPH-002, PORT-EPH-005
 def test_release_frees_limiter_slot_exactly_once() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -608,6 +624,7 @@ def test_release_frees_limiter_slot_exactly_once() -> None:
 # ---- update_locale: one validator, stamped at the next mint --------------------
 
 
+# @spec PORT-LID-001
 def test_update_locale_delegates_to_select_prompt() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -628,6 +645,7 @@ def test_update_locale_delegates_to_select_prompt() -> None:
     _run(scenario())
 
 
+# @spec PORT-LID-001
 def test_update_locale_rejects_unknown_and_prior_selection_stands() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
@@ -686,6 +704,7 @@ def test_render_factory_mirrors_core_parse_render_wrap(
 # ---- structural protocol conformance (PORT-EPH-004) ----------------------------
 
 
+# @spec PORT-EPH-004
 def test_concrete_factory_and_lease_satisfy_protocols_by_shape() -> None:
     engine = FakeAsyncOmni()
     factory = NemotronSessionFactory(
@@ -697,6 +716,7 @@ def test_concrete_factory_and_lease_satisfy_protocols_by_shape() -> None:
     _run(lease.release())
 
 
+# @spec PORT-EPH-004
 def test_runtime_path_never_imports_the_protocols() -> None:
     source = _MODULE_PATH.read_text()
     # AdmissionBusyError is the ONE sanctioned ephemeral_session import;
@@ -716,6 +736,7 @@ def test_runtime_path_never_imports_the_protocols() -> None:
 # ---- source-scan: the binding holds no cadence arithmetic (ING-FE-006) ---------
 
 
+# @spec PORT-EPH-004, ING-FE-006
 def test_binding_source_has_no_cadence_arithmetic() -> None:
     source = _MODULE_PATH.read_text()
     banned = (

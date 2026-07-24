@@ -21,7 +21,8 @@ transcription; everything else names itself in the error.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 
@@ -59,6 +60,31 @@ FIXED_DECODE_DEFAULTS: tuple[tuple[str, float | None], ...] = (
 )
 
 
+# @spec ING-FE-005
+def parse_positive_finite_env(*, name: str, raw: str) -> float:
+    """Parse one positive-finite ENV tuning value.
+
+    Args:
+        name: Environment-variable name, for diagnostics.
+        raw: Raw environment value.
+
+    Returns:
+        The parsed positive finite float.
+
+    Raises:
+        ValueError: If ``raw`` is not numeric, finite, and positive.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} is not a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{name} must be finite and positive, got {value}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class RequestRejection:
     """One named rejection of an unsupported request control.
@@ -86,6 +112,7 @@ class MappedError:
     message: str
 
 
+# @spec PORT-INT-006
 def first_rejection(
     *,
     response_format: str = "json",
@@ -93,6 +120,9 @@ def first_rejection(
     timestamp_granularities: Sequence[str] | None = None,
     use_beam_search: bool = False,
     n: int = 1,
+    length_penalty: float = 1.0,
+    include_stop_str_in_output: bool = False,
+    vllm_xargs: Mapping[str, str | int | float | bool] | None = None,
     hotwords: str | None = None,
     prompt: str = "",
     to_language: str | None = None,
@@ -119,6 +149,10 @@ def first_rejection(
         timestamp_granularities: Requested timestamp granularities.
         use_beam_search: Beam-search opt-in.
         n: Beam count (only meaningful with beam search; 1 is default).
+        length_penalty: Beam length penalty (unsupported).
+        include_stop_str_in_output: Stop-string rendering control
+            (unsupported).
+        vllm_xargs: Custom extension arguments (unsupported).
         hotwords: Bias phrases the model does not support.
         prompt: Style/continuation prompt (empty string means unset).
         to_language: Target language (a translation control).
@@ -177,6 +211,30 @@ def first_rejection(
                 "exactly one hypothesis"
             ),
         )
+    if length_penalty != 1.0:
+        return RequestRejection(
+            param="length_penalty",
+            message=(
+                f"length_penalty={length_penalty!r} is not supported: "
+                "the RNN-T decode is pinned greedy"
+            ),
+        )
+    if include_stop_str_in_output:
+        return RequestRejection(
+            param="include_stop_str_in_output",
+            message=(
+                "include_stop_str_in_output is not supported: the "
+                "session returns an already-final RNN-T transcript"
+            ),
+        )
+    if vllm_xargs:
+        return RequestRejection(
+            param="vllm_xargs",
+            message=(
+                "vllm_xargs are not supported by the delegated "
+                "Nemotron transcription path"
+            ),
+        )
     if hotwords:
         return RequestRejection(
             param="hotwords",
@@ -226,14 +284,18 @@ def first_rejection(
     return None
 
 
+# @spec PORT-LID-001, PORT-REGIME-003
 def normalize_language(language: str | None) -> str:
     """Map the OpenAI request ``language`` to a candidate locale.
 
     ``None``/empty/whitespace -> :data:`AUTO_LOCALE` (brief §C);
-    anything else passes through verbatim for the model's
-    ``validate_language`` gate — this function performs NO membership
-    check, because the checkpoint prompt dictionary is the model's
-    authority, not the adapter's (PORT-LID-001).
+    anything else is stripped but otherwise preserved for the model's
+    ``validate_language`` gate. The model resolves exact checkpoint
+    keys first, then normalized casing and unique ISO-639-1 matches;
+    preserving the raw tag here is what lets an exact checkpoint key
+    win. This function performs NO membership check: the checkpoint
+    prompt dictionary is the model's authority, not the adapter's
+    (PORT-LID-001).
 
     Args:
         language: The raw request field.
@@ -243,7 +305,7 @@ def normalize_language(language: str | None) -> str:
     """
     if language is None or not language.strip():
         return AUTO_LOCALE
-    return language
+    return language.strip()
 
 
 def map_orchestrator_error(error: BaseException) -> MappedError | None:

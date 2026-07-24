@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import os
 import sys
 from collections.abc import Coroutine
@@ -609,6 +610,61 @@ def test_hanging_abort_cannot_retain_the_slot() -> None:
     assert lease.calls[-1] == "release"  # release ran despite the hang
 
 
+def test_cancellation_resistant_abort_cannot_retain_the_slot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # @spec PORT-EPH-002
+    # A cleanup coroutine may catch its cancellation. The orchestrator
+    # must still move on to release after the finite bound instead of
+    # waiting forever for the cancellation handshake.
+    async def scenario() -> None:
+        resisted = asyncio.Event()
+        unblock = asyncio.Event()
+        detached: asyncio.Task[None] | None = None
+
+        class ResistantAbortLease(InstantLease):
+            async def feed(self, samples: Any) -> list[str]:
+                self.calls.append("feed")
+                raise RuntimeError("feed boom")
+
+            async def abort(self) -> None:
+                nonlocal detached
+                self.calls.append("abort")
+                detached = asyncio.current_task()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    resisted.set()
+                    await unblock.wait()
+                    raise RuntimeError("late abort boom")
+
+        lease = ResistantAbortLease()
+        factory = FakeSessionFactory(cast(Any, lease))
+        with pytest.raises(RuntimeError, match="feed boom"):
+            await asyncio.wait_for(
+                transcribe_ephemeral(
+                    [_block(1)],
+                    factory=factory,
+                    locale=_LOCALE,
+                    finalization_timeout_s=0.02,
+                    submit_bound_samples=_BOUND,
+                ),
+                0.5,
+            )
+        await asyncio.wait_for(resisted.wait(), 0.5)
+        assert lease.calls[-1] == "release"
+        unblock.set()
+        assert detached is not None
+        while not detached.done():
+            await asyncio.sleep(0)
+        # The detached task's later failure is retrieved and logged by
+        # the observer callback; no "Task exception was never retrieved".
+        await asyncio.sleep(0)
+        assert "late abort boom" in caplog.text
+
+    _run(scenario())
+
+
 def test_release_failure_never_masks_the_primary_error() -> None:
     # @spec PORT-EPH-002
     class RaisingReleaseLease(InstantLease):
@@ -643,6 +699,22 @@ def test_release_failure_after_clean_finish_is_suppressed() -> None:
     assert result.text == "late-success"
     assert "finish" in lease.calls
     assert "abort" not in lease.calls
+
+
+def test_cleanup_failure_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    # @spec PORT-EPH-002
+    class RaisingReleaseLease(InstantLease):
+        async def release(self) -> None:
+            self.calls.append("release")
+            raise RuntimeError("secondary release boom")
+
+    lease = RaisingReleaseLease()
+    factory = FakeSessionFactory(cast(Any, lease))
+    with caplog.at_level(logging.WARNING):
+        result = _call(factory, [_block(1)])
+    assert result.text == "late-success"
+    assert "release" in caplog.text
+    assert "secondary release boom" in caplog.text
 
 
 def test_cancellation_during_cleanup_cannot_skip_release() -> None:
