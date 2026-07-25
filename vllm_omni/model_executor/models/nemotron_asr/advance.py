@@ -2328,8 +2328,8 @@ def advance_model_rows(
     # frame legally feeds an emitted park token back as the next input
     # (the label twin of this row is ROLE_REPLAY, armed at commit). A
     # non-chunk park-token row on a drained, unarmed, live session is
-    # therefore a sanctioned no-op FLUSH — validated downstream as
-    # emit-park-change-nothing — not a protocol violation.
+    # therefore a distinct asynchronous park echo — validated downstream
+    # as emit-park-change-nothing — not FLUSH or a protocol violation.
     park_echo = (~is_chunk_dev) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == park_id)
     status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized)) & (~park_echo)).to(
         torch.int32

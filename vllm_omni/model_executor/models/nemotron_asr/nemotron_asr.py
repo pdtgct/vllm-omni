@@ -65,6 +65,7 @@ from vllm_omni.model_executor.models.nemotron_asr.plan import (
     SessionRegistry,
     prepare_plan_context,
     reject_unsupported_outer_graph_mode,
+    resolve_row_envelope_header,
 )
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
@@ -583,9 +584,9 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
 
         Called by the fork AR runner immediately before ``forward``
         with the FINAL host row order. Observes each row's scheduled
-        CPU token, per-request state block, and — for rows whose new
-        CHUNK envelope is scheduled this step — the envelope's CPU
-        header, then stages the consume-once :class:`PlanContext` that
+        CPU token, per-request state block, and — for every CHUNK row —
+        the overlapping request feature's CPU envelope header, then
+        stages the consume-once :class:`PlanContext` that
         ``forward`` combines with the attention metadata. All reads
         here are host-side; no device work happens in the hook.
         """
@@ -612,23 +613,15 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
                     "allocates exactly one block per resident session "
                     "(PORT-STATE-002)"
                 )
-            header: tuple[float, ...] | None = None
-            scheduled = scheduled_encoder_inputs.get(req_id)
-            if scheduled:
-                if len(scheduled) != 1:
-                    raise ValueError(f"request {req_id!r} scheduled {len(scheduled)} envelopes in one step")
-                feature = state.mm_features[scheduled[0]]
-                item = feature.data
-                if item is None:
-                    raise ValueError(f"request {req_id!r} scheduled an envelope with no kwargs payload")
-                payload = item["audio"].data
-                env = payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
-                if env.device.type != "cpu":
-                    raise ValueError("envelope payload must be host-resident at the hook")
-                env = env.reshape(-1)
-                if int(env.shape[0]) < ENVELOPE_HEADER_SLOTS:
-                    raise ValueError(f"request {req_id!r} envelope is smaller than its header")
-                header = tuple(float(v) for v in env[:ENVELOPE_HEADER_SLOTS].tolist())
+            header = resolve_row_envelope_header(
+                scheduled_token_id=token,
+                placeholder_id=int(self.config.audio_chunk_token_id),
+                num_computed_tokens=computed,
+                mm_features=state.mm_features,
+                scheduled_encoder_input_ids=scheduled_encoder_inputs.get(
+                    req_id, ()
+                ),
+            )
             rows.append(
                 ObservedRow(
                     request_id=str(req_id),

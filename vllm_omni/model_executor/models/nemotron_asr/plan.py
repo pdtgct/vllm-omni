@@ -6,8 +6,9 @@
 each row's :class:`PreparedRowBinding`; this module is where those
 bindings are MINTED truthfully. The model's ``prepare_row_plan_context``
 runner hook observes the final host row order (request ids, scheduled
-CPU token ids, per-request block ids, and each scheduled CHUNK's CPU
-envelope header) and asks the :class:`SessionRegistry` to join them
+CPU token ids, per-request block ids, and each CHUNK's CPU envelope
+header from its request-side multimodal feature) and asks the
+:class:`SessionRegistry` to join them
 into one immutable, consume-once :class:`PlanContext`; ``forward`` then
 combines that context with the attention metadata's host row counts
 into the transaction's ``RowPlan`` (design §Phase-6c transaction
@@ -75,6 +76,94 @@ _DEADLINE_BUDGET_NS_BY_GEOMETRY: tuple[int, ...] = tuple(
 )
 
 
+def resolve_row_envelope_header(
+    *,
+    scheduled_token_id: int,
+    placeholder_id: int,
+    num_computed_tokens: int,
+    mm_features: Sequence[object],
+    scheduled_encoder_input_ids: Sequence[int],
+) -> tuple[float, ...] | None:
+    """Resolve one row's host CHUNK header independently of cache state.
+
+    ``scheduled_encoder_input_ids`` names encoder cache misses/new compute,
+    not every semantically present multimodal feature. The scheduled CPU
+    token and the request feature overlapping that one-token window are the
+    row authorities; a present encoder-input id only cross-checks them
+    (PORT-ADV-003 / PORT-INT-003).
+    """
+    start = int(num_computed_tokens)
+    end = start + 1
+    overlapping: list[tuple[int, object]] = []
+    for index, feature in enumerate(mm_features):
+        position = getattr(feature, "mm_position", None)
+        if position is None:
+            raise ValueError(
+                f"multimodal feature {index} has no position metadata"
+            )
+        offset = int(position.offset)
+        length = int(position.length)
+        if length <= 0:
+            raise ValueError(
+                f"multimodal feature {index} has non-positive length {length}"
+            )
+        if offset < end and offset + length > start:
+            overlapping.append((index, feature))
+
+    scheduled = tuple(int(index) for index in scheduled_encoder_input_ids)
+    is_chunk = int(scheduled_token_id) == int(placeholder_id)
+    if not is_chunk:
+        if overlapping:
+            raise ValueError(
+                "non-CHUNK row has an overlapping multimodal feature"
+            )
+        if scheduled:
+            raise ValueError(
+                "non-CHUNK row has a scheduled encoder input"
+            )
+        return None
+
+    if len(overlapping) != 1:
+        raise ValueError(
+            "CHUNK row requires exactly one overlapping multimodal feature, "
+            f"found {len(overlapping)}"
+        )
+    feature_index, feature = overlapping[0]
+    if len(scheduled) > 1:
+        raise ValueError(
+            "CHUNK row may have at most one encoder input scheduled"
+        )
+    if scheduled and scheduled[0] != feature_index:
+        raise ValueError(
+            "scheduled encoder input must name the same overlapping feature"
+        )
+    modality = getattr(feature, "modality", None)
+    if modality != "audio":
+        raise ValueError(
+            f"CHUNK row feature must be audio, got {modality!r}"
+        )
+    item = getattr(feature, "data", None)
+    if item is None:
+        raise ValueError("CHUNK row envelope has no kwargs payload")
+    try:
+        field = item["audio"]
+        payload = field.data
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(
+            "CHUNK row audio feature has no envelope payload"
+        ) from exc
+    env = payload if isinstance(payload, torch.Tensor) else torch.as_tensor(payload)
+    if env.device.type != "cpu":
+        raise ValueError("envelope payload must be host-resident at the hook")
+    env = env.reshape(-1)
+    if int(env.shape[0]) < ENVELOPE_HEADER_SLOTS:
+        raise ValueError("CHUNK row envelope is smaller than its header")
+    return tuple(
+        float(value)
+        for value in env[:ENVELOPE_HEADER_SLOTS].tolist()
+    )
+
+
 def _reconstruct_deadline_ns(
     admission_ms_mod: int, *, now_ns: int, geometry: int
 ) -> int:
@@ -98,9 +187,10 @@ class ObservedRow:
     """One scheduled model row as the runner hook sees it, host-side.
 
     ``envelope_header``: the first :data:`ENVELOPE_HEADER_SLOTS` values
-    of the row's scheduled CPU envelope when a new CHUNK carrier is
-    scheduled this step, else ``None``. ``has_prior_state`` mirrors the
-    scheduler's freshness authority (``num_computed_tokens > 0``).
+    of the CPU feature overlapping a CHUNK row's scheduled token,
+    irrespective of encoder-cache hit/miss; ``None`` for non-CHUNK rows.
+    ``has_prior_state`` mirrors the scheduler's freshness authority
+    (``num_computed_tokens > 0``).
     """
 
     request_id: str
@@ -272,7 +362,7 @@ class SessionRegistry:
         header = row.envelope_header
         if header is None:
             raise ValueError(
-                f"CHUNK row {row.request_id!r} has no scheduled envelope "
+                f"CHUNK row {row.request_id!r} has no overlapping envelope "
                 "header — the serving tier mints one per CHUNK"
             )
         if len(header) != ENVELOPE_HEADER_SLOTS:

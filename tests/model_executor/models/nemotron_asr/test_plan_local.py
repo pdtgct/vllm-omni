@@ -117,6 +117,117 @@ def _bind(registry: Any, rows: list[Any], *, now_ns: int = NOW_NS) -> Any:
     )
 
 
+# ---- CPU feature/header authority (PORT-ADV-003 / PORT-INT-003) ----------
+
+
+def _feature(
+    *,
+    header: tuple[float, ...] | None = None,
+    offset: int = 0,
+    length: int = 1,
+    modality: str = "audio",
+    payload: torch.Tensor | None | object = ...,
+) -> Any:
+    if header is None:
+        header = _header()
+    if payload is ...:
+        payload = torch.tensor(header, dtype=torch.float32)
+    data = (
+        None
+        if payload is None
+        else {"audio": types.SimpleNamespace(data=payload)}
+    )
+    return types.SimpleNamespace(
+        data=data,
+        modality=modality,
+        identifier="same-complete-envelope",
+        mm_position=types.SimpleNamespace(offset=offset, length=length),
+    )
+
+
+def _resolve_header(
+    *,
+    token: int = PLACEHOLDER_ID,
+    computed: int = 0,
+    features: list[Any] | None = None,
+    scheduled: list[int] | None = None,
+) -> tuple[float, ...] | None:
+    return plan_mod.resolve_row_envelope_header(
+        scheduled_token_id=token,
+        placeholder_id=PLACEHOLDER_ID,
+        num_computed_tokens=computed,
+        mm_features=[] if features is None else features,
+        scheduled_encoder_input_ids=[] if scheduled is None else scheduled,
+    )
+
+
+def test_cache_hit_and_cache_miss_resolve_the_same_chunk_header() -> None:
+    # @spec PORT-ADV-003 / PORT-INT-003
+    # A missing scheduled_encoder_inputs entry is a legal encoder-cache hit,
+    # not evidence that the CHUNK feature is absent.
+    feature = _feature()
+    cache_hit = _resolve_header(features=[feature], scheduled=[])
+    cache_miss = _resolve_header(features=[feature], scheduled=[0])
+    assert cache_hit == cache_miss == _header()
+
+
+def test_non_chunk_without_current_feature_has_no_header() -> None:
+    # Carrier-free REPLAY/FLUSH remains legal.
+    assert (
+        _resolve_header(
+            token=7,
+            computed=1,
+            features=[_feature(offset=0)],
+            scheduled=[],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("features", "scheduled", "match"),
+    [
+        ([_feature(offset=1)], [], "exactly one overlapping"),
+        ([_feature(), _feature()], [], "exactly one overlapping"),
+        (
+            [_feature(offset=0), _feature(offset=2)],
+            [1],
+            "same overlapping feature",
+        ),
+        ([_feature(), _feature(offset=2)], [0, 1], "at most one encoder input"),
+        ([_feature(modality="video")], [], "audio"),
+        ([_feature(payload=None)], [], "no kwargs payload"),
+        (
+            [_feature(payload=torch.empty(7, device="meta"))],
+            [],
+            "host-resident",
+        ),
+    ],
+)
+def test_chunk_feature_authority_rejects_structural_drift(
+    features: list[Any],
+    scheduled: list[int],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _resolve_header(features=features, scheduled=scheduled)
+
+
+def test_non_chunk_rejects_overlapping_multimodal_feature() -> None:
+    with pytest.raises(ValueError, match="non-CHUNK.*overlapping"):
+        _resolve_header(token=7, features=[_feature()], scheduled=[])
+
+
+def test_non_chunk_rejects_scheduled_encoder_input() -> None:
+    with pytest.raises(ValueError, match="non-CHUNK.*encoder input"):
+        _resolve_header(
+            token=7,
+            computed=1,
+            features=[_feature(offset=0)],
+            scheduled=[0],
+        )
+
+
 # ---- SessionRegistry lifecycle -------------------------------------------
 
 

@@ -802,13 +802,16 @@ def test_chunk_on_undrained_queue_masks_and_reports() -> None:
     assert int(status.staged[0][0]) & advance.ROW_STATUS_QUEUE_NOT_DRAINED
 
 
-def test_flush_parks_only_when_drained_and_finalized() -> None:
+def test_flush_and_async_park_echo_are_clean_noops() -> None:
     core = _tiny_core()
     pools = _fresh_pools()
+    # Row 1 is the explicit post-final-tail FLUSH; row 2 is the distinct
+    # async-scheduler echo of an earlier park on a live session.
     _set_drained_book(pools, 1, blank=core.blank_id)
     pools["frontend_counter_pool"][1, _CTR["finalized"]] = 1
     pools["frontend_counter_pool"][1, _CTR["expected_chunk_sequence"]] = 1
     _set_drained_book(pools, 2, blank=core.blank_id)  # NOT finalized
+    before = _clone_pools(pools)
     plan = _plan(decodes=[1, 2])
     status = _CommitRecorder()
     out = _call(
@@ -821,7 +824,8 @@ def test_flush_parks_only_when_drained_and_finalized() -> None:
     )
     assert _decision(out) == [PARK_ID, PARK_ID]
     assert int(status.staged[0][0]) == 0
-    assert int(status.staged[0][1]) & advance.ROW_STATUS_SESSION_PROTOCOL
+    assert int(status.staged[0][1]) == 0
+    _assert_pools_equal(pools, before)
 
 
 # ---- the full MRV1 arc ----------------------------------------------------
