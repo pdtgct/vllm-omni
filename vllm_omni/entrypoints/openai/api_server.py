@@ -5,6 +5,7 @@ import base64
 import dataclasses
 import io
 import json
+import math
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -93,7 +94,6 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.nemotron_session import NemotronSessionFactory
 from vllm_omni.entrypoints.openai.application_plugins import (
     DEFAULT_WS_MAX_SIZE,
     ApplicationASGIComposition,
@@ -515,6 +515,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 supported_tasks = ("generate",)
 
         selected_plugin_names = list(getattr(args, "application_plugin", []))
+        application_admission = (
+            create_application_admission()
+            if selected_plugin_names
+            else None
+        )
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
@@ -529,9 +534,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         asgi_composition: ApplicationASGIComposition | None = None
-        if selected_plugin_names:
+        if application_admission is not None:
             try:
                 # @spec ING-VEH-003, ING-VEH-010, ING-VEH-016
+                app.state.application_admission = application_admission.view
                 asgi_composition = prepare_application_plugin_asgi_wrappers(app)
             except BaseException:
                 sock.close()
@@ -626,9 +632,25 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 launcher_app.state = _LauncherState(app.state, launcher_engine)
             server_options = dict(uvicorn_kwargs)
             server_options.pop("ws_max_size", None)
-            server_options.pop("timeout_graceful_shutdown", None)
+            host_shutdown_grace = server_options.pop(
+                "timeout_graceful_shutdown",
+                None,
+            )
             if plugin_lifetime is not None:
-                server_options["timeout_graceful_shutdown"] = plugin_lifetime.shutdown_grace
+                plugin_shutdown_grace = plugin_lifetime.shutdown_grace
+                if (
+                    isinstance(host_shutdown_grace, (int, float))
+                    and not isinstance(host_shutdown_grace, bool)
+                    and host_shutdown_grace > 0
+                    and math.isfinite(host_shutdown_grace)
+                ):
+                    plugin_shutdown_grace = max(
+                        plugin_shutdown_grace,
+                        float(host_shutdown_grace),
+                    )
+                server_options["timeout_graceful_shutdown"] = (
+                    plugin_shutdown_grace
+                )
             serve_call = serve_http(
                 launcher_app,
                 sock=sock,
@@ -655,16 +677,16 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 await shutdown
                 return
 
-            assert plugin_context is not None
+            assert application_admission is not None
             serve_task = asyncio.create_task(serve_call)
             drain_task: asyncio.Task[None] | None = None
             shutdown_task: asyncio.Task[None] | None = None
 
             async def quiesce_on_http_shutdown() -> None:
-                while plugin_context.admission.is_open():
+                while application_admission.is_open():
                     server = getattr(app.state, "server", None)
                     if serve_task.done() or (server is not None and server.should_exit):
-                        await plugin_context.admission.close_before_owner_drain()
+                        await application_admission.close_before_owner_drain()
                         break
                     await asyncio.sleep(0.01)
                 await plugin_lifetime.quiesce_and_drain()
@@ -675,19 +697,19 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     serve_task,
                     timeout=getattr(args, "init_timeout", 600),
                 )
-                await plugin_context.admission.open_after_http_listener_bound()
+                await application_admission.open_after_http_listener_bound()
                 if serve_task.done():
                     raise RuntimeError("HTTP serving ended during readiness transition")
                 await plugin_lifetime.mark_serving()
                 drain_task = asyncio.create_task(quiesce_on_http_shutdown())
                 shutdown = await serve_task
-                await plugin_context.admission.close_before_owner_drain()
+                await application_admission.close_before_owner_drain()
                 await asyncio.sleep(0)
                 shutdown_task = asyncio.create_task(shutdown)
                 await asyncio.shield(shutdown_task)
                 await drain_task
             finally:
-                await plugin_context.admission.close_before_owner_drain()
+                await application_admission.close_before_owner_drain()
                 if drain_task is None:
                     drain_task = asyncio.create_task(plugin_lifetime.quiesce_and_drain())
                 if not serve_task.done():
@@ -704,6 +726,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         try:
             if selected_plugin_names:
                 assert asgi_composition is not None
+                assert application_admission is not None
                 api_server_count = getattr(args, "api_server_count", None)
                 worker_count = api_server_count if api_server_count is not None else 1
                 config_by_name = validate_application_plugin_options(
@@ -719,16 +742,14 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     selected_plugins.append(SelectedApplicationPlugin(name, entry_point, config))
 
                 # @spec ING-VEH-003, ING-VEH-014, ING-VEH-016
-                admission = create_application_admission()
-                app.state.application_admission = admission
-                session_factory = NemotronSessionFactory(engine=engine_client)
-                launcher_engine = defer_engine_shutdown_until_application_drain(engine_client, admission)
+                launcher_engine = defer_engine_shutdown_until_application_drain(
+                    engine_client,
+                    application_admission,
+                )
                 plugin_context = ApplicationPluginHostContext(
                     app=app,
                     engine_client=engine_client,
-                    session_factory=session_factory,
-                    serve_args=args,
-                    admission=admission,
+                    admission=application_admission.view,
                     install_asgi_wrapper=asgi_composition.install,
                 )
 
@@ -1930,25 +1951,15 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
         await websocket.close()
         return
-    admission = getattr(websocket.app.state, "application_admission", None)
-    # @spec ING-VEH-016
-    if admission is not None and not admission.is_open():
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": "Application inference is unavailable",
-                "code": "service_unavailable",
-            }
-        )
-        await websocket.close()
-        return
     # PORT-OBS-003: route-to-session injection — the installed observer
     # (if any was installed for this app state) is threaded into native
     # session construction here, never constructed or resolved again.
     # The park-token id is the serving's model-gated resolution: the
     # recognized streaming model resolves it (loudly), any other
     # realtime model yields None and park detection stays inert.
+    #
+    # ING-VEH-019: the admission guard is NOT applied per-route here; the
+    # generic ASGI wrapper owns it for every native scope.
     observer = streaming_install.resolve_installed_observer(websocket.app.state)
     park_token_id = getattr(serving, "park_token_id", None)
     connection = RealtimeConnection(
