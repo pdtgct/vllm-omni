@@ -93,6 +93,19 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.nemotron_session import NemotronSessionFactory
+from vllm_omni.entrypoints.openai.application_plugins import (
+    DEFAULT_WS_MAX_SIZE,
+    ApplicationASGIComposition,
+    ApplicationPluginHostContext,
+    SelectedApplicationPlugin,
+    application_plugin_lifetime,
+    create_application_admission,
+    defer_engine_shutdown_until_application_drain,
+    discover_application_plugins,
+    prepare_application_plugin_asgi_wrappers,
+    validate_application_plugin_options,
+)
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -501,6 +514,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             if not hasattr(engine_client, "get_supported_tasks"):
                 supported_tasks = ("generate",)
 
+        selected_plugin_names = list(getattr(args, "application_plugin", []))
+
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
 
@@ -513,23 +528,40 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # that understand the multi-stage orchestrator lifecycle.
         _register_omni_exception_handlers(app)
 
-        await omni_init_app_state(engine_client, app.state, args)
+        asgi_composition: ApplicationASGIComposition | None = None
+        if selected_plugin_names:
+            try:
+                # @spec ING-VEH-003, ING-VEH-010, ING-VEH-016
+                asgi_composition = prepare_application_plugin_asgi_wrappers(app)
+            except BaseException:
+                sock.close()
+                raise
 
-        # After initializing the app state, shut down any endpoints that are model specific
-        if hasattr(engine_client, "endpoint_restrictions"):
-            shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
-        else:
-            logger.warning("engine client has no endpoint restrictions attribute")
-        # Start background processes
-        await STORAGE_MANAGER.start()
+        try:
+            await omni_init_app_state(engine_client, app.state, args)
 
-        # Conditionally register profiler endpoints based on stage YAML configs
-        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        if _should_enable_profiler_endpoints(stage_configs):
-            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
-            app.include_router(profiler_router)
+            # After initializing the app state, shut down any endpoints that
+            # are model specific
+            if hasattr(engine_client, "endpoint_restrictions"):
+                shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
+            else:
+                logger.warning("engine client has no endpoint restrictions attribute")
 
-        vllm_config = await _get_vllm_config(engine_client)
+            # Start background processes
+            await STORAGE_MANAGER.start()
+
+            # Conditionally register profiler endpoints based on stage YAML configs
+            stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+            if _should_enable_profiler_endpoints(stage_configs):
+                logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+                app.include_router(profiler_router)
+
+            vllm_config = await _get_vllm_config(engine_client)
+        except BaseException:
+            if asgi_composition is not None:
+                asgi_composition.fail()
+            sock.close()
+            raise
 
         # Check if pure diffusion mode (vllm_config will be None)
         is_pure_diffusion = vllm_config is None
@@ -565,35 +597,182 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     scope["state"]["request_timestamp"] = time.time()
                 await self._inner(scope, receive, send)
 
-        shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
-            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
-            h11_max_header_count=args.h11_max_header_count,
-            **uvicorn_kwargs,
-        )
+        class _LauncherState:
+            """Expose a launcher-only engine proxy without mutating app state."""
+
+            def __init__(self, state: Any, launcher_engine: Any) -> None:
+                self._state = state
+                self._launcher_engine = launcher_engine
+
+            def __getattr__(self, name: str) -> Any:
+                if name == "engine_client":
+                    return self._launcher_engine
+                return getattr(self._state, name)
+
+            def __setattr__(self, name: str, value: Any) -> None:
+                if name in {"_state", "_launcher_engine"}:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._state, name, value)
+
+        plugin_context: ApplicationPluginHostContext | None = None
+        selected_plugins: list[SelectedApplicationPlugin] = []
+        launcher_engine = engine_client
+
+        async def run_http_server(plugin_lifetime=None) -> None:
+            assert plugin_lifetime is None or plugin_context is not None
+            launcher_app = _TimestampMiddleware(app)
+            if plugin_context is not None:
+                launcher_app.state = _LauncherState(app.state, launcher_engine)
+            server_options = dict(uvicorn_kwargs)
+            server_options.pop("ws_max_size", None)
+            server_options.pop("timeout_graceful_shutdown", None)
+            if plugin_lifetime is not None:
+                server_options["timeout_graceful_shutdown"] = plugin_lifetime.shutdown_grace
+            serve_call = serve_http(
+                launcher_app,
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                ssl_ciphers=args.ssl_ciphers,
+                h11_max_incomplete_event_size=(args.h11_max_incomplete_event_size),
+                h11_max_header_count=args.h11_max_header_count,
+                ws_max_size=getattr(args, "ws_max_size", DEFAULT_WS_MAX_SIZE),
+                **server_options,
+            )
+            if plugin_lifetime is None:
+                shutdown = await serve_call
+                await shutdown
+                return
+
+            assert plugin_context is not None
+            serve_task = asyncio.create_task(serve_call)
+            drain_task: asyncio.Task[None] | None = None
+            shutdown_task: asyncio.Task[None] | None = None
+
+            async def quiesce_on_http_shutdown() -> None:
+                while plugin_context.admission.is_open():
+                    server = getattr(app.state, "server", None)
+                    if serve_task.done() or (server is not None and server.should_exit):
+                        await plugin_context.admission.close_before_owner_drain()
+                        break
+                    await asyncio.sleep(0.01)
+                await plugin_lifetime.quiesce_and_drain()
+
+            try:
+                await _wait_for_http_listener_bound(
+                    app,
+                    serve_task,
+                    timeout=getattr(args, "init_timeout", 600),
+                )
+                await plugin_context.admission.open_after_http_listener_bound()
+                if serve_task.done():
+                    raise RuntimeError("HTTP serving ended during readiness transition")
+                await plugin_lifetime.mark_serving()
+                drain_task = asyncio.create_task(quiesce_on_http_shutdown())
+                shutdown = await serve_task
+                await plugin_context.admission.close_before_owner_drain()
+                await asyncio.sleep(0)
+                shutdown_task = asyncio.create_task(shutdown)
+                await asyncio.shield(shutdown_task)
+                await drain_task
+            finally:
+                await plugin_context.admission.close_before_owner_drain()
+                if drain_task is None:
+                    drain_task = asyncio.create_task(plugin_lifetime.quiesce_and_drain())
+                if not serve_task.done():
+                    serve_task.cancel()
+                serve_result = await asyncio.gather(serve_task, return_exceptions=True)
+                if shutdown_task is None and serve_result:
+                    late_shutdown = serve_result[0]
+                    if late_shutdown is not None and not isinstance(late_shutdown, BaseException):
+                        shutdown_task = asyncio.create_task(late_shutdown)
+                tasks = [task for task in (shutdown_task, drain_task) if task is not None]
+                if tasks:
+                    await asyncio.gather(*tasks)
 
         try:
-            await shutdown_task
+            if selected_plugin_names:
+                assert asgi_composition is not None
+                api_server_count = getattr(args, "api_server_count", None)
+                worker_count = api_server_count if api_server_count is not None else 1
+                config_by_name = validate_application_plugin_options(
+                    selected_plugin_names,
+                    list(getattr(args, "application_plugin_config", [])),
+                    api_server_worker_count=worker_count,
+                )
+                entry_points = discover_application_plugins(selected_plugin_names)
+                for name, entry_point in zip(selected_plugin_names, entry_points, strict=True):
+                    config = config_by_name[name]
+                    if config is None and not getattr(entry_point, "config_optional", False):
+                        raise ValueError(f"application plugin requires configuration: {name}")
+                    selected_plugins.append(SelectedApplicationPlugin(name, entry_point, config))
+
+                # @spec ING-VEH-003, ING-VEH-014, ING-VEH-016
+                admission = create_application_admission()
+                app.state.application_admission = admission
+                session_factory = NemotronSessionFactory(engine=engine_client)
+                launcher_engine = defer_engine_shutdown_until_application_drain(engine_client, admission)
+                plugin_context = ApplicationPluginHostContext(
+                    app=app,
+                    engine_client=engine_client,
+                    session_factory=session_factory,
+                    serve_args=args,
+                    admission=admission,
+                    install_asgi_wrapper=asgi_composition.install,
+                )
+
+            if plugin_context is None:
+                await run_http_server()
+            else:
+                async with application_plugin_lifetime(selected_plugins, plugin_context) as plugin_lifetime:
+                    assert asgi_composition is not None
+                    asgi_composition.seal()
+                    await run_http_server(plugin_lifetime)
+        except BaseException:
+            if asgi_composition is not None:
+                asgi_composition.fail()
+            raise
         finally:
             state = getattr(app, "state", None)
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
-            if serving_speech is not None:
-                serving_speech.shutdown()
-            sock.close()
+            try:
+                if serving_speech is not None:
+                    serving_speech.shutdown()
+            finally:
+                sock.close()
+
+
+async def _wait_for_http_listener_bound(
+    app: Any,
+    serve_task: asyncio.Task,
+    *,
+    timeout: float,
+) -> None:
+    """Wait for Uvicorn startup without awaiting its serving lifetime."""
+    async with asyncio.timeout(timeout):
+        while True:
+            if serve_task.done():
+                shutdown_task = await serve_task
+                if shutdown_task is not None:
+                    await shutdown_task
+                raise RuntimeError("HTTP serving ended before the listener became ready")
+            server = getattr(app.state, "server", None)
+            if server is not None and server.started:
+                if serve_task.done():
+                    continue
+                return
+            await asyncio.sleep(0.01)
 
 
 @asynccontextmanager
@@ -1749,6 +1928,19 @@ async def realtime_websocket(websocket: WebSocket):
     if serving is None:
         await websocket.accept()
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    admission = getattr(websocket.app.state, "application_admission", None)
+    # @spec ING-VEH-016
+    if admission is not None and not admission.is_open():
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": "Application inference is unavailable",
+                "code": "service_unavailable",
+            }
+        )
         await websocket.close()
         return
     # PORT-OBS-003: route-to-session injection — the installed observer
