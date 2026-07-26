@@ -705,9 +705,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 shutdown = await serve_task
                 await application_admission.close_before_owner_drain()
                 await asyncio.sleep(0)
+                await drain_task
                 shutdown_task = asyncio.create_task(shutdown)
                 await asyncio.shield(shutdown_task)
-                await drain_task
             finally:
                 await application_admission.close_before_owner_drain()
                 if drain_task is None:
