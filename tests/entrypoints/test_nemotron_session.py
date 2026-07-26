@@ -151,6 +151,7 @@ _LOCALE = "auto"
 
 def _hf(**overrides: Any) -> SimpleNamespace:
     fields: dict[str, Any] = {
+        "architectures": ["Nemotron3_5AsrForRNNT"],
         "eos_token_id": PARK_ID,
         "audio_chunk_token_id": PLACEHOLDER_ID,
         "prompt_dictionary": dict(PROMPTS),
@@ -251,6 +252,42 @@ def _make_lease(
 
 
 # ---- factory: caller-selected model controls, no parallel gate ----------------
+
+
+# @spec PORT-RTC-003, PORT-RTC-007
+def test_public_constructor_validates_engine_without_opening_a_lease() -> None:
+    engine = FakeAsyncOmni()
+    constructor = getattr(_NS, "create_nemotron_session_factory")
+
+    factory = constructor(engine)
+
+    assert isinstance(factory, SessionFactory)
+    assert engine.request_ids == []
+    assert engine.prompts == []
+    assert engine.aborted == []
+
+
+# @spec PORT-RTC-003
+@pytest.mark.parametrize(
+    ("hf_config", "match"),
+    [
+        (_hf(architectures=["OtherModel"]), "architecture"),
+        (_hf(prompt_dictionary={}), "prompt_dictionary"),
+    ],
+)
+def test_public_constructor_rejects_incompatible_engine_before_readiness(
+    hf_config: SimpleNamespace,
+    match: str,
+) -> None:
+    engine = FakeAsyncOmni()
+    engine.model_config = SimpleNamespace(hf_config=hf_config)
+    constructor = getattr(_NS, "create_nemotron_session_factory")
+
+    with pytest.raises(ValueError, match=match):
+        constructor(engine)
+
+    assert engine.request_ids == []
+    assert engine.prompts == []
 
 
 # @spec PORT-RTC-001, PORT-RTC-003, PORT-LID-001, PORT-SESS-002

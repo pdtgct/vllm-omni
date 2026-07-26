@@ -11,6 +11,7 @@ import importlib.util
 import sys
 from builtins import BaseExceptionGroup
 from contextlib import asynccontextmanager
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,7 +32,6 @@ _SPEC.loader.exec_module(application_plugins)
 
 ApplicationAdmissionState = application_plugins.ApplicationAdmissionState
 ApplicationPluginContext = application_plugins.ApplicationPluginContext
-ApplicationPluginHostContext = application_plugins.ApplicationPluginHostContext
 SelectedApplicationPlugin = application_plugins.SelectedApplicationPlugin
 
 
@@ -44,7 +44,7 @@ def _host_context(admission):
         del wrapper
 
     return (
-        ApplicationPluginHostContext(
+        SimpleNamespace(
             app=app,
             engine_client=engine_client,
             session_factory=session_factory,
@@ -58,28 +58,45 @@ def _host_context(admission):
     )
 
 
+# @spec ING-VEH-003, ING-VEH-016
 def test_per_entry_context_preserves_host_identity_and_scopes_opaque_config() -> None:
-    """ING-VEH-003/009/014: each entry gets only its own opaque config."""
-    admission = object()
-    host_context, app, engine_client, session_factory = _host_context(admission)
+    """Each plugin gets only generic values and a read-only admission view."""
+
+    class AdmissionView:
+        def is_open(self) -> bool:
+            return False
+
+    admission = AdmissionView()
+    app = object()
+    engine_client = object()
+
     context = ApplicationPluginContext(
-        app=host_context.app,
-        engine_client=host_context.engine_client,
-        session_factory=host_context.session_factory,
-        serve_args=host_context.serve_args,
-        admission=host_context.admission,
-        install_asgi_wrapper=host_context.install_asgi_wrapper,
+        app=app,
+        engine_client=engine_client,
+        admission=admission,
+        install_asgi_wrapper=lambda wrapper: None,
         plugin_name="first",
         config="first.toml",
     )
 
     assert context.app is app
     assert context.engine_client is engine_client
-    assert context.session_factory is session_factory
     assert context.admission is admission
-    assert context.install_asgi_wrapper is host_context.install_asgi_wrapper
     assert context.plugin_name == "first"
     assert context.config == "first.toml"
+    assert {field.name for field in fields(ApplicationPluginContext)} == {
+        "app",
+        "engine_client",
+        "admission",
+        "install_asgi_wrapper",
+        "plugin_name",
+        "config",
+    }
+    assert not hasattr(context, "session_factory")
+    assert not hasattr(context, "serve_args")
+    assert not hasattr(context.admission, "open_after_http_listener_bound")
+    assert not hasattr(context.admission, "close_before_owner_drain")
+    assert not hasattr(context.admission, "close_from_launcher_thread")
 
 
 # @spec ING-VEH-003
@@ -235,6 +252,85 @@ def test_prepared_asgi_slot_restores_host_if_eager_rebuild_fails() -> None:
 
     assert app.router is original_router
     assert app.middleware_stack is original_stack
+
+
+# @spec ING-VEH-016, ING-VEH-019
+@pytest.mark.asyncio
+async def test_closed_admission_guard_blocks_native_work_but_keeps_ops_live() -> None:
+    """The innermost guard projects 503/1013 before the host router."""
+    routed: list[tuple[str, str]] = []
+    wrapped: list[str] = []
+    sent: list[dict[str, object]] = []
+
+    class Router:
+        async def __call__(self, scope, receive, send) -> None:
+            del receive, send
+            routed.append((scope["type"], scope["path"]))
+
+    admission = application_plugins.create_application_admission()
+    app = SimpleNamespace(
+        router=Router(),
+        middleware_stack=None,
+        state=SimpleNamespace(application_admission=admission),
+    )
+    slot = application_plugins.prepare_application_plugin_asgi_wrappers(app)
+
+    def wrapper(inner):
+        async def installed(scope, receive, send) -> None:
+            wrapped.append(scope["path"])
+            await inner(scope, receive, send)
+
+        return installed
+
+    slot.install(wrapper)
+    slot.seal()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    for path in ("/health", "/metrics"):
+        await app.router(
+            {"type": "http", "method": "GET", "path": path},
+            receive,
+            send,
+        )
+    assert routed == [("http", "/health"), ("http", "/metrics")]
+
+    await app.router(
+        {"type": "http", "method": "GET", "path": "/v1/models"},
+        receive,
+        send,
+    )
+    assert routed == [("http", "/health"), ("http", "/metrics")]
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 503
+
+    sent.clear()
+    await app.router(
+        {"type": "websocket", "path": "/v1/realtime"},
+        receive,
+        send,
+    )
+    assert routed == [("http", "/health"), ("http", "/metrics")]
+    assert sent == [{"type": "websocket.close", "code": 1013}]
+
+    await admission.open_after_http_listener_bound()
+    await app.router(
+        {"type": "http", "method": "GET", "path": "/v1/models"},
+        receive,
+        send,
+    )
+    assert routed[-1] == ("http", "/v1/models")
+    assert wrapped == [
+        "/health",
+        "/metrics",
+        "/v1/models",
+        "/v1/realtime",
+        "/v1/models",
+    ]
 
 
 def test_selection_requires_explicit_unique_names_and_keyed_config() -> None:
@@ -443,6 +539,55 @@ async def test_lifetime_scopes_config_signals_serving_then_drains_before_reverse
     ]
 
 
+# @spec ING-VEH-010, ING-VEH-020
+@pytest.mark.asyncio
+async def test_mark_serving_failure_drains_every_entered_participant() -> None:
+    """A failed advertisement drains all entries in reverse CLI order."""
+    events: list[str] = []
+    admission = FakeAdmission(events)
+    host_context, _, _, _ = _host_context(admission)
+
+    class FailingAdvertisement(FakeParticipant):
+        async def mark_serving(self) -> None:
+            self.events.append(f"serving:{self.name}")
+            raise RuntimeError("advertisement failed")
+
+    def first(context):
+        del context
+        return FakeParticipant(events, "first")
+
+    def second(context):
+        del context
+        return FailingAdvertisement(events, "second")
+
+    def third(context):
+        del context
+        return FakeParticipant(events, "third")
+
+    selected = [
+        SelectedApplicationPlugin("first", first, None),
+        SelectedApplicationPlugin("second", second, None),
+        SelectedApplicationPlugin("third", third, None),
+    ]
+    async with application_plugins.application_plugin_lifetime(
+        selected,
+        host_context,
+    ) as lifetime:
+        with pytest.raises(RuntimeError, match="advertisement failed"):
+            await lifetime.mark_serving()
+        await lifetime.quiesce_and_drain()
+
+    assert "serving:first" in events
+    assert "serving:second" in events
+    assert "serving:third" not in events
+    assert events[5:8] == [
+        "drain:third",
+        "drain:second",
+        "drain:first",
+    ]
+    assert events[-3:] == ["exit:third", "exit:second", "exit:first"]
+
+
 # @spec ING-VEH-003, ING-VEH-016
 @pytest.mark.asyncio
 async def test_lifetime_scopes_each_asgi_installer_to_its_entry() -> None:
@@ -475,7 +620,7 @@ async def test_lifetime_scopes_each_asgi_installer_to_its_entry() -> None:
 
     app = SimpleNamespace(router=Router(), middleware_stack=None)
     slot = application_plugins.prepare_application_plugin_asgi_wrappers(app)
-    host_context = ApplicationPluginHostContext(
+    host_context = SimpleNamespace(
         app=app,
         engine_client=object(),
         session_factory=object(),
@@ -537,8 +682,9 @@ async def test_no_plugin_is_a_compatibility_noop() -> None:
     assert events == ["host-serving"]
 
 
+# @spec ING-VEH-017, ING-VEH-022
 def test_drain_attempts_every_participant_and_grace_is_finite() -> None:
-    """ING-VEH-017: one failed drain cannot strand a later participant."""
+    """One failed drain cannot strand a later participant."""
 
     class FailingParticipant(FakeParticipant):
         async def quiesce_and_drain(self) -> None:
@@ -572,8 +718,9 @@ def test_drain_attempts_every_participant_and_grace_is_finite() -> None:
     asyncio.run(exercise())
 
 
-def test_nonfinite_participant_shutdown_grace_is_rejected() -> None:
-    """ING-VEH-017: Uvicorn never receives an unbounded plugin grace."""
+# @spec ING-VEH-010, ING-VEH-018
+def test_nonfinite_participant_shutdown_grace_is_rejected_on_entry() -> None:
+    """An invalid grace rolls back before another participant enters."""
 
     class InfiniteParticipant(FakeParticipant):
         @property
@@ -584,14 +731,85 @@ def test_nonfinite_participant_shutdown_grace_is_rejected() -> None:
         events: list[str] = []
         host_context, _, _, _ = _host_context(FakeAdmission(events))
 
-        def entry_point(context):
+        def invalid(context):
             del context
             return InfiniteParticipant(events, "infinite")
 
-        selected = [SelectedApplicationPlugin("infinite", entry_point, None)]
-        async with application_plugins.application_plugin_lifetime(selected, host_context) as lifetime:
-            with pytest.raises(ValueError, match="finite and positive"):
-                _ = lifetime.shutdown_grace
+        def must_not_enter(context):
+            del context
+            return FakeParticipant(events, "later")
+
+        selected = [
+            SelectedApplicationPlugin("infinite", invalid, None),
+            SelectedApplicationPlugin("later", must_not_enter, None),
+        ]
+        with pytest.raises(ValueError, match="finite and positive"):
+            async with application_plugins.application_plugin_lifetime(
+                selected, host_context
+            ):
+                pytest.fail("invalid grace must fail before the lifetime yields")
+
+        assert events == ["enter:infinite", "exit:infinite"]
+
+    asyncio.run(exercise())
+
+
+# @spec ING-VEH-017, ING-VEH-022
+def test_each_participant_drain_is_timeboxed_and_all_are_attempted() -> None:
+    """A hung reverse-first drain cannot prevent remaining attempts."""
+
+    class HangingParticipant(FakeParticipant):
+        @property
+        def shutdown_grace(self) -> float:
+            return 0.01
+
+        async def quiesce_and_drain(self) -> None:
+            self.events.append(f"drain:{self.name}")
+            await asyncio.Future()
+
+    class FailingParticipant(FakeParticipant):
+        @property
+        def shutdown_grace(self) -> float:
+            return 0.02
+
+        async def quiesce_and_drain(self) -> None:
+            self.events.append(f"drain:{self.name}")
+            raise RuntimeError(self.name)
+
+    async def exercise() -> None:
+        events: list[str] = []
+        host_context, _, _, _ = _host_context(FakeAdmission(events))
+
+        def failing(context):
+            del context
+            return FailingParticipant(events, "failing")
+
+        def hanging(context):
+            del context
+            return HangingParticipant(events, "hanging")
+
+        selected = [
+            SelectedApplicationPlugin("failing", failing, None),
+            SelectedApplicationPlugin("hanging", hanging, None),
+        ]
+        async with application_plugins.application_plugin_lifetime(
+            selected, host_context
+        ) as lifetime:
+            with pytest.raises(BaseExceptionGroup) as error:
+                await asyncio.wait_for(
+                    lifetime.quiesce_and_drain(),
+                    timeout=0.25,
+                )
+            assert any(
+                isinstance(item, TimeoutError)
+                for item in error.value.exceptions
+            )
+            assert any(
+                isinstance(item, RuntimeError)
+                for item in error.value.exceptions
+            )
+
+        assert events[2:4] == ["drain:hanging", "drain:failing"]
 
     asyncio.run(exercise())
 
