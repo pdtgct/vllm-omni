@@ -72,6 +72,7 @@ class FakeAdmission:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.open = False
+        self.view = FakeAdmissionView(self)
 
     async def open_after_http_listener_bound(self) -> None:
         self.open = True
@@ -89,30 +90,14 @@ class FakeAdmission:
         return self.open
 
 
-class ClosedAdmission:
+class FakeAdmissionView:
+    """Read-only projection given to app state and selected plugins."""
+
+    def __init__(self, controller: FakeAdmission) -> None:
+        self._controller = controller
+
     def is_open(self) -> bool:
-        return False
-
-
-class FakeWebSocket:
-    def __init__(self, admission) -> None:
-        self.app = SimpleNamespace(
-            state=SimpleNamespace(
-                openai_serving_realtime=object(),
-                application_admission=admission,
-            )
-        )
-        self.messages: list[dict[str, str]] = []
-        self.closed = False
-
-    async def accept(self) -> None:
-        pass
-
-    async def send_json(self, message: dict[str, str]) -> None:
-        self.messages.append(message)
-
-    async def close(self) -> None:
-        self.closed = True
+        return self._controller.open
 
 
 def _args(*, selected_plugins: list[str]) -> SimpleNamespace:
@@ -189,13 +174,22 @@ def _install_worker_basics(monkeypatch, events: list[str], *, serve):
     return fake_engine
 
 
-def _assert_plugin_host_context(context, engine, factories: list[object], events: list[str]) -> FakePluginLifetime:
-    """Assert the host passes one factory constructed for its live engine."""
-    assert len(factories) == 1
-    assert factories[0].engine is engine
+def _assert_plugin_host_context(
+    context,
+    engine,
+    admission: FakeAdmission,
+    events: list[str],
+) -> FakePluginLifetime:
+    """Assert the host context is generic and admission is read-only."""
     assert context.engine_client is engine
-    assert context.session_factory is factories[0]
+    assert context.admission is admission.view
+    assert context.app.state.application_admission is admission.view
     assert callable(context.install_asgi_wrapper)
+    assert not hasattr(context, "session_factory")
+    assert not hasattr(context, "serve_args")
+    assert not hasattr(context.admission, "open_after_http_listener_bound")
+    assert not hasattr(context.admission, "close_before_owner_drain")
+    assert not hasattr(context.admission, "close_from_launcher_thread")
     return FakePluginLifetime(events)
 
 
@@ -221,19 +215,19 @@ async def test_listener_bound_signal_is_distinct_from_serving_lifetime() -> None
     await serve_task
 
 
+# @spec ING-VEH-003, ING-VEH-016, ING-VEH-017, ING-VEH-022
 @pytest.mark.asyncio
 async def test_selected_plugin_lifecycle_is_nested_around_serving_and_engine(monkeypatch) -> None:
-    """ING-VEH-003/010/014/016/017: host owns composed lifecycle ordering."""
+    """The generic host owns composed readiness, grace, and shutdown."""
     events: list[str] = []
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
     admission = FakeAdmission(events)
-    factories: list[object] = []
 
     async def fake_serve_http(*args, **kwargs):
         launcher_app = args[0]
         assert kwargs["ws_max_size"] == 2097152
-        assert kwargs["timeout_graceful_shutdown"] == 1.0
+        assert kwargs["timeout_graceful_shutdown"] == 7.0
         events.append("http-bound")
         serve_started.set()
         await http_shutdown.wait()
@@ -246,12 +240,6 @@ async def test_selected_plugin_lifecycle_is_nested_around_serving_and_engine(mon
 
     engine = _install_worker_basics(monkeypatch, events, serve=fake_serve_http)
 
-    class FakeSessionFactory:
-        def __init__(self, *, engine) -> None:
-            events.append("factory-create")
-            self.engine = engine
-            factories.append(self)
-
     def optional_entry_point(context):
         del context
         raise AssertionError("test lifetime replaces the plugin entry point")
@@ -259,7 +247,6 @@ async def test_selected_plugin_lifecycle_is_nested_around_serving_and_engine(mon
     optional_entry_point.config_optional = True
 
     monkeypatch.setattr(api_server, "create_application_admission", lambda: admission, raising=False)
-    monkeypatch.setattr(api_server, "NemotronSessionFactory", FakeSessionFactory, raising=False)
     monkeypatch.setattr(
         api_server,
         "discover_application_plugins",
@@ -269,20 +256,29 @@ async def test_selected_plugin_lifecycle_is_nested_around_serving_and_engine(mon
     monkeypatch.setattr(
         api_server,
         "application_plugin_lifetime",
-        lambda plugins, context: _assert_plugin_host_context(context, engine, factories, events),
+        lambda plugins, context: _assert_plugin_host_context(
+            context,
+            engine,
+            admission,
+            events,
+        ),
         raising=False,
     )
 
     worker_task = asyncio.create_task(
-        api_server.omni_run_server_worker("127.0.0.1:0", FakeServerSocket(), _args(selected_plugins=["example"]))
+        api_server.omni_run_server_worker(
+            "127.0.0.1:0",
+            FakeServerSocket(),
+            _args(selected_plugins=["example"]),
+            timeout_graceful_shutdown=7.0,
+        )
     )
     await asyncio.wait_for(serve_started.wait(), timeout=2)
     http_shutdown.set()
     await asyncio.wait_for(worker_task, timeout=2)
 
     assert events.index("engine-enter") < events.index("plugin-enter")
-    assert events.index("app-state-init") < events.index("factory-create")
-    assert events.index("factory-create") < events.index("plugin-enter")
+    assert events.index("app-state-init") < events.index("plugin-enter")
     assert events.index("plugin-enter") < events.index("http-bound")
     assert events.index("http-bound") < events.index("admission-open")
     assert events.index("admission-open") < events.index("plugin-serving")
@@ -357,11 +353,6 @@ async def test_selected_plugin_prepares_eager_asgi_slot_before_state_init_and_se
     )
     monkeypatch.setattr(
         api_server,
-        "NemotronSessionFactory",
-        lambda **kwargs: object(),
-    )
-    monkeypatch.setattr(
-        api_server,
         "application_plugin_lifetime",
         lambda plugins, context: InstallingLifetime(context),
     )
@@ -382,24 +373,6 @@ async def test_selected_plugin_prepares_eager_asgi_slot_before_state_init_and_se
     assert events.index("asgi-install") < events.index("asgi-seal")
     assert events.index("asgi-seal") < events.index("http-bound")
     assert "asgi-fail" not in events
-
-
-@pytest.mark.asyncio
-async def test_native_realtime_rejects_closed_host_admission_before_connection(monkeypatch) -> None:
-    """ING-VEH-016: native RFC-1 inference shares the host admission boundary."""
-    websocket = FakeWebSocket(ClosedAdmission())
-
-    def must_not_construct_connection(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("closed admission constructed a realtime connection")
-
-    monkeypatch.setattr(api_server, "RealtimeConnection", must_not_construct_connection)
-
-    await api_server.realtime_websocket(websocket)
-
-    assert websocket.messages[-1]["code"] == "service_unavailable"
-    assert websocket.closed
-
 
 @pytest.mark.asyncio
 async def test_post_bind_plugin_failure_closes_admission_drains_and_cancels_http(monkeypatch) -> None:
@@ -433,7 +406,6 @@ async def test_post_bind_plugin_failure_closes_admission_drains_and_cancels_http
 
     _install_worker_basics(monkeypatch, events, serve=fake_serve_http)
     monkeypatch.setattr(api_server, "create_application_admission", lambda: admission, raising=False)
-    monkeypatch.setattr(api_server, "NemotronSessionFactory", lambda **kwargs: object(), raising=False)
     monkeypatch.setattr(
         api_server,
         "discover_application_plugins",
@@ -510,6 +482,41 @@ async def test_plugin_start_failure_prevents_http_serving(monkeypatch) -> None:
     assert "engine-exit" in events
 
 
+# @spec ING-VEH-009, ING-VEH-010
+@pytest.mark.asyncio
+async def test_missing_required_config_fails_before_entry_or_http(
+    monkeypatch,
+) -> None:
+    """An absent optionality declaration defaults to required config."""
+    events: list[str] = []
+
+    async def must_not_serve(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("HTTP started after config validation failed")
+
+    def required_entry(context):
+        del context
+        raise AssertionError("entry ran without its required configuration")
+
+    _install_worker_basics(monkeypatch, events, serve=must_not_serve)
+    monkeypatch.setattr(
+        api_server,
+        "discover_application_plugins",
+        lambda selected: [required_entry],
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="requires configuration"):
+        await api_server.omni_run_server_worker(
+            "127.0.0.1:0",
+            FakeServerSocket(),
+            _args(selected_plugins=["required"]),
+        )
+
+    assert "plugin-enter" not in events
+    assert "http-bound" not in events
+
+
 # @spec ING-VEH-003
 @pytest.mark.asyncio
 async def test_no_selected_plugin_does_not_discover_entry_points(monkeypatch) -> None:
@@ -545,11 +552,31 @@ async def test_no_selected_plugin_does_not_discover_entry_points(monkeypatch) ->
     assert not discovered
 
 
-def test_api_server_has_no_compatibility_frontend_specific_dependency() -> None:
-    """ING-VEH-001/014: the upstream call site remains transport-neutral."""
+# @spec ING-VEH-001, ING-VEH-003, ING-VEH-014
+def test_api_server_has_no_model_or_frontend_specific_plugin_dependency() -> None:
+    """The generic host imports neither frontend nor model-specific seams."""
     tree = ast.parse(_API_SERVER.read_text())
-    imports = [
-        alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
-    ]
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imported_symbols = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
 
-    assert not [name for name in imports if name.startswith(("grpc", "riva", "nvidia_riva"))]
+    assert not [
+        name
+        for name in imported_modules
+        if name.startswith(("grpc", "riva", "nvidia_riva"))
+    ]
+    assert "vllm_omni.entrypoints.nemotron_session" not in imported_modules
+    assert "NemotronSessionFactory" not in imported_symbols

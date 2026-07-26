@@ -71,6 +71,7 @@ def test_rfc1_contains_no_declared_task_advertisement_extension() -> None:
     assert offenders == []
 
 
+# @spec PORT-RTC-003, PORT-RTC-007
 def test_session_binding_has_no_ephemeral_cadence_or_admission_counter() -> None:
     """PORT-RTC-003/007: the retained binding is transport-neutral."""
     binding = (_ENTRYPOINTS / "nemotron_session.py").read_text()
@@ -86,6 +87,7 @@ def test_session_binding_has_no_ephemeral_cadence_or_admission_counter() -> None
     ):
         assert forbidden not in binding
     assert "EPHEMERAL_CADENCE" not in model_session
+    assert "def create_nemotron_session_factory(" in binding
     assert "class NemotronSessionFactory" in binding
     assert "class NemotronSessionLease" in binding
 
