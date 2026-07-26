@@ -10,6 +10,8 @@ application plugins.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import math
 import threading
 from builtins import BaseExceptionGroup
@@ -18,9 +20,11 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass
 from enum import Enum
 from importlib import metadata
+from types import TracebackType
 from typing import Any, Protocol, Self
 
 APPLICATION_PLUGIN_ENTRY_POINT_GROUP = "vllm_omni.application_plugins"
+APPLICATION_PLUGIN_OPERATIONAL_PATHS = frozenset({"/health", "/metrics"})
 DEFAULT_WS_MAX_SIZE = 16 * 1024 * 1024
 ApplicationASGI = Callable[[Any, Any, Any], Awaitable[None]]
 ApplicationASGIWrapper = Callable[[ApplicationASGI], ApplicationASGI]
@@ -47,12 +51,23 @@ class ApplicationAdmissionState(Enum):
     OPEN = "open"
 
 
+class ApplicationAdmissionView(Protocol):
+    """Read-only projection of the host-owned admission linearization point."""
+
+    def is_open(self) -> bool:
+        """Return whether application inference can create an owner."""
+
+
 class ApplicationAdmission(Protocol):
-    """The host-owned linearization point exposed to application plugins."""
+    """Host-internal controller for application inference admission."""
 
     @property
     def state(self) -> ApplicationAdmissionState:
         """Return the current admission state."""
+
+    @property
+    def view(self) -> ApplicationAdmissionView:
+        """Return the stable read-only projection exposed outside the host."""
 
     def is_open(self) -> bool:
         """Return whether application inference can create an owner."""
@@ -69,17 +84,11 @@ class ApplicationAdmission(Protocol):
 
 @dataclass(frozen=True)
 class ApplicationPluginHostContext:
-    """Generic host values shared by all explicitly selected plugins.
-
-    The host owns all values and preserves object identity for ``app``,
-    ``engine_client``, and ``session_factory``.
-    """
+    """Generic host values shared by all explicitly selected plugins."""
 
     app: Any
     engine_client: Any
-    session_factory: Any
-    serve_args: Any
-    admission: ApplicationAdmission
+    admission: ApplicationAdmissionView
     install_asgi_wrapper: ApplicationASGIInstaller
 
 
@@ -135,7 +144,12 @@ class ApplicationPluginLifetime(AbstractAsyncContextManager["ApplicationPluginLi
     async def __aenter__(self) -> Self:
         """Enter selected plugins in explicit CLI order."""
 
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Unwind every entered plugin in reverse order."""
 
     async def mark_serving(self) -> None:
@@ -221,7 +235,10 @@ def discover_application_plugins(
     if hasattr(entry_points, "select"):
         entries = entry_points.select(group=APPLICATION_PLUGIN_ENTRY_POINT_GROUP)
     else:
-        entries = entry_points.get(APPLICATION_PLUGIN_ENTRY_POINT_GROUP, ())
+        entries = getattr(entry_points, "get")(
+            APPLICATION_PLUGIN_ENTRY_POINT_GROUP,
+            (),
+        )
     by_name: dict[str, list[Any]] = {}
     for entry_point in entries:
         by_name.setdefault(entry_point.name, []).append(entry_point)
@@ -263,7 +280,12 @@ def prepare_application_plugin_asgi_wrappers(
     if not callable(router):
         raise TypeError("application host router must be callable")
     middleware_stack = getattr(app, "middleware_stack", None)
-    slot = _ApplicationASGICompositionSlot(router)
+    admission = getattr(getattr(app, "state", None), "application_admission", None)
+    if admission is not None:
+        admission = getattr(admission, "view", admission)
+        if not callable(getattr(admission, "is_open", None)):
+            raise TypeError("application admission view must expose is_open()")
+    slot = _ApplicationASGICompositionSlot(router, admission)
 
     try:
         app.router = slot
@@ -294,8 +316,13 @@ class _ApplicationASGICompositionState(Enum):
 class _ApplicationASGICompositionSlot:
     """Stable router identity populated before the host starts serving."""
 
-    def __init__(self, host_router: ApplicationASGI) -> None:
+    def __init__(
+        self,
+        host_router: ApplicationASGI,
+        admission: ApplicationAdmissionView | None,
+    ) -> None:
         self._host_router = host_router
+        self._admission = admission
         self._wrappers: list[ApplicationASGIWrapper] = []
         self._installed: ApplicationASGI | None = None
         self._state = _ApplicationASGICompositionState.PREPARED
@@ -313,7 +340,9 @@ class _ApplicationASGICompositionSlot:
     def seal(self) -> None:
         """Construct wrappers in CLI order and freeze the slot."""
         self._require_prepared("seal application ASGI wrappers")
-        installed = self._host_router
+        installed: ApplicationASGI = self._host_router
+        if self._admission is not None:
+            installed = _ApplicationAdmissionGuard(installed, self._admission)
         try:
             for wrapper in reversed(self._wrappers):
                 installed = wrapper(installed)
@@ -345,6 +374,56 @@ class _ApplicationASGICompositionSlot:
                 raise RuntimeError("application ASGI composition has failed")
             raise RuntimeError("application ASGI composition is not sealed")
         await installed(scope, receive, send)
+
+
+class _ApplicationAdmissionGuard:
+    """Innermost guard that rejects application work while admission is closed."""
+
+    def __init__(
+        self,
+        host_router: ApplicationASGI,
+        admission: ApplicationAdmissionView,
+    ) -> None:
+        self._host_router = host_router
+        self._admission = admission
+
+    # @spec ING-VEH-016, ING-VEH-019
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        scope_type = scope.get("type")
+        path = scope.get("path", "")
+        if (
+            scope_type not in {"http", "websocket"}
+            or path in APPLICATION_PLUGIN_OPERATIONAL_PATHS
+            or self._admission.is_open()
+        ):
+            await self._host_router(scope, receive, send)
+            return
+        if scope_type == "websocket":
+            await send({"type": "websocket.close", "code": 1013})
+            return
+
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "Application inference is unavailable",
+                    "type": "ServiceUnavailableError",
+                    "param": None,
+                    "code": 503,
+                }
+            },
+            separators=(",", ":"),
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
 
 class _EntryScopedApplicationASGIInstaller:
@@ -384,11 +463,16 @@ class _ApplicationAdmission:
         self._state = ApplicationAdmissionState.CLOSED
         self._opened_once = False
         self._lock = threading.Lock()
+        self._view = _ReadOnlyApplicationAdmissionView(self)
 
     @property
     def state(self) -> ApplicationAdmissionState:
         with self._lock:
             return self._state
+
+    @property
+    def view(self) -> ApplicationAdmissionView:
+        return self._view
 
     def is_open(self) -> bool:
         return self.state is ApplicationAdmissionState.OPEN
@@ -411,6 +495,18 @@ class _ApplicationAdmission:
         """Perform the synchronous OPEN→CLOSED shutdown transition."""
         with self._lock:
             self._state = ApplicationAdmissionState.CLOSED
+
+
+class _ReadOnlyApplicationAdmissionView:
+    """Stable capability exposing only the admission predicate."""
+
+    __slots__ = ("_admission",)
+
+    def __init__(self, admission: _ApplicationAdmission) -> None:
+        self._admission = admission
+
+    def is_open(self) -> bool:
+        return self._admission.is_open()
 
 
 class _DrainOrderedEngineClient:
@@ -447,6 +543,7 @@ class _ManagedApplicationPluginLifetime:
         self._plugins = plugins
         self._host_context = host_context
         self._participants: list[ApplicationPluginParticipant] = []
+        self._shutdown_graces: list[float] = []
         self._exit_stack = AsyncExitStack()
 
     # @spec ING-VEH-003, ING-VEH-010
@@ -458,8 +555,6 @@ class _ManagedApplicationPluginLifetime:
                     context = ApplicationPluginContext(
                         app=self._host_context.app,
                         engine_client=self._host_context.engine_client,
-                        session_factory=self._host_context.session_factory,
-                        serve_args=self._host_context.serve_args,
                         admission=self._host_context.admission,
                         install_asgi_wrapper=scoped_installer,
                         plugin_name=selected.name,
@@ -467,7 +562,9 @@ class _ManagedApplicationPluginLifetime:
                     )
                     participant = selected.entry_point(context)
                     await self._exit_stack.enter_async_context(participant)
+                    shutdown_grace = _validate_shutdown_grace(participant.shutdown_grace)
                     self._participants.append(participant)
+                    self._shutdown_graces.append(shutdown_grace)
                 finally:
                     scoped_installer.close()
         except BaseException:
@@ -485,9 +582,12 @@ class _ManagedApplicationPluginLifetime:
     async def quiesce_and_drain(self) -> None:
         """Ask selected plugins to quiesce before reverse-order exit."""
         errors: list[BaseException] = []
-        for participant in reversed(self._participants):
+        for participant, shutdown_grace in reversed(
+            list(zip(self._participants, self._shutdown_graces, strict=True))
+        ):
             try:
-                await participant.quiesce_and_drain()
+                async with asyncio.timeout(shutdown_grace):
+                    await participant.quiesce_and_drain()
             except BaseException as error:
                 errors.append(error)
         if errors:
@@ -496,12 +596,25 @@ class _ManagedApplicationPluginLifetime:
     @property
     def shutdown_grace(self) -> float:
         """Use the longest finite selected-plugin grace for HTTP draining."""
-        if not self._participants:
+        if not self._shutdown_graces:
             return 0.0
-        values = [participant.shutdown_grace for participant in self._participants]
-        if any(value <= 0 or not math.isfinite(value) for value in values):
-            raise ValueError("application plugin shutdown grace must be finite and positive")
-        return max(values)
+        return max(self._shutdown_graces)
 
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self._exit_stack.__aexit__(exc_type, exc_value, traceback)
+
+
+def _validate_shutdown_grace(value: float) -> float:
+    """Validate and normalize one participant's shutdown budget."""
+    try:
+        grace = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("application plugin shutdown grace must be finite and positive") from exc
+    if grace <= 0 or not math.isfinite(grace):
+        raise ValueError("application plugin shutdown grace must be finite and positive")
+    return grace

@@ -356,3 +356,33 @@ class NemotronSessionFactory:
             session=session,
             request_id=f"{self._request_id_prefix}-{uuid4()}",
         )
+
+
+# @spec PORT-RTC-003, PORT-RTC-007
+def create_nemotron_session_factory(engine_client: Any) -> SessionFactory:
+    """Validate a compatible engine and return its public session factory.
+
+    This is the transport-neutral construction boundary for external
+    frontends. Validation performs no engine request, lease allocation, or
+    admission transition.
+    """
+    model_config = getattr(engine_client, "model_config", None)
+    if model_config is None:
+        raise ValueError("Nemotron session factory requires an engine model_config")
+    hf_config = getattr(model_config, "hf_config", model_config)
+    architectures = getattr(hf_config, "architectures", None)
+    if (
+        not isinstance(architectures, (list, tuple))
+        or "Nemotron3_5AsrForRNNT" not in architectures
+    ):
+        raise ValueError(
+            "Nemotron session factory requires the "
+            "Nemotron3_5AsrForRNNT architecture"
+        )
+
+    from vllm_omni.model_executor.models.nemotron_asr.session import (
+        NemotronRealtimeSession,
+    )
+
+    NemotronRealtimeSession.from_model_config(model_config)
+    return NemotronSessionFactory(engine=engine_client)
