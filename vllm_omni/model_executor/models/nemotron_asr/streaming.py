@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.session import (
     NemotronRealtimeSession,
+    StreamingObserver,
 )
 
 _ENVELOPE_VERSION = 2.0
@@ -81,6 +82,9 @@ async def buffer_stream(
     audio_stream: Any,
     input_stream: Any,
     model_config: Any,
+    *,
+    observer: StreamingObserver | None = None,
+    final_tail_ready_stamp_s: float | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Chunk client audio: one yield = one StreamingUpdate.
 
@@ -91,6 +95,16 @@ async def buffer_stream(
     park-time queue consumption); applies the NeMo tail rules on
     finalize (PORT-SESS-003: exactly one actual-residual final-tail,
     including an explicit zero-sample transaction; never zero-padded).
+
+    Args:
+        observer: PORT-OBS-003 stub — overrides ``session.observer`` when
+            given (e.g. the ledgerless native path, where ``model_config``
+            is a bare config with no session object to carry one). Not yet
+            wired to any ready/park event.
+        final_tail_ready_stamp_s: PORT-OBS-004 stub — the caller-captured
+            monotonic finalize-acceptance stamp. Not yet consumed; the
+            eventual final-tail ``unit_ready`` call must use exactly this
+            value rather than reconstruct it here at generator resumption.
     """
     # Every session control is a typed attribute of the session object
     # riding the model_config position (PORT-RTC-001); anything else is

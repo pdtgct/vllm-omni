@@ -129,3 +129,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
+    # PORT-OBS-008/009 stub field: the runner-drained
+    # ``(geometry_id, rows)`` batch-size sub-stat, forwarded by the omni
+    # scheduler only while host statistics collection is enabled. ``None``
+    # means not collecting; ``[]`` means no nonempty CHUNK bucket executed
+    # this step. Every hop is an existing omni-owned subclass — no vLLM
+    # core type changes.
+    streaming_chunk_batch_stats: list[tuple[int, int]] | None = None

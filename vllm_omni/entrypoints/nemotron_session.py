@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.session import (
         NemotronRealtimeSession,
         ReceiptLedger,
+        StreamingObserver,
     )
 
     FloatSamples = npt.NDArray[np.float32]
@@ -333,10 +334,16 @@ class NemotronSessionFactory:
         engine: Any,
         max_pending_carriers: int | None = None,
         request_id_prefix: str = "nemotron-session",
+        observer: StreamingObserver | None = None,
     ) -> None:
         self._engine = engine
         self._max_pending_carriers = max_pending_carriers
         self._request_id_prefix = request_id_prefix
+        # PORT-OBS-003 stub: injected at every session this factory opens
+        # ("the transport-neutral factory/lease binding, which injects the
+        # same observer at session construction"). Not yet consumed by
+        # NemotronRealtimeSession beyond storage.
+        self._observer = observer
 
     async def open(self, *, cadence: str, locale: str) -> NemotronSessionLease:
         """Validate model controls and construct one ordinary session."""
@@ -350,6 +357,7 @@ class NemotronSessionFactory:
             locale=locale,
             with_ledger=True,
             max_pending_carriers=self._max_pending_carriers,
+            observer=self._observer,
         )
         return NemotronSessionLease(
             engine=self._engine,
@@ -365,6 +373,13 @@ def create_nemotron_session_factory(engine_client: Any) -> SessionFactory:
     This is the transport-neutral construction boundary for external
     frontends. Validation performs no engine request, lease allocation, or
     admission transition.
+
+    PORT-RTC-003 pins this PUBLIC signature to exactly ``(engine_client)``
+    — no observer parameter here. Observer injection (PORT-OBS-003) lives
+    ONLY on the internal ``NemotronSessionFactory`` constructor; a
+    model-aware downstream participant that wants observation wires it by
+    constructing ``NemotronSessionFactory(engine=..., observer=...)``
+    directly rather than through this public constructor.
     """
     model_config = getattr(engine_client, "model_config", None)
     if model_config is None:

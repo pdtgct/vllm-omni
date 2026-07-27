@@ -1973,6 +1973,26 @@ def warmup_advance_model_rows_scatter(
         warmup_masked_page_scatter(pool, scratch)
 
 
+# ---- PORT-OBS-008 batch-size sub-stat: consume-once extraction hook ----
+def consume_batch_stats() -> list[tuple[int, int]] | None:
+    """Drain this call's per-executed-bucket ``(geometry_id, rows)`` list.
+
+    PORT-OBS-008/009: ``advance_model_rows`` shall record one entry per
+    executed nonempty CHUNK geometry bucket — bounded by the five admitted
+    geometries, CPU-only, no device synchronization — unconditionally
+    (recording stands even when export is disabled), and expose it through
+    this consume-once hook, drained by the runner once per execution
+    (mirroring ``plan.PlanContextSlot``'s stage/consume shape). ``None``
+    means not collecting; ``[]`` means a transaction that executed no
+    nonempty CHUNK bucket; downstream consumers skip both.
+
+    Raises:
+        NotImplementedError: Always, until Phase 6 wires the recording
+            into the ``executed`` bucket loop and stages it here.
+    """
+    raise NotImplementedError("advance_model_rows does not yet record PORT-OBS-008 batch stats")
+
+
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
 # @spec PORT-PERF-001, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(

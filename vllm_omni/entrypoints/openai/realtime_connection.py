@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator, Mapping
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
@@ -26,10 +26,26 @@ class RealtimeConnection(VllmRealtimeConnection):
     generation output handling to emit audio deltas.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, observer: Any = None, park_token_id: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        # PORT-OBS-003 stub: the connection adapter observes chunk
+        # terminal disposition and open rejections at this layer, but it
+        # does NOT own session-open accounting — that fires at
+        # observer-bearing NemotronRealtimeSession construction
+        # (PORT-OBS-006: never WebSocket acceptance), which this
+        # `__init__` deliberately does not call. Stored, not yet
+        # consumed by `_run_generation`/`handle_event`.
+        self._observer = observer
+        # PORT-OBS-003 stub: generic (never model-specific) park-token
+        # id. `None` is inert — no park detection is attempted. Once
+        # wired, a committed park is inferred from park-token identity
+        # PLUS an outstanding ready handle (`observer.pop_next_ready`),
+        # never token identity plus text emptiness — so a carrierless
+        # scheduler park echo or a FLUSH park (neither mints a ready
+        # handle) is correctly ignored rather than double-counted.
+        self._park_token_id = park_token_id
 
     async def start_generation(self):
         await super().start_generation()
