@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator, Mapping
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
@@ -43,7 +43,7 @@ class RealtimeConnection(VllmRealtimeConnection):
     generation output handling to emit audio deltas.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, observer: Any = None, park_token_id: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
@@ -67,6 +67,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         if self.session_configuration_timeout <= 0:
             raise ValueError("session_configuration_timeout must be positive")
         self._configuration_timeout_task: asyncio.Task[None] | None = None
+        # Metrics observe the admitted model session, never mere WebSocket
+        # acceptance.  The park token remains a generic optional detector
+        # input; `None` keeps non-Nemotron realtime paths inert.
+        self._observer = observer
+        self._park_token_id = park_token_id
 
     async def handle_connection(self):
         """Arm model-admission lifetime separately from transport lifetime."""
@@ -134,7 +139,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                 [parsed]
             )
             yield StreamingInput(prompt=engine_input)
-
     async def start_generation(self):
         if self._nemotron_session is None:
             await super().start_generation()

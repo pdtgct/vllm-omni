@@ -13,6 +13,14 @@ arithmetic.
 Engine-free (dataclasses/asyncio/manifests only — no ``torch``, no
 ``vllm``), so it loads and runs on the macOS loader path alongside
 ``streaming.py``.
+
+The ``StreamingObserver`` protocol and its ``ChunkReadyHandle`` handle
+type are NOT defined here: they live in the neutral, Prometheus-free
+``vllm_omni.metrics.streaming_transport`` module (PORT-OBS-003's
+"Observer protocol home" decision) so this model package imports a
+capability-neutral seam rather than owning it, and the Prometheus
+metrics adapter can be statically typed against the same protocol
+without this package importing Prometheus.
 """
 
 from __future__ import annotations
@@ -23,6 +31,10 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_omni.metrics.streaming_transport import (
+    ChunkReadyHandle,
+    StreamingObserver,
+)
 from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import (
     AcceptedAudioAuthority,
     AcceptedPiece,
@@ -41,6 +53,22 @@ from vllm_omni.model_executor.models.nemotron_asr.transcript import (
     BoundedTranscript,
 )
 
+__all__ = [
+    "ChunkReadyHandle",
+    "StreamingObserver",
+    "AdmittedGeometry",
+    "CarrierTicket",
+    "PieceReceipt",
+    "ReceiptLedger",
+    "NemotronRealtimeSession",
+    "DEFAULT_CADENCE",
+    "DEFAULT_LOCALE",
+    "LEDGER_BACKLOG_S",
+    "ACCEPTED_AUDIO_BUDGET_DEFAULT_S",
+    "normalize_locale_tag",
+    "resolve_checkpoint_locale",
+]
+
 #: The channel-less standard serving path has no per-session admission
 #: channel today, so the package publishes explicit, greppable defaults
 #: rather than attribute fallbacks (round-3 gate, decisions 1-2).
@@ -56,6 +84,16 @@ DEFAULT_ACCEPTED_AUDIO_CAPACITY_S = 30.0
 DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES = 1 << 20
 DEFAULT_TRANSCRIPT_FRAGMENT_OVERHEAD_BYTES = 16
 DEFAULT_TRANSCRIPT_TERMINAL_HEADROOM_BYTES = 4_096
+
+#: PORT's per-session accepted-audio queue budget, in seconds of audio
+#: (design §Park, Finalization, and Backpressure, Decision 1): "one
+#: coherent backpressure budget with the receipt ledger's pending-carrier
+#: bound" — hence sharing :data:`LEDGER_BACKLOG_S`'s default. Serving-
+#: owned and ENV-configured as a positive finite value per deployment;
+#: checked strictly BEFORE acceptance on both native and leased paths.
+#: Phase-5 typed stub only: stored on the session, not yet enforced by
+#: any acceptance path.
+ACCEPTED_AUDIO_BUDGET_DEFAULT_S = LEDGER_BACKLOG_S
 
 _SAMPLE_RATE_HZ: int = int(FRONTEND_CONSTANTS["sample_rate"])
 #: Geometry ids follow manifests.CADENCES order (PORT-SESS-002: the
@@ -446,6 +484,8 @@ class NemotronRealtimeSession:
         prompts: dict[str, int],
         prompt_index: int,
         ledger: ReceiptLedger | None = None,
+        observer: StreamingObserver | None = None,
+        accepted_audio_budget_s: float = ACCEPTED_AUDIO_BUDGET_DEFAULT_S,
     ) -> None:
         self._geometry = geometry
         self._park_token_id = park_token_id
@@ -458,6 +498,13 @@ class NemotronRealtimeSession:
         self._prompts = dict(prompts)
         self._prompt_index = prompt_index
         self._ledger = ledger
+        # PORT-OBS-003 stub: stored, not yet called anywhere. The leased
+        # path (NemotronSessionFactory) is the intended injection point;
+        # wiring calls into buffer_stream/the lease consumer is Phase 6.
+        self._observer = observer
+        # Design §Park, Finalization, and Backpressure (Decision 1) typed
+        # stub: not yet enforced by buffer_stream or any acceptance path.
+        self._accepted_audio_budget_s = accepted_audio_budget_s
 
     @classmethod
     def from_model_config(
@@ -478,6 +525,8 @@ class NemotronRealtimeSession:
         engine_epoch: str = "unbound",
         lease_generation: int = 0,
         max_session_samples: int | None = None,
+        observer: StreamingObserver | None = None,
+        accepted_audio_budget_s: float = ACCEPTED_AUDIO_BUDGET_DEFAULT_S,
     ) -> NemotronRealtimeSession:
         """Build a session from the served checkpoint's configuration.
 
@@ -495,6 +544,13 @@ class NemotronRealtimeSession:
             max_pending_carriers: Override for the ledger's backlog
                 bound; the default is :data:`LEDGER_BACKLOG_S` of
                 admitted-cadence audio.
+            observer: The optional PORT-OBS-003 chunk/session observer.
+                Stub: accepted and stored, not yet wired to any event.
+            accepted_audio_budget_s: The serving-configured per-session
+                accepted-audio queue budget, in seconds (design §Park,
+                Finalization, and Backpressure, Decision 1). Stub:
+                accepted and stored, not yet enforced by any acceptance
+                path.
 
         Returns:
             The typed session.
@@ -607,6 +663,8 @@ class NemotronRealtimeSession:
             prompts=prompts,
             prompt_index=prompts[resolved_locale],
             ledger=ledger,
+            observer=observer,
+            accepted_audio_budget_s=accepted_audio_budget_s,
         )
 
     @property
@@ -658,6 +716,21 @@ class NemotronRealtimeSession:
     def ledger(self) -> ReceiptLedger | None:
         """The receipt ledger, or ``None`` when no consumer armed one."""
         return self._ledger
+
+    @property
+    def observer(self) -> StreamingObserver | None:
+        """The PORT-OBS-003 observer, or ``None`` when none was injected."""
+        return self._observer
+
+    @property
+    def accepted_audio_budget_s(self) -> float:
+        """The per-session accepted-audio queue budget, in seconds.
+
+        Design §Park, Finalization, and Backpressure (Decision 1) typed
+        stub: not yet enforced by ``buffer_stream`` or any acceptance
+        path.
+        """
+        return self._accepted_audio_budget_s
 
     def select_prompt(self, locale: str) -> int:
         """Select the session-control prompt for a locale.
