@@ -224,6 +224,14 @@ class _RecordingObserver:
     def overflow(self, *, kind: str) -> None:
         self.calls.append(("overflow", {"kind": kind}))
 
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        handles = list(self._waiting.get(session_key, ()))
+        inflight = self._inflight.get(session_key)
+        if inflight is not None:
+            handles.append(inflight)
+        for handle in handles:
+            self.unit_cleared(handle, outcome=outcome)
+
     # ---- test-only introspection -------------------------------------
     def outstanding(self, session_key: str) -> list[Any]:
         return list(self._waiting.get(session_key, ()))
@@ -313,17 +321,24 @@ def test_park_correlation_interleaving_matches_the_settled_design() -> None:
 
 
 # @spec PORT-OBS-003
-def test_absent_observer_is_inert_versus_a_supplied_but_unwired_one() -> None:
-    """Reuses the segmenter fixture from test_realtime_session.py: driving
-    the SAME audio through buffer_stream with and without an observer must
-    yield byte-identical envelopes, because the Phase-5 stub never reads
-    the observer. This pins today's inertness contract (PORT-OBS-003's
-    "absent observer -> pre-metrics baseline behavior") independent of
-    whether Phase 6 wiring has landed yet.
+def test_absent_observer_produces_baseline_behavior_with_zero_observer_traffic() -> None:
+    """No observer supplied: the segmenter's full detection/delivery/
+    budget path runs to completion with zero observer traffic (there is
+    no observer object to call — this is the durable PORT-OBS-003
+    contract: "absent observer -> pre-metrics baseline behavior",
+    forever, not just pre-Phase-6), and produces byte-identical envelopes
+    across two independent back-to-back runs (baseline determinism).
+
+    Lead-authorized fix (Phase-6 round 2, Q1b): retires the sibling
+    "supplied-but-unwired" leg this test used to carry — that leg pinned
+    the Phase-5 stub's literal non-consumption of a supplied observer,
+    an invariant that necessarily breaks once Phase 6 wires real
+    observation (the point of this phase). The absent-observer leg below
+    is what PORT-OBS-003 actually requires long-term.
     """
 
-    async def run_with(observer: Any) -> list[Any]:
-        session = _session(with_ledger=True, observer=observer)
+    async def run_without_observer() -> list[Any]:
+        session = _session(with_ledger=True, observer=None)
         queue: asyncio.Queue = asyncio.Queue()
         agen = buffer_stream(_audio(8_960 * 2), queue, session)
         envelopes = []
@@ -333,13 +348,12 @@ def test_absent_observer_is_inert_versus_a_supplied_but_unwired_one() -> None:
             queue.put_nowait([PARK_ID])
         return envelopes
 
-    without = _run(run_with(None))
-    fake = _RecordingObserver()
-    withobs = _run(run_with(fake))
-    assert len(without) == len(withobs) == 3  # 2 regular + 1 final-tail
+    first = _run(run_without_observer())
+    second = _run(run_without_observer())
+    assert len(first) == len(second) == 3  # 2 regular + 1 final-tail
     envelope_header_fields = _MODULES["manifests"].ENVELOPE_HEADER_FIELDS
     admission_slot = envelope_header_fields.index("admission_ms_mod")
-    for a, b in zip(without, withobs, strict=True):
+    for a, b in zip(first, second, strict=True):
         # The header's admission_ms_mod slot is a genuine wall-clock stamp
         # (design §Ingress-deadline plumbing) — the two back-to-back runs
         # are expected to differ there by a millisecond or so; mask it out
@@ -348,8 +362,6 @@ def test_absent_observer_is_inert_versus_a_supplied_but_unwired_one() -> None:
         a_masked[admission_slot] = 0.0
         b_masked[admission_slot] = 0.0
         np.testing.assert_array_equal(a_masked, b_masked)
-    # The stub never calls the observer at all yet.
-    assert fake.calls == []
 
 
 # ---- regular ready at cadence completion (PORT-OBS-004) — RED ----------------

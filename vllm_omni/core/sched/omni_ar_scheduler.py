@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.metrics import streaming_transport
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
@@ -611,6 +612,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        # PORT-OBS-008/009: the scheduler-side hop, gated by this
+        # scheduler's own host-statistics switch — mirrors the
+        # scheduler_stats "return to only one front-end" selection above,
+        # since batch stats are likewise a global, not per-client, signal.
+        # Gated on the OUTSIDE (not just via ``stats_enabled=``) so a
+        # disabled collector never synthesizes an otherwise-unneeded
+        # EngineCoreOutputs for a step that would send nothing else.
+        if self.log_stats:
+            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+                engine_core_outputs[0] = eco = EngineCoreOutputs()
+            streaming_transport.forward_batch_stats_to_engine_core_outputs(
+                model_runner_output,
+                eco,
+                stats_enabled=True,
+            )
 
         self._capture_omni_connector_output(model_runner_output)
 

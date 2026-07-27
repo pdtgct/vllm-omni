@@ -1974,23 +1974,46 @@ def warmup_advance_model_rows_scatter(
 
 
 # ---- PORT-OBS-008 batch-size sub-stat: consume-once extraction hook ----
-def consume_batch_stats() -> list[tuple[int, int]] | None:
-    """Drain this call's per-executed-bucket ``(geometry_id, rows)`` list.
+#: Module-level (not per-instance, mirroring ``plan.PlanContextSlot``'s
+#: stage/consume shape but never raising on an empty/absent stage):
+#: ``advance_model_rows`` overwrites this every call, so a stranded
+#: earlier list can never leak into a later transaction's read.
+#:
+#: Queued EARS amendment (Phase-6 round 2, Q3, lead-authorized
+#: spec-tightening): OBS-008 now reads "one (cadence_ms, rows) entry per
+#: executed nonempty CHUNK geometry bucket, cadence resolved at
+#: recording from the geometry authority" — cadence is resolved HERE
+#: (the manifest-table authority is this model package's own), not by
+#: any downstream consumer, so the metrics/orchestrator layers stay
+#: model-agnostic (never importing a geometry->cadence table of their
+#: own).
+_batch_stats_slot: list[tuple[str, int]] | None = None
 
-    PORT-OBS-008/009: ``advance_model_rows`` shall record one entry per
-    executed nonempty CHUNK geometry bucket — bounded by the five admitted
-    geometries, CPU-only, no device synchronization — unconditionally
-    (recording stands even when export is disabled), and expose it through
-    this consume-once hook, drained by the runner once per execution
-    (mirroring ``plan.PlanContextSlot``'s stage/consume shape). ``None``
-    means not collecting; ``[]`` means a transaction that executed no
+
+def _stage_batch_stats(stats: list[tuple[str, int]]) -> None:
+    """Record one transaction's executed-bucket stats (PORT-OBS-008)."""
+    global _batch_stats_slot
+    _batch_stats_slot = stats
+
+
+def consume_batch_stats() -> list[tuple[str, int]] | None:
+    """Drain this call's per-executed-bucket ``(cadence_ms, rows)`` list.
+
+    PORT-OBS-008/009 (amended): ``advance_model_rows`` records one entry
+    per executed nonempty CHUNK geometry bucket — bounded by the five
+    admitted geometries, CPU-only, no device synchronization —
+    unconditionally (recording stands even when export is disabled),
+    cadence resolved from the geometry authority (``manifests.CADENCES``)
+    at recording time, exposed through this consume-once hook, drained
+    by the runner once per execution (mirroring ``plan.PlanContextSlot``'s
+    stage/consume shape). ``None`` means not collecting (nothing staged
+    since the last drain); ``[]`` means a transaction that executed no
     nonempty CHUNK bucket; downstream consumers skip both.
-
-    Raises:
-        NotImplementedError: Always, until Phase 6 wires the recording
-            into the ``executed`` bucket loop and stages it here.
     """
-    raise NotImplementedError("advance_model_rows does not yet record PORT-OBS-008 batch stats")
+    global _batch_stats_slot
+    stats = _batch_stats_slot
+    _batch_stats_slot = None
+    return stats
 
 
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
@@ -2237,6 +2260,22 @@ def advance_model_rows(
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
             raise ValueError("decode resolver returned an invalid binding")
         bucket_pos.append((geometry, positions, resolved))
+
+    # PORT-OBS-008 (amended): one (cadence_ms, rows) entry per executed
+    # nonempty CHUNK geometry bucket, unconditionally — CPU-only (``live``
+    # above is already a plain int, no device sync; ``cadence_labels`` is
+    # a python list index, not a tensor read), independent of ``capture``
+    # or export being enabled. ``bucket_pos`` is exactly the executed set
+    # (the loop below processes every entry; nothing filters it further).
+    # Cadence is resolved HERE, at the manifest-table authority, so every
+    # downstream consumer (metrics, orchestrator) stays model-agnostic.
+    cadence_labels = list(CADENCES)
+    _stage_batch_stats(
+        [
+            (cadence_labels[geometry].removesuffix("ms"), int(positions.numel()))
+            for geometry, positions, _ in bucket_pos
+        ]
+    )
 
     # ---- small continuing-row gather + metadata-only fresh init ----
     def _stage(slot_name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:

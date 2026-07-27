@@ -19,14 +19,19 @@ from typing import Any
 
 import numpy as np
 
+from vllm_omni.metrics.streaming_transport import observe_safely
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     ADMISSION_EPOCH_MODULUS_MS,
     ENVELOPE_HEADER_FIELDS,
+    FRONTEND_CONSTANTS,
 )
 from vllm_omni.model_executor.models.nemotron_asr.session import (
     NemotronRealtimeSession,
     StreamingObserver,
+    cadence_ms_label,
 )
+
+_SAMPLE_RATE_HZ = int(FRONTEND_CONSTANTS["sample_rate"])
 
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
@@ -85,6 +90,7 @@ async def buffer_stream(
     *,
     observer: StreamingObserver | None = None,
     final_tail_ready_stamp_s: float | None = None,
+    accepted_audio_budget_s: float | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Chunk client audio: one yield = one StreamingUpdate.
 
@@ -97,23 +103,40 @@ async def buffer_stream(
     including an explicit zero-sample transaction; never zero-padded).
 
     Args:
-        observer: PORT-OBS-003 stub — overrides ``session.observer`` when
-            given (e.g. the ledgerless native path, where ``model_config``
-            is a bare config with no session object to carry one). Not yet
-            wired to any ready/park event.
-        final_tail_ready_stamp_s: PORT-OBS-004 stub — the caller-captured
-            monotonic finalize-acceptance stamp. Not yet consumed; the
-            eventual final-tail ``unit_ready`` call must use exactly this
-            value rather than reconstruct it here at generator resumption.
+        observer: PORT-OBS-003: overrides ``session.observer`` when given
+            (e.g. the ledgerless native path, where ``model_config`` is a
+            bare config with no session object to carry one).
+        final_tail_ready_stamp_s: PORT-OBS-004: the caller-captured
+            monotonic finalize-acceptance stamp. When given, the
+            final-tail ``unit_ready`` call uses exactly this value rather
+            than reconstructing one here at generator resumption.
+        accepted_audio_budget_s: PORT-SESS-001 Decision 1: overrides the
+            per-session accepted-audio queue budget when ``model_config``
+            is a bare config (a new session is constructed here) — the
+            native path's only construction point for one. Ignored when
+            ``model_config`` is already a :class:`NemotronRealtimeSession`
+            (that session's own configured budget governs). ``None``
+            (the default) leaves :data:`ACCEPTED_AUDIO_BUDGET_DEFAULT_S`
+            in force, keeping today's behavior exactly.
+
+    Raises:
+        RuntimeError: If a piece would push the session's accepted-audio
+            queue occupancy past ``session.accepted_audio_budget_s``
+            (design §Park, Finalization, and Backpressure, Decision 1,
+            amended PORT-SESS-001) — the whole piece is rejected before
+            any of its complete cadences are accepted.
     """
     # Every session control is a typed attribute of the session object
     # riding the model_config position (PORT-RTC-001); anything else is
     # the channel-less standard path, whose defaults live only in the
     # factory.
+    session_kwargs: dict[str, Any] = {}
+    if accepted_audio_budget_s is not None:
+        session_kwargs["accepted_audio_budget_s"] = accepted_audio_budget_s
     session = (
         model_config
         if isinstance(model_config, NemotronRealtimeSession)
-        else NemotronRealtimeSession.from_model_config(model_config)
+        else NemotronRealtimeSession.from_model_config(model_config, **session_kwargs)
     )
     geometry = session.geometry
     chunk_samples = geometry.chunk_samples
@@ -121,11 +144,28 @@ async def buffer_stream(
     park_id = session.park_token_id
     placeholder_id = session.audio_chunk_token_id
     ledger = session.ledger
+    # PORT-OBS-003: the explicit override takes precedence over the
+    # session's own observer (the ledgerless native path threads one in
+    # without a session-owning observer to fall back to).
+    active_observer: StreamingObserver | None = observer if observer is not None else session.observer
+    session_key = session.session_key
+    cadence_ms = cadence_ms_label(geometry.cadence)
+    budget_s = session.accepted_audio_budget_s
+
+    # PORT-SESS-001 (amended): queue OCCUPANCY only — accepted-but-not-
+    # yet-drained audio seconds. Released exactly when the CHUNK that
+    # audio became part of is observed parked (below), never on a
+    # lifetime-cumulative basis.
+    occupied_s = 0.0
+    pending_release_s: deque[float] = deque()
 
     async def hold_until_park() -> None:
+        nonlocal occupied_s
         while True:
             ids = await input_stream.get()
             if park_id in ids:
+                if pending_release_s:
+                    occupied_s = max(0.0, occupied_s - pending_release_s.popleft())
                 return
 
     sequence = 0
@@ -167,26 +207,55 @@ async def buffer_stream(
     # the same burst would only be stamped when the generator resumes
     # after the first chunk's hold — understating its true queuing
     # delay exactly in the case the LLD calls out.
-    ready: deque[tuple[np.ndarray, int]] = deque()
+    ready: deque[tuple[np.ndarray, int, Any]] = deque()
     yielded = False
     async for frame in audio_stream:
+        # PORT-SESS-001 (amended): checked strictly BEFORE acceptance —
+        # a piece that would push occupancy past budget is rejected
+        # whole, before touching ``buffer`` or extracting any of its
+        # complete cadences.
+        frame_seconds = frame.shape[0] / _SAMPLE_RATE_HZ
+        if occupied_s + frame_seconds > budget_s:
+            if active_observer is not None:
+                observe_safely(active_observer.overflow, kind="input_queue")
+            raise RuntimeError(
+                "accepted-audio queue occupancy would exceed the "
+                f"session's accepted_audio_budget_s={budget_s}; the whole "
+                "piece is rejected before any of its complete cadences "
+                "are accepted (PORT-SESS-001)"
+            )
+        occupied_s += frame_seconds
+        if active_observer is not None:
+            observe_safely(active_observer.accepted_audio_seconds, cadence_ms=cadence_ms, seconds=frame_seconds)
         buffer = np.concatenate([buffer, frame])
         while buffer.shape[0] >= chunk_samples:
             chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
             stamp = _admission_ms_mod()
-            ready.append((chunk, stamp))
+            handle = None
+            if active_observer is not None:
+                handle = observe_safely(
+                    active_observer.unit_ready,
+                    session_key=session_key,
+                    cadence_ms=cadence_ms,
+                    chunk_type="regular",
+                    ready_stamp_s=time.monotonic(),
+                )
+            ready.append((chunk, stamp, handle))
             # The ticket exists before the prompt is yielded, so a park
             # returned immediately after cannot outrun its handle
             # (PORT-RTC-002); the call is synchronous, leaving the
             # stamp-then-drain pass await-free.
             if ledger is not None:
-                ledger.mint(final_tail=False, admission_ms_mod=stamp)
+                ledger.mint(final_tail=False, admission_ms_mod=stamp, handle=handle)
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
         while ready:
-            chunk, admission_ms_mod = ready.popleft()
+            chunk, admission_ms_mod, handle = ready.popleft()
             if yielded:
                 await hold_until_park()
+            if active_observer is not None and handle is not None:
+                observe_safely(active_observer.unit_minted, handle)
+            pending_release_s.append(chunk.shape[0] / _SAMPLE_RATE_HZ)
             yield prompt(chunk, final_tail=False, admission_ms_mod=admission_ms_mod)
             yielded = True
     # Finalization is an explicit protocol transaction even when the
@@ -196,8 +265,21 @@ async def buffer_stream(
     if yielded:
         await hold_until_park()
     tail_stamp = _admission_ms_mod()
+    tail_handle = None
+    if active_observer is not None:
+        tail_ready_stamp_s = final_tail_ready_stamp_s if final_tail_ready_stamp_s is not None else time.monotonic()
+        tail_handle = observe_safely(
+            active_observer.unit_ready,
+            session_key=session_key,
+            cadence_ms=cadence_ms,
+            chunk_type="final_tail",
+            ready_stamp_s=tail_ready_stamp_s,
+        )
     if ledger is not None:
-        ledger.mint(final_tail=True, admission_ms_mod=tail_stamp)
+        ledger.mint(final_tail=True, admission_ms_mod=tail_stamp, handle=tail_handle)
+    if active_observer is not None and tail_handle is not None:
+        observe_safely(active_observer.unit_minted, tail_handle)
+    pending_release_s.append(buffer.shape[0] / _SAMPLE_RATE_HZ)
     yield prompt(buffer, final_tail=True, admission_ms_mod=tail_stamp)
     # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003
     # The engine's later non-resumable end marker closes the request

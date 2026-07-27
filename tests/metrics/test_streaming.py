@@ -464,7 +464,10 @@ class TestStrictLatencyMissBoundary:
         handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_parked(handle, park_stamp_s=0.56)  # exactly the 560ms cadence period
 
-        after = _count_value(generate_latest(REGISTRY).decode(), miss_prefix)
+        # Lead-authorized fix (Phase-6 round 2, Q1a): coerce both sides
+        # identically — an absent series IS the correct no-observation
+        # outcome, not a value distinct from a coerced 0.0.
+        after = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
         assert after == before  # equality must NOT count as a miss
 
     # @spec PORT-OBS-004
@@ -514,10 +517,13 @@ class TestParkedVsCleared:
         handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_cleared(handle, outcome="aborted")
 
+        # Lead-authorized fix (Phase-6 round 2, Q1a): coerce identically
+        # on both sides — an absent series IS the correct no-observation
+        # outcome for latency/miss (never touched for a cleared unit).
         out = generate_latest(REGISTRY).decode()
-        assert _count_value(out, latency_count_prefix) == latency_before
-        assert _count_value(out, miss_prefix) == miss_before
-        assert _count_value(out, outcome_prefix) == outcome_before + 1.0
+        assert (_count_value(out, latency_count_prefix) or 0.0) == latency_before
+        assert (_count_value(out, miss_prefix) or 0.0) == miss_before
+        assert (_count_value(out, outcome_prefix) or 0.0) == outcome_before + 1.0
 
 
 class TestBoundedEnumRejection:

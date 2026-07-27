@@ -55,12 +55,13 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
         inter_stage_outputs: Optional per-request list of inter-stage payload dicts
             for connector transport (``save_async`` / full_payload).  Not forwarded
             to the orchestrator output processor.
-        streaming_chunk_batch_stats: PORT-OBS-008/009 stub field — one
-            ``(geometry_id, rows)`` entry per executed nonempty CHUNK
+        streaming_chunk_batch_stats: PORT-OBS-008/009 (amended) — one
+            ``(cadence_ms, rows)`` entry per executed nonempty CHUNK
             geometry bucket this step, drained from the model's
-            consume-once extraction hook. ``None`` means not collecting;
-            ``[]`` means a step that executed no nonempty CHUNK bucket;
-            downstream consumers skip both.
+            consume-once extraction hook (cadence already resolved from
+            the geometry authority at recording time). ``None`` means
+            not collecting; ``[]`` means a step that executed no
+            nonempty CHUNK bucket; downstream consumers skip both.
     """
 
     multimodal_outputs: list[dict[str, object]] | None = None
@@ -69,7 +70,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
-    streaming_chunk_batch_stats: list[tuple[int, int]] | None = None
+    streaming_chunk_batch_stats: list[tuple[str, int]] | None = None
 
 
 @dataclass

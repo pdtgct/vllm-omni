@@ -15,6 +15,7 @@ GPU-free unit-testable.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -284,6 +285,12 @@ class NemotronSessionLease:
 
     async def _consume(self) -> None:
         """Drive generation and resolve ledger tickets at legal parks."""
+        from vllm_omni.metrics.streaming_transport import observe_safely
+        from vllm_omni.model_executor.models.nemotron_asr.session import (
+            cadence_ms_label,
+        )
+
+        observer = self._session.observer
         try:
             render = self._render or _render_factory(self._engine)
             outputs = self._engine.generate(
@@ -303,6 +310,15 @@ class NemotronSessionLease:
                     self._input_stream.put_nowait(ids)
                 self._text += first.text or ""
                 if self._park_id in ids:
+                    # PORT-OBS-003: the single-in-flight-handle
+                    # correlation authority — resolves to the CHUNK this
+                    # park completes, or ``None`` for the terminal FLUSH
+                    # park (no in-flight unit left to resolve, correctly
+                    # ignored).
+                    if observer is not None:
+                        handle = observe_safely(observer.complete_inflight, self._session.session_key)
+                        if handle is not None:
+                            observe_safely(observer.unit_parked, handle, park_stamp_s=time.monotonic())
                     if self._ledger.pending:
                         self._ledger.complete_next(self._text)
                     elif self._audio_closed and not self._flush_parked:
@@ -322,6 +338,24 @@ class NemotronSessionLease:
                 self._ledger.fail(self._error)
             elif not self._audio_closed or self._ledger.pending or not self._flush_parked:
                 self._ledger.fail(RuntimeError("generation ended before the session's normal finalization"))
+            # PORT-OBS-006: the lease's single idempotent terminal-
+            # disposition section — this coroutine body runs exactly
+            # once per lease, so no separate guard flag is needed.
+            # ``self._aborted`` is already correctly set by the time this
+            # runs even under an abort/finish race, because ``abort()``
+            # sets it BEFORE cancelling (and awaiting) this same task.
+            if observer is not None:
+                if self._aborted:
+                    reason = "aborted"
+                elif self._error is not None:
+                    reason = "error"
+                else:
+                    reason = "completed"
+                observe_safely(
+                    observer.session_finished,
+                    cadence_ms=cadence_ms_label(self._session.geometry.cadence),
+                    reason=reason,
+                )
 
 
 # @spec PORT-RTC-001, PORT-RTC-003, PORT-RTC-007

@@ -108,6 +108,12 @@ GEOM_REG = 0
 REG_SAMPLES = 1_280
 GEOM_FINAL = 2
 FINAL_SAMPLES = 3_840
+# PORT-OBS-008 amended (Phase-6 round 2, Q3, lead-authorized): recorded
+# stats now carry the cadence label, resolved from the geometry
+# authority (manifests.CADENCES) at recording time — never the bare
+# geometry id.
+CADENCE_REG = list(manifests.CADENCES)[GEOM_REG].removesuffix("ms")
+CADENCE_FINAL = list(manifests.CADENCES)[GEOM_FINAL].removesuffix("ms")
 
 _BOOK = {name: i for i, (name, _) in enumerate(manifests.BOOK_FIELDS)}
 _CTR = {name: i for i, name in enumerate(manifests.FRONTEND_COUNTER_FIELDS)}
@@ -418,7 +424,7 @@ def test_advance_model_rows_exposes_no_stats_disable_flag() -> None:
 def test_records_one_entry_per_executed_nonempty_chunk_geometry_bucket() -> None:
     _two_geometry_call()
     stats = advance.consume_batch_stats()
-    assert sorted(stats) == [(GEOM_REG, 1), (GEOM_FINAL, 1)]
+    assert sorted(stats) == sorted([(CADENCE_REG, 1), (CADENCE_FINAL, 1)])
 
 
 # @spec PORT-OBS-008
@@ -457,20 +463,20 @@ def test_no_chunk_transaction_produces_an_empty_list_not_none() -> None:
 # @spec PORT-OBS-008
 def test_multiple_rows_in_one_geometry_aggregate_under_a_single_entry() -> None:
     """Three CHUNK rows sharing ONE geometry execute as a single bucket —
-    one (geometry_id, rows) entry with rows=3, never three entries."""
+    one (cadence_ms, rows) entry with rows=3, never three entries."""
     _single_geometry_call(num_rows=3, geometry=GEOM_REG)
     stats = advance.consume_batch_stats()
-    assert stats == [(GEOM_REG, 3)]
+    assert stats == [(CADENCE_REG, 3)]
 
 
 # @spec PORT-OBS-008
 def test_replay_and_flush_rows_are_excluded_from_batch_stats() -> None:
     """A FLUSH row and a REPLAY row alongside one CHUNK row: the executed-
-    bucket list must reflect ONLY the CHUNK row's geometry, at rows=1 —
+    bucket list must reflect ONLY the CHUNK row's cadence, at rows=1 —
     REPLAY/FLUSH never contribute to any bucket's row count."""
     _mixed_replay_flush_and_chunk_call()
     stats = advance.consume_batch_stats()
-    assert stats == [(GEOM_REG, 1)]
+    assert stats == [(CADENCE_REG, 1)]
 
 
 # @spec PORT-OBS-008
@@ -479,8 +485,8 @@ def test_successive_transactions_produce_independent_stats() -> None:
     carrying over or accumulating entries from an earlier transaction."""
     _two_geometry_call()
     first = advance.consume_batch_stats()
-    assert first is not None and sorted(first) == [(GEOM_REG, 1), (GEOM_FINAL, 1)]
+    assert first is not None and sorted(first) == sorted([(CADENCE_REG, 1), (CADENCE_FINAL, 1)])
 
     _single_geometry_call(num_rows=1, geometry=GEOM_REG)
     second = advance.consume_batch_stats()
-    assert second == [(GEOM_REG, 1)]
+    assert second == [(CADENCE_REG, 1)]

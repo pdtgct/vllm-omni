@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.metrics.streaming_transport import observe_safely
 
 logger = init_logger(__name__)
 
@@ -30,25 +32,36 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
-        # PORT-OBS-003 stub: the connection adapter observes chunk
-        # terminal disposition and open rejections at this layer, but it
-        # does NOT own session-open accounting — that fires at
-        # observer-bearing NemotronRealtimeSession construction
-        # (PORT-OBS-006: never WebSocket acceptance), which this
-        # `__init__` deliberately does not call. Stored, not yet
-        # consumed by `_run_generation`/`handle_event`.
+        # PORT-OBS-003: the connection adapter observes chunk terminal
+        # disposition (`_run_generation`) and connection-layer open
+        # rejections (`_check_model`) at this layer, but it does NOT own
+        # session-open accounting — that fires at observer-bearing
+        # NemotronRealtimeSession construction (PORT-OBS-006: never
+        # WebSocket acceptance), which this `__init__` deliberately does
+        # not call.
         self._observer = observer
-        # PORT-OBS-003 stub: generic (never model-specific) park-token
-        # id. `None` is inert — no park detection is attempted. Once
-        # wired, a committed park is inferred from park-token identity
-        # PLUS an outstanding ready handle (`observer.pop_next_ready`),
-        # never token identity plus text emptiness — so a carrierless
-        # scheduler park echo or a FLUSH park (neither mints a ready
-        # handle) is correctly ignored rather than double-counted.
+        # PORT-OBS-003: generic (never model-specific) park-token id.
+        # `None` is inert — no park detection is attempted. A committed
+        # park is inferred from park-token identity PLUS the single
+        # in-flight handle (`observer.complete_inflight`), never token
+        # identity plus text emptiness — so a carrierless scheduler park
+        # echo or a FLUSH park (neither has an in-flight handle) is
+        # correctly ignored rather than double-counted.
         self._park_token_id = park_token_id
 
     async def start_generation(self):
         await super().start_generation()
+
+    def _check_model(self, model: str | None) -> None | ErrorResponse:
+        """Wrap the inherited model-validation gate with PORT-OBS-007.
+
+        A denied session open is diagnostic-only, never a scaling signal,
+        and carries no cadence label (rejection precedes admission).
+        """
+        err = super()._check_model(model)
+        if err is not None and self._observer is not None:
+            observe_safely(self._observer.session_open_rejected, reason="model")
+        return err
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:
@@ -146,6 +159,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        generation_error: BaseException | None = None
+        # ``getattr`` defensive: some fixtures across this test suite
+        # construct a connection via ``RealtimeConnection.__new__``,
+        # bypassing ``__init__`` (and hence these two attributes)
+        # entirely — inert observation, not an AttributeError, is the
+        # correct behavior for such a connection.
+        observer = getattr(self, "_observer", None)
+        park_token_id = getattr(self, "_park_token_id", None)
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -169,6 +190,16 @@ class RealtimeConnection(VllmRealtimeConnection):
                     new_token_ids = list(first_output.token_ids)
                     if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
+                    # PORT-OBS-003: the single-in-flight-handle
+                    # correlation authority — resolves to the CHUNK this
+                    # park completes, or ``None`` for a carrierless
+                    # scheduler park echo or FLUSH's ticketless park
+                    # (correctly ignored, every waiting-ready unit for
+                    # this session left outstanding).
+                    if observer is not None and park_token_id is not None and park_token_id in new_token_ids:
+                        handle = observe_safely(observer.complete_inflight, request_id)
+                        if handle is not None:
+                            observe_safely(observer.unit_parked, handle, park_stamp_s=time.monotonic())
 
                     if output.prompt_token_ids:
                         prompt_token_ids_len = max(
@@ -216,6 +247,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                     audio_done_sent = True
         except Exception as e:
+            generation_error = e
             logger.exception("Error in generation: %s", e)
             if self._is_connected:
                 await self.send_error(str(e), "processing_error")
@@ -228,6 +260,22 @@ class RealtimeConnection(VllmRealtimeConnection):
                     logger.exception("Failed to send response.audio.done")
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
+            # PORT-OBS-003/005: end-of-generation cleanup — this
+            # connection has no independent local record of every ready
+            # handle the segmenter minted, only the observer's own
+            # {waiting, in-flight} state does, so every still-outstanding
+            # unit for this generation is cleared here in one pass
+            # (mirrors NemotronSessionLease._consume's finally-clearing
+            # pattern on the leased path). Gated on ``_park_token_id``
+            # exactly like park detection itself: with no park-token id
+            # configured, this connection performs no chunk-terminal
+            # observation of any kind, cleanup included.
+            if observer is not None and park_token_id is not None:
+                observe_safely(
+                    observer.clear_all_outstanding,
+                    request_id,
+                    outcome="error" if generation_error is not None else "aborted",
+                )
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))

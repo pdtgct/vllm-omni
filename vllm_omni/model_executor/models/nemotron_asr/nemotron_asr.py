@@ -555,6 +555,9 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         audio_stream: Any,
         input_stream: Any,
         model_config: Any,
+        *,
+        observer: Any = None,
+        accepted_audio_budget_s: float | None = None,
     ) -> Any:
         """The ``SupportsRealtime`` segmenter seam — delegates to the
         engine-free ``buffer_stream`` (PORT-SESS-001/002/003).
@@ -562,12 +565,32 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         The chunking behaviour lives in ``streaming.buffer_stream`` so it
         stays CPU/loader-tested; this classmethod is the thin protocol
         surface the engine calls (pod-tested).
+
+        Args:
+            observer: PORT-OBS-003 — optional, keyword-only. Phase-6
+                round 2 (Q2, lead-decided): widens the
+                ``SupportsRealtime`` protocol surface (a strictly wider
+                signature — extra optional keyword params — still
+                satisfies that Protocol structurally) so the fork's own
+                ``NemotronServingRealtime.transcribe_realtime`` override
+                can thread the installed observer into the natively
+                constructed session. ``None`` (the default) is exactly
+                today's inert behavior — absent params, absent effect.
+            accepted_audio_budget_s: PORT-SESS-001 Decision 1 — optional,
+                keyword-only, same rationale as ``observer``. ``None``
+                leaves the model's default budget in force.
         """
         from vllm_omni.model_executor.models.nemotron_asr.streaming import (
             buffer_stream,
         )
 
-        async for update in buffer_stream(audio_stream, input_stream, model_config):
+        async for update in buffer_stream(
+            audio_stream,
+            input_stream,
+            model_config,
+            observer=observer,
+            accepted_audio_budget_s=accepted_audio_budget_s,
+        ):
             yield update
 
     def prepare_row_plan_context(
@@ -865,6 +888,22 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             graph_covers_decode=False,
             staging=self._ensure_host_staging(),
         )
+
+    def consume_batch_stats(self) -> list[tuple[str, int]] | None:
+        """PORT-OBS-008 consume-once hook: drain this call's per-executed
+        nonempty-CHUNK-geometry-bucket ``(cadence_ms, rows)`` list.
+
+        The generic ``GPUARModelRunner`` calls this (when present —
+        PORT-OBS-008's hook is Nemotron-ASR-specific, not a base-model
+        contract) once per execution when building
+        ``OmniModelRunnerOutput``, mirroring the existing plan-slot
+        pattern (``prepare_row_plan_context``/``PlanContextSlot``).
+        """
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            consume_batch_stats,
+        )
+
+        return consume_batch_stats()
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any = None) -> torch.Tensor:
         """Forced-logits rows from the hidden-row decision carrier.
