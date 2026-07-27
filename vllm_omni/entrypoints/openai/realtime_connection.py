@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
@@ -21,6 +22,7 @@ from vllm_omni.engine.persistent_state_service import (
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.metrics.streaming_transport import observe_safely
 from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
     EndpointPolicy,
 )
@@ -61,16 +63,29 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._native_fifo_event = asyncio.Event()
         self._native_finalized = False
         self._segment_generation = 0
+        self._streaming_session_finished = False
+        self._streaming_finish_reason = "aborted"
         self.session_configuration_timeout = float(
             getattr(self.serving, "session_configuration_timeout_s", 30.0)
         )
         if self.session_configuration_timeout <= 0:
             raise ValueError("session_configuration_timeout must be positive")
         self._configuration_timeout_task: asyncio.Task[None] | None = None
-        # Metrics observe the admitted model session, never mere WebSocket
-        # acceptance.  The park token remains a generic optional detector
-        # input; `None` keeps non-Nemotron realtime paths inert.
+        # PORT-OBS-003: the connection adapter observes chunk terminal
+        # disposition (`_run_generation`) and connection-layer open
+        # rejections (`_check_model`) at this layer, but it does NOT own
+        # session-open accounting — that fires at observer-bearing
+        # NemotronRealtimeSession construction (PORT-OBS-006: never
+        # WebSocket acceptance), which this `__init__` deliberately does
+        # not call.
         self._observer = observer
+        # PORT-OBS-003: generic (never model-specific) park-token id.
+        # `None` is inert — no park detection is attempted. A committed
+        # park is inferred from park-token identity PLUS the single
+        # in-flight handle (`observer.complete_inflight`), never token
+        # identity plus text emptiness — so a carrierless scheduler park
+        # echo or a FLUSH park (neither has an in-flight handle) is
+        # correctly ignored rather than double-counted.
         self._park_token_id = park_token_id
 
     async def handle_connection(self):
@@ -305,7 +320,17 @@ class RealtimeConnection(VllmRealtimeConnection):
                     request_id=session_key,
                     engine_epoch=engine_epoch,
                     lease_generation=generation,
+                    observer=self._observer,
+                    accepted_audio_budget_s=float(
+                        getattr(
+                            self.serving,
+                            "_accepted_audio_budget_s",
+                            None,
+                        )
+                        or 30.0
+                    ),
                 )
+                self._park_token_id = self._nemotron_session.park_token_id
         except Exception:
             await service.release(
                 operation_id=release_operation_id,
@@ -320,6 +345,17 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._is_model_validated = True
         if self._configuration_timeout_task is not None:
             self._configuration_timeout_task.cancel()
+
+    def _check_model(self, model: str | None) -> None | ErrorResponse:
+        """Wrap the inherited model-validation gate with PORT-OBS-007.
+
+        A denied session open is diagnostic-only, never a scaling signal,
+        and carries no cadence label (rejection precedes admission).
+        """
+        err = super()._check_model(model)
+        if err is not None and self._observer is not None:
+            observe_safely(self._observer.session_open_rejected, reason="model")
+        return err
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:
@@ -456,6 +492,14 @@ class RealtimeConnection(VllmRealtimeConnection):
             fragment_overhead_bytes=0,
             terminal_headroom_bytes=0,
         )
+        generation_error: BaseException | None = None
+        # ``getattr`` defensive: some fixtures across this test suite
+        # construct a connection via ``RealtimeConnection.__new__``,
+        # bypassing ``__init__`` (and hence these two attributes)
+        # entirely — inert observation, not an AttributeError, is the
+        # correct behavior for such a connection.
+        observer = getattr(self, "_observer", None)
+        park_token_id = getattr(self, "_park_token_id", None)
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -495,6 +539,16 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                     if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
+                    # PORT-OBS-003: the single-in-flight-handle
+                    # correlation authority — resolves to the CHUNK this
+                    # park completes, or ``None`` for a carrierless
+                    # scheduler park echo or FLUSH's ticketless park
+                    # (correctly ignored, every waiting-ready unit for
+                    # this session left outstanding).
+                    if observer is not None and park_token_id is not None and park_token_id in new_token_ids:
+                        handle = observe_safely(observer.complete_inflight, request_id)
+                        if handle is not None:
+                            observe_safely(observer.unit_parked, handle, park_stamp_s=time.monotonic())
 
                     if output.prompt_token_ids:
                         prompt_token_ids_len = max(
@@ -566,6 +620,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                         terminal=True,
                     )
                 )
+                self._streaming_finish_reason = "completed"
 
                 if sent_audio:
                     await self.send_json(
@@ -575,7 +630,9 @@ class RealtimeConnection(VllmRealtimeConnection):
                         }
                     )
                     audio_done_sent = True
-        except OutputCapacityExceeded:
+        except OutputCapacityExceeded as error:
+            generation_error = error
+            self._streaming_finish_reason = "error"
             logger.exception("Realtime transcript capacity exhausted")
             if self._is_connected:
                 await self.send_error(
@@ -583,6 +640,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "output_capacity_exceeded",
                 )
         except Exception as e:
+            generation_error = e
+            self._streaming_finish_reason = "error"
             logger.exception("Error in generation: %s", e)
             if self._is_connected:
                 await self.send_error(str(e), "processing_error")
@@ -595,6 +654,22 @@ class RealtimeConnection(VllmRealtimeConnection):
                     logger.exception("Failed to send response.audio.done")
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
+            # PORT-OBS-003/005: end-of-generation cleanup — this
+            # connection has no independent local record of every ready
+            # handle the segmenter minted, only the observer's own
+            # {waiting, in-flight} state does, so every still-outstanding
+            # unit for this generation is cleared here in one pass
+            # (mirrors NemotronSessionLease._consume's finally-clearing
+            # pattern on the leased path). Gated on ``_park_token_id``
+            # exactly like park detection itself: with no park-token id
+            # configured, this connection performs no chunk-terminal
+            # observation of any kind, cleanup included.
+            if observer is not None and park_token_id is not None:
+                observe_safely(
+                    observer.clear_all_outstanding,
+                    request_id,
+                    outcome="error" if generation_error is not None else "aborted",
+                )
 
     async def _bind_state_lease(
         self,
@@ -645,6 +720,18 @@ class RealtimeConnection(VllmRealtimeConnection):
                 operation_id=self._state_operation_id,
                 lease=self._state_lease,
                 reason="connection_cleanup",
+            )
+        session = self._nemotron_session
+        if (
+            session is not None
+            and self._observer is not None
+            and not self._streaming_session_finished
+        ):
+            self._streaming_session_finished = True
+            observe_safely(
+                self._observer.session_finished,
+                cadence_ms=str(session.geometry.cadence).removesuffix("ms"),
+                reason=self._streaming_finish_reason,
             )
 
     async def send_json(self, payload: dict):

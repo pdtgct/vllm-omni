@@ -50,6 +50,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUpdateResult
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.streaming_install import observe_chunk_batch_stats
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -212,6 +213,10 @@ class Orchestrator:
     _running_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    # PORT-OBS-008/009: set post-construction, via set_streaming_metrics
+    # (the orchestrator is built before the FastAPI app state that owns
+    # the one-time install seam exists) — None means not collecting.
+    _streaming_metrics: Any = None
 
     def __init__(
         self,
@@ -330,6 +335,39 @@ class Orchestrator:
             # break orchestrator construction.
             logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
             self._stat_logger = None
+
+    def set_streaming_metrics(self, metrics: Any) -> None:
+        """Wire the PORT-OBS-008/009 batch-size sub-stat sink post-
+        construction.
+
+        The orchestrator is constructed before the FastAPI app state
+        that owns the one-time streaming-metrics install seam
+        (``streaming_install.install_streaming_observer``) exists, so
+        the resolved ``OmniStreamingMetrics`` (never the observer
+        wrapper — this sink is engine-output-driven, not chunk-
+        lifecycle-driven) is threaded in here once, after install.
+        ``None`` (never installed, or a non-streaming deployment) keeps
+        the orchestration loop's dispatch a no-op.
+        """
+        self._streaming_metrics = metrics
+
+    def _observe_batch_stats(self, raw_outputs: Any, stage_id: int, replica_id: int) -> None:
+        """PORT-OBS-008/009: dispatch the runner-drained, scheduler-
+        forwarded ``(cadence_ms, rows)`` batch-size sub-stat under this
+        loop's existing stage/replica identity.
+
+        A no-op when no sink was ever installed (``self._streaming_metrics
+        is None``); ``observe_chunk_batch_stats`` itself already skips a
+        ``None``/``[]`` payload without observation.
+        """
+        if self._streaming_metrics is None:
+            return
+        observe_chunk_batch_stats(
+            self._streaming_metrics,
+            getattr(raw_outputs, "streaming_chunk_batch_stats", None),
+            stage=str(stage_id),
+            replica=str(replica_id),
+        )
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -844,6 +882,7 @@ class Orchestrator:
                                 )
                                 if req_state.streaming.enabled:
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                            self._observe_batch_stats(raw_outputs, stage_id, replica_id)
                             # OmniSchedulerMixin.make_stats() already throttles
                             # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
                             # being non-None means this replica passed its own gate.

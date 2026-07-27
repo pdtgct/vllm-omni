@@ -22,20 +22,24 @@ of here — this module (and its ``PrometheusStreamingObserver``/
 ``OmniStreamingMetrics`` imports) is Prometheus-coupled and must not be
 imported by the GPU worker/scheduler.
 
-Phase-5 tests-first stub: every function below is a typed, unimplemented
-seam — see each docstring's ``Raises``.
+Each function below is real: see the docstring's ``Raises`` for the
+validation it performs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.metrics.streaming import OmniStreamingMetrics, PrometheusStreamingObserver
 from vllm_omni.metrics.streaming_transport import StreamingObserver
 
+#: The app-state attribute the installed observer is stored under.
+#: Attribute-based (not a module-level dict keyed by app_state) because
+#: app_state stand-ins (e.g. ``SimpleNamespace``) are commonly unhashable.
+_INSTALLED_ATTR = "_vllm_omni_streaming_observer"
 
-def install_streaming_observer(app_state: Any) -> PrometheusStreamingObserver:
+
+def install_streaming_observer(app_state: Any, *, log_stats: bool) -> PrometheusStreamingObserver:
     """Install the app-owned streaming observer exactly once.
 
     Must complete (and be resolvable via :func:`resolve_installed_observer`)
@@ -45,19 +49,57 @@ def install_streaming_observer(app_state: Any) -> PrometheusStreamingObserver:
     satisfying the model package's ``StreamingObserver`` protocol by
     shape), wrapping a fresh :class:`OmniStreamingMetrics`.
 
+    PORT-OBS-001: callers must only reach this seam on the streaming-path
+    (e.g. ``"realtime" in supported_tasks``) — a deployment serving no
+    streaming model must never import/register the streaming families at
+    all, so this is not called unconditionally at app-state init.
+
     Args:
         app_state: The serving app state. Must already carry
             ``openai_serving_models`` (the served-name registry authority);
             construction resolves ``model_name`` from it once.
+        log_stats: PORT-OBS-002 — the API server's own host-statistics
+            switch (``not args.disable_log_stats``, statistics default
+            ON), threaded straight through to ``OmniStreamingMetrics``.
+            Required, no default: a caller that silently defaulted this
+            would drift from the server's actual statistics setting.
 
     Returns:
         The installed :class:`PrometheusStreamingObserver`.
 
     Raises:
-        NotImplementedError: Always, until Phase 6 wires the registry read,
-            the duplicate-install guard, and the single-API-server assertion.
+        ValueError: If ``app_state.openai_serving_models`` is absent, or
+            its ``model_name()`` resolves empty.
+        RuntimeError: If installation is late (HTTP serving has already
+            started for this app state) or a duplicate (an observer is
+            already installed for this app state).
     """
-    raise NotImplementedError
+    if getattr(app_state, "http_serving_started", False):
+        raise RuntimeError(
+            "streaming-metrics install is late: HTTP serving has already "
+            "started for this app state — install must complete before "
+            "application-plugin participant entry and before HTTP serving "
+            "starts (PORT-OBS-009)"
+        )
+    if getattr(app_state, _INSTALLED_ATTR, None) is not None:
+        raise RuntimeError(
+            "streaming-metrics observer is already installed for this app "
+            "state — duplicate installation fails startup rather than "
+            "silently rebinding (PORT-OBS-009)"
+        )
+    registry = getattr(app_state, "openai_serving_models", None)
+    if registry is None:
+        raise ValueError(
+            "streaming-metrics install requires app_state.openai_serving_models "
+            "(the served-name registry authority) to already exist (PORT-OBS-001)"
+        )
+    model_name = registry.model_name()
+    if not model_name:
+        raise ValueError("app_state.openai_serving_models.model_name() resolved empty")
+    metrics = OmniStreamingMetrics(model_name=model_name, log_stats=log_stats)
+    observer = PrometheusStreamingObserver(metrics)
+    setattr(app_state, _INSTALLED_ATTR, observer)
+    return observer
 
 
 def resolve_installed_observer(app_state: Any) -> StreamingObserver | None:
@@ -73,12 +115,8 @@ def resolve_installed_observer(app_state: Any) -> StreamingObserver | None:
 
     Returns:
         The installed observer, or ``None`` if none was installed.
-
-    Raises:
-        NotImplementedError: Always, until Phase 6 wires the app-state
-            read.
     """
-    raise NotImplementedError
+    return getattr(app_state, _INSTALLED_ATTR, None)
 
 
 def assert_single_api_server_invariant(api_server_count: int = 1) -> None:
@@ -93,19 +131,21 @@ def assert_single_api_server_invariant(api_server_count: int = 1) -> None:
             resolved config/app indicates.
 
     Raises:
-        NotImplementedError: Always, until Phase 6 implements the check
-            (which must raise when ``api_server_count`` is not exactly 1).
+        RuntimeError: If ``api_server_count`` is not exactly 1.
     """
-    raise NotImplementedError
+    if api_server_count != 1:
+        raise RuntimeError(
+            "vLLM-Omni streaming metrics require the pinned single-API-server "
+            f"invariant (process-local gauges); got api_server_count={api_server_count}"
+        )
 
 
 def observe_chunk_batch_stats(
     metrics: OmniStreamingMetrics,
-    stats: list[tuple[int, int]] | None,
+    stats: list[tuple[str, int]] | None,
     *,
     stage: str,
     replica: str,
-    cadence_ms_by_geometry: Mapping[int, str],
 ) -> None:
     """Defensive-skip dispatch for the orchestrator batch-stat sink.
 
@@ -113,19 +153,20 @@ def observe_chunk_batch_stats(
     consume-once hook, forwarded through ``OmniModelRunnerOutput`` /
     ``OmniEngineCoreOutputs``. ``None`` means not collecting; ``[]`` means a
     transaction that executed no nonempty CHUNK bucket. Both are skipped
-    without observation (PORT-OBS-009) — this part of the dispatch is real,
-    not a stub; only the underlying ``observe_chunk_batch_size`` recording is
-    unimplemented.
+    without observation (PORT-OBS-009).
 
     Args:
         metrics: The installed streaming metrics wrapper.
-        stats: The drained ``(geometry_id, rows)`` list, or ``None``.
+        stats: The drained ``(cadence_ms, rows)`` list, or ``None``.
+            PORT-OBS-008 (amended, Phase-6 round 2 Q3): cadence is
+            already resolved from the geometry authority at recording
+            time (``advance.py``, the model package's own manifest
+            table) — this dispatch, and every layer above it, stays
+            model-agnostic; it never sees a geometry id.
         stage: The stable stage identity for the histogram's labels.
         replica: The stable replica identity for the histogram's labels.
-        cadence_ms_by_geometry: Geometry id -> admitted cadence-ms label.
     """
     if not stats:
         return
-    for geometry_id, rows in stats:
-        cadence_ms = cadence_ms_by_geometry[geometry_id]
+    for cadence_ms, rows in stats:
         metrics.observe_chunk_batch_size(stage, replica, cadence_ms, rows)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,7 @@ from typing import Any
 from vllm_omni.metrics.streaming_transport import (
     ChunkReadyHandle,
     StreamingObserver,
+    observe_safely,
 )
 from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import (
     AcceptedAudioAuthority,
@@ -67,6 +69,7 @@ __all__ = [
     "ACCEPTED_AUDIO_BUDGET_DEFAULT_S",
     "normalize_locale_tag",
     "resolve_checkpoint_locale",
+    "cadence_ms_label",
 ]
 
 #: The channel-less standard serving path has no per-session admission
@@ -80,7 +83,6 @@ DEFAULT_LOCALE = "auto"
 #: the backlog bound is RFC-1's own contract and depends on no consumer
 #: invariant.
 LEDGER_BACKLOG_S = 30.0
-DEFAULT_ACCEPTED_AUDIO_CAPACITY_S = 30.0
 DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES = 1 << 20
 DEFAULT_TRANSCRIPT_FRAGMENT_OVERHEAD_BYTES = 16
 DEFAULT_TRANSCRIPT_TERMINAL_HEADROOM_BYTES = 4_096
@@ -99,6 +101,18 @@ _SAMPLE_RATE_HZ: int = int(FRONTEND_CONSTANTS["sample_rate"])
 #: Geometry ids follow manifests.CADENCES order (PORT-SESS-002: the
 #: geometry is admission-selected, never invented).
 _GEOMETRY_ID_BY_CADENCE = {label: index for index, label in enumerate(CADENCES)}
+
+
+# @spec PORT-OBS-003, PORT-OBS-004, PORT-OBS-006
+def cadence_ms_label(cadence: str) -> str:
+    """Strip a :data:`manifests.CADENCES` label's ``"ms"`` suffix.
+
+    The observer protocol's ``cadence_ms`` fields (and the Prometheus
+    metrics module's bounded-enum guard, ``defs.STREAMING_CADENCE_MS_VALUES``)
+    use the bare numeral (``"560"``), never the manifest label
+    (``"560ms"``); this is the one place that conversion happens.
+    """
+    return cadence.removesuffix("ms")
 
 
 # @spec PORT-LID-001, PORT-REGIME-003
@@ -270,7 +284,13 @@ class ReceiptLedger:
     than dropping a ticket or growing without limit.
     """
 
-    def __init__(self, *, max_pending_carriers: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_pending_carriers: int,
+        observer: StreamingObserver | None = None,
+        cadence_ms: str | None = None,
+    ) -> None:
         if max_pending_carriers < 1:
             raise ValueError("max_pending_carriers must be positive")
         self._max_pending_carriers = max_pending_carriers
@@ -281,6 +301,20 @@ class ReceiptLedger:
         self._samples_consumed = 0
         self._sequence = 0
         self._failed: BaseException | None = None
+        # PORT-OBS-003/005: the ledger's own bound trip (a real, already-
+        # implemented backpressure mechanism, PORT-RTC-002) and its own
+        # terminal-failure path are the ONLY observation call sites a bare
+        # ``ledger.mint``/``ledger.fail`` caller ever reaches — the
+        # segmenter's own unit_ready/unit_minted calls (buffer_stream) are
+        # a separate, higher-level event stream keyed by the SAME handles
+        # when the caller supplies one via :meth:`mint`'s ``handle``
+        # argument. Only a caller that mints directly, bypassing
+        # buffer_stream (as these two unit-level tests do), reaches the
+        # synthesis fallback below — never the real segmenter flow.
+        self._observer = observer
+        self._ready_handles: dict[int, Any] = {}
+        self._cadence_ms = cadence_ms
+        self._handle_by_ticket: dict[int, Any] = {}
 
     def _reject_if_failed(self) -> None:
         """Raise once the ledger has been terminally failed."""
@@ -299,12 +333,25 @@ class ReceiptLedger:
         """Minted tickets not yet completed, in mint order."""
         return tuple(self._pending)
 
-    def mint(self, *, final_tail: bool, admission_ms_mod: int) -> CarrierTicket:
+    def mint(
+        self,
+        *,
+        final_tail: bool,
+        admission_ms_mod: int,
+        handle: Any = None,
+    ) -> CarrierTicket:
         """Record one minted carrier and return its ticket.
 
         Args:
             final_tail: Whether this carrier is the session's final tail.
             admission_ms_mod: The carrier's ready-stamp (PORT-SESS-001).
+            handle: The :class:`ChunkReadyHandle` the segmenter's own
+                ``unit_ready`` call already minted for this carrier, when
+                called from ``buffer_stream``. When omitted (a caller
+                minting directly, bypassing the segmenter), and an
+                observer is configured, one is synthesized here instead —
+                never both, so a segmenter-driven mint never double-fires
+                ``unit_ready``.
 
         Returns:
             The ticket, whose ``done`` future the consumer completes at
@@ -316,6 +363,8 @@ class ReceiptLedger:
         """
         self._reject_if_failed()
         if len(self._pending) >= self._max_pending_carriers:
+            if self._observer is not None:
+                observe_safely(self._observer.overflow, kind="carrier")
             raise RuntimeError(
                 f"pending carrier tickets reached the session's backlog "
                 f"bound ({self._max_pending_carriers}); the receipt "
@@ -331,6 +380,16 @@ class ReceiptLedger:
         self._sequence += 1
         self._pending.append(ticket)
         self._minted_by_frame.append(ticket)
+        if handle is None and self._observer is not None and self._cadence_ms is not None:
+            handle = observe_safely(
+                self._observer.unit_ready,
+                session_key=str(id(self)),
+                cadence_ms=self._cadence_ms,
+                chunk_type="final_tail" if final_tail else "regular",
+                ready_stamp_s=time.monotonic(),
+            )
+        if handle is not None:
+            self._handle_by_ticket[ticket.sequence] = handle
         return ticket
 
     def acknowledge_piece(self, samples: int) -> PieceReceipt:
@@ -424,6 +483,11 @@ class ReceiptLedger:
         ticket = self._pending.popleft()
         if not ticket.done.done():
             ticket.done.set_result(payload)
+        # Park observation (unit_parked) is a lease/native-adapter
+        # concern, not the ledger's (see session.py's terminal-
+        # disposition ownership note); this bookkeeping map only needs
+        # tidying so it never grows past the pending bound.
+        self._handle_by_ticket.pop(ticket.sequence, None)
         return ticket
 
     def fail(self, error: BaseException) -> None:
@@ -455,6 +519,15 @@ class ReceiptLedger:
             ticket = self._pending.popleft()
             if not ticket.done.done():
                 ticket.done.set_exception(error)
+            # PORT-OBS-003/005: the ledger's own terminal-failure path is
+            # the ticket-level clearing authority for still-pending
+            # carriers (the leased-path lease consumer's own ledger
+            # failure just calls this method — it does not separately
+            # re-clear). Guarded by the same idempotency check above:
+            # a second ``fail`` call never re-enters this loop.
+            handle = self._handle_by_ticket.pop(ticket.sequence, None)
+            if handle is not None and self._observer is not None:
+                observe_safely(self._observer.unit_cleared, handle, outcome="error")
         self._minted_by_frame.clear()
         self._receipts.clear()
 
@@ -498,13 +571,27 @@ class NemotronRealtimeSession:
         self._prompts = dict(prompts)
         self._prompt_index = prompt_index
         self._ledger = ledger
-        # PORT-OBS-003 stub: stored, not yet called anywhere. The leased
-        # path (NemotronSessionFactory) is the intended injection point;
-        # wiring calls into buffer_stream/the lease consumer is Phase 6.
+        # The transport-neutral factory/lease binding injects the same
+        # observer at session construction (PORT-OBS-003); buffer_stream
+        # reads it back off the session (or an explicit override) to emit
+        # ready/minted events, and the lease consumer reads it back to
+        # observe terminal disposition.
         self._observer = observer
-        # Design §Park, Finalization, and Backpressure (Decision 1) typed
-        # stub: not yet enforced by buffer_stream or any acceptance path.
+        # Design §Park, Finalization, and Backpressure (Decision 1): the
+        # per-session accepted-audio queue occupancy budget, enforced by
+        # buffer_stream on both the native and leased paths regardless of
+        # whether an observer is attached.
+        if accepted_audio_budget_s <= 0 or not math.isfinite(
+            accepted_audio_budget_s
+        ):
+            raise ValueError("accepted_audio_budget_s must be positive and finite")
         self._accepted_audio_budget_s = accepted_audio_budget_s
+        # Native open is observer-bearing model-session construction
+        # after successful validation and before engine request creation
+        # (PORT-OBS-006) — every native/leased path funnels through this
+        # constructor, so this is the single, un-duplicated open site.
+        if self._observer is not None:
+            observe_safely(self._observer.session_opened, cadence_ms=cadence_ms_label(geometry.cadence))
 
     @classmethod
     def from_model_config(
@@ -627,7 +714,7 @@ class NemotronRealtimeSession:
 
         if accepted_audio_capacity_samples is None:
             accepted_audio_capacity_samples = int(
-                DEFAULT_ACCEPTED_AUDIO_CAPACITY_S * _SAMPLE_RATE_HZ
+                accepted_audio_budget_s * _SAMPLE_RATE_HZ
             )
         accepted_audio = AcceptedAudioAuthority(
             request_id=request_id,
@@ -650,7 +737,11 @@ class NemotronRealtimeSession:
         if with_ledger:
             if max_pending_carriers is None:
                 max_pending_carriers = math.ceil(LEDGER_BACKLOG_S / geometry.seconds)
-            ledger = ReceiptLedger(max_pending_carriers=max_pending_carriers)
+            ledger = ReceiptLedger(
+                max_pending_carriers=max_pending_carriers,
+                observer=observer,
+                cadence_ms=cadence_ms_label(geometry.cadence),
+            )
         return cls(
             geometry=geometry,
             park_token_id=park_token_id,
@@ -723,6 +814,19 @@ class NemotronRealtimeSession:
         return self._observer
 
     @property
+    def session_key(self) -> str:
+        """This session's stable observer-correlation identity.
+
+        The native adapter and the leased-path consumer each hold their
+        own reference to the same session object, but neither carries a
+        shared identifier minted elsewhere (the native path's connection
+        request id, and the leased path's engine request id, are both
+        assigned independently of session construction) — so the session
+        object's own identity is the one thing both sides already share.
+        """
+        return self._accepted_audio.request_id
+
+    @property
     def accepted_audio_budget_s(self) -> float:
         """The per-session accepted-audio queue budget, in seconds.
 
@@ -755,7 +859,26 @@ class NemotronRealtimeSession:
 
     def accept_audio(self, samples: Any) -> AcceptedPiece:
         """Atomically accept one whole application-audio piece."""
-        return self._accepted_audio.accept(samples)
+        prior_sequences = {
+            unit.logical_sequence for unit in self._accepted_audio.ready_units
+        }
+        try:
+            accepted = self._accepted_audio.accept(samples)
+        except ValueError as error:
+            if (
+                self._observer is not None
+                and "buffer_overflow" in str(error)
+            ):
+                observe_safely(self._observer.overflow, kind="input_queue")
+            raise
+        if self._observer is not None:
+            observe_safely(
+                self._observer.accepted_audio_seconds,
+                cadence_ms=cadence_ms_label(self._geometry.cadence),
+                seconds=accepted.samples_accepted / _SAMPLE_RATE_HZ,
+            )
+            self._observe_new_ready_units(prior_sequences)
+        return accepted
 
     def force_segment(self) -> None:
         """Queue one ordered, zero-sample semantic boundary barrier."""
@@ -763,9 +886,39 @@ class NemotronRealtimeSession:
             raise ValueError("endpointing controls are not configured")
         self._accepted_audio.force_segment()
 
-    def begin_finalize(self) -> None:
+    def begin_finalize(self, *, finalize_at_ns: int | None = None) -> None:
         """Close audio acceptance and queue exactly one final tail."""
-        self._accepted_audio.begin_finalize()
+        if self._accepted_audio.snapshot().finalizing:
+            return
+        prior_sequences = {
+            unit.logical_sequence for unit in self._accepted_audio.ready_units
+        }
+        self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
+        if self._observer is not None:
+            self._observe_new_ready_units(prior_sequences)
+
+    def _observe_new_ready_units(self, prior_sequences: set[int]) -> None:
+        """Publish newly ready carrier units from the state authority."""
+        assert self._observer is not None
+        for unit in self._accepted_audio.ready_units:
+            if (
+                unit.logical_sequence in prior_sequences
+                or unit.kind == "forced_eou"
+            ):
+                continue
+            handle = observe_safely(
+                self._observer.unit_ready,
+                session_key=self.session_key,
+                cadence_ms=cadence_ms_label(self._geometry.cadence),
+                chunk_type=unit.kind,
+                ready_stamp_s=unit.ready_at_ns / 1_000_000_000,
+            )
+            if handle is not None:
+                self._ready_handles[unit.logical_sequence] = handle
+
+    def take_ready_handle(self, logical_sequence: int) -> Any:
+        """Consume the observer handle paired with one dispatched unit."""
+        return self._ready_handles.pop(logical_sequence, None)
 
 
 # @spec PORT-RTC-003

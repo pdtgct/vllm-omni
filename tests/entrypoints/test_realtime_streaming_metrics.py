@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -51,6 +52,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 PARK_ID = 13088
 _FIXED_UUID = UUID(int=0)
+
+
+@dataclass(frozen=True)
+class _FakeHandle:
+    """A hashable fake handle (Phase-6 round 2, Q1d, lead-authorized):
+    frozen — same as round-3 F6 already did for the real
+    ``ChunkReadyHandle`` — so callers may key sets/dicts by handle
+    identity (e.g. "every ready handle got exactly one disposition",
+    checked over a ``set`` of disposed handles)."""
+
+    id: int
+    session_key: str
+    cadence_ms: str
+    chunk_type: str
 
 
 class _RecordingObserver:
@@ -89,7 +104,7 @@ class _RecordingObserver:
         ready_stamp_s: float,
     ) -> Any:
         self._seq += 1
-        handle = SimpleNamespace(id=self._seq, session_key=session_key, cadence_ms=cadence_ms, chunk_type=chunk_type)
+        handle = _FakeHandle(id=self._seq, session_key=session_key, cadence_ms=cadence_ms, chunk_type=chunk_type)
         self._waiting.setdefault(session_key, []).append(handle)
         self.calls.append(
             ("unit_ready", {"session_key": session_key, "cadence_ms": cadence_ms, "chunk_type": chunk_type})
@@ -124,6 +139,14 @@ class _RecordingObserver:
     def overflow(self, *, kind: str) -> None:
         self.calls.append(("overflow", {"kind": kind}))
 
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        handles = list(self._waiting.get(session_key, ()))
+        inflight = self._inflight.get(session_key)
+        if inflight is not None:
+            handles.append(inflight)
+        for handle in handles:
+            self.unit_cleared(handle, outcome=outcome)
+
     # ---- test-only seeding/introspection --------------------------------
     def seed_ready(self, session_key: str, *, n: int = 1, cadence_ms: str = "560") -> list[Any]:
         """Simulate the segmenter having already minted ``n`` ready
@@ -151,6 +174,16 @@ class _RealtimeGenerationEngine:
     def generate(self, **_kwargs: Any) -> AsyncGenerator[Any, None]:
         async def _outputs() -> AsyncGenerator[Any, None]:
             for output in self.outputs:
+                # Lead-authorized extension (Phase-6 round 2, Q1c): a
+                # callable step is a scripted out-of-band side effect
+                # (e.g. minting a handle between generation outputs,
+                # mirroring what the segmenter does between CHUNKs) run
+                # synchronously in-stream rather than yielded as an
+                # output — existing callers that only pass output
+                # objects are unaffected.
+                if callable(output):
+                    output()
+                    continue
                 yield output
 
         return _outputs()
@@ -293,36 +326,58 @@ async def test_flush_park_is_ignored_because_flush_mints_no_ready_handle(
 async def test_interleaving_echo_between_two_mints_leaves_the_waiting_unit_outstanding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE required interleaving scenario, driven against `_run_generation`
-    (still unwired -> RED): ready A, ready B -> mint A -> park (completes
-    A) -> carrierless echo (ignored; B still outstanding) -> mint B ->
-    park (completes B); every handle gets exactly one disposition. A
-    ready-order FIFO would instead have wrongly resolved the echo against
-    B — see test_streaming_observer.py's real/green reference proof of
-    this same interleaving against the fake's own tracking logic."""
+    """THE required interleaving scenario, driven end-to-end against
+    `_run_generation`: ready A, ready B -> mint A -> park (completes A)
+    -> carrierless echo (ignored; B still outstanding, resolved to
+    `None`, never wrongly completing B) -> mint B out-of-band (mirroring
+    what the segmenter does between CHUNKs) -> park (completes B); every
+    handle gets exactly one disposition, and both are `unit_parked` (no
+    clears). A ready-order FIFO would instead have wrongly resolved the
+    echo against B — see test_streaming_observer.py's real/green
+    reference proof of this same interleaving against the fake's own
+    tracking logic.
+
+    Lead-authorized fix (Phase-6 round 2, Q1c): the fixture now actually
+    implements the third step ("mint B out-of-band... a second park
+    completes B") its docstring always described but never scripted —
+    the out-of-band mint is a scripted callable step in the generation
+    stream, giving a natural mid-stream checkpoint (asserted inside the
+    callable, before B is minted) as well as the final end-state.
+    """
     session_key = _fixed_session_key(monkeypatch)
     observer = _RecordingObserver()
     handle_a, handle_b = observer.seed_ready(session_key, n=2)
     observer.mint(handle_a)
 
-    # Three generation steps: park (completes A), carrierless echo
-    # (ignored), then — after minting B out-of-band, mirroring what the
-    # segmenter would do between CHUNKs — a second park (completes B).
+    def _mint_b_after_echo_mid_stream() -> None:
+        # Mid-stream checkpoint: after A's park and the carrierless
+        # echo, B must still be outstanding — parked ONLY by the later
+        # park below, never by the echo.
+        assert observer.outstanding(session_key) == 1
+        terminal_so_far = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
+        assert len(terminal_so_far) == 1
+        assert terminal_so_far[0][1]["handle"] is handle_a
+        observer.mint(handle_b)
+
     engine = _RealtimeGenerationEngine(
         [
             _generation_output("", [PARK_ID]),  # completes A
             _generation_output("", [PARK_ID]),  # carrierless echo: ignored
+            _mint_b_after_echo_mid_stream,  # out-of-band mint + mid-stream assertions
+            _generation_output("", [PARK_ID]),  # completes B
         ]
     )
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
     await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
 
-    # After the echo, B must still be outstanding (never wrongly resolved).
-    assert observer.outstanding(session_key) == 1
-    terminal_so_far = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
-    assert len(terminal_so_far) == 1
-    assert terminal_so_far[0][1]["handle"] is handle_a
+    # End state: A parked, B parked, no clears, nothing outstanding.
+    terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
+    assert len(terminal) == 2
+    assert all(c[0] == "unit_parked" for c in terminal)
+    assert terminal[0][1]["handle"] is handle_a
+    assert terminal[1][1]["handle"] is handle_b
+    assert observer.outstanding(session_key) == 0
 
 
 # @spec PORT-OBS-003, PORT-OBS-005
@@ -350,6 +405,61 @@ async def test_every_ready_handle_gets_exactly_one_disposition_by_generation_end
     disposed_handles = {c[1]["handle"] for c in terminal}
     assert disposed_handles == {handle_a, handle_b}
     assert observer.outstanding(session_key) == 0
+
+
+# ---- generation-end cleanup outcome is cause-mapped (lead-settled, Q&A round 2) -----
+
+
+# @spec PORT-OBS-005, PORT-OBS-006
+@pytest.mark.asyncio
+async def test_generation_end_cleanup_clears_as_aborted_on_a_clean_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lead-settled (Phase-6 round 2): a clean generation end (no
+    exception) clears any still-outstanding units with outcome
+    "aborted"."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    observer.seed_ready(session_key, n=1)  # never minted, never parked
+
+    engine = _RealtimeGenerationEngine([])  # generation ends immediately, cleanly
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+
+    cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
+    assert len(cleared) == 1
+    assert cleared[0][1]["outcome"] == "aborted"
+
+
+# @spec PORT-OBS-005, PORT-OBS-006
+@pytest.mark.asyncio
+async def test_generation_end_cleanup_clears_as_error_on_an_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lead-settled (Phase-6 round 2): the exception path clears any
+    still-outstanding units with outcome "error"."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    observer.seed_ready(session_key, n=1)  # never minted, never parked
+
+    class _RaisingEngine:
+        default_sampling_params_list = [SimpleNamespace(tag="default")]
+
+        def generate(self, **_kwargs: Any) -> AsyncGenerator[Any, None]:
+            async def _outputs() -> AsyncGenerator[Any, None]:
+                raise RuntimeError("boom")
+                yield  # pragma: no cover - unreachable, satisfies the generator shape
+
+            return _outputs()
+
+    connection, _sent_events, _sent_json = _connection(_RaisingEngine(), observer=observer)
+
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+
+    cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
+    assert len(cleared) == 1
+    assert cleared[0][1]["outcome"] == "error"
 
 
 # ---- park_token_id is generic and inert when None (real, GREEN) --------------
@@ -518,6 +628,94 @@ async def test_realtime_route_setup_injects_the_installed_observer_into_native_s
     )
 
 
+# ---- streaming-path-only install gate (PORT-OBS-001/002, lead-authorized fix) ------
+#
+# Drives the REAL ``api_server._install_streaming_observer_and_build_realtime_
+# serving`` (the exact call site inlined into ``omni_init_app_state``,
+# extracted to a standalone function specifically so this gate is
+# independently testable without driving that ~900-line function's full
+# engine/model/tool-server setup).
+
+
+def _fake_state_with_registry(model_name: str = "gate-test-model", *, log_stats: bool = True) -> Any:
+    registry = SimpleNamespace(model_name=lambda: model_name)
+    return SimpleNamespace(openai_serving_models=registry, log_stats=log_stats)
+
+
+def _fake_engine_client() -> Any:
+    """Minimal fake satisfying OpenAIServing.__init__'s real attribute
+    reads (model_config/renderer/input_processor; vllm_config is
+    fingerprint-optional and safely absent)."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(),
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+    )
+
+
+# @spec PORT-OBS-001
+def test_non_streaming_deployment_never_installs_an_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No "realtime" in supported_tasks -> install_streaming_observer
+    must never even be called (never construct OmniStreamingMetrics,
+    never touch the orchestrator), resolve_installed_observer must find
+    nothing, and state.openai_serving_realtime must be None."""
+    from vllm_omni.entrypoints.openai import api_server as api_server_mod
+    from vllm_omni.metrics import streaming_install
+
+    def _fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "install_streaming_observer must not be called for a non-streaming deployment (PORT-OBS-001)"
+        )
+
+    monkeypatch.setattr(streaming_install, "install_streaming_observer", _fail_if_called)
+
+    state = _fake_state_with_registry()
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        state,
+        _fake_engine_client(),
+        {"generate"},
+        request_logger=None,
+    )
+
+    assert streaming_install.resolve_installed_observer(state) is None
+    assert state.openai_serving_realtime is None
+
+
+# @spec PORT-OBS-001, PORT-OBS-009
+def test_streaming_deployment_installs_the_observer_exactly_once() -> None:
+    """"realtime" in supported_tasks -> the real production call site
+    installs an observer resolvable off app state and threads it into
+    the constructed NemotronServingRealtime; a second call (the
+    duplicate-install case) must fail loudly rather than silently
+    rebind."""
+    from vllm_omni.entrypoints.openai import api_server as api_server_mod
+    from vllm_omni.metrics import streaming_install
+
+    state = _fake_state_with_registry()
+    engine_client = _fake_engine_client()
+
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        state,
+        engine_client,
+        {"generate", "realtime"},
+        request_logger=None,
+    )
+
+    installed = streaming_install.resolve_installed_observer(state)
+    assert installed is not None
+    assert state.openai_serving_realtime is not None
+    assert state.openai_serving_realtime._observer is installed
+
+    with pytest.raises(RuntimeError, match="already installed"):
+        api_server_mod._install_streaming_observer_and_build_realtime_serving(
+            state,
+            engine_client,
+            {"generate", "realtime"},
+            request_logger=None,
+        )
+
+
 # ---- api-server-count invariant: real config-validation call site (correction 3)
 
 
@@ -541,3 +739,101 @@ async def test_api_server_count_invariant_is_asserted_at_its_real_call_site(
         "api_server.py must call assert_single_api_server_invariant at its "
         "worker_count/api_server_count resolution site"
     )
+
+
+# ---- native serving-level injection: NemotronServingRealtime (Phase-6 round 2, Q2) --
+#
+# Lead-decided (Q2): no contextvar, no vLLM-core change. A fork-owned
+# ``NemotronServingRealtime`` subclass overrides ``transcribe_realtime``
+# with the same body as upstream, threading observer/budget into the
+# widened ``buffer_realtime_audio`` optional keyword-only params. These
+# tests drive the REAL override end-to-end (a fake ``model_cls`` in
+# place of the actual Nemotron model class, since only the reach of the
+# kwargs is being proven here — the model package's own
+# ``buffer_realtime_audio``/``buffer_stream`` wiring is proven
+# separately in test_streaming_observer.py).
+
+
+class _FakeBufferRealtimeModelCls:
+    """Records the kwargs ``transcribe_realtime`` passes through."""
+
+    captured: dict[str, Any]
+
+    def __init__(self) -> None:
+        self.captured = {}
+
+    async def buffer_realtime_audio(
+        self,
+        audio_stream: Any,
+        input_stream: Any,
+        model_config: Any,
+        *,
+        observer: Any = None,
+        accepted_audio_budget_s: float | None = None,
+    ) -> AsyncGenerator[Any, None]:
+        self.captured["observer"] = observer
+        self.captured["accepted_audio_budget_s"] = accepted_audio_budget_s
+        self.captured["model_config"] = model_config
+        return
+        yield  # pragma: no cover - the standard empty-async-generator idiom
+
+
+def _serving_realtime(*, observer: Any, accepted_audio_budget_s: float | None) -> Any:
+    """Construct ``NemotronServingRealtime`` bypassing ``OpenAIServing.
+    __init__``'s vLLM-core base-class plumbing (the same ``__new__`` +
+    manual-attribute pattern this file already uses for
+    ``RealtimeConnection``) — only the OVERRIDDEN ``transcribe_realtime``
+    method is under test here, not upstream's own constructor."""
+    from vllm_omni.entrypoints.openai.serving_realtime import (
+        NemotronServingRealtime,
+    )
+
+    serving: Any = NemotronServingRealtime.__new__(NemotronServingRealtime)
+    serving.model_config = SimpleNamespace()
+    serving.renderer = None
+    fake_model_cls = _FakeBufferRealtimeModelCls()
+    # ``model_cls`` is a ``functools.cached_property`` on the base class;
+    # pre-seeding the instance ``__dict__`` short-circuits it without
+    # touching vLLM's real model registry.
+    serving.__dict__["model_cls"] = fake_model_cls
+    serving._observer = observer
+    serving._accepted_audio_budget_s = accepted_audio_budget_s
+    return serving, fake_model_cls
+
+
+async def _empty_audio_stream() -> AsyncGenerator[Any, None]:
+    return
+    yield None  # pragma: no cover - the standard empty-async-generator idiom
+
+
+# @spec PORT-OBS-003, PORT-SESS-001
+@pytest.mark.asyncio
+async def test_serving_transcribe_realtime_threads_observer_and_budget_end_to_end() -> None:
+    """The installed observer and configured budget must reach
+    ``buffer_realtime_audio`` exactly — proving the full native-path
+    injection chain the lead's Q2 decision established."""
+    observer = _RecordingObserver()
+    serving, fake_model_cls = _serving_realtime(observer=observer, accepted_audio_budget_s=12.5)
+
+    async for _ in serving.transcribe_realtime(_empty_audio_stream(), asyncio.Queue()):
+        pass  # pragma: no cover - the fake yields nothing
+
+    assert fake_model_cls.captured["observer"] is observer
+    assert fake_model_cls.captured["accepted_audio_budget_s"] == 12.5
+
+
+# @spec PORT-OBS-003, PORT-SESS-001
+@pytest.mark.asyncio
+async def test_serving_transcribe_realtime_is_inert_with_no_observer_installed() -> None:
+    """No observer installed (the common case for a server that never
+    streams Nemotron-ASR audio) -> `None`/`None` reaches
+    ``buffer_realtime_audio`` exactly like calling it with no kwargs at
+    all — the widened signature changes nothing for an uninstrumented
+    deployment."""
+    serving, fake_model_cls = _serving_realtime(observer=None, accepted_audio_budget_s=None)
+
+    async for _ in serving.transcribe_realtime(_empty_audio_stream(), asyncio.Queue()):
+        pass  # pragma: no cover - the fake yields nothing
+
+    assert fake_model_cls.captured["observer"] is None
+    assert fake_model_cls.captured["accepted_audio_budget_s"] is None

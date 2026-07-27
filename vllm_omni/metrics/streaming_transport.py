@@ -31,8 +31,12 @@ unimplemented — see each docstring's ``Raises``.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,55 @@ class StreamingObserver(Protocol):
         or the armed receipt ledger (``kind="carrier"``/``"receipt"``)."""
         ...
 
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        """Terminal bulk clear: every unit still outstanding for
+        ``session_key`` — waiting-ready AND the in-flight unit, if any —
+        receives ``outcome`` as its terminal disposition in one pass,
+        decrementing backlog by exactly the number of units cleared
+        (PORT-OBS-005's decrement-by-exact-count).
+
+        Discovered during Phase-6 implementation: a session-terminal
+        cleanup site (the lease's ledger-failure path, the native
+        connection's end-of-generation cleanup) has no independent local
+        record of every ready handle the observer minted — only the
+        observer's own {waiting, in-flight} state does — so this is the
+        single terminal-disposition entry point those call sites use
+        instead of re-deriving handles themselves. Idempotent: a session
+        with nothing outstanding is a no-op, and re-invoking after a
+        first clear clears nothing further (every handle it would have
+        touched is already disposed).
+        """
+        ...
+
+
+def observe_safely(observer_method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Invoke one bound ``StreamingObserver`` method, swallowing failure.
+
+    Observation is non-authoritative (PORT-OBS-002): a misbehaving
+    observer implementation must never break feed/flush/park/generation.
+    Every production call site across the model package, the lease
+    consumer, and the native adapter goes through this helper rather than
+    invoking an observer method directly, so a single defensive posture
+    covers all of them.
+
+    Args:
+        observer_method: A bound method of an installed
+            :class:`StreamingObserver` (e.g. ``observer.unit_ready``).
+        *args: Forwarded positional arguments.
+        **kwargs: Forwarded keyword arguments.
+
+    Returns:
+        The method's return value, or ``None`` if it raised.
+    """
+    try:
+        return observer_method(*args, **kwargs)
+    except Exception:
+        _logger.exception(
+            "streaming observer call %r failed; observation is nonfatal (PORT-OBS-002)",
+            getattr(observer_method, "__name__", observer_method),
+        )
+        return None
+
 
 def drain_batch_stats_into_runner_output(model: Any, runner_output: Any) -> None:
     """The runner-side drain hop: model -> ``OmniModelRunnerOutput``.
@@ -172,11 +225,8 @@ def drain_batch_stats_into_runner_output(model: Any, runner_output: Any) -> None
             int, int]] | None``.
         runner_output: The ``OmniModelRunnerOutput`` to attach the drained
             list to.
-
-    Raises:
-        NotImplementedError: Always, until Phase 6 wires this hop.
     """
-    raise NotImplementedError
+    runner_output.streaming_chunk_batch_stats = model.consume_batch_stats()
 
 
 def forward_batch_stats_to_engine_core_outputs(
@@ -200,8 +250,8 @@ def forward_batch_stats_to_engine_core_outputs(
             runner-drained ``streaming_chunk_batch_stats``.
         engine_core_outputs: The ``OmniEngineCoreOutputs`` to forward onto.
         stats_enabled: Whether host statistics collection is enabled.
-
-    Raises:
-        NotImplementedError: Always, until Phase 6 wires this hop.
     """
-    raise NotImplementedError
+    if not stats_enabled:
+        engine_core_outputs.streaming_chunk_batch_stats = None
+        return
+    engine_core_outputs.streaming_chunk_batch_stats = runner_output.streaming_chunk_batch_stats

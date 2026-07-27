@@ -76,7 +76,6 @@ from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -126,6 +125,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_realtime import NemotronServingRealtime
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -147,6 +147,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decod
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics import streaming_install
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -736,6 +737,50 @@ async def _install_persistent_state_service(
     logger.info("Persistent-state service installed and ready")
 
 
+def _install_streaming_observer_and_build_realtime_serving(
+    state: State,
+    engine_client: EngineClient,
+    supported_tasks: Any,
+    *,
+    request_logger: RequestLogger | None,
+) -> None:
+    """PORT-OBS-001/002: streaming-path-only install + realtime serving
+    construction.
+
+    A deployment serving no streaming model must import/register nothing
+    here — never construct ``OmniStreamingMetrics``, never touch the
+    orchestrator's sink — and end with no observer in app state (``state.
+    openai_serving_realtime`` is set to ``None``, matching this module's
+    own transcription/translation gate). Gated on ``"realtime" in
+    supported_tasks`` — the same condition upstream vLLM's own
+    ``init_speech_to_text_state`` uses for ``OpenAIServingRealtime``
+    construction (``vllm/entrypoints/speech_to_text/factories.py``).
+    """
+    if "realtime" not in supported_tasks:
+        state.openai_serving_realtime = None
+        return
+    # PORT-OBS-002: thread the server's own host-statistics switch through
+    # (statistics default ON) rather than defaulting inside the install
+    # seam, so a caller can never silently drift from what the server was
+    # actually configured to collect.
+    installed_streaming_observer = streaming_install.install_streaming_observer(
+        state, log_stats=state.log_stats
+    )
+    state.openai_serving_realtime = NemotronServingRealtime(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        request_logger=request_logger,
+        observer=installed_streaming_observer,
+    )
+    # PORT-OBS-008/009: the orchestrator is built before this app state
+    # exists, so its batch-size sub-stat sink is wired post-construction,
+    # reached via the same one-time install seam (never a second,
+    # independently-configured OmniStreamingMetrics instance).
+    orchestrator = getattr(engine_client, "orchestrator", None)
+    if orchestrator is not None:
+        orchestrator.set_streaming_metrics(installed_streaming_observer.metrics)
+
+
 async def omni_init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -1152,9 +1197,10 @@ async def omni_init_app_state(
         if state.openai_serving_chat is not None
         else None
     )
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
+    _install_streaming_observer_and_build_realtime_serving(
+        state,
+        engine_client,
+        supported_tasks,
         request_logger=request_logger,
     )
 
@@ -1658,7 +1704,11 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
         await websocket.close()
         return
-    connection = RealtimeConnection(websocket, serving)
+    # PORT-OBS-003: route-to-session injection — the installed observer
+    # (if any was installed for this app state) is threaded into native
+    # session construction here, never constructed or resolved again.
+    observer = streaming_install.resolve_installed_observer(websocket.app.state)
+    connection = RealtimeConnection(websocket, serving, observer=observer)
     await connection.handle_connection()
 
 

@@ -12,14 +12,13 @@ it — via the thin ``SupportsRealtime.buffer_realtime_audio`` classmethod
 
 from __future__ import annotations
 
-import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import numpy as np
 
+from vllm_omni.metrics.streaming_transport import observe_safely
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
-    ADMISSION_EPOCH_MODULUS_MS,
     ENVELOPE_HEADER_FIELDS,
     FRONTEND_CONSTANTS,
 )
@@ -31,16 +30,6 @@ from vllm_omni.model_executor.models.nemotron_asr.session import (
 
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
-def _admission_ms_mod() -> int:
-    """The acceptance wall-clock stamp (design §Ingress-deadline
-    plumbing): milliseconds since epoch, modulo
-    ``manifests.ADMISSION_EPOCH_MODULUS_MS`` so it stays FP32-exact
-    when it rides the envelope header. Wall-clock, not monotonic —
-    this value crosses from the frontend process into the worker
-    process, and only wall-clock is comparable across that boundary
-    (the same basis vLLM's own scheduler uses for cross-process
-    ``Request.arrival_time`` ordering)."""
-    return int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS
 
 
 def mint_envelope(
@@ -94,14 +83,28 @@ async def buffer_stream(
     including an explicit zero-sample transaction; never zero-padded).
 
     Args:
-        observer: PORT-OBS-003 stub — overrides ``session.observer`` when
-            given (e.g. the ledgerless native path, where ``model_config``
-            is a bare config with no session object to carry one). Not yet
-            wired to any ready/park event.
-        final_tail_ready_stamp_s: PORT-OBS-004 stub — the caller-captured
-            monotonic finalize-acceptance stamp. Not yet consumed; the
-            eventual final-tail ``unit_ready`` call must use exactly this
-            value rather than reconstruct it here at generator resumption.
+        observer: PORT-OBS-003: overrides ``session.observer`` when given
+            (e.g. the ledgerless native path, where ``model_config`` is a
+            bare config with no session object to carry one).
+        final_tail_ready_stamp_s: PORT-OBS-004: the caller-captured
+            monotonic finalize-acceptance stamp. When given, the
+            final-tail ``unit_ready`` call uses exactly this value rather
+            than reconstructing one here at generator resumption.
+        accepted_audio_budget_s: PORT-SESS-001 Decision 1: overrides the
+            per-session accepted-audio queue budget when ``model_config``
+            is a bare config (a new session is constructed here) — the
+            native path's only construction point for one. Ignored when
+            ``model_config`` is already a :class:`NemotronRealtimeSession`
+            (that session's own configured budget governs). ``None``
+            (the default) leaves :data:`ACCEPTED_AUDIO_BUDGET_DEFAULT_S`
+            in force, keeping today's behavior exactly.
+
+    Raises:
+        RuntimeError: If a piece would push the session's accepted-audio
+            queue occupancy past ``session.accepted_audio_budget_s``
+            (design §Park, Finalization, and Backpressure, Decision 1,
+            amended PORT-SESS-001) — the whole piece is rejected before
+            any of its complete cadences are accepted.
     """
     # Every session control is a typed attribute of the session object
     # riding the model_config position (PORT-RTC-001); anything else is
@@ -128,15 +131,16 @@ async def buffer_stream(
                 else ACCEPTED_AUDIO_BUDGET_DEFAULT_S
             ),
         )
-    # Observation is installed by the app-owned serving adapter.  Accepting
-    # it here preserves the model-generic SupportsRealtime call contract
-    # without coupling this engine-free segmenter to Prometheus.
-    del final_tail_ready_stamp_s
     geometry = session.geometry
     geometry_id = geometry.geometry_id
     park_id = session.park_token_id
     placeholder_id = session.audio_chunk_token_id
     ledger = session.ledger
+    # PORT-OBS-003: the explicit override takes precedence over the
+    # session's own observer (the ledgerless native path threads one in
+    # without a session-owning observer to fall back to).
+    active_observer: StreamingObserver | None = observer if observer is not None else session.observer
+    session_key = session.session_key
 
     async def hold_until_park() -> None:
         while True:
@@ -178,6 +182,15 @@ async def buffer_stream(
             unit = authority.dispatch_next()
             if unit is None:
                 raise RuntimeError("ready audio could not become in-flight")
+            handle = session.take_ready_handle(unit.logical_sequence)
+            if ledger is not None and unit.kind != "forced_eou":
+                ledger.mint(
+                    final_tail=unit.kind == "final_tail",
+                    admission_ms_mod=unit.admission_ms_mod,
+                    handle=handle,
+                )
+            if active_observer is not None and handle is not None:
+                observe_safely(active_observer.unit_minted, handle)
             yield prompt(unit)
             await hold_until_park()
             authority.park(
@@ -197,46 +210,33 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        prior_sequences = {
-            unit.logical_sequence for unit in authority.ready_units
-        }
-        session.accept_audio(frame)
-        new_units = tuple(
-            unit
-            for unit in authority.ready_units
-            if unit.logical_sequence not in prior_sequences
-        )
-        if ledger is not None:
-            for unit in new_units:
-                if unit.kind != "forced_eou":
-                    ledger.mint(
-                        final_tail=unit.kind == "final_tail",
-                        admission_ms_mod=unit.admission_ms_mod,
-                    )
+        try:
+            session.accept_audio(frame)
+        except ValueError as error:
+            if "buffer_overflow" not in str(error):
+                raise
+            raise RuntimeError(
+                "accepted-audio queue occupancy would exceed the "
+                f"session's accepted_audio_budget_s="
+                f"{session.accepted_audio_budget_s}; the whole piece is "
+                "rejected before any of its complete cadences are accepted "
+                "(PORT-SESS-001)"
+            ) from error
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
         async for rendered in dispatch_ready():
             yield rendered
-
     # Finalization is an explicit protocol transaction even when the
     # residual is shorter than the frontend's minimum commit or is
     # exactly zero. The frontend owns the zero-frame decision; the
     # session transition still needs the final marker (PORT-SESS-003).
     if not authority.snapshot().finalizing:
-        session.begin_finalize()
-    ready_tail = next(
-        (
-            unit
-            for unit in reversed(authority.ready_units)
-            if unit.kind == "final_tail"
-        ),
-        None,
-    )
-    if ledger is not None and ready_tail is not None:
-        ledger.mint(
-            final_tail=True,
-            admission_ms_mod=ready_tail.admission_ms_mod,
+        finalize_at_ns = (
+            None
+            if final_tail_ready_stamp_s is None
+            else int(final_tail_ready_stamp_s * 1_000_000_000)
         )
+        session.begin_finalize(finalize_at_ns=finalize_at_ns)
     async for rendered in dispatch_ready():
         yield rendered
     # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003

@@ -196,8 +196,16 @@ async def _passthrough_render(prompt: Any) -> Any:
 
 
 class _RecordingObserver:
+    """Real per-session waiting/in-flight tracking (matching
+    ``test_streaming_observer.py``'s reference implementation) so
+    ``complete_inflight`` correctly resolves handles the lease minted —
+    a bare recorder that always returned ``None`` would silently break
+    every real park-resolution call site exercised below."""
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._waiting: dict[str, list[Any]] = {}
+        self._inflight: dict[str, Any] = {}
 
     def session_opened(self, *, cadence_ms: str) -> None:
         self.calls.append(("session_opened", {"cadence_ms": cadence_ms}))
@@ -225,26 +233,47 @@ class _RecordingObserver:
             chunk_type=chunk_type,
             ready_stamp_s=ready_stamp_s,
         )
+        self._waiting.setdefault(session_key, []).append(handle)
         self.calls.append(
             ("unit_ready", {"session_key": session_key, "cadence_ms": cadence_ms, "chunk_type": chunk_type})
         )
         return handle
 
     def unit_minted(self, handle: Any) -> None:
+        waiting = self._waiting.get(handle.session_key)
+        if waiting is not None and handle in waiting:
+            waiting.remove(handle)
+        self._inflight[handle.session_key] = handle
         self.calls.append(("unit_minted", {"handle": handle}))
 
     def complete_inflight(self, session_key: str) -> Any:
+        handle = self._inflight.get(session_key)
+        self._inflight[session_key] = None
         self.calls.append(("complete_inflight", {"session_key": session_key}))
-        return None
+        return handle
 
     def unit_parked(self, handle: Any, *, park_stamp_s: float) -> None:
         self.calls.append(("unit_parked", {"handle": handle, "park_stamp_s": park_stamp_s}))
 
     def unit_cleared(self, handle: Any, *, outcome: str) -> None:
+        session_key = handle.session_key
+        waiting = self._waiting.get(session_key)
+        if waiting is not None and handle in waiting:
+            waiting.remove(handle)
+        if self._inflight.get(session_key) is handle:
+            self._inflight[session_key] = None
         self.calls.append(("unit_cleared", {"handle": handle, "outcome": outcome}))
 
     def overflow(self, *, kind: str) -> None:
         self.calls.append(("overflow", {"kind": kind}))
+
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        handles = list(self._waiting.get(session_key, ()))
+        inflight = self._inflight.get(session_key)
+        if inflight is not None:
+            handles.append(inflight)
+        for handle in handles:
+            self.unit_cleared(handle, outcome=outcome)
 
 
 # ---- factory injects the observer at session construction (real, GREEN) ------
@@ -702,6 +731,9 @@ class _RaisingObserver:
 
     def overflow(self, *, kind: str) -> None:
         raise RuntimeError("sink boom: overflow")
+
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        raise RuntimeError("sink boom: clear_all_outstanding")
 
 
 # @spec PORT-OBS-002, PORT-OBS-003

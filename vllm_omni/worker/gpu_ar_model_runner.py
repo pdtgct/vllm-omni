@@ -43,6 +43,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.metrics import streaming_transport
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -1938,6 +1939,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
                 output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
+            # PORT-OBS-008: the runner-side drain hop. The hook is
+            # model-specific (Nemotron-ASR's, not a base-model contract),
+            # so this stays generic across every model this runner loads.
+            if hasattr(self.model, "consume_batch_stats"):
+                streaming_transport.drain_batch_stats_into_runner_output(self.model, output)
         return output
 
     @torch.inference_mode()
