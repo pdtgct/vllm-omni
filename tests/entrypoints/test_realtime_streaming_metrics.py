@@ -766,6 +766,27 @@ def test_async_omni_engine_declares_the_orchestrator_binding() -> None:
     assert "self.orchestrator = orchestrator" in src
 
 
+# @spec PORT-OBS-008, PORT-OBS-009
+def test_async_omni_wrapper_passes_the_orchestrator_binding_through() -> None:
+    """The API server's engine client is ``AsyncOmni`` (the wrapper),
+    not ``AsyncOmniEngine`` — ``build_async_omni`` yields the wrapper.
+    The sink attach therefore needs the wrapper to mirror the engine's
+    ``orchestrator`` binding, as a live property (the engine binds it
+    on its bootstrap thread; an ``__init__`` snapshot would race).
+
+    Regression pin (2026-07-28 GPU re-run): with the binding only on
+    the engine, the real serve logged 'sink NOT attached' — the seam
+    read the wrapper, which had no passthrough."""
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    wrapper: Any = AsyncOmni.__new__(AsyncOmni)
+    sentinel = object()
+    wrapper.engine = SimpleNamespace(orchestrator=None)
+    assert wrapper.orchestrator is None
+    wrapper.engine.orchestrator = sentinel
+    assert wrapper.orchestrator is sentinel
+
+
 # ---- api-server-count invariant: real config-validation call site (correction 3)
 
 

@@ -137,6 +137,19 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
+    @property
+    def orchestrator(self) -> Any:
+        """The engine's orchestrator binding (``None`` before startup).
+
+        The streaming batch-stat sink attach point (PORT-OBS-008/009):
+        the API server receives this wrapper as its engine client, so
+        the engine's binding is mirrored here the way ``config_path``
+        and ``input_processor`` are. A property, not an ``__init__``
+        snapshot — the engine binds the orchestrator on its bootstrap
+        thread, and a snapshot taken at construction would race it.
+        """
+        return self.engine.orchestrator
+
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
