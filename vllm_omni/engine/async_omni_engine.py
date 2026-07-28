@@ -299,6 +299,11 @@ class AsyncOmniEngine:
         self.input_processor: InputProcessor | None = None
         self.prompt_expand_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
+        # Bound by the orchestrator bootstrap thread before startup_future
+        # resolves; the API server's streaming batch-stat sink attach
+        # (PORT-OBS-008/009) reads it after engine init. None only before
+        # startup or if bootstrap failed.
+        self.orchestrator: Orchestrator | None = None
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
         # Janus queues are constructed eagerly here (not deferred to the
@@ -445,6 +450,11 @@ class AsyncOmniEngine:
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
             )
+            # Bind before startup_future resolves so the instance is
+            # visible to anything that runs after engine init (the
+            # streaming batch-stat sink attach reads this; a GIL-atomic
+            # attribute write, read-side None-guarded).
+            self.orchestrator = orchestrator
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()

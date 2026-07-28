@@ -654,51 +654,29 @@ def _fake_engine_client() -> Any:
     )
 
 
-# @spec PORT-OBS-001
-def test_non_streaming_deployment_never_installs_an_observer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No "realtime" in supported_tasks -> install_streaming_observer
-    must never even be called (never construct OmniStreamingMetrics,
-    never touch the orchestrator), resolve_installed_observer must find
-    nothing, and state.openai_serving_realtime must be None."""
+# @spec PORT-OBS-001, PORT-OBS-003
+def test_install_and_serving_construction_are_unconditional_at_the_pin() -> None:
+    """The install seam takes no task vocabulary and always installs.
+
+    Regression pin (2026-07-28 GPU round): a prior revision gated this
+    seam on ``"realtime" in supported_tasks``, porting upstream vLLM's
+    ``factories.py`` condition across the engine boundary. But
+    ``AsyncOmniEngine`` derives its task vocabulary only from
+    ``{"generate", "speech"}`` (is_comprehension / audio final output),
+    so the gate was False in every real deployment: ``/v1/realtime``
+    answered "Realtime API is not available" and no observer was ever
+    installed — while unit tests passed by feeding the seam a
+    ``"realtime"`` membership the engine can never produce. The seam
+    now matches the pre-metrics base (unconditional construction) and
+    PORT-OBS-003's actual contract: one observer per serving app state.
+    """
     from vllm_omni.entrypoints.openai import api_server as api_server_mod
     from vllm_omni.metrics import streaming_install
-
-    def _fail_if_called(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError(
-            "install_streaming_observer must not be called for a non-streaming deployment (PORT-OBS-001)"
-        )
-
-    monkeypatch.setattr(streaming_install, "install_streaming_observer", _fail_if_called)
 
     state = _fake_state_with_registry()
     api_server_mod._install_streaming_observer_and_build_realtime_serving(
         state,
         _fake_engine_client(),
-        {"generate"},
-        request_logger=None,
-    )
-
-    assert streaming_install.resolve_installed_observer(state) is None
-    assert state.openai_serving_realtime is None
-
-
-# @spec PORT-OBS-001, PORT-OBS-009
-def test_streaming_deployment_installs_the_observer_exactly_once() -> None:
-    """"realtime" in supported_tasks -> the real production call site
-    installs an observer resolvable off app state and threads it into
-    the constructed NemotronServingRealtime; a second call (the
-    duplicate-install case) must fail loudly rather than silently
-    rebind."""
-    from vllm_omni.entrypoints.openai import api_server as api_server_mod
-    from vllm_omni.metrics import streaming_install
-
-    state = _fake_state_with_registry()
-    engine_client = _fake_engine_client()
-
-    api_server_mod._install_streaming_observer_and_build_realtime_serving(
-        state,
-        engine_client,
-        {"generate", "realtime"},
         request_logger=None,
     )
 
@@ -707,13 +685,85 @@ def test_streaming_deployment_installs_the_observer_exactly_once() -> None:
     assert state.openai_serving_realtime is not None
     assert state.openai_serving_realtime._observer is installed
 
+
+# @spec PORT-OBS-001, PORT-OBS-009
+def test_duplicate_install_fails_loudly_rather_than_silently_rebinding() -> None:
+    state = _fake_state_with_registry()
+    engine_client = _fake_engine_client()
+    from vllm_omni.entrypoints.openai import api_server as api_server_mod
+
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        state,
+        engine_client,
+        request_logger=None,
+    )
     with pytest.raises(RuntimeError, match="already installed"):
         api_server_mod._install_streaming_observer_and_build_realtime_serving(
             state,
             engine_client,
-            {"generate", "realtime"},
             request_logger=None,
         )
+
+
+# @spec PORT-OBS-008, PORT-OBS-009
+def test_batch_stat_sink_attaches_through_the_engines_orchestrator_binding() -> None:
+    """The sink attach reads ``engine_client.orchestrator`` — the
+    binding ``AsyncOmniEngine``'s bootstrap thread now sets before the
+    engine reports ready. Regression pin (2026-07-28 GPU round): the
+    ``Orchestrator`` used to be a bootstrap-closure local that was
+    never bound to the engine, so ``getattr(engine, "orchestrator",
+    None)`` silently skipped the attach in every real serve and
+    ``chunk_batch_size`` could never record. An engine exposing no
+    binding must degrade observability only — never fail app-state
+    init."""
+    from vllm_omni.entrypoints.openai import api_server as api_server_mod
+    from vllm_omni.metrics import streaming_install
+
+    class _RecordingOrchestrator:
+        def __init__(self) -> None:
+            self.received: Any = None
+
+        def set_streaming_metrics(self, metrics: Any) -> None:
+            self.received = metrics
+
+    state = _fake_state_with_registry()
+    engine_client = _fake_engine_client()
+    engine_client.orchestrator = _RecordingOrchestrator()
+
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        state,
+        engine_client,
+        request_logger=None,
+    )
+
+    installed = streaming_install.resolve_installed_observer(state)
+    assert installed is not None
+    assert engine_client.orchestrator.received is installed.metrics
+
+    # Absent binding: install + serving still complete (already covered
+    # implicitly above via _fake_engine_client(), asserted explicitly
+    # here for the no-raise contract).
+    bare_state = _fake_state_with_registry(model_name="no-orch-model")
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        bare_state,
+        _fake_engine_client(),
+        request_logger=None,
+    )
+    assert bare_state.openai_serving_realtime is not None
+
+
+def test_async_omni_engine_declares_the_orchestrator_binding() -> None:
+    """`AsyncOmniEngine.__init__` must initialize ``self.orchestrator``
+    and the bootstrap must bind the constructed instance — the attach
+    seam above depends on this attribute existing on the real engine,
+    which is exactly what the pre-fix code lacked."""
+    import inspect
+
+    from vllm_omni.engine import async_omni_engine as eng_mod
+
+    src = inspect.getsource(eng_mod.AsyncOmniEngine)
+    assert "self.orchestrator: Orchestrator | None = None" in src
+    assert "self.orchestrator = orchestrator" in src
 
 
 # ---- api-server-count invariant: real config-validation call site (correction 3)
@@ -837,3 +887,48 @@ async def test_serving_transcribe_realtime_is_inert_with_no_observer_installed()
 
     assert fake_model_cls.captured["observer"] is None
     assert fake_model_cls.captured["accepted_audio_budget_s"] is None
+
+
+# @spec PORT-OBS-003
+@pytest.mark.asyncio
+async def test_unwidened_model_receives_the_exact_upstream_call() -> None:
+    """A model whose ``buffer_realtime_audio`` carries the un-widened
+    upstream signature (``qwen3_omni`` at the pin, and every upstream
+    ``SupportsRealtime`` implementation) must receive the exact
+    upstream call — no widened kwargs.
+
+    Regression pin (2026-07-28 GPU round, latent behind the dead
+    install gate): the override passed ``observer``/
+    ``accepted_audio_budget_s`` unconditionally, a ``TypeError`` for
+    any non-Nemotron realtime model the pre-metrics base served fine.
+    Only a signature that explicitly declares both params opts in.
+    """
+
+    class _UnwidenedModelCls:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def buffer_realtime_audio(
+            self, audio_stream: Any, input_stream: Any, model_config: Any
+        ) -> AsyncGenerator[Any, None]:
+            self.calls.append({"model_config": model_config})
+            return
+            yield  # pragma: no cover - the standard empty-async-generator idiom
+
+    from vllm_omni.entrypoints.openai.serving_realtime import (
+        NemotronServingRealtime,
+    )
+
+    serving: Any = NemotronServingRealtime.__new__(NemotronServingRealtime)
+    serving.model_config = SimpleNamespace()
+    serving.renderer = None
+    model_cls = _UnwidenedModelCls()
+    serving.__dict__["model_cls"] = model_cls
+    serving._observer = _RecordingObserver()
+    serving._accepted_audio_budget_s = 30.0
+
+    # Must not raise TypeError despite an installed observer + budget.
+    async for _ in serving.transcribe_realtime(_empty_audio_stream(), asyncio.Queue()):
+        pass  # pragma: no cover - the fake yields nothing
+
+    assert len(model_cls.calls) == 1
