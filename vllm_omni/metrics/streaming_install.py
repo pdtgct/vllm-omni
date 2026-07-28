@@ -49,10 +49,14 @@ def install_streaming_observer(app_state: Any, *, log_stats: bool) -> Prometheus
     satisfying the model package's ``StreamingObserver`` protocol by
     shape), wrapping a fresh :class:`OmniStreamingMetrics`.
 
-    PORT-OBS-001: callers must only reach this seam on the streaming-path
-    (e.g. ``"realtime" in supported_tasks``) — a deployment serving no
-    streaming model must never import/register the streaming families at
-    all, so this is not called unconditionally at app-state init.
+    PORT-OBS-001: this seam is reached from the omni API server's
+    app-state init — that server mounts ``/v1/realtime`` for every
+    deployment, so it *is* the streaming serving path family
+    registration is scoped to; deployments not running it never import
+    these families. Never gate the call on the engine task vocabulary:
+    ``AsyncOmniEngine`` derives ``supported_tasks`` only from
+    ``{"generate", "speech"}``, so a ``"realtime"`` membership test is
+    False in every real deployment (2026-07-28 GPU-round regression).
 
     Args:
         app_state: The serving app state. Must already carry

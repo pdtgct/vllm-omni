@@ -901,29 +901,38 @@ async def build_async_omni_from_stage_config(
 def _install_streaming_observer_and_build_realtime_serving(
     state: State,
     engine_client: EngineClient,
-    supported_tasks: Any,
     *,
     request_logger: RequestLogger | None,
 ) -> None:
-    """PORT-OBS-001/002: streaming-path-only install + realtime serving
-    construction.
+    """PORT-OBS-001/002/003: one-time observer install + realtime serving
+    construction for the omni API server.
 
-    A deployment serving no streaming model must import/register nothing
-    here — never construct ``OmniStreamingMetrics``, never touch the
-    orchestrator's sink — and end with no observer in app state (``state.
-    openai_serving_realtime`` is set to ``None``, matching this module's
-    own transcription/translation gate). Gated on ``"realtime" in
-    supported_tasks`` — the same condition upstream vLLM's own
-    ``init_speech_to_text_state`` uses for ``OpenAIServingRealtime``
-    construction (``vllm/entrypoints/speech_to_text/factories.py``).
+    Unconditional, matching the pre-metrics base: this server mounts
+    ``/v1/realtime`` for every deployment and constructed
+    ``OpenAIServingRealtime`` unconditionally, so the serving app state
+    *is* the streaming serving path PORT-OBS-001 scopes family
+    registration to, and PORT-OBS-003 installs exactly one observer per
+    serving app state. Never gate this on the engine task vocabulary:
+    ``AsyncOmniEngine`` derives ``supported_tasks`` only from
+    ``{"generate", "speech"}`` (``async_omni_engine.py``, task
+    derivation), so a ``"realtime"`` membership test — upstream vLLM's
+    ``factories.py`` gate, whose engine *can* advertise ``"realtime"``
+    — is False in every real omni deployment. Gating on it silently
+    replaced ``/v1/realtime`` with an "unavailable" close and skipped
+    the observer install (2026-07-28 GPU-round regression).
+
+    PORT-OBS-002: the server's own host-statistics switch is threaded
+    through (statistics default ON) rather than defaulted inside the
+    install seam, so a caller can never silently drift from what the
+    server was actually configured to collect.
+
+    PORT-OBS-008/009: the orchestrator is built before this app state
+    exists, so its batch-size sub-stat sink is wired post-construction
+    through the engine's ``orchestrator`` binding (never a second,
+    independently-configured ``OmniStreamingMetrics`` instance). A
+    missing binding degrades observability only, never serving — logged
+    loudly rather than passing silently.
     """
-    if "realtime" not in supported_tasks:
-        state.openai_serving_realtime = None
-        return
-    # PORT-OBS-002: thread the server's own host-statistics switch through
-    # (statistics default ON) rather than defaulting inside the install
-    # seam, so a caller can never silently drift from what the server was
-    # actually configured to collect.
     installed_streaming_observer = streaming_install.install_streaming_observer(
         state, log_stats=state.log_stats
     )
@@ -933,13 +942,20 @@ def _install_streaming_observer_and_build_realtime_serving(
         request_logger=request_logger,
         observer=installed_streaming_observer,
     )
-    # PORT-OBS-008/009: the orchestrator is built before this app state
-    # exists, so its batch-size sub-stat sink is wired post-construction,
-    # reached via the same one-time install seam (never a second,
-    # independently-configured OmniStreamingMetrics instance).
+    logger.info(
+        "Streaming metrics observer installed (model_name=%s, log_stats=%s)",
+        state.openai_serving_models.model_name(),
+        state.log_stats,
+    )
     orchestrator = getattr(engine_client, "orchestrator", None)
     if orchestrator is not None:
         orchestrator.set_streaming_metrics(installed_streaming_observer.metrics)
+        logger.info("Streaming batch-stat sink attached to orchestrator")
+    else:
+        logger.warning(
+            "Streaming batch-stat sink NOT attached: engine client exposes "
+            "no orchestrator binding (chunk_batch_size will record nothing)"
+        )
 
 
 async def omni_init_app_state(
@@ -1355,7 +1371,6 @@ async def omni_init_app_state(
     _install_streaming_observer_and_build_realtime_serving(
         state,
         engine_client,
-        supported_tasks,
         request_logger=request_logger,
     )
 
