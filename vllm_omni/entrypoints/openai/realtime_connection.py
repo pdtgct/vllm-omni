@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -155,18 +156,47 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
             yield StreamingInput(prompt=engine_input)
     async def start_generation(self):
-        if self._nemotron_session is None:
-            await super().start_generation()
-            return
+        """Start one generation with a single pre-minted correlation id."""
         if self.generation_task is not None and not self.generation_task.done():
+            logger.warning("Generation already in progress, ignoring commit")
             return
+        if self._nemotron_session is None:
+            request_id = f"rt-{self.connection_id}-{uuid4()}"
+            audio_stream = self.audio_stream_generator()
+            input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
+            transcribe = self.serving.transcribe_realtime
+            if "session_key" in inspect.signature(transcribe).parameters:
+                streaming_input = transcribe(
+                    audio_stream,
+                    input_stream,
+                    session_key=request_id,
+                )
+            else:
+                streaming_input = transcribe(audio_stream, input_stream)
+            self.generation_task = asyncio.create_task(
+                self._run_generation(
+                    streaming_input,
+                    input_stream,
+                    request_id=request_id,
+                )
+            )
+            return
+        request_id = self._state_session_key
+        if request_id is None:
+            raise RuntimeError(
+                "admitted Nemotron session has no correlation identity"
+            )
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
         streaming_input = self._transcribe_nemotron_realtime(
             self._native_audio_controls(),
             input_stream,
         )
         self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input, input_stream)
+            self._run_generation(
+                streaming_input,
+                input_stream,
+                request_id=request_id,
+            )
         )
 
     async def handle_event(self, event: dict):
@@ -471,15 +501,14 @@ class RealtimeConnection(VllmRealtimeConnection):
             reason=reason,
         )
 
-    # @spec ING-LIFE-011
+    # @spec ING-LIFE-011, PORT-OBS-006
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        *,
+        request_id: str | None = None,
     ) -> None:
-        request_id = getattr(self, "_state_session_key", None) or (
-            f"rt-{self.connection_id}-{uuid4()}"
-        )
         sent_audio = False
         audio_done_sent = False
         prompt_token_ids_len = 0
@@ -492,7 +521,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             fragment_overhead_bytes=0,
             terminal_headroom_bytes=0,
         )
-        generation_error: BaseException | None = None
+        cancelled: asyncio.CancelledError | None = None
+        disconnected = False
+        model_finalized = False
         # ``getattr`` defensive: some fixtures across this test suite
         # construct a connection via ``RealtimeConnection.__new__``,
         # bypassing ``__init__`` (and hence these two attributes)
@@ -500,6 +531,22 @@ class RealtimeConnection(VllmRealtimeConnection):
         # correct behavior for such a connection.
         observer = getattr(self, "_observer", None)
         park_token_id = getattr(self, "_park_token_id", None)
+        # PORT-OBS-003 (amended): the per-generation correlation key is
+        # minted in start_generation and passed in. With an observer
+        # installed, a keyless invocation must NOT mint a second
+        # identity and observe under it (that mismatch is exactly the
+        # D6 defect class) — observation for THIS generation is disabled
+        # loudly instead; keyless compatibility remains only on the
+        # unobserved path.
+        if request_id is None:
+            if observer is not None:
+                logger.warning(
+                    "generation started without the threaded correlation "
+                    "id — observation disabled for this generation "
+                    "(PORT-OBS-003)"
+                )
+                observer = None
+            request_id = f"rt-{self.connection_id}-{uuid4()}"
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -604,7 +651,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
 
                 if not self._is_connected:
+                    disconnected = True
                     break
+            else:
+                # The engine generator exhausted normally — on this path
+                # the request finishes only through finalization/FLUSH,
+                # so MODEL completion is decided here, before any
+                # terminal send: transport delivery is not part of model
+                # completion (PORT-OBS-006; review round F3).
+                model_finalized = True
 
             if self._is_connected:
                 usage = UsageInfo(
@@ -630,8 +685,9 @@ class RealtimeConnection(VllmRealtimeConnection):
                         }
                     )
                     audio_done_sent = True
-        except OutputCapacityExceeded as error:
-            generation_error = error
+        except asyncio.CancelledError as error:
+            cancelled = error
+        except OutputCapacityExceeded:
             self._streaming_finish_reason = "error"
             logger.exception("Realtime transcript capacity exhausted")
             if self._is_connected:
@@ -640,7 +696,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "output_capacity_exceeded",
                 )
         except Exception as e:
-            generation_error = e
             self._streaming_finish_reason = "error"
             logger.exception("Error in generation: %s", e)
             if self._is_connected:
@@ -654,22 +709,50 @@ class RealtimeConnection(VllmRealtimeConnection):
                     logger.exception("Failed to send response.audio.done")
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
-            # PORT-OBS-003/005: end-of-generation cleanup — this
-            # connection has no independent local record of every ready
-            # handle the segmenter minted, only the observer's own
-            # {waiting, in-flight} state does, so every still-outstanding
-            # unit for this generation is cleared here in one pass
-            # (mirrors NemotronSessionLease._consume's finally-clearing
-            # pattern on the leased path). Gated on ``_park_token_id``
-            # exactly like park detection itself: with no park-token id
-            # configured, this connection performs no chunk-terminal
-            # observation of any kind, cleanup included.
-            if observer is not None and park_token_id is not None:
-                observe_safely(
-                    observer.clear_all_outstanding,
-                    request_id,
-                    outcome="error" if generation_error is not None else "aborted",
+            # PORT-OBS-003/006: the native path's single observer
+            # terminal section. Gated on the observer/session key ONLY —
+            # never the park token (only park DETECTION needs the token;
+            # a token-less connection still clears and finishes).
+            #
+            # Reason taxonomy (PORT-OBS-006):
+            #   completed — result generation exhausted after the
+            #     model's FLUSH park: on this path the engine finishes
+            #     the request only through finalization, so normal
+            #     exhaustion WITH zero outstanding units is completion.
+            #   aborted   — disconnect, cancellation.
+            #   error     — engine/protocol failure, or an ostensibly
+            #     normal end that still had outstanding units
+            #     (lifecycle divergence): the remaining work is cleared
+            #     as error and the session finishes as error.
+            if observer is not None:
+                if cancelled is not None or disconnected:
+                    outcome, reason = "aborted", "aborted"
+                elif model_finalized:
+                    # Classified from finalization state, NOT from
+                    # generation_error: a terminal-send failure after
+                    # the model finished is a transport event and must
+                    # not turn completion into error (PORT-OBS-006).
+                    outcome, reason = "error", "completed"
+                else:
+                    outcome, reason = "error", "error"
+                remaining = observe_safely(
+                    observer.clear_all_outstanding, request_id, outcome=outcome
                 )
+                if reason == "completed" and remaining:
+                    logger.warning(
+                        "generation ended normally with %s undisposed unit(s) "
+                        "— lifecycle divergence, session finishes as error",
+                        remaining,
+                    )
+                    reason = "error"
+                observe_safely(
+                    observer.session_finished,
+                    session_key=request_id,
+                    reason=reason,
+                )
+                self._streaming_session_finished = True
+            if cancelled is not None:
+                raise cancelled
 
     async def _bind_state_lease(
         self,
@@ -730,7 +813,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._streaming_session_finished = True
             observe_safely(
                 self._observer.session_finished,
-                cadence_ms=str(session.geometry.cadence).removesuffix("ms"),
+                session_key=session.session_key,
                 reason=self._streaming_finish_reason,
             )
 

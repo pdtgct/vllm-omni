@@ -21,6 +21,7 @@ non-authoritative and nonfatal by construction.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -30,6 +31,21 @@ from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.streaming_transport import ChunkReadyHandle, StreamingObserver
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _SessionRecord:
+    """The bounded per-session observer state (PORT-OBS-003 as amended).
+
+    A record exists if and only if the session was opened: open-at-
+    construction is authoritative, and a ready arriving without an open
+    is ignored loudly rather than manufacturing implicit session state
+    (review round 2026-07-28, F6/F7).
+    """
+
+    cadence_ms: str
+    waiting: list[ChunkReadyHandle] = field(default_factory=list)
+    inflight: ChunkReadyHandle | None = None
 
 _cadence_labels = list(defs.STREAMING_CADENCE_LABELS)
 _finished_labels = list(defs.STREAMING_FINISHED_LABELS)
@@ -270,13 +286,15 @@ class PrometheusStreamingObserver(StreamingObserver):
 
     def __init__(self, metrics: OmniStreamingMetrics) -> None:
         self._metrics = metrics
-        self._waiting: dict[str, list[ChunkReadyHandle]] = {}
-        self._inflight: dict[str, ChunkReadyHandle | None] = {}
-        # Idempotency guard: a handle enters here on its FIRST terminal
-        # disposition (park or clear) and every later disposition on the
-        # same handle is a full no-op — backlog decrements exactly once
-        # per unit even under a racing double-terminal call.
-        self._disposed: set[ChunkReadyHandle] = set()
+        # One bounded record per session key (PORT-OBS-003 as amended):
+        # {cadence, waiting-ready handles, single in-flight handle},
+        # created at first open (or first ready, for observation-only
+        # flows that never open), popped exactly once at terminal
+        # finish. Disposition succeeds only while its handle is waiting
+        # or in-flight in its session's record, which makes duplicate
+        # and late dispositions natural no-ops WITHOUT a process-
+        # lifetime disposed-handle set — no state outlives the record.
+        self._sessions: dict[str, _SessionRecord] = {}
 
     @property
     def metrics(self) -> OmniStreamingMetrics:
@@ -300,11 +318,50 @@ class PrometheusStreamingObserver(StreamingObserver):
         except Exception:
             logger.exception("streaming observer sink failed in %s; observation is nonfatal", fn)
 
-    def session_opened(self, *, cadence_ms: str) -> None:
-        self._safe(self._metrics.inc_sessions_active, cadence_ms)
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
+        record = self._sessions.get(session_key)
+        if record is None:
+            self._sessions[session_key] = _SessionRecord(cadence_ms=cadence_ms)
+            self._safe(self._metrics.inc_sessions_active, cadence_ms)
+            return
+        # Duplicate open of an active session: idempotent no-op; a
+        # conflicting cadence is logged and ignored (PORT-OBS-003).
+        if record.cadence_ms != cadence_ms:
+            logger.warning(
+                "duplicate session open with conflicting cadence "
+                "(recorded=%s, ignored=%s); keeping the first",
+                record.cadence_ms,
+                cadence_ms,
+            )
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
-        self._safe(self._metrics.observe_session_finished, cadence_ms, reason)
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        record = self._sessions.get(session_key)
+        if record is None:
+            # Unknown or duplicate finish: no-op.
+            return
+        # Divergence defense-in-depth: units still waiting/in-flight at
+        # terminal finish are cleared as error before the record is
+        # released, and the EFFECTIVE reason is normalized to error —
+        # never the caller's reason alongside error chunk outcomes
+        # (review round 2026-07-28, F4).
+        remaining = self.clear_all_outstanding(session_key, outcome="error")
+        if remaining:
+            logger.warning(
+                "session finished (caller reason=%s) with %d undisposed "
+                "unit(s) — lifecycle divergence, cleared as error and the "
+                "session finishes as error",
+                reason,
+                remaining,
+            )
+            reason = "error"
+        # observe_session_finished is the single terminal section: it
+        # decrements active and increments finished together.
+        self._safe(self._metrics.observe_session_finished, record.cadence_ms, reason)
+        del self._sessions[session_key]
+
+    def session_record_count(self) -> int:
+        """The number of live per-session records (bounded-state check)."""
+        return len(self._sessions)
 
     def session_open_rejected(self, *, reason: str) -> None:
         self._safe(self._metrics.inc_open_rejection, reason)
@@ -315,7 +372,7 @@ class PrometheusStreamingObserver(StreamingObserver):
     def unit_ready(
         self,
         *,
-        session_key: str = "default",
+        session_key: str,
         cadence_ms: str,
         chunk_type: str,
         ready_stamp_s: float,
@@ -326,20 +383,57 @@ class PrometheusStreamingObserver(StreamingObserver):
             chunk_type=chunk_type,
             ready_stamp_s=ready_stamp_s,
         )
-        self._waiting.setdefault(session_key, []).append(handle)
+        record = self._sessions.get(session_key)
+        if record is None:
+            # Open-at-construction is authoritative (PORT-OBS-003): a
+            # ready without an open is ignored LOUDLY — no implicit
+            # record, no backlog movement; the returned handle is inert
+            # (all dispositions on it no-op via record membership).
+            logger.warning(
+                "unit_ready for un-opened session key — ignored; "
+                "session open must precede ready (PORT-OBS-003)"
+            )
+            return handle
+        record.waiting.append(handle)
         self._safe(self._metrics.inc_backlog, cadence_ms)
         return handle
 
     def unit_minted(self, handle: ChunkReadyHandle) -> None:
-        waiting = self._waiting.get(handle.session_key)
-        if waiting is not None and handle in waiting:
-            waiting.remove(handle)
-        self._inflight[handle.session_key] = handle
+        """Promote a WAITING handle to the single in-flight slot.
+
+        Strict transitions (review round 2026-07-28, F1): a duplicate
+        mint of the current in-flight handle is idempotent; a mint of a
+        handle that was never waiting (foreign or already disposed) is a
+        no-op; a mint while a DIFFERENT unit is in flight is an illegal
+        transition under PORT-SESS-001's one-in-flight invariant and
+        no-ops with the handle left waiting — it can be minted legally
+        once the in-flight unit reaches its terminal disposition.
+        """
+        record = self._sessions.get(handle.session_key)
+        if record is None:
+            return
+        if record.inflight is handle:
+            return
+        if handle not in record.waiting:
+            return
+        if record.inflight is not None:
+            return
+        record.waiting.remove(handle)
+        record.inflight = handle
 
     def complete_inflight(self, session_key: str) -> ChunkReadyHandle | None:
-        handle = self._inflight.get(session_key)
-        self._inflight[session_key] = None
-        return handle
+        """Resolve (without disposing) the single in-flight unit.
+
+        The returned handle stays in the record until its terminal
+        disposition removes it — disposal is the one place membership
+        changes, which is what makes duplicate/late dispositions no-ops
+        under the bounded-record design. A second resolve after the
+        disposition (e.g. a carrierless park echo) returns ``None``.
+        """
+        record = self._sessions.get(session_key)
+        if record is None:
+            return None
+        return record.inflight
 
     def unit_parked(self, handle: ChunkReadyHandle, *, park_stamp_s: float) -> None:
         if not self._dispose(handle):
@@ -359,25 +453,32 @@ class PrometheusStreamingObserver(StreamingObserver):
     def overflow(self, *, kind: str) -> None:
         self._safe(self._metrics.inc_backlog_overflow, kind)
 
-    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
-        handles = list(self._waiting.get(session_key, ()))
-        inflight = self._inflight.get(session_key)
-        if inflight is not None:
-            handles.append(inflight)
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> int:
+        """Clear every still-outstanding unit; returns the number cleared."""
+        record = self._sessions.get(session_key)
+        if record is None:
+            return 0
+        handles = list(record.waiting)
+        if record.inflight is not None:
+            handles.append(record.inflight)
         for handle in handles:
             self.unit_cleared(handle, outcome=outcome)
+        return len(handles)
 
     def _dispose(self, handle: ChunkReadyHandle) -> bool:
         """Idempotent terminal disposition: decrements backlog exactly
-        once per handle. Returns ``False`` (a full no-op for the caller)
-        when ``handle`` was already disposed."""
-        waiting = self._waiting.get(handle.session_key)
-        if waiting is not None and handle in waiting:
-            waiting.remove(handle)
-        if self._inflight.get(handle.session_key) is handle:
-            self._inflight[handle.session_key] = None
-        if handle in self._disposed:
+        once per handle. Succeeds only while the handle is waiting or
+        in-flight in its session's record (PORT-OBS-003 as amended) —
+        duplicate and late dispositions, including any after the record
+        was released, are full no-ops with no process-lifetime state."""
+        record = self._sessions.get(handle.session_key)
+        if record is None:
             return False
-        self._disposed.add(handle)
+        if handle in record.waiting:
+            record.waiting.remove(handle)
+        elif record.inflight is handle:
+            record.inflight = None
+        else:
+            return False
         self._safe(self._metrics.dec_backlog, handle.cadence_ms)
         return True

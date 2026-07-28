@@ -88,17 +88,26 @@ class StreamingObserver(Protocol):
     pre-metrics baseline.
     """
 
-    def session_opened(self, *, cadence_ms: str) -> None:
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
         """One successful session open (PORT-OBS-006): opens the active
-        gauge. Native open is observer-bearing model-session construction
-        after successful validation and before engine request creation —
-        never WebSocket acceptance."""
+        gauge, keyed by the per-generation correlation key (the engine
+        request id, minted once before session construction — PORT-OBS-003
+        as amended). Native open is observer-bearing model-session
+        construction after successful validation and before engine
+        request creation — never WebSocket acceptance. A duplicate open
+        of an active session is an idempotent no-op; a conflicting
+        cadence is logged and ignored. The key is internal correlation
+        state, never a metric label."""
         ...
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
-        """The session's single idempotent terminal-disposition section:
-        active decrements and finished increments together, so
-        opens - finished == active."""
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        """The session's single idempotent terminal-disposition section,
+        keyed like :meth:`session_opened`: active decrements and finished
+        increments together (cadence resolved from the record captured at
+        open), so opens - finished == active. Unknown or duplicate finish
+        is a no-op; terminal finish releases the session's entire bounded
+        record, clearing any still-outstanding units as ``error``
+        (lifecycle-divergence defense in depth)."""
         ...
 
     def session_open_rejected(self, *, reason: str) -> None:
@@ -158,12 +167,14 @@ class StreamingObserver(Protocol):
         or the armed receipt ledger (``kind="carrier"``/``"receipt"``)."""
         ...
 
-    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> int:
         """Terminal bulk clear: every unit still outstanding for
         ``session_key`` — waiting-ready AND the in-flight unit, if any —
         receives ``outcome`` as its terminal disposition in one pass,
         decrementing backlog by exactly the number of units cleared
-        (PORT-OBS-005's decrement-by-exact-count).
+        (PORT-OBS-005's decrement-by-exact-count). Returns that number,
+        so a terminal caller can detect lifecycle divergence (an
+        ostensibly clean end that still had outstanding work).
 
         Discovered during Phase-6 implementation: a session-terminal
         cleanup site (the lease's ledger-failure path, the native
@@ -254,4 +265,11 @@ def forward_batch_stats_to_engine_core_outputs(
     if not stats_enabled:
         engine_core_outputs.streaming_chunk_batch_stats = None
         return
-    engine_core_outputs.streaming_chunk_batch_stats = runner_output.streaming_chunk_batch_stats
+    # getattr, not attribute access: idle scheduler steps carry vLLM's
+    # vanilla ModelRunnerOutput (the shared empty singleton), which has
+    # no such attribute — an unconditional read raised AttributeError
+    # inside the engine-core busy loop and killed the engine on the
+    # first idle step after a generation (2026-07-28 GPU round).
+    engine_core_outputs.streaming_chunk_batch_stats = getattr(
+        runner_output, "streaming_chunk_batch_stats", None
+    )

@@ -126,6 +126,7 @@ class StageRuntime:
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -134,6 +135,12 @@ class StageRuntime:
         self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
+        # PORT-OBS-008 (A27 amendment 5): the host-statistics switch,
+        # threaded from the engine into every local replica launch and
+        # the logical-stage output processor. A hardcoded False here is
+        # what silenced the stage-proc scheduler's batch-stat forward in
+        # every real serve.
+        self._log_stats = log_stats
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -572,7 +579,7 @@ class StageRuntime:
                 with launch_stage_replica(
                     vllm_config=vllm_config,
                     executor_class=executor_class,
-                    log_stats=False,
+                    log_stats=self._log_stats,
                     stage_id=plan.metadata.stage_id,
                     replica_id=plan.replica_id,
                     stage_config=plan.stage_cfg,
@@ -701,7 +708,9 @@ class StageRuntime:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(
+                    plan, stage_vllm_config, log_stats=self._log_stats
+                )
 
             stage_pools.append(
                 StagePool(
@@ -747,6 +756,7 @@ class DistStageRuntime(StageRuntime):
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
         request_queue: janus.Queue[EngineQueueMessage] | None = None,
+        log_stats: bool = False,
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -756,6 +766,7 @@ class DistStageRuntime(StageRuntime):
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1084,6 +1095,7 @@ def create_stage_runtime(
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
+    log_stats: bool = False,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1104,6 +1116,7 @@ def create_stage_runtime(
             omni_heartbeat_timeout=omni_heartbeat_timeout,
             omni_lb_policy=omni_lb_policy,
             request_queue=request_queue,
+            log_stats=log_stats,
         )
     return StageRuntime(
         stage_configs=stage_configs,
@@ -1113,4 +1126,5 @@ def create_stage_runtime(
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        log_stats=log_stats,
     )

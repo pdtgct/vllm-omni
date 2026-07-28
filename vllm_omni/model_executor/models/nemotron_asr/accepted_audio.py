@@ -79,8 +79,8 @@ class AcceptedAudioAuthority:
     ) -> None:
         if chunk_samples <= 0:
             raise ValueError("chunk_samples must be positive")
-        if capacity_samples < chunk_samples:
-            raise ValueError("capacity_samples must cover one cadence")
+        if capacity_samples <= 0:
+            raise ValueError("capacity_samples must be positive")
         if carrier_sequence_modulus <= 0:
             raise ValueError("carrier_sequence_modulus must be positive")
         if initial_logical_sequence < 0:

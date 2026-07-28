@@ -1722,8 +1722,14 @@ async def realtime_websocket(websocket: WebSocket):
     # PORT-OBS-003: route-to-session injection — the installed observer
     # (if any was installed for this app state) is threaded into native
     # session construction here, never constructed or resolved again.
+    # The park-token id is the serving's model-gated resolution: the
+    # recognized streaming model resolves it (loudly), any other
+    # realtime model yields None and park detection stays inert.
     observer = streaming_install.resolve_installed_observer(websocket.app.state)
-    connection = RealtimeConnection(websocket, serving, observer=observer)
+    park_token_id = getattr(serving, "park_token_id", None)
+    connection = RealtimeConnection(
+        websocket, serving, observer=observer, park_token_id=park_token_id
+    )
     await connection.handle_connection()
 
 

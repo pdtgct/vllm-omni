@@ -15,6 +15,7 @@ tests-first rule, matching ``test_manifests.py``).
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pytest
 from prometheus_client import REGISTRY, generate_latest
@@ -452,7 +453,8 @@ class TestBacklogIdempotency:
         prefix = f'{defs.STREAMING_BACKLOG_CHUNKS}{{cadence_ms="560",model_name="idempotent-backlog-model"}}'
         base = _count_value(generate_latest(REGISTRY).decode(), prefix) or 0.0
 
-        handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        observer.session_opened(session_key="idem-key", cadence_ms="560")
+        handle = observer.unit_ready(session_key="idem-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_parked(handle, park_stamp_s=0.1)
         after_first_terminal = _count_value(generate_latest(REGISTRY).decode(), prefix)
         assert after_first_terminal == base  # +1 at ready, -1 at park -> net 0
@@ -479,7 +481,8 @@ class TestStrictLatencyMissBoundary:
         )
         before = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
 
-        handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        observer.session_opened(session_key="fixture-key", cadence_ms="560")
+        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_parked(handle, park_stamp_s=0.56)  # exactly the 560ms cadence period
 
         # Lead-authorized fix (Phase-6 round 2, Q1a): coerce both sides
@@ -500,7 +503,8 @@ class TestStrictLatencyMissBoundary:
         )
         before = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
 
-        handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        observer.session_opened(session_key="fixture-key", cadence_ms="560")
+        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_parked(handle, park_stamp_s=0.560001)  # strictly over
 
         after = _count_value(generate_latest(REGISTRY).decode(), miss_prefix)
@@ -532,7 +536,8 @@ class TestParkedVsCleared:
         miss_before = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
         outcome_before = _count_value(generate_latest(REGISTRY).decode(), outcome_prefix) or 0.0
 
-        handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        observer.session_opened(session_key="fixture-key", cadence_ms="560")
+        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_cleared(handle, outcome="aborted")
 
         # Lead-authorized fix (Phase-6 round 2, Q1a): coerce identically
@@ -583,3 +588,261 @@ class TestBoundedEnumRejection:
 
         after = generate_latest(REGISTRY).decode()
         assert 'outcome="not-a-bounded-outcome"' not in after
+
+
+# ---------------------------------------------------------------------------
+# Keyed session lifecycle + bounded per-session observer state
+# (PORT-OBS-003/006 as amended by the A27 topology cascade, notes PR #106).
+# ---------------------------------------------------------------------------
+
+
+def _keyed_observer(model_name: str) -> Any:
+    from vllm_omni.metrics.streaming import PrometheusStreamingObserver
+
+    metrics = OmniStreamingMetrics(model_name=model_name, log_stats=True)
+    return PrometheusStreamingObserver(metrics)
+
+
+def _gauge(prefix: str) -> float:
+    return _count_value(generate_latest(REGISTRY).decode(), prefix) or 0.0
+
+
+class TestKeyedSessionLifecycle:
+    # @spec PORT-OBS-003, PORT-OBS-006
+    def test_first_open_increments_active_and_finish_uses_opens_cadence(self) -> None:
+        """Open records the cadence; finish takes no cadence argument and
+        resolves the label from the record captured at open."""
+        observer = _keyed_observer("keyed-lc-1")
+        active = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="keyed-lc-1"}}'
+        finished = (
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
+            f'{{cadence_ms="560",model_name="keyed-lc-1",reason="completed"}}'
+        )
+        base_active, base_fin = _gauge(active), _gauge(finished)
+
+        observer.session_opened(session_key="req-a", cadence_ms="560")
+        assert _gauge(active) == base_active + 1
+
+        observer.session_finished(session_key="req-a", reason="completed")
+        assert _gauge(active) == base_active
+        assert _gauge(finished) == base_fin + 1
+
+    # @spec PORT-OBS-003
+    def test_duplicate_open_of_an_active_session_is_a_no_op(self) -> None:
+        observer = _keyed_observer("keyed-lc-2")
+        active = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="keyed-lc-2"}}'
+        base = _gauge(active)
+        observer.session_opened(session_key="req-b", cadence_ms="560")
+        observer.session_opened(session_key="req-b", cadence_ms="560")
+        assert _gauge(active) == base + 1
+        observer.session_finished(session_key="req-b", reason="completed")
+        assert _gauge(active) == base
+
+    # @spec PORT-OBS-003
+    def test_conflicting_cadence_on_duplicate_open_is_logged_and_ignored(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        observer = _keyed_observer("keyed-lc-3")
+        active_560 = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="keyed-lc-3"}}'
+        base = _gauge(active_560)
+        observer.session_opened(session_key="req-c", cadence_ms="560")
+        with caplog.at_level("WARNING", logger="vllm_omni.metrics.streaming"):
+            observer.session_opened(session_key="req-c", cadence_ms="1120")
+        assert any("cadence" in rec.message for rec in caplog.records)
+        # The record keeps the FIRST cadence; finish resolves to it.
+        observer.session_finished(session_key="req-c", reason="completed")
+        assert _gauge(active_560) == base
+
+    # @spec PORT-OBS-003, PORT-OBS-006
+    def test_unknown_and_duplicate_finish_are_no_ops(self) -> None:
+        observer = _keyed_observer("keyed-lc-4")
+        active = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="keyed-lc-4"}}'
+        base = _gauge(active)
+        observer.session_finished(session_key="never-opened", reason="completed")
+        assert _gauge(active) == base
+        observer.session_opened(session_key="req-d", cadence_ms="560")
+        observer.session_finished(session_key="req-d", reason="completed")
+        observer.session_finished(session_key="req-d", reason="error")
+        assert _gauge(active) == base
+
+    # @spec PORT-OBS-003
+    def test_session_key_is_never_a_label(self) -> None:
+        observer = _keyed_observer("keyed-lc-5")
+        observer.session_opened(session_key="SECRET-CORRELATION-KEY", cadence_ms="560")
+        observer.session_finished(session_key="SECRET-CORRELATION-KEY", reason="completed")
+        assert "SECRET-CORRELATION-KEY" not in generate_latest(REGISTRY).decode()
+
+    # @spec PORT-OBS-003, PORT-OBS-005
+    def test_finish_clears_remaining_handles_as_error_and_releases_the_record(self) -> None:
+        """Divergence defense-in-depth: units still waiting/in-flight at
+        terminal finish are cleared as error (backlog returns to zero,
+        outcome=error counted) and the record is released — a late
+        disposition afterwards is a no-op."""
+        observer = _keyed_observer("keyed-lc-6")
+        backlog = f'{defs.STREAMING_BACKLOG_CHUNKS}{{cadence_ms="560",model_name="keyed-lc-6"}}'
+        err = (
+            f'{defs.STREAMING_CHUNKS}_total'
+            f'{{cadence_ms="560",chunk_type="regular",model_name="keyed-lc-6",outcome="error"}}'
+        )
+        base_b, base_e = _gauge(backlog), _gauge(err)
+
+        observer.session_opened(session_key="req-f", cadence_ms="560")
+        h1 = observer.unit_ready(
+            session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        observer.unit_ready(
+            session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
+        )
+        assert _gauge(backlog) == base_b + 2
+
+        observer.session_finished(session_key="req-f", reason="error")
+        assert _gauge(backlog) == base_b
+        assert _gauge(err) == base_e + 2
+
+        # Late disposition after release: full no-op.
+        observer.unit_parked(h1, park_stamp_s=1.0)
+        assert _gauge(backlog) == base_b
+
+    # @spec PORT-OBS-003
+    def test_clear_all_outstanding_returns_the_number_cleared(self) -> None:
+        observer = _keyed_observer("keyed-lc-7")
+        observer.session_opened(session_key="req-g", cadence_ms="560")
+        h = observer.unit_ready(
+            session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        observer.unit_minted(h)
+        observer.unit_ready(
+            session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
+        )
+        assert observer.clear_all_outstanding("req-g", outcome="aborted") == 2
+        assert observer.clear_all_outstanding("req-g", outcome="aborted") == 0
+
+    # @spec PORT-OBS-003
+    def test_no_state_outlives_the_session_record(self) -> None:
+        """The bounded-state contract: after open -> ready -> park ->
+        finish, the observer holds nothing for the session — no
+        process-lifetime disposed-set, no orphan waiting/in-flight maps."""
+        observer = _keyed_observer("keyed-lc-8")
+        observer.session_opened(session_key="req-h", cadence_ms="560")
+        h = observer.unit_ready(
+            session_key="req-h", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        observer.unit_minted(h)
+        observer.complete_inflight("req-h")
+        observer.unit_parked(h, park_stamp_s=0.2)
+        observer.session_finished(session_key="req-h", reason="completed")
+        assert observer.session_record_count() == 0
+
+
+class TestStrictLifecycleTransitions:
+    """Review round (2026-07-28): adversarial transitions must not
+    corrupt backlog or publish a false terminal reason."""
+
+    # @spec PORT-OBS-003, PORT-OBS-005, PORT-SESS-001
+    def test_double_ready_double_mint_cannot_corrupt_backlog(self) -> None:
+        """Reviewer repro (F1): two readies + two mints used to orphan
+        the first in-flight handle — terminal cleanup released the
+        record with backlog stuck at 1. A mint while another unit is in
+        flight is an illegal transition and must no-op, leaving the
+        second unit waiting (PORT-SESS-001's one-in-flight)."""
+        observer = _keyed_observer("strict-lc-1")
+        backlog = f'{defs.STREAMING_BACKLOG_CHUNKS}{{cadence_ms="560",model_name="strict-lc-1"}}'
+        base = _gauge(backlog)
+
+        observer.session_opened(session_key="req-m1", cadence_ms="560")
+        h1 = observer.unit_ready(
+            session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        h2 = observer.unit_ready(
+            session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
+        )
+        observer.unit_minted(h1)
+        observer.unit_minted(h2)  # illegal while h1 in flight: no-op
+        assert observer.complete_inflight("req-m1") is h1
+        observer.unit_parked(h1, park_stamp_s=0.2)
+        observer.unit_minted(h2)  # now legal
+        assert observer.complete_inflight("req-m1") is h2
+        observer.unit_parked(h2, park_stamp_s=0.3)
+        observer.session_finished(session_key="req-m1", reason="completed")
+
+        assert _gauge(backlog) == base
+        assert observer.session_record_count() == 0
+
+    # @spec PORT-OBS-003, PORT-SESS-001
+    def test_duplicate_and_foreign_mints_are_no_ops(self) -> None:
+        observer = _keyed_observer("strict-lc-2")
+        observer.session_opened(session_key="req-m2", cadence_ms="560")
+        h = observer.unit_ready(
+            session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        observer.unit_minted(h)
+        observer.unit_minted(h)  # duplicate: idempotent
+        assert observer.complete_inflight("req-m2") is h
+
+        # A foreign handle (never made ready for this session) must not
+        # displace the in-flight unit.
+        from vllm_omni.metrics.streaming_transport import ChunkReadyHandle
+
+        foreign = ChunkReadyHandle(
+            session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=9.9
+        )
+        observer.unit_minted(foreign)
+        assert observer.complete_inflight("req-m2") is h
+        observer.unit_parked(h, park_stamp_s=0.2)
+        observer.session_finished(session_key="req-m2", reason="completed")
+        assert observer.session_record_count() == 0
+
+    # @spec PORT-OBS-003, PORT-OBS-006
+    def test_completed_finish_with_outstanding_normalizes_to_error(self) -> None:
+        """Reviewer F4: when the divergence defense fires, the effective
+        reason is error — never the caller's completed alongside error
+        chunk outcomes."""
+        observer = _keyed_observer("strict-lc-3")
+        completed = (
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
+            f'{{cadence_ms="560",model_name="strict-lc-3",reason="completed"}}'
+        )
+        errored = (
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
+            f'{{cadence_ms="560",model_name="strict-lc-3",reason="error"}}'
+        )
+        base_c, base_e = _gauge(completed), _gauge(errored)
+        observer.session_opened(session_key="req-m3", cadence_ms="560")
+        observer.unit_ready(
+            session_key="req-m3", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
+        observer.session_finished(session_key="req-m3", reason="completed")
+        assert _gauge(completed) == base_c
+        assert _gauge(errored) == base_e + 1
+
+    # @spec PORT-OBS-003
+    def test_ready_before_open_is_ignored_loudly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reviewer F6 / PR #106 wording: open-at-construction is
+        authoritative; a ready without an open creates no record, moves
+        no backlog, and warns — it never manufactures implicit session
+        state that could shadow the correlation invariant."""
+        observer = _keyed_observer("strict-lc-4")
+        backlog = f'{defs.STREAMING_BACKLOG_CHUNKS}{{cadence_ms="560",model_name="strict-lc-4"}}'
+        base = _gauge(backlog)
+        with caplog.at_level("WARNING", logger="vllm_omni.metrics.streaming"):
+            h = observer.unit_ready(
+                session_key="never-opened", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+            )
+        assert any("un-opened" in rec.message for rec in caplog.records)
+        assert _gauge(backlog) == base
+        assert observer.session_record_count() == 0
+        observer.unit_parked(h, park_stamp_s=0.1)  # inert handle: no-op
+        assert _gauge(backlog) == base
+
+    # @spec PORT-OBS-003
+    def test_unit_ready_requires_an_explicit_session_key(self) -> None:
+        """Reviewer F6: the correlation key has no default — keyless
+        compatibility exists only on the unobserved path."""
+        import inspect
+
+        from vllm_omni.metrics.streaming import PrometheusStreamingObserver
+
+        param = inspect.signature(PrometheusStreamingObserver.unit_ready).parameters["session_key"]
+        assert param.default is inspect.Parameter.empty

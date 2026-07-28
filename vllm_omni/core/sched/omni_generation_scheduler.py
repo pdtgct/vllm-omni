@@ -17,7 +17,6 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
-    EngineCoreOutputs,
 )
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -34,6 +33,12 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+
+# PORT-OBS-008/009 (A27 amendment 6): this scheduler already emits
+# OmniEngineCoreOutput elements; its enclosing envelope is the omni type
+# too — a vanilla envelope would perpetuate an invariant split and
+# cannot carry streaming_chunk_batch_stats (slotted msgspec struct).
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)

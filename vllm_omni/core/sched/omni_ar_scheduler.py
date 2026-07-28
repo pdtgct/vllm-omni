@@ -14,7 +14,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -30,6 +30,14 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+
+# PORT-OBS-008/009 (A27 amendment 6): every envelope this scheduler
+# constructs is the OMNI type — the vanilla EngineCoreOutputs is a
+# slotted msgspec struct that cannot carry streaming_chunk_batch_stats
+# (assignment raises AttributeError), so binding the omni type at the
+# module level makes every construction site correct at once and is
+# pinned by test_omni_outputs_envelope.py's module-binding check.
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.metrics import streaming_transport
 from vllm_omni.outputs import OmniConnectorOutput
@@ -291,6 +299,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+        )
+
+    def _forward_streaming_batch_stats(
+        self,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+        model_runner_output: Any,
+    ) -> None:
+        """PORT-OBS-008/009: the scheduler-side hop, gated by this
+        scheduler's own host-statistics switch — mirrors the
+        scheduler_stats "return to only one front-end" selection in
+        ``update_from_output``, since batch stats are likewise a global,
+        not per-client, signal. Gated on the OUTSIDE (not just via
+        ``stats_enabled=``) so a disabled collector never synthesizes an
+        otherwise-unneeded envelope for a step that would send nothing
+        else. A real method (not inline) so the seam is drivable by CPU
+        tests on scheduler-constructed envelopes."""
+        if not self.log_stats:
+            return
+        if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+            engine_core_outputs[0] = eco = EngineCoreOutputs()
+        streaming_transport.forward_batch_stats_to_engine_core_outputs(
+            model_runner_output,
+            eco,
+            stats_enabled=True,
         )
 
     def update_from_output(
@@ -620,21 +652,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # PORT-OBS-008/009: the scheduler-side hop, gated by this
-        # scheduler's own host-statistics switch — mirrors the
-        # scheduler_stats "return to only one front-end" selection above,
-        # since batch stats are likewise a global, not per-client, signal.
-        # Gated on the OUTSIDE (not just via ``stats_enabled=``) so a
-        # disabled collector never synthesizes an otherwise-unneeded
-        # EngineCoreOutputs for a step that would send nothing else.
-        if self.log_stats:
-            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
-                engine_core_outputs[0] = eco = EngineCoreOutputs()
-            streaming_transport.forward_batch_stats_to_engine_core_outputs(
-                model_runner_output,
-                eco,
-                stats_enabled=True,
-            )
+        self._forward_streaming_batch_stats(engine_core_outputs, model_runner_output)
 
         self._capture_omni_connector_output(model_runner_output)
 
