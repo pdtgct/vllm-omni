@@ -26,6 +26,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _MODEL = "test-streaming-model"
 
+
+def _streaming_lines(out: str) -> list[str]:
+    """Exposition lines for this module's families only.
+
+    The default registry also carries live process collectors
+    (``process_cpu_seconds_total``, ``process_resident_memory_bytes``,
+    ``python_gc_*``) whose values move on their own between two scrapes,
+    so a whole-registry diff is not a stable assertion — it fails
+    whenever CPU time ticks or a GC runs mid-test, which depends on what
+    ran before. Scope the comparison to the families under test.
+    """
+    return [
+        line
+        for line in out.splitlines()
+        if line.startswith(defs.METRIC_PREFIX + "streaming_")
+    ]
+
 _EXPECTED_FAMILIES: dict[str, tuple[str, tuple[str, ...]]] = {
     # exposition name -> (type, labelnames)
     defs.STREAMING_SESSIONS_ACTIVE: ("gauge", defs.STREAMING_CADENCE_LABELS),
@@ -218,13 +235,14 @@ class TestLogStatsGating:
     # @spec PORT-OBS-002
     def test_disabled_collection_returns_without_recording_or_raising(self) -> None:
         metrics = OmniStreamingMetrics(model_name=_MODEL, log_stats=False)
-        before = generate_latest(REGISTRY).decode()
+        before = _streaming_lines(generate_latest(REGISTRY).decode())
 
-        # Once implemented: disabled collection must return silently and
-        # leave the registry's samples untouched.
+        # Disabled collection must return silently and leave every
+        # streaming sample untouched — stronger than checking one
+        # family, and unaffected by collectors this module does not own.
         metrics.inc_sessions_active("560")
 
-        after = generate_latest(REGISTRY).decode()
+        after = _streaming_lines(generate_latest(REGISTRY).decode())
         assert after == before
 
     # @spec PORT-OBS-002
