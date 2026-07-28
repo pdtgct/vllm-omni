@@ -91,6 +91,7 @@ async def buffer_stream(
     observer: StreamingObserver | None = None,
     final_tail_ready_stamp_s: float | None = None,
     accepted_audio_budget_s: float | None = None,
+    session_key: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Chunk client audio: one yield = one StreamingUpdate.
 
@@ -133,6 +134,17 @@ async def buffer_stream(
     session_kwargs: dict[str, Any] = {}
     if accepted_audio_budget_s is not None:
         session_kwargs["accepted_audio_budget_s"] = accepted_audio_budget_s
+    # PORT-OBS-003/006 (amended): on the bare-config (native) path the
+    # session constructed HERE is the one whose constructor carries the
+    # single un-duplicated open site — so the observer and the minted
+    # correlation key must reach that constructor, not merely this
+    # generator's own ready/minted events. (The A27 GPU round proved the
+    # override-only threading left session_opened dead and the handle
+    # keys unresolvable from the connection.)
+    if observer is not None:
+        session_kwargs["observer"] = observer
+    if session_key is not None:
+        session_kwargs["session_key"] = session_key
     session = (
         model_config
         if isinstance(model_config, NemotronRealtimeSession)

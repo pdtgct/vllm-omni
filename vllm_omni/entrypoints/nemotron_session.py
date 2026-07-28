@@ -286,9 +286,6 @@ class NemotronSessionLease:
     async def _consume(self) -> None:
         """Drive generation and resolve ledger tickets at legal parks."""
         from vllm_omni.metrics.streaming_transport import observe_safely
-        from vllm_omni.model_executor.models.nemotron_asr.session import (
-            cadence_ms_label,
-        )
 
         observer = self._session.observer
         try:
@@ -334,9 +331,17 @@ class NemotronSessionLease:
             self._error = error
         finally:
             self._done.set()
+            # Explicit finalization state (review round 2026-07-28, F2):
+            # completed means the session's NORMAL finalization actually
+            # happened — audio closed, no pending tickets, FLUSH parked.
+            # A generation that merely stopped early fails the ledger
+            # AND reports error; leaving the reason derived only from
+            # "no exception caught" previously published completed for
+            # premature exhaustion.
+            finalized = self._audio_closed and not self._ledger.pending and self._flush_parked
             if self._error is not None:
                 self._ledger.fail(self._error)
-            elif not self._audio_closed or self._ledger.pending or not self._flush_parked:
+            elif not finalized:
                 self._ledger.fail(RuntimeError("generation ended before the session's normal finalization"))
             # PORT-OBS-006: the lease's single idempotent terminal-
             # disposition section — this coroutine body runs exactly
@@ -347,13 +352,13 @@ class NemotronSessionLease:
             if observer is not None:
                 if self._aborted:
                     reason = "aborted"
-                elif self._error is not None:
+                elif self._error is not None or not finalized:
                     reason = "error"
                 else:
                     reason = "completed"
                 observe_safely(
                     observer.session_finished,
-                    cadence_ms=cadence_ms_label(self._session.geometry.cadence),
+                    session_key=self._session.session_key,
                     reason=reason,
                 )
 
@@ -385,6 +390,11 @@ class NemotronSessionFactory:
             NemotronRealtimeSession,
         )
 
+        # PORT-OBS-003 (amended): the engine request id is minted BEFORE
+        # session construction and becomes the session's correlation key
+        # — one identity for ready events, in-flight completion, and
+        # lifecycle, exactly as on the native path.
+        request_id = f"{self._request_id_prefix}-{uuid4()}"
         session = NemotronRealtimeSession.from_model_config(
             self._engine.model_config,
             cadence=cadence,
@@ -392,11 +402,12 @@ class NemotronSessionFactory:
             with_ledger=True,
             max_pending_carriers=self._max_pending_carriers,
             observer=self._observer,
+            session_key=request_id,
         )
         return NemotronSessionLease(
             engine=self._engine,
             session=session,
-            request_id=f"{self._request_id_prefix}-{uuid4()}",
+            request_id=request_id,
         )
 
 

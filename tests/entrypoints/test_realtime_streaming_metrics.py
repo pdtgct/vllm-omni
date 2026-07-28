@@ -83,11 +83,11 @@ class _RecordingObserver:
         self._inflight: dict[str, Any] = {}
         self._seq = 0
 
-    def session_opened(self, *, cadence_ms: str) -> None:
-        self.calls.append(("session_opened", {"cadence_ms": cadence_ms}))
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
+        self.calls.append(("session_opened", {"session_key": session_key, "cadence_ms": cadence_ms}))
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
-        self.calls.append(("session_finished", {"cadence_ms": cadence_ms, "reason": reason}))
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        self.calls.append(("session_finished", {"session_key": session_key, "reason": reason}))
 
     def session_open_rejected(self, *, reason: str) -> None:
         self.calls.append(("session_open_rejected", {"reason": reason}))
@@ -139,13 +139,14 @@ class _RecordingObserver:
     def overflow(self, *, kind: str) -> None:
         self.calls.append(("overflow", {"kind": kind}))
 
-    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> int:
         handles = list(self._waiting.get(session_key, ()))
         inflight = self._inflight.get(session_key)
         if inflight is not None:
             handles.append(inflight)
         for handle in handles:
             self.unit_cleared(handle, outcome=outcome)
+        return len(handles)
 
     # ---- test-only seeding/introspection --------------------------------
     def seed_ready(self, session_key: str, *, n: int = 1, cadence_ms: str = "560") -> list[Any]:
@@ -264,7 +265,7 @@ async def test_blank_chunk_park_with_an_inflight_handle_is_counted_parked(
     engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     parked = [c for c in observer.calls if c[0] == "unit_parked"]
     assert len(parked) == 1
@@ -288,7 +289,7 @@ async def test_park_output_with_no_inflight_unit_is_ignored_as_carrierless_echo(
     engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
     assert terminal == []
@@ -314,7 +315,7 @@ async def test_flush_park_is_ignored_because_flush_mints_no_ready_handle(
     engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
     assert terminal == []
@@ -369,7 +370,7 @@ async def test_interleaving_echo_between_two_mints_leaves_the_waiting_unit_outst
     )
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     # End state: A parked, B parked, no clears, nothing outstanding.
     terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
@@ -398,7 +399,7 @@ async def test_every_ready_handle_gets_exactly_one_disposition_by_generation_end
     engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
     assert len(terminal) == 2
@@ -412,12 +413,13 @@ async def test_every_ready_handle_gets_exactly_one_disposition_by_generation_end
 
 # @spec PORT-OBS-005, PORT-OBS-006
 @pytest.mark.asyncio
-async def test_generation_end_cleanup_clears_as_aborted_on_a_clean_end(
+async def test_clean_end_with_outstanding_units_is_lifecycle_divergence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lead-settled (Phase-6 round 2): a clean generation end (no
-    exception) clears any still-outstanding units with outcome
-    "aborted"."""
+    """Amended (A27 topology cascade): an ostensibly normal end with
+    still-outstanding units is lifecycle divergence — the remaining
+    work is cleared as "error" and the session finishes as "error",
+    never "completed"."""
     session_key = _fixed_session_key(monkeypatch)
     observer = _RecordingObserver()
     observer.seed_ready(session_key, n=1)  # never minted, never parked
@@ -425,11 +427,14 @@ async def test_generation_end_cleanup_clears_as_aborted_on_a_clean_end(
     engine = _RealtimeGenerationEngine([])  # generation ends immediately, cleanly
     connection, _sent_events, _sent_json = _connection(engine, observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
     assert len(cleared) == 1
-    assert cleared[0][1]["outcome"] == "aborted"
+    assert cleared[0][1]["outcome"] == "error"
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["error"]
+    assert finishes[0][1]["session_key"] == session_key
 
 
 # @spec PORT-OBS-005, PORT-OBS-006
@@ -455,7 +460,7 @@ async def test_generation_end_cleanup_clears_as_error_on_an_exception(
 
     connection, _sent_events, _sent_json = _connection(_RaisingEngine(), observer=observer)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
     cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
     assert len(cleared) == 1
@@ -467,10 +472,13 @@ async def test_generation_end_cleanup_clears_as_error_on_an_exception(
 
 # @spec PORT-OBS-003
 @pytest.mark.asyncio
-async def test_park_token_id_none_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No park-token id configured -> no park detection is attempted,
-    regardless of what ids the engine emits. This holds trivially today
-    (nothing is wired), and must continue to hold once Phase 6 lands."""
+async def test_park_token_id_none_is_inert_for_detection_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Amended (A27 topology cascade): no park-token id -> no park
+    DETECTION is attempted, but cleanup and lifecycle completion depend
+    only on the observer/session key — outstanding units are still
+    cleared and the session still finishes."""
     session_key = _fixed_session_key(monkeypatch)
     observer = _RecordingObserver()
     (handle,) = observer.seed_ready(session_key, n=1)
@@ -479,10 +487,14 @@ async def test_park_token_id_none_is_inert(monkeypatch: pytest.MonkeyPatch) -> N
     engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
     connection, _sent_events, _sent_json = _connection(engine, observer=observer, park_token_id=None)
 
-    await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
 
-    terminal = [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared")]
-    assert terminal == []
+    assert [c for c in observer.calls if c[0] == "unit_parked"] == []
+    cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
+    assert len(cleared) == 1  # the minted handle, cleared at generation end
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert len(finishes) == 1
+    assert finishes[0][1]["session_key"] == session_key
 
 
 # ---- connection construction increments NOTHING (real, GREEN) ----------------
@@ -841,9 +853,11 @@ class _FakeBufferRealtimeModelCls:
         *,
         observer: Any = None,
         accepted_audio_budget_s: float | None = None,
+        session_key: str | None = None,
     ) -> AsyncGenerator[Any, None]:
         self.captured["observer"] = observer
         self.captured["accepted_audio_budget_s"] = accepted_audio_budget_s
+        self.captured["session_key"] = session_key
         self.captured["model_config"] = model_config
         return
         yield  # pragma: no cover - the standard empty-async-generator idiom
@@ -953,3 +967,393 @@ async def test_unwidened_model_receives_the_exact_upstream_call() -> None:
         pass  # pragma: no cover - the fake yields nothing
 
     assert len(model_cls.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# A27 topology cascade: correlation identity, terminal-reason taxonomy,
+# model-gated park-token resolution (lead-approved amendments 1, 3, 4).
+# ---------------------------------------------------------------------------
+
+
+class _CapturingServing:
+    """Fake serving that records the session_key it is handed."""
+
+    def __init__(self) -> None:
+        self.session_keys: list[Any] = []
+
+    def transcribe_realtime(
+        self, audio_stream: Any, input_stream: Any, *, session_key: str | None = None
+    ) -> Any:
+        self.session_keys.append(session_key)
+        return _empty_streaming_input()
+
+
+# @spec PORT-OBS-003
+@pytest.mark.asyncio
+async def test_start_generation_mints_one_identity_for_serving_and_engine() -> None:
+    """Amendment 1: the engine request id is minted once in
+    start_generation, handed to transcribe_realtime as session_key, and
+    handed to the engine as request_id — one identity, both paths."""
+
+    captured_request_ids: list[str] = []
+
+    class _IdCapturingEngine:
+        default_sampling_params_list = [SimpleNamespace(tag="default")]
+
+        def generate(self, **kwargs: Any) -> AsyncGenerator[Any, None]:
+            captured_request_ids.append(kwargs["request_id"])
+
+            async def _outputs() -> AsyncGenerator[Any, None]:
+                return
+                yield  # pragma: no cover
+
+            return _outputs()
+
+    serving = _CapturingServing()
+    connection: Any = RealtimeConnection.__new__(RealtimeConnection)
+    connection.connection_id = "identity-test"
+    connection.engine = _IdCapturingEngine()
+    connection.serving = serving
+    connection._is_connected = True
+    connection.audio_queue = asyncio.Queue()
+    connection._observer = None
+    connection._park_token_id = None
+    connection.generation_task = None
+
+    async def _audio() -> AsyncGenerator[Any, None]:
+        return
+        yield  # pragma: no cover
+
+    connection.audio_stream_generator = _audio
+
+    async def _send(event: Any) -> None:
+        pass
+
+    connection.send = _send
+    connection.send_json = _send
+    connection.send_error = _send
+
+    await connection.start_generation()
+    assert connection.generation_task is not None
+    await connection.generation_task
+
+    assert len(serving.session_keys) == 1
+    assert len(captured_request_ids) == 1
+    assert serving.session_keys[0] == captured_request_ids[0]
+    assert str(serving.session_keys[0]).startswith("rt-identity-test-")
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_completed_reason_requires_exhaustion_with_zero_outstanding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal exhaustion with every unit already disposed -> exactly one
+    session_finished with reason "completed" and no divergence clears."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    (handle,) = observer.seed_ready(session_key, n=1)
+    observer.mint(handle)
+
+    engine = _RealtimeGenerationEngine([_generation_output("hi", [PARK_ID])])
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
+
+    parked = [c for c in observer.calls if c[0] == "unit_parked"]
+    assert len(parked) == 1
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["completed"]
+    assert finishes[0][1]["session_key"] == session_key
+    assert [c for c in observer.calls if c[0] == "unit_cleared"] == []
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_cancelled_error_records_aborted_and_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Amendment 4: asyncio.CancelledError is handled separately —
+    recorded as "aborted", then re-raised."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    observer.seed_ready(session_key, n=1)
+
+    class _CancelledEngine:
+        default_sampling_params_list = [SimpleNamespace(tag="default")]
+
+        def generate(self, **_kwargs: Any) -> AsyncGenerator[Any, None]:
+            async def _outputs() -> AsyncGenerator[Any, None]:
+                raise asyncio.CancelledError()
+                yield  # pragma: no cover
+
+            return _outputs()
+
+    connection, _sent_events, _sent_json = _connection(_CancelledEngine(), observer=observer)
+
+    with pytest.raises(asyncio.CancelledError):
+        await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
+
+    cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
+    assert [c[1]["outcome"] for c in cleared] == ["aborted"]
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["aborted"]
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_engine_error_finishes_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    observer.seed_ready(session_key, n=1)
+
+    class _RaisingEngine:
+        default_sampling_params_list = [SimpleNamespace(tag="default")]
+
+        def generate(self, **_kwargs: Any) -> AsyncGenerator[Any, None]:
+            async def _outputs() -> AsyncGenerator[Any, None]:
+                raise RuntimeError("engine boom")
+                yield  # pragma: no cover
+
+            return _outputs()
+
+    connection, _sent_events, _sent_json = _connection(_RaisingEngine(), observer=observer)
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
+
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["error"]
+    assert finishes[0][1]["session_key"] == session_key
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_client_disconnect_finishes_aborted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The loop's disconnect break is an abort, not an error and not a
+    completion."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    (handle,) = observer.seed_ready(session_key, n=1)
+    observer.mint(handle)
+
+    connection_holder: list[Any] = []
+
+    def _disconnect() -> None:
+        connection_holder[0]._is_connected = False
+
+    engine = _RealtimeGenerationEngine(
+        [_generation_output("partial", [7]), _disconnect, _generation_output("late", [8])]
+    )
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+    connection_holder.append(connection)
+
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
+
+    cleared = [c for c in observer.calls if c[0] == "unit_cleared"]
+    assert [c[1]["outcome"] for c in cleared] == ["aborted"]
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["aborted"]
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_exactly_one_terminal_section_even_when_terminal_send_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    (handle,) = observer.seed_ready(session_key, n=1)
+    observer.mint(handle)
+
+    engine = _RealtimeGenerationEngine([_generation_output("t", [PARK_ID])])
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+
+    async def _failing_send_json(payload: dict[str, Any]) -> None:
+        raise RuntimeError("socket already closed")
+
+    connection.send_json = _failing_send_json
+
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id=session_key)
+
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert len(finishes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Amendment 3: model-gated park-token resolution on the serving.
+# ---------------------------------------------------------------------------
+
+
+class _WidenedModelClsWithConfig:
+    """Nemotron-shaped: widened signature, so token resolution applies."""
+
+    async def buffer_realtime_audio(
+        self,
+        audio_stream: Any,
+        input_stream: Any,
+        model_config: Any,
+        *,
+        observer: Any = None,
+        accepted_audio_budget_s: float | None = None,
+        session_key: str | None = None,
+    ) -> AsyncGenerator[Any, None]:
+        return
+        yield  # pragma: no cover
+
+
+class _UnwidenedModelClsShape:
+    async def buffer_realtime_audio(
+        self, audio_stream: Any, input_stream: Any, model_config: Any
+    ) -> AsyncGenerator[Any, None]:
+        return
+        yield  # pragma: no cover
+
+
+def _serving_with_model_cls(model_cls: Any, hf_config: Any) -> Any:
+    from vllm_omni.entrypoints.openai.serving_realtime import (
+        NemotronServingRealtime,
+    )
+
+    serving: Any = NemotronServingRealtime.__new__(NemotronServingRealtime)
+    serving.model_config = SimpleNamespace(hf_config=hf_config)
+    serving.renderer = None
+    serving.__dict__["model_cls"] = model_cls
+    serving._observer = None
+    serving._accepted_audio_budget_s = None
+    return serving
+
+
+# @spec PORT-OBS-003
+def test_park_token_resolves_for_the_recognized_streaming_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Architecture-identity gate (review F5): the recognized Nemotron
+    architecture resolves through the model package's own authority."""
+    import vllm_omni.entrypoints.openai.serving_realtime as serving_mod
+
+    monkeypatch.setattr(
+        serving_mod, "_resolve_park_token_id", lambda hf_config: 777, raising=False
+    )
+    serving = _serving_with_model_cls(
+        _WidenedModelClsWithConfig(),
+        hf_config=SimpleNamespace(architectures=["Nemotron3_5AsrForRNNT"]),
+    )
+    assert serving.park_token_id == 777
+
+
+# @spec PORT-OBS-003
+def test_park_token_resolution_fails_loudly_when_authority_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recognized streaming model but no resolvable token -> loud
+    failure, never a silent None (silent None was the A27 GPU-round
+    defect class)."""
+    import vllm_omni.entrypoints.openai.serving_realtime as serving_mod
+
+    def _raise(hf_config: Any) -> int:
+        raise ValueError("park token authority cannot resolve")
+
+    monkeypatch.setattr(serving_mod, "_resolve_park_token_id", _raise, raising=False)
+    serving = _serving_with_model_cls(
+        _WidenedModelClsWithConfig(),
+        hf_config=SimpleNamespace(architectures=["Nemotron3_5AsrForRNNT"]),
+    )
+    with pytest.raises(ValueError):
+        _ = serving.park_token_id
+
+
+# @spec PORT-OBS-003
+def test_park_token_is_none_and_inert_for_other_realtime_models() -> None:
+    serving = _serving_with_model_cls(_UnwidenedModelClsShape(), hf_config=SimpleNamespace())
+    assert serving.park_token_id is None
+
+
+# @spec PORT-OBS-003
+def test_unrelated_widened_model_gets_no_park_token() -> None:
+    """Review F5: a future realtime model may declare the same three
+    generic observer params for call-shape compatibility WITHOUT
+    inheriting Nemotron park semantics — identity, not signature,
+    gates the resolver."""
+    serving = _serving_with_model_cls(
+        _WidenedModelClsWithConfig(),
+        hf_config=SimpleNamespace(architectures=["SomeFutureRealtimeModel"]),
+    )
+    assert serving._model_declares_widened_buffer_kwargs is True
+    assert serving.park_token_id is None
+
+
+# @spec PORT-OBS-003
+def test_widened_guard_requires_session_key_too() -> None:
+    """Amendment 1: a model declaring only observer+budget (but not
+    session_key) predates the correlation-identity contract and must be
+    treated as un-widened."""
+
+    class _PartiallyWidened:
+        async def buffer_realtime_audio(
+            self,
+            audio_stream: Any,
+            input_stream: Any,
+            model_config: Any,
+            *,
+            observer: Any = None,
+            accepted_audio_budget_s: float | None = None,
+        ) -> AsyncGenerator[Any, None]:
+            return
+            yield  # pragma: no cover
+
+    serving = _serving_with_model_cls(_PartiallyWidened(), hf_config=SimpleNamespace())
+    assert serving._model_declares_widened_buffer_kwargs is False
+
+
+# @spec PORT-OBS-006
+@pytest.mark.asyncio
+async def test_terminal_send_failure_after_finalization_still_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewer F3: transport delivery is not part of model completion.
+    The engine generator exhausts successfully (model finalized), then
+    the TranscriptionDone send fails — the session must finish
+    completed, never error."""
+    session_key = _fixed_session_key(monkeypatch)
+    observer = _RecordingObserver()
+    (handle,) = observer.seed_ready(session_key, n=1)
+    observer.mint(handle)
+
+    # Empty delta text: the only ``send`` is the post-exhaustion
+    # TranscriptionDone, so the failure is strictly after finalization.
+    engine = _RealtimeGenerationEngine([_generation_output("", [PARK_ID])])
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+
+    async def _failing_send(event: Any) -> None:
+        raise RuntimeError("socket write failed after generation finished")
+
+    connection.send = _failing_send
+
+    await connection._run_generation(
+        _empty_streaming_input(), asyncio.Queue(), request_id=session_key
+    )
+
+    finishes = [c for c in observer.calls if c[0] == "session_finished"]
+    assert [f[1]["reason"] for f in finishes] == ["completed"]
+    assert [c for c in observer.calls if c[0] == "unit_cleared"] == []
+
+
+# @spec PORT-OBS-003
+@pytest.mark.asyncio
+async def test_keyless_generation_with_observer_disables_observation_loudly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reviewer F6: with an observer installed, a generation without the
+    threaded correlation id must not mint a second identity and observe
+    under it — observation is disabled loudly; keyless compatibility
+    remains only on the unobserved path."""
+    observer = _RecordingObserver()
+    observer.seed_ready("whatever", n=1)
+
+    engine = _RealtimeGenerationEngine([_generation_output("t", [PARK_ID])])
+    connection, _sent_events, _sent_json = _connection(engine, observer=observer)
+
+    with caplog.at_level("WARNING"):
+        await connection._run_generation(_empty_streaming_input(), asyncio.Queue())
+
+    assert any("correlation" in rec.message for rec in caplog.records)
+    assert [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared", "session_finished")] == []

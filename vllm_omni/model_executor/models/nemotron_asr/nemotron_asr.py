@@ -558,6 +558,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
         *,
         observer: Any = None,
         accepted_audio_budget_s: float | None = None,
+        session_key: str | None = None,
     ) -> Any:
         """The ``SupportsRealtime`` segmenter seam — delegates to the
         engine-free ``buffer_stream`` (PORT-SESS-001/002/003).
@@ -590,6 +591,7 @@ class NemotronASRForRNNT(nn.Module, HybridStateModelMixin):
             model_config,
             observer=observer,
             accepted_audio_budget_s=accepted_audio_budget_s,
+            session_key=session_key,
         ):
             yield update
 

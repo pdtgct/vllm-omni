@@ -13,6 +13,28 @@ from vllm.inputs import PromptType
 from vllm.renderers.inputs.preprocess import parse_model_prompt
 
 
+def _resolve_park_token_id(hf_config: Any) -> int:
+    """Resolve the park-token id from the model package's own authority.
+
+    A module-level indirection (not an inline import in the property) so
+    the resolution seam is patchable and the Nemotron model package is
+    imported only when a recognized streaming model is actually served.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        park_token_id,
+    )
+
+    return park_token_id(hf_config)
+
+
+#: Architecture identities whose park semantics this serving owns.
+#: Park-token resolution is gated on MODEL IDENTITY, never on signature
+#: shape (review round 2026-07-28, F5): any future realtime model may
+#: declare the same three generic observer params for call-shape
+#: compatibility without inheriting Nemotron's RNN-T park semantics.
+_NEMOTRON_STREAMING_ARCHITECTURES = frozenset({"Nemotron3_5AsrForRNNT"})
+
+
 class NemotronServingRealtime(OpenAIServingRealtime):
     """Threads the installed PORT-OBS-003 observer and the PORT-SESS-001
     accepted-audio budget into the natively (ledgerless) constructed
@@ -68,19 +90,57 @@ class NemotronServingRealtime(OpenAIServingRealtime):
         is itself cached on the base class).
         """
         params = inspect.signature(self.model_cls.buffer_realtime_audio).parameters
-        return "observer" in params and "accepted_audio_budget_s" in params
+        return (
+            "observer" in params
+            and "accepted_audio_budget_s" in params
+            and "session_key" in params
+        )
+
+    @functools.cached_property
+    def _is_recognized_streaming_model(self) -> bool:
+        """Model-identity gate for park semantics (review F5): the
+        architecture list is the identity authority; the widened
+        signature remains a call-shape check only."""
+        hf_config = getattr(self.model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or ()
+        return any(arch in _NEMOTRON_STREAMING_ARCHITECTURES for arch in architectures)
+
+    @functools.cached_property
+    def park_token_id(self) -> int | None:
+        """The model's park-token id, or ``None`` for models this fork
+        does not observe.
+
+        Gated on architecture identity, never signature shape: the
+        recognized Nemotron streaming model resolves through the model
+        package's own authority and FAILS LOUDLY if the authority cannot
+        produce a token — a silent ``None`` here would disable every
+        connection-layer park observation invisibly, the A27 GPU-round
+        defect class. Any other realtime model — including a future one
+        that declares the same widened observer params for call-shape
+        compatibility — resolves ``None`` and stays fully inert
+        (PORT-OBS-003: only park detection depends on the token; cleanup
+        and lifecycle completion depend on the observer/session key).
+        """
+        if not self._is_recognized_streaming_model:
+            return None
+        return _resolve_park_token_id(self.model_config.hf_config)
 
     async def transcribe_realtime(
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
+        *,
+        session_key: str | None = None,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Transform audio stream into StreamingInput for engine.generate().
 
         Identical to upstream except for the ``observer``/
-        ``accepted_audio_budget_s`` kwargs passed to
+        ``accepted_audio_budget_s``/``session_key`` kwargs passed to
         ``buffer_realtime_audio`` (see the class docstring's pin-drift
-        guard).
+        guard). ``session_key`` is the per-generation correlation key —
+        the engine request id the fork connection mints in
+        ``start_generation`` (PORT-OBS-003 as amended); keyword-only and
+        optional, so upstream-shaped callers remain valid.
         """
         model_config = self.model_config
         renderer = self.renderer
@@ -92,6 +152,7 @@ class NemotronServingRealtime(OpenAIServingRealtime):
                 model_config,
                 observer=self._observer,
                 accepted_audio_budget_s=self._accepted_audio_budget_s,
+                session_key=session_key,
             )
         else:
             # The exact upstream call shape — un-widened models keep

@@ -289,6 +289,11 @@ class ReceiptLedger:
         self._samples_consumed = 0
         self._sequence = 0
         self._failed: BaseException | None = None
+        # The session's correlation key, bound by the owning session at
+        # its construction (set-once): the fallback unit_ready below must
+        # key by the SESSION's identity, never the ledger's — a ledger-id
+        # key would break complete_inflight resolution (PORT-OBS-003).
+        self._session_key: str | None = None
         # PORT-OBS-003/005: the ledger's own bound trip (a real, already-
         # implemented backpressure mechanism, PORT-RTC-002) and its own
         # terminal-failure path are the ONLY observation call sites a bare
@@ -370,7 +375,7 @@ class ReceiptLedger:
         if handle is None and self._observer is not None and self._cadence_ms is not None:
             handle = observe_safely(
                 self._observer.unit_ready,
-                session_key=str(id(self)),
+                session_key=self._session_key or str(id(self)),
                 cadence_ms=self._cadence_ms,
                 chunk_type="final_tail" if final_tail else "regular",
                 ready_stamp_s=time.monotonic(),
@@ -541,6 +546,7 @@ class NemotronRealtimeSession:
         ledger: ReceiptLedger | None = None,
         observer: StreamingObserver | None = None,
         accepted_audio_budget_s: float = ACCEPTED_AUDIO_BUDGET_DEFAULT_S,
+        session_key: str | None = None,
     ) -> None:
         self._geometry = geometry
         self._park_token_id = park_token_id
@@ -548,6 +554,21 @@ class NemotronRealtimeSession:
         self._prompts = dict(prompts)
         self._prompt_index = prompt_index
         self._ledger = ledger
+        # PORT-OBS-003 (amended): the per-generation correlation key,
+        # minted by the caller (connection request id on the native
+        # path, lease request id on the leased path) BEFORE session
+        # construction. With an observer attached the key is REQUIRED —
+        # a keyless observed session would fall back to object identity
+        # and silently break every connection/consumer-side correlation
+        # (the D6 defect class); keyless construction remains legal only
+        # on the unobserved path (review round 2026-07-28, F6).
+        if observer is not None and session_key is None:
+            raise ValueError(
+                "observer-bearing session construction requires the minted "
+                "per-generation correlation key (PORT-OBS-003); keyless "
+                "construction is only legal without an observer"
+            )
+        self._session_key = session_key
         # The transport-neutral factory/lease binding injects the same
         # observer at session construction (PORT-OBS-003); buffer_stream
         # reads it back off the session (or an explicit override) to emit
@@ -559,12 +580,21 @@ class NemotronRealtimeSession:
         # buffer_stream on both the native and leased paths regardless of
         # whether an observer is attached.
         self._accepted_audio_budget_s = accepted_audio_budget_s
+        # Bind the correlation key into the armed ledger so its fallback
+        # ready events key by the session, never the ledger (PORT-OBS-003).
+        if self._ledger is not None:
+            self._ledger._session_key = self.session_key
         # Native open is observer-bearing model-session construction
         # after successful validation and before engine request creation
         # (PORT-OBS-006) — every native/leased path funnels through this
-        # constructor, so this is the single, un-duplicated open site.
+        # constructor, so this is the single, un-duplicated open site,
+        # keyed by the per-generation correlation key.
         if self._observer is not None:
-            observe_safely(self._observer.session_opened, cadence_ms=cadence_ms_label(geometry.cadence))
+            observe_safely(
+                self._observer.session_opened,
+                session_key=self.session_key,
+                cadence_ms=cadence_ms_label(geometry.cadence),
+            )
 
     @classmethod
     def from_model_config(
@@ -577,6 +607,7 @@ class NemotronRealtimeSession:
         max_pending_carriers: int | None = None,
         observer: StreamingObserver | None = None,
         accepted_audio_budget_s: float = ACCEPTED_AUDIO_BUDGET_DEFAULT_S,
+        session_key: str | None = None,
     ) -> NemotronRealtimeSession:
         """Build a session from the served checkpoint's configuration.
 
@@ -638,6 +669,7 @@ class NemotronRealtimeSession:
             ledger=ledger,
             observer=observer,
             accepted_audio_budget_s=accepted_audio_budget_s,
+            session_key=session_key,
         )
 
     @property
@@ -674,14 +706,14 @@ class NemotronRealtimeSession:
     def session_key(self) -> str:
         """This session's stable observer-correlation identity.
 
-        The native adapter and the leased-path consumer each hold their
-        own reference to the same session object, but neither carries a
-        shared identifier minted elsewhere (the native path's connection
-        request id, and the leased path's engine request id, are both
-        assigned independently of session construction) — so the session
-        object's own identity is the one thing both sides already share.
+        PORT-OBS-003 (amended): the per-generation correlation key — the
+        engine request id, minted by the caller before construction and
+        passed in as ``session_key`` — on both the native and leased
+        paths, so the adapter/consumer resolves handles and terminal
+        state with the identity it already owns. Object identity remains
+        the fallback for key-less construction only.
         """
-        return str(id(self))
+        return self._session_key or str(id(self))
 
     @property
     def accepted_audio_budget_s(self) -> float:

@@ -124,6 +124,11 @@ def _hf(**overrides: Any) -> SimpleNamespace:
 
 
 def _session(**kwargs: Any) -> Any:
+    # Observer-bearing construction requires the minted correlation key
+    # (PORT-OBS-003 as amended, review F6); tests not about keying get a
+    # fixture key injected so each stays focused on its own concern.
+    if kwargs.get("observer") is not None and "session_key" not in kwargs:
+        kwargs["session_key"] = "test-fixture-key"
     return NemotronRealtimeSession.from_model_config(_hf(), **kwargs)
 
 
@@ -156,11 +161,11 @@ class _RecordingObserver:
         self._waiting: dict[str, deque[Any]] = {}
         self._inflight: dict[str, Any] = {}
 
-    def session_opened(self, *, cadence_ms: str) -> None:
-        self.calls.append(("session_opened", {"cadence_ms": cadence_ms}))
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
+        self.calls.append(("session_opened", {"session_key": session_key, "cadence_ms": cadence_ms}))
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
-        self.calls.append(("session_finished", {"cadence_ms": cadence_ms, "reason": reason}))
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        self.calls.append(("session_finished", {"session_key": session_key, "reason": reason}))
 
     def session_open_rejected(self, *, reason: str) -> None:
         self.calls.append(("session_open_rejected", {"reason": reason}))
@@ -528,7 +533,11 @@ def test_session_construction_is_the_native_open_boundary() -> None:
 
     assert session.observer is fake
     opened = [c for c in fake.calls if c[0] == "session_opened"]
-    assert opened == [("session_opened", {"cadence_ms": "560"})]
+    # Keyed since the A27 topology cascade: identity-fallback key here
+    # (no minted correlation key was supplied to construction).
+    assert opened == [
+        ("session_opened", {"session_key": session.session_key, "cadence_ms": "560"})
+    ]
 
 
 # @spec PORT-OBS-006
@@ -664,3 +673,80 @@ def test_model_package_imports_no_prometheus_client() -> None:
         f"nemotron_asr package files import prometheus_client: {offenders}; "
         "the observer protocol must stay Prometheus-free (PORT-OBS-003)"
     )
+
+
+# ---------------------------------------------------------------------------
+# A27 topology cascade (amendment 1): the per-generation correlation key
+# threads caller -> classmethod -> buffer_stream -> session construction.
+# ---------------------------------------------------------------------------
+
+
+# @spec PORT-OBS-003
+def test_session_key_param_overrides_the_identity_fallback() -> None:
+    session = _session(session_key="req-under-test")
+    assert session.session_key == "req-under-test"
+
+
+# @spec PORT-OBS-003
+def test_session_key_defaults_to_object_identity_when_not_minted() -> None:
+    session = _session()
+    assert session.session_key == str(id(session))
+
+
+# @spec PORT-OBS-003, PORT-OBS-006
+@pytest.mark.asyncio
+async def test_buffer_stream_threads_observer_and_key_into_the_session() -> None:
+    """The native (bare-config) path: buffer_stream must construct the
+    session WITH the observer and the minted key, so the constructor's
+    single un-duplicated open site fires, keyed — the A27 GPU round
+    proved the override-only threading left session_opened dead."""
+    observer = _RecordingObserver()
+
+    async def _audio() -> AsyncIterator[Any]:
+        return
+        yield  # pragma: no cover
+
+    stream = buffer_stream(
+        _audio(),
+        asyncio.Queue(),
+        _hf(),
+        observer=observer,
+        session_key="rt-native-req-1",
+    )
+    # One step only: session construction (and the open observation)
+    # happens when the generator first runs. Iterating to exhaustion
+    # would hang — buffer-until-drained waits for park tokens nothing
+    # in this unit test feeds.
+    try:
+        await stream.__anext__()
+    except StopAsyncIteration:
+        pass
+    finally:
+        await stream.aclose()
+
+    opens = [c for c in observer.calls if c[0] == "session_opened"]
+    assert len(opens) == 1
+    assert opens[0][1]["session_key"] == "rt-native-req-1"
+    assert opens[0][1]["cadence_ms"] == "560"
+    readies = [c for c in observer.calls if c[0] == "unit_ready"]
+    assert all(r[1]["session_key"] == "rt-native-req-1" for r in readies)
+
+
+# @spec PORT-OBS-003
+def test_ledger_fallback_ready_uses_the_sessions_key_not_the_ledgers() -> None:
+    """The armed ledger's fallback unit_ready keys by the SESSION's
+    correlation key — a ledger-id key would break complete_inflight
+    resolution on the leased path."""
+    observer = _RecordingObserver()
+    session = _session(with_ledger=True, observer=observer, session_key="leased-req-9")
+    ledger = session.ledger
+    assert ledger is not None
+
+    async def scenario() -> None:
+        # mint() creates the ticket's asyncio future — needs a loop.
+        ledger.mint(final_tail=False, admission_ms_mod=0)
+
+    _run(scenario())
+    readies = [c for c in observer.calls if c[0] == "unit_ready"]
+    assert readies, "ledger mint must emit a ready event"
+    assert all(r[1]["session_key"] == "leased-req-9" for r in readies)

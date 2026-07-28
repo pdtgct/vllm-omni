@@ -207,11 +207,11 @@ class _RecordingObserver:
         self._waiting: dict[str, list[Any]] = {}
         self._inflight: dict[str, Any] = {}
 
-    def session_opened(self, *, cadence_ms: str) -> None:
-        self.calls.append(("session_opened", {"cadence_ms": cadence_ms}))
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
+        self.calls.append(("session_opened", {"session_key": session_key, "cadence_ms": cadence_ms}))
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
-        self.calls.append(("session_finished", {"cadence_ms": cadence_ms, "reason": reason}))
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        self.calls.append(("session_finished", {"session_key": session_key, "reason": reason}))
 
     def session_open_rejected(self, *, reason: str) -> None:
         self.calls.append(("session_open_rejected", {"reason": reason}))
@@ -340,7 +340,8 @@ def test_parked_ticket_resolution_reports_latency_from_the_ready_stamp() -> None
         fake = _RecordingObserver()
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="test-fixture-key",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -374,7 +375,8 @@ def test_ledger_failure_clears_every_pending_unit_by_exact_count() -> None:
         # in test_nemotron_session.py).
         engine = FakeAsyncOmni(script=lambda item, index: [], stop_after=1)
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="test-fixture-key",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -402,7 +404,8 @@ def test_session_finished_reason_completed_after_flush_park() -> None:
         fake = _RecordingObserver()
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="rt-obs-3",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -416,7 +419,7 @@ def test_session_finished_reason_completed_after_flush_park() -> None:
 
     calls = _run(scenario())
     finished = [c for c in calls if c[0] == "session_finished"]
-    assert finished == [("session_finished", {"cadence_ms": "560", "reason": "completed"})]
+    assert finished == [("session_finished", {"session_key": "rt-obs-3", "reason": "completed"})]
 
 
 # @spec PORT-OBS-006
@@ -425,7 +428,8 @@ def test_session_finished_reason_aborted_on_client_abort() -> None:
         fake = _RecordingObserver()
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="rt-obs-4",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -440,7 +444,7 @@ def test_session_finished_reason_aborted_on_client_abort() -> None:
 
     calls = _run(scenario())
     finished = [c for c in calls if c[0] == "session_finished"]
-    assert finished == [("session_finished", {"cadence_ms": "560", "reason": "aborted"})]
+    assert finished == [("session_finished", {"session_key": "rt-obs-4", "reason": "aborted"})]
 
 
 # @spec PORT-OBS-006
@@ -453,7 +457,8 @@ def test_opens_minus_finished_equals_active_under_an_abort_close_race() -> None:
         fake = _RecordingObserver()
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="test-fixture-key",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -488,7 +493,8 @@ def test_every_ready_unit_gets_exactly_one_disposition_at_the_lease() -> None:
         fake = _RecordingObserver()
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="test-fixture-key",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -528,6 +534,7 @@ def test_leased_piece_exceeding_the_budget_is_rejected_whole_before_acceptance()
             locale="auto",
             with_ledger=True,
             observer=fake,
+            session_key="test-fixture-key",
             accepted_audio_budget_s=0.001,
         )
         lease = _NS.NemotronSessionLease(
@@ -555,6 +562,7 @@ def test_leased_rejected_piece_accrues_no_accepted_audio_seconds() -> None:
             locale="auto",
             with_ledger=True,
             observer=fake,
+            session_key="test-fixture-key",
             accepted_audio_budget_s=0.001,
         )
         lease = _NS.NemotronSessionLease(
@@ -586,6 +594,7 @@ def test_leased_rejected_piece_emits_exactly_one_input_queue_overflow() -> None:
             locale="auto",
             with_ledger=True,
             observer=fake,
+            session_key="test-fixture-key",
             accepted_audio_budget_s=0.001,
         )
         lease = _NS.NemotronSessionLease(
@@ -623,6 +632,7 @@ def test_leased_session_follows_ordinary_terminal_clearing_after_budget_rejectio
             locale="auto",
             with_ledger=True,
             observer=fake,
+            session_key="test-fixture-key",
             accepted_audio_budget_s=0.001,
         )
         lease = _NS.NemotronSessionLease(
@@ -662,6 +672,7 @@ def test_leased_occupancy_lifecycle_never_caps_lifetime_cumulative_audio() -> No
             locale="auto",
             with_ledger=True,
             observer=fake,
+            session_key="test-fixture-key",
             accepted_audio_budget_s=1.12,  # covers exactly 2 cadences of occupancy
         )
         engine = FakeAsyncOmni()
@@ -744,7 +755,8 @@ def test_observer_sink_failure_never_propagates_into_feed_or_flush() -> None:
     async def scenario() -> tuple[list[str], str]:
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
-            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=_RaisingObserver()
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=_RaisingObserver(),
+            session_key="test-fixture-key",
         )
         lease = _NS.NemotronSessionLease(
             engine=engine,
@@ -763,3 +775,59 @@ def test_observer_sink_failure_never_propagates_into_feed_or_flush() -> None:
     results, text = _run(scenario())
     assert results == [" w0"]
     assert text == " w0 w1"
+
+
+# ---------------------------------------------------------------------------
+# A27 topology cascade (amendment 1): the leased path mints the engine
+# request id BEFORE constructing the session and uses it as the key.
+# ---------------------------------------------------------------------------
+
+
+# @spec PORT-OBS-003, PORT-RTC-003
+def test_factory_open_uses_the_request_id_as_the_session_key() -> None:
+    """The request id is minted BEFORE session construction and becomes
+    the session's correlation key — one identity for ready events,
+    in-flight completion, and lifecycle on the leased path."""
+
+    async def scenario() -> None:
+        factory = NemotronSessionFactory(engine=FakeAsyncOmni())
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+        assert lease.session.session_key == lease.request_id
+        assert lease.request_id.startswith("nemotron-session-")
+        await lease.release()
+
+    _run(scenario())
+
+
+# @spec PORT-OBS-006
+def test_premature_generation_exhaustion_finishes_error_not_completed() -> None:
+    """Reviewer F2: generation ending before audio close / FLUSH park is
+    a failed finalization — the ledger is failed AND the session reason
+    is error, never completed."""
+
+    async def scenario() -> list[tuple[str, dict[str, Any]]]:
+        fake = _RecordingObserver()
+        engine = FakeAsyncOmni(stop_after=1)  # engine stops mid-stream
+        session = NemotronRealtimeSession.from_model_config(
+            _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=fake,
+            session_key="rt-obs-premature",
+        )
+        lease = _NS.NemotronSessionLease(
+            engine=engine,
+            session=session,
+            request_id="rt-obs-premature",
+            render=_passthrough_render,
+        )
+        try:
+            await _wait(lease.feed(_audio(_CHUNK)))
+            await _wait(lease.feed(_audio(_CHUNK)))
+            await _wait(lease.flush())
+        except Exception:
+            pass  # the failed ledger surfaces to the consumer; reason is under test
+        await lease.release()
+        return fake.calls
+
+    calls = _run(scenario())
+    finished = [c for c in calls if c[0] == "session_finished"]
+    assert len(finished) == 1
+    assert finished[0][1]["reason"] == "error"

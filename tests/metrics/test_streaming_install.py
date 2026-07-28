@@ -96,10 +96,10 @@ def test_install_with_log_stats_false_keeps_scrape_sample_free_and_accepts_event
     app_state = _app_state_with_registry("log-stats-off-model")
     observer = install_streaming_observer(app_state, log_stats=False)
 
-    observer.session_opened(cadence_ms="560")
-    handle = observer.unit_ready(cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+    observer.session_opened(session_key="install-scope-key", cadence_ms="560")
+    handle = observer.unit_ready(session_key="install-scope-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
     observer.unit_parked(handle, park_stamp_s=0.1)
-    observer.session_finished(cadence_ms="560", reason="completed")
+    observer.session_finished(session_key="install-scope-key", reason="completed")
 
     out = generate_latest(REGISTRY).decode()
     assert (
@@ -134,7 +134,7 @@ def test_install_with_log_stats_true_produces_scrape_deltas() -> None:
     prefix = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="log-stats-on-model"}}'
     before = _count_value(generate_latest(REGISTRY).decode(), prefix) or 0.0
 
-    observer.session_opened(cadence_ms="560")
+    observer.session_opened(session_key="install-scope-key", cadence_ms="560")
 
     after = _count_value(generate_latest(REGISTRY).decode(), prefix)
     assert after == before + 1.0
@@ -235,7 +235,9 @@ def test_route_setup_injects_the_installed_observer_into_native_session_construc
         prompt_dictionary={"auto": 0},
         num_prompts=1,
     )
-    session = NemotronRealtimeSession.from_model_config(hf_config, observer=observer)
+    session = NemotronRealtimeSession.from_model_config(
+        hf_config, observer=observer, session_key="route-inject-key"
+    )
 
     assert session.observer is observer
     assert observer is not None

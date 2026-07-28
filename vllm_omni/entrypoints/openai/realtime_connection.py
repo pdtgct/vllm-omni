@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -50,7 +51,36 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._park_token_id = park_token_id
 
     async def start_generation(self):
-        await super().start_generation()
+        """Fork override of upstream ``start_generation`` (pinned vLLM
+        v0.24.0, ``realtime/connection.py``): same body, except the
+        engine request id is minted HERE — once, before the serving
+        input stream is constructed — and threaded as both the
+        serving's ``session_key`` and the generation's ``request_id``
+        (PORT-OBS-003 as amended: one per-generation correlation
+        identity, never two). Re-diff against upstream at every pin
+        bump, same as ``NemotronServingRealtime.transcribe_realtime``.
+        """
+        if self.generation_task is not None and not self.generation_task.done():
+            logger.warning("Generation already in progress, ignoring commit")
+            return
+
+        request_id = f"rt-{self.connection_id}-{uuid4()}"
+
+        audio_stream = self.audio_stream_generator()
+        input_stream = asyncio.Queue[list[int]]()
+
+        # The fork serving accepts the key keyword-only; an
+        # upstream-shaped serving (no such param) gets the exact
+        # upstream call and simply goes unkeyed/unobserved.
+        transcribe = self.serving.transcribe_realtime
+        if "session_key" in inspect.signature(transcribe).parameters:
+            streaming_input_gen = transcribe(audio_stream, input_stream, session_key=request_id)
+        else:
+            streaming_input_gen = transcribe(audio_stream, input_stream)
+
+        self.generation_task = asyncio.create_task(
+            self._run_generation(streaming_input_gen, input_stream, request_id=request_id)
+        )
 
     def _check_model(self, model: str | None) -> None | ErrorResponse:
         """Wrap the inherited model-validation gate with PORT-OBS-007.
@@ -146,20 +176,23 @@ class RealtimeConnection(VllmRealtimeConnection):
         pcm16 = (clipped * 32767.0).astype(np.int16)
         return base64.b64encode(pcm16.tobytes()).decode("utf-8")
 
-    # @spec ING-LIFE-011
+    # @spec ING-LIFE-011, PORT-OBS-006
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        *,
+        request_id: str | None = None,
     ) -> None:
-        request_id = f"rt-{self.connection_id}-{uuid4()}"
         sent_audio = False
         audio_done_sent = False
         full_text = ""
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
-        generation_error: BaseException | None = None
+        cancelled: asyncio.CancelledError | None = None
+        disconnected = False
+        model_finalized = False
         # ``getattr`` defensive: some fixtures across this test suite
         # construct a connection via ``RealtimeConnection.__new__``,
         # bypassing ``__init__`` (and hence these two attributes)
@@ -167,6 +200,22 @@ class RealtimeConnection(VllmRealtimeConnection):
         # correct behavior for such a connection.
         observer = getattr(self, "_observer", None)
         park_token_id = getattr(self, "_park_token_id", None)
+        # PORT-OBS-003 (amended): the per-generation correlation key is
+        # minted in start_generation and passed in. With an observer
+        # installed, a keyless invocation must NOT mint a second
+        # identity and observe under it (that mismatch is exactly the
+        # D6 defect class) — observation for THIS generation is disabled
+        # loudly instead; keyless compatibility remains only on the
+        # unobserved path.
+        if request_id is None:
+            if observer is not None:
+                logger.warning(
+                    "generation started without the threaded correlation "
+                    "id — observation disabled for this generation "
+                    "(PORT-OBS-003)"
+                )
+                observer = None
+            request_id = f"rt-{self.connection_id}-{uuid4()}"
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -228,7 +277,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
 
                 if not self._is_connected:
+                    disconnected = True
                     break
+            else:
+                # The engine generator exhausted normally — on this path
+                # the request finishes only through finalization/FLUSH,
+                # so MODEL completion is decided here, before any
+                # terminal send: transport delivery is not part of model
+                # completion (PORT-OBS-006; review round F3).
+                model_finalized = True
 
             if self._is_connected:
                 usage = UsageInfo(
@@ -246,8 +303,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                         }
                     )
                     audio_done_sent = True
+        except asyncio.CancelledError as e:
+            # Amendment 4 (PORT-OBS-006): cancellation is an ABORT —
+            # recorded in the single terminal section below, then
+            # RE-RAISED so task-cancellation semantics stay intact.
+            cancelled = e
         except Exception as e:
-            generation_error = e
             logger.exception("Error in generation: %s", e)
             if self._is_connected:
                 await self.send_error(str(e), "processing_error")
@@ -260,22 +321,45 @@ class RealtimeConnection(VllmRealtimeConnection):
                     logger.exception("Failed to send response.audio.done")
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
-            # PORT-OBS-003/005: end-of-generation cleanup — this
-            # connection has no independent local record of every ready
-            # handle the segmenter minted, only the observer's own
-            # {waiting, in-flight} state does, so every still-outstanding
-            # unit for this generation is cleared here in one pass
-            # (mirrors NemotronSessionLease._consume's finally-clearing
-            # pattern on the leased path). Gated on ``_park_token_id``
-            # exactly like park detection itself: with no park-token id
-            # configured, this connection performs no chunk-terminal
-            # observation of any kind, cleanup included.
-            if observer is not None and park_token_id is not None:
-                observe_safely(
-                    observer.clear_all_outstanding,
-                    request_id,
-                    outcome="error" if generation_error is not None else "aborted",
+            # PORT-OBS-003/006: the native path's single observer
+            # terminal section. Gated on the observer/session key ONLY —
+            # never the park token (only park DETECTION needs the token;
+            # a token-less connection still clears and finishes).
+            #
+            # Reason taxonomy (PORT-OBS-006):
+            #   completed — result generation exhausted after the
+            #     model's FLUSH park: on this path the engine finishes
+            #     the request only through finalization, so normal
+            #     exhaustion WITH zero outstanding units is completion.
+            #   aborted   — disconnect, cancellation.
+            #   error     — engine/protocol failure, or an ostensibly
+            #     normal end that still had outstanding units
+            #     (lifecycle divergence): the remaining work is cleared
+            #     as error and the session finishes as error.
+            if observer is not None:
+                if cancelled is not None or disconnected:
+                    outcome, reason = "aborted", "aborted"
+                elif model_finalized:
+                    # Classified from finalization state, NOT from
+                    # generation_error: a terminal-send failure after
+                    # the model finished is a transport event and must
+                    # not turn completion into error (PORT-OBS-006).
+                    outcome, reason = "error", "completed"
+                else:
+                    outcome, reason = "error", "error"
+                remaining = observe_safely(
+                    observer.clear_all_outstanding, request_id, outcome=outcome
                 )
+                if reason == "completed" and remaining:
+                    logger.warning(
+                        "generation ended normally with %s undisposed unit(s) "
+                        "— lifecycle divergence, session finishes as error",
+                        remaining,
+                    )
+                    reason = "error"
+                observe_safely(observer.session_finished, session_key=request_id, reason=reason)
+            if cancelled is not None:
+                raise cancelled
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))
