@@ -3,21 +3,21 @@
 vLLM-Omni exposes Prometheus metrics via the `/metrics` endpoint on the OpenAI-compatible API server. This page covers the text and audio surface; diffusion / image / video metrics are tracked in a follow-up PR.
 
 ```bash
-vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000
+vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000 --log-stats
 curl http://localhost:8000/metrics
 ```
 
-**Statistics collection is on by default for `vllm-omni serve`; disable it with `--disable-log-stats`.** With statistics disabled the endpoint still returns `200 OK` and every family stays registered, but no sample data is written — the runtime cost is essentially zero for deployments that don't need monitoring.
+**`--log-stats` is required to populate metric data.** Without the flag, the endpoint still returns `200 OK` but the upstream `vllm:*` wrap is not registered at all, and the 15 `vllm:omni_*` families are registered as placeholders with no data written to them. This keeps the runtime cost essentially zero for deployments that don't need monitoring. With the flag, all ~80 families populate.
 
 ## Metric Namespaces
 
 | Prefix | Source | Present when |
 |--------|--------|--------------|
-| `vllm_omni:` | vLLM-Omni orchestrator / audio modality / cross-stage transfer | Pipeline-dependent |
+| `vllm:omni_` | vLLM-Omni orchestrator / audio modality / cross-stage transfer | Pipeline-dependent |
 | `vllm:` | Upstream vLLM engine, wrapped by `OmniPrometheusStatLogger` to expose `{stage, replica}` | Pipeline includes an LLM (AR) stage |
 | `http_` / `process_` | Uvicorn / Python runtime | Always |
 
-## Pipeline-Level Metrics (`vllm_omni:`)
+## Pipeline-Level Metrics (`vllm:omni_`)
 
 Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the full multi-stage pipeline.
 
@@ -25,50 +25,48 @@ Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `vllm_omni:num_requests_running` | Gauge | `model_name` | Pipeline-global in-flight requests (dispatched to engine, not yet finalized) |
-| `vllm_omni:num_requests_waiting` | Gauge | `model_name` | Requests waiting in the Orchestrator queue |
-| `vllm_omni:requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason. `finished_reason` ∈ {`stop`, `length`, `abort`, ...} mirroring upstream `vllm:request_success_total`; aborts cover client disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
+| `vllm:omni_num_requests_running` | Gauge | `model_name` | Pipeline-global in-flight requests (dispatched to engine, not yet finalized) |
+| `vllm:omni_num_requests_waiting` | Gauge | `model_name` | Requests waiting in the Orchestrator queue |
+| `vllm:omni_requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason. `finished_reason` ∈ {`stop`, `length`, `abort`, ...} mirroring upstream `vllm:request_success_total`; aborts cover client disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
 
 ### Latency
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `vllm_omni:e2e_request_latency_s` | Histogram | `model_name` | Pipeline-global end-to-end request latency in seconds |
+| `vllm:omni_e2e_request_latency_s` | Histogram | `model_name` | Pipeline-global end-to-end request latency in seconds |
 
-## Audio Modality Metrics (`vllm_omni:`)
+## Audio Modality Metrics (`vllm:omni_`)
 
 Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the first audio packet) and `audio_underrun_s` / `audio_continuity_ok_total` (streaming finalize, after the chunk stream is exhausted). All carry `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
 |--------|------|-------------|-------------|
-| `vllm_omni:audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
-| `vllm_omni:audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
-| `vllm_omni:audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
-| `vllm_omni:audio_frames_total` | Counter | — | Cumulative audio frame count; throughput via `rate()` |
-| `vllm_omni:audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
-| `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
-| `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
+| `vllm:omni_audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
+| `vllm:omni_audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
+| `vllm:omni_audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
+| `vllm:omni_audio_frames_total` | Counter | — | Cumulative audio frame count; throughput via `rate()` |
+| `vllm:omni_audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
+| `vllm:omni_audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
+| `vllm:omni_audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
 
-## Cross-Stage Transfer Metrics (`vllm_omni:`)
+## Cross-Stage Transfer Metrics (`vllm:omni_`)
 
 Per-physical-transfer histograms tracking the data hop between adjacent stages. Labels `{model_name, from_stage, from_replica, to_stage, to_replica}` let dashboards attribute latency to specific replica edges. `from_replica` / `to_replica` are resolved from the orchestrator's sticky-routing binding (`stage_pool.get_bound_replica_id(request_id)`), so no extra plumbing through `TransferEdgeStats` is needed.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `vllm_omni:transfer_size_bytes` | Histogram | Per-transfer payload size in bytes |
-| `vllm_omni:transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
-| `vllm_omni:transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
-| `vllm_omni:transfer_in_flight_s` | Histogram | Network in-flight time (TX done → RX recv start) |
+| `vllm:omni_transfer_size_bytes` | Histogram | Per-transfer payload size in bytes |
+| `vllm:omni_transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
+| `vllm:omni_transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
+| `vllm:omni_transfer_in_flight_s` | Histogram | Network in-flight time (TX done → RX recv start) |
 
 ## Streaming Session Metrics (`vllm_omni:streaming_*`)
 
-Defined in `vllm_omni/metrics/streaming.py`. Ten families covering realtime streaming-ASR sessions on the `/v1/realtime` path (and any transport frontend built on the transport-neutral session factory). They are designed as **autoscaler inputs** (HPA/KEDA) and SLO signals: backlog, deadline misses, active sessions, and effective batch size are the series to scale and alert on.
+Defined in `vllm_omni/metrics/streaming.py`. Ten families covering realtime streaming-ASR sessions on the `/v1/realtime` path (and any transport frontend built on the transport-neutral session factory). They are designed as **autoscaler inputs** (HPA/KEDA) and SLO signals: backlog, deadline misses, active sessions, and effective batch size are the series to scale and alert on. The family names below are the exposition names as served (they follow `vllm_omni/metrics/definitions.py`'s shared `METRIC_PREFIX`, the same constant the pipeline families above use).
 
-Every family labels `model_name` with the **served alias** (the `--served-model-name` identity), not the checkpoint path. Note this deliberately differs from the older `vllm_omni:` request-tracking families above, which label the canonical model path — an inherited inconsistency that was not copied into the new families.
-
-`cadence_ms` is the session's admitted streaming cadence, a bounded enumeration `{80, 160, 320, 560, 1120}`. `chunk_type` distinguishes `regular` cadence units from the single `final_tail` unit minted at finalization. All label values are bounded enumerations — an out-of-vocabulary value is dropped, never a new series.
+Every family labels `model_name` with the **served alias** (the `--served-model-name` identity), not the checkpoint path. `cadence_ms` is the session's admitted streaming cadence, a bounded enumeration `{80, 160, 320, 560, 1120}`. `chunk_type` distinguishes `regular` cadence units from the single `final_tail` unit minted at finalization. All label values are bounded enumerations — an out-of-vocabulary value is dropped, never a new series.
 
 ### Session lifecycle
 
@@ -97,7 +95,7 @@ Every family labels `model_name` with the **served alias** (the `--served-model-
 
 ### Operational notes
 
-- Gated by the same host statistics switch as everything else: with `--disable-log-stats` all ten families stay registered but sample-free, and every observation path returns before recording.
+- These families follow the host statistics switch: when statistics collection is disabled on the serving path, all ten stay registered but sample-free, and every observation path returns before recording.
 - The streaming gauges are process-local; serving asserts the single-API-server invariant (`--api-server-count 1`) at startup rather than assuming it.
 - Observation is non-authoritative and non-fatal: an exporter failure can never fail audio acceptance, parking, finalization, or scheduling.
 
@@ -120,19 +118,18 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 
 ## Metric Availability by Pipeline Type
 
-| Metric group | Present when |
+| Metric group | Multi-stage LLM (Qwen3-Omni) |
 |---|---|
-| `vllm_omni:` request tracking + latency | Statistics enabled (the default; off with `--disable-log-stats`) |
-| `vllm_omni:` audio modality | Statistics enabled, if pipeline has a talker stage |
-| `vllm_omni:` transfer | Statistics enabled, if pipeline has ≥ 2 stages |
-| `vllm_omni:streaming_*` session metrics | Statistics enabled, realtime streaming path served |
-| `vllm:` engine metrics (per `(stage, replica)`) | Statistics enabled |
-| `vllm:` MFU metrics | Statistics enabled, plus `--enable-mfu-metrics` |
+| `vllm:omni_` request tracking + latency | With `--log-stats` |
+| `vllm:omni_` audio modality | With `--log-stats`, if pipeline has a talker stage |
+| `vllm:omni_` transfer | With `--log-stats`, if pipeline has ≥ 2 stages |
+| `vllm:` engine metrics (per `(stage, replica)`) | With `--log-stats` |
+| `vllm:` MFU metrics | With `--log-stats --enable-mfu-metrics` |
 
 ## Naming Convention
 
 - All time-bearing metrics use the `_s` suffix (values in seconds). Buckets are `SECONDS_BUCKETS` for e2e / generation-style values and `SECONDS_FAST_BUCKETS` (1 ms → 60 s) for the fine-grained transfer and audio-underrun values.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
-- All omni-specific families are prefixed `vllm_omni:`.
-- Text and audio first-output use distinct families (`vllm:time_to_first_token_seconds` reused from upstream for text; `vllm_omni:audio_ttfp_s` for audio) rather than a single metric with a `modality` label.
+- All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched (see `vllm_omni/patch.py`) to a scoped version that still strips upstream `vllm:*` collectors so multi-engine init within one process does not crash on duplicate registration, but preserves anything prefixed `vllm:omni_` / `vllm_omni`.
+- Text and audio first-output use distinct families (`vllm:time_to_first_token_seconds` reused from upstream for text; `vllm:omni_audio_ttfp_s` for audio) rather than a single metric with a `modality` label.
