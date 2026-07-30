@@ -1123,9 +1123,7 @@ def test_nonfinite_participant_shutdown_grace_is_rejected_on_entry() -> None:
             SelectedApplicationPlugin("later", must_not_enter, None),
         ]
         with pytest.raises(ValueError, match="finite and positive"):
-            async with application_plugins.application_plugin_lifetime(
-                selected, host_context
-            ):
+            async with application_plugins.application_plugin_lifetime(selected, host_context):
                 pytest.fail("invalid grace must fail before the lifetime yields")
 
         assert events == ["enter:infinite", "exit:infinite"]
