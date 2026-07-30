@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+from argparse import Namespace
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 
 from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -784,6 +786,36 @@ async def test_application_server_arguments_do_not_enter_async_omni(
     )
     assert not hasattr(observed_engine_args, "ws_max_size")
     assert args.application_plugin == ["application"]
+
+
+def test_application_server_argument_projection_supports_tracking_namespace() -> None:
+    """The real CLI namespace remains usable after server-only filtering."""
+    # @spec ING-VEH-003
+    args = TrackingNamespace(
+        Namespace(
+            model="example/model",
+            application_plugin=["application"],
+            application_plugin_config=["application=config.json"],
+            application_plugin_startup_timeout=60.0,
+            ws_max_size=2097152,
+        ),
+        frozenset(
+            {
+                "model",
+                "application_plugin",
+                "application_plugin_config",
+                "application_plugin_startup_timeout",
+                "ws_max_size",
+            }
+        ),
+    )
+
+    engine_args = api_server._engine_args_without_application_options(args)
+
+    assert isinstance(engine_args, TrackingNamespace)
+    assert engine_args.get_explicit_kwargs_dict() == {"model": "example/model"}
+    assert args.application_plugin == ["application"]
+    assert args.application_plugin_config == ["application=config.json"]
 
 
 @pytest.mark.asyncio
