@@ -21,6 +21,35 @@ vLLM-Omni is quickly evolving, please see the [installation guide](../getting_st
 !!! tip
     vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
 
+When testing a vLLM-Omni checkout against an editable vLLM source checkout,
+install both into the same fresh environment. Do not put a newer vLLM checkout
+on `PYTHONPATH` over an environment containing an older editable vLLM install:
+imports and package metadata will then identify different revisions.
+
+For example, the following creates a CPU environment for frontend tests on
+macOS. Replace the source paths with your own checkouts, and check out the vLLM
+release paired with the vLLM-Omni branch before installing:
+
+```bash
+uv venv --python 3.12
+uv pip install --python .venv/bin/python \
+  --editable /path/to/vllm --torch-backend=auto
+VLLM_OMNI_TARGET_DEVICE=cpu uv pip install \
+  --python .venv/bin/python --editable .
+uv pip install --python .venv/bin/python \
+  pytest==9.1.1 pytest-asyncio==1.4.0 ruff
+```
+
+The full `.[dev]` extra includes accelerator-specific test dependencies that
+are not available on macOS. Install that extra in the supported Linux
+accelerator environment; the smaller command above is only for portable
+CPU/frontend tests. Verify the active source pair before running tests:
+
+```bash
+.venv/bin/python -c \
+  'import importlib.metadata as m, vllm, vllm_omni; print(m.version("vllm"), vllm.__file__); print(m.version("vllm-omni"), vllm_omni.__file__)'
+```
+
 ### Adding a new model to vLLM-Omni
 
 Please check [model implementation](model/README.md) for how to add diffusion and omni-modality models to vLLM-Omni.
