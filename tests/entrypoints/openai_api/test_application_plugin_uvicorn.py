@@ -16,10 +16,7 @@ from fastapi import FastAPI, WebSocket
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_MODULE_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "vllm_omni/entrypoints/openai/application_plugins.py"
-)
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_omni/entrypoints/openai/application_plugins.py"
 _SPEC = importlib.util.spec_from_file_location(
     "_application_plugins_uvicorn_under_test",
     _MODULE_PATH,
@@ -129,9 +126,7 @@ async def test_closed_websocket_is_denied_as_http_before_accept() -> None:
         writer.close()
         await writer.wait_closed()
 
-        assert response_head.split(b"\r\n", 1)[0] == (
-            b"HTTP/1.1 503 Service Unavailable"
-        )
+        assert response_head.split(b"\r\n", 1)[0] == (b"HTTP/1.1 503 Service Unavailable")
     finally:
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=2)
@@ -171,9 +166,7 @@ async def test_post_accept_admission_race_closes_websocket_with_1013() -> None:
     writer = None
     try:
         reader, writer, response_head = await _open_websocket(host, port)
-        assert response_head.split(b"\r\n", 1)[0] == (
-            b"HTTP/1.1 101 Switching Protocols"
-        )
+        assert response_head.split(b"\r\n", 1)[0] == (b"HTTP/1.1 101 Switching Protocols")
         await asyncio.wait_for(accepted.wait(), timeout=2)
         admission.close_from_launcher_thread()
         try_detached_owner.set()
@@ -236,9 +229,7 @@ async def test_open_websocket_lease_survives_close_until_disconnect() -> None:
     writer = None
     try:
         _, writer, response_head = await _open_websocket(host, port)
-        assert response_head.split(b"\r\n", 1)[0] == (
-            b"HTTP/1.1 101 Switching Protocols"
-        )
+        assert response_head.split(b"\r\n", 1)[0] == (b"HTTP/1.1 101 Switching Protocols")
         await asyncio.wait_for(accepted.wait(), timeout=2)
         assert active_leases == 1
 
@@ -295,19 +286,13 @@ async def test_h11_incomplete_event_limit_precedes_raw_asgi_composition() -> Non
     server, server_task = await _start_server(
         app,
         listen_socket,
+        http="h11",
         h11_max_incomplete_event_size=128,
     )
     writer = None
     try:
         reader, writer = await asyncio.open_connection(host, port)
-        writer.write(
-            (
-                "POST /v1/work HTTP/1.1\r\n"
-                f"Host: {host}:{port}\r\n"
-                "X-Oversized: "
-                + ("a" * 512)
-            ).encode()
-        )
+        writer.write((f"POST /v1/work HTTP/1.1\r\nHost: {host}:{port}\r\nX-Oversized: " + ("a" * 512)).encode())
         await writer.drain()
         response_head = await asyncio.wait_for(
             reader.readuntil(b"\r\n\r\n"),

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,10 +192,6 @@ def _install_worker_basics(monkeypatch, events: list[str], *, serve):
     async def fake_storage_start():
         pass
 
-    async def fake_listener_bound(*args, **kwargs):
-        del args, kwargs
-        await asyncio.sleep(0)
-
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", serve)
@@ -208,12 +205,6 @@ def _install_worker_basics(monkeypatch, events: list[str], *, serve):
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
-    monkeypatch.setattr(
-        api_server,
-        "_wait_for_http_listener_bound",
-        fake_listener_bound,
-        raising=False,
-    )
     return fake_engine
 
 
@@ -261,26 +252,13 @@ async def _wait_for_worker_event(
     await event_task
 
 
-@pytest.mark.asyncio
-async def test_listener_bound_signal_is_distinct_from_serving_lifetime() -> None:
-    """ING-VEH-016: readiness does not await the server's full lifetime."""
-    app = FastAPI()
-    serving = asyncio.Event()
+def test_api_server_delegates_listener_and_signal_ownership_to_launcher() -> None:
+    """The API worker contains no polling/proxy shutdown workaround."""
+    # @spec ING-VEH-017
+    source = inspect.getsource(api_server.omni_run_server_worker)
 
-    async def serve_forever() -> None:
-        await serving.wait()
-
-    serve_task = asyncio.create_task(serve_forever())
-    app.state.server = SimpleNamespace(started=False)
-
-    wait_task = asyncio.create_task(api_server._wait_for_http_listener_bound(app, serve_task, timeout=1))
-    await asyncio.sleep(0)
-    assert not wait_task.done()
-    app.state.server.started = True
-    await asyncio.wait_for(wait_task, timeout=1)
-    assert not serve_task.done()
-    serving.set()
-    await serve_task
+    assert "_wait_for_http_listener_bound" not in source
+    assert "server.should_exit" not in source
 
 
 # @spec ING-VEH-003, ING-VEH-016, ING-VEH-017, ING-VEH-022
@@ -295,15 +273,21 @@ async def test_selected_plugin_lifecycle_is_nested_around_serving_and_engine(mon
 
     async def fake_serve_http(*args, **kwargs):
         launcher_app = args[0]
+        hook = kwargs.pop("lifecycle_hook")
+        assert hook is not None
         assert kwargs["ws_max_size"] == 2097152
         assert kwargs["timeout_graceful_shutdown"] == 7.0
         events.append("http-bound")
         serve_started.set()
+        await hook.on_bound()
         await http_shutdown.wait()
-        launcher_app.state.engine_client.shutdown(timeout=1.0)
+        hook.on_shutdown_requested()
+        await hook.before_http_shutdown()
+        events.append("http-shutdown")
+        await hook.before_engine_shutdown()
 
         async def wait_for_shutdown() -> None:
-            events.append("http-shutdown")
+            assert launcher_app.state.engine_client is engine
 
         return wait_for_shutdown()
 
@@ -376,13 +360,20 @@ async def test_selected_plugin_prepares_eager_asgi_slot_before_state_init_and_se
     slot = FakeASGICompositionSlot(events)
 
     async def fake_serve_http(*args, **kwargs):
-        del args, kwargs
+        del args
+        hook = kwargs.pop("lifecycle_hook")
+        assert hook is not None
         events.append("http-bound")
         serve_started.set()
+        await hook.on_bound()
         await http_shutdown.wait()
+        hook.on_shutdown_requested()
+        await hook.before_http_shutdown()
+        events.append("http-shutdown")
+        await hook.before_engine_shutdown()
 
         async def shutdown() -> None:
-            events.append("http-shutdown")
+            pass
 
         return shutdown()
 
@@ -395,7 +386,8 @@ async def test_selected_plugin_prepares_eager_asgi_slot_before_state_init_and_se
         lambda args, supported_tasks: eager_app,
     )
 
-    def prepare(app):
+    def prepare(app, *, admission=None):
+        del admission
         assert app is eager_app
         assert app.middleware_stack is not None
         events.append("asgi-prepare")
@@ -453,6 +445,7 @@ async def test_selected_plugin_prepares_eager_asgi_slot_before_state_init_and_se
     assert events.index("asgi-seal") < events.index("http-bound")
     assert "asgi-fail" not in events
 
+
 @pytest.mark.asyncio
 async def test_post_bind_plugin_failure_closes_admission_drains_and_cancels_http(monkeypatch) -> None:
     """ING-VEH-010/017: post-bind startup failure leaves no live HTTP task."""
@@ -460,12 +453,17 @@ async def test_post_bind_plugin_failure_closes_admission_drains_and_cancels_http
     admission = FakeAdmission(events)
 
     async def fake_serve_http(*args, **kwargs):
-        del args, kwargs
+        del args
+        hook = kwargs.pop("lifecycle_hook")
+        assert hook is not None
         events.append("http-bound")
         try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
+            await hook.on_bound()
+        finally:
+            hook.on_shutdown_requested()
+            await hook.before_http_shutdown()
             events.append("http-cancelled")
+            await hook.before_engine_shutdown()
 
         async def shutdown() -> None:
             pass
@@ -536,7 +534,7 @@ async def test_plugin_start_failure_prevents_http_serving(monkeypatch) -> None:
     monkeypatch.setattr(
         api_server,
         "prepare_application_plugin_asgi_wrappers",
-        lambda app: slot,
+        lambda app, **kwargs: slot,
         raising=False,
     )
     monkeypatch.setattr(api_server, "create_application_admission", lambda: FakeAdmission(events), raising=False)
@@ -610,13 +608,8 @@ async def test_no_selected_plugin_does_not_discover_entry_points(monkeypatch) ->
             launcher_app.state,
             "application_admission",
         )
-        assert not any(
-            getattr(route, "path", None) == "/live"
-            for route in launcher_app.routes
-        )
-        response = await api_server.health(
-            SimpleNamespace(app=launcher_app)
-        )
+        assert not any(getattr(route, "path", None) == "/live" for route in launcher_app.routes)
+        response = await api_server.health(SimpleNamespace(app=launcher_app))
         assert response.status_code == 200
         return asyncio.create_task(asyncio.sleep(0))
 
@@ -649,27 +642,13 @@ def test_api_server_has_no_model_or_frontend_specific_plugin_dependency() -> Non
     """The generic host imports neither frontend nor model-specific seams."""
     tree = ast.parse(_API_SERVER.read_text())
     imported_modules = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    } | {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module is not None
-    }
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+    } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module is not None}
     imported_symbols = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) for alias in node.names
     }
 
-    assert not [
-        name
-        for name in imported_modules
-        if name.startswith(("grpc", "riva", "nvidia_riva"))
-    ]
+    assert not [name for name in imported_modules if name.startswith(("grpc", "riva", "nvidia_riva"))]
     assert "vllm_omni.entrypoints.nemotron_session" not in imported_modules
     assert "NemotronSessionFactory" not in imported_symbols
 
@@ -729,15 +708,9 @@ async def test_endpoint_plugin_phase_b_uses_retained_instances_without_applicati
 
     assert events.count(f"endpoint-state:first:{id(first)}") == 1
     assert events.count(f"endpoint-state:second:{id(second)}") == 1
-    assert events.index("ordinary-state") < events.index(
-        f"endpoint-state:first:{id(first)}"
-    )
-    assert events.index(f"endpoint-state:first:{id(first)}") < events.index(
-        f"endpoint-state:second:{id(second)}"
-    )
-    assert events.index(f"endpoint-state:second:{id(second)}") < events.index(
-        "http"
-    )
+    assert events.index("ordinary-state") < events.index(f"endpoint-state:first:{id(first)}")
+    assert events.index(f"endpoint-state:first:{id(first)}") < events.index(f"endpoint-state:second:{id(second)}")
+    assert events.index(f"endpoint-state:second:{id(second)}") < events.index("http")
 
 
 @pytest.mark.asyncio
@@ -1137,13 +1110,18 @@ async def test_post_start_failure_closes_admission_and_stops_http(
             raise RuntimeError("listener died")
 
     async def serve_until_cancelled(*args, **kwargs):
-        del args, kwargs
+        del args
+        hook = kwargs.pop("lifecycle_hook")
+        assert hook is not None
         events.append("http-bound")
         try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
+            await hook.on_bound()
+            await hook.wait_failed()
+        finally:
+            hook.on_shutdown_requested()
+            await hook.before_http_shutdown()
             events.append("http-cancelled")
-            raise
+            await hook.before_engine_shutdown()
 
     def optional_entry_point(context):
         del context
@@ -1193,14 +1171,8 @@ async def test_launcher_hook_orders_shutdown_without_polling_server_state(
         launcher_app = args[0]
         hook = kwargs.pop("lifecycle_hook")
         assert hook is not None
-        live_route = next(
-            route
-            for route in launcher_app.routes
-            if getattr(route, "path", None) == "/live"
-        )
-        before_ready = await api_server.health(
-            SimpleNamespace(app=launcher_app)
-        )
+        live_route = next(route for route in launcher_app.routes if getattr(route, "path", None) == "/live")
+        before_ready = await api_server.health(SimpleNamespace(app=launcher_app))
         assert before_ready.status_code == 503
         events.append("http-bound")
         await hook.on_bound()
@@ -1264,9 +1236,7 @@ async def test_launcher_hook_orders_shutdown_without_polling_server_state(
     assert events.index("http-bound") < events.index("admission-open")
     assert events.index("admission-open") < events.index("plugin-serving")
     assert events.index("shutdown-signal") < events.index("admission-closed")
-    assert events.index("admission-closed") < events.index(
-        "shutdown-requested-return"
-    )
+    assert events.index("admission-closed") < events.index("shutdown-requested-return")
     assert events.index("admission-closed") < events.index("plugin-drain")
     assert events.index("plugin-drain") < events.index("http-shutdown")
     assert events.index("http-shutdown") < events.index("plugin-exit")
