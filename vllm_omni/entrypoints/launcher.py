@@ -100,10 +100,11 @@ async def _serve_http_with_lifecycle(
 ) -> Awaitable[None]:
     """Own Uvicorn so admission closure precedes every shutdown trigger."""
     _log_routes(app)
+    engine_client = app.state.engine_client
     server, config = _build_server(app, uvicorn_kwargs)
     loop = asyncio.get_running_loop()
     server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
-    watchdog_task = loop.create_task(_watchdog_loop(server, app.state.engine_client))
+    watchdog_task = loop.create_task(_watchdog_loop(server, engine_client))
     programmatic_stop_task = loop.create_task(_wait_for_programmatic_stop(server))
     failure_task = loop.create_task(lifecycle_hook.wait_failed())
     shutdown_event = asyncio.Event()
@@ -193,7 +194,7 @@ async def _serve_http_with_lifecycle(
             )
 
         await _coordinated_shutdown(
-            app,
+            engine_client,
             server,
             server_task,
             watchdog_task,
@@ -217,7 +218,7 @@ async def _serve_http_with_lifecycle(
         request_shutdown()
         await asyncio.shield(
             _coordinated_shutdown(
-                app,
+                engine_client,
                 server,
                 server_task,
                 watchdog_task,
@@ -248,7 +249,7 @@ async def _serve_http_with_lifecycle(
 
 
 async def _coordinated_shutdown(
-    app: FastAPI,
+    engine_client: EngineClient,
     server: uvicorn.Server,
     server_task: asyncio.Task[Any],
     watchdog_task: asyncio.Task[Any],
@@ -300,7 +301,6 @@ async def _coordinated_shutdown(
         errors.append(error)
         logger.exception("Application participant exit failed")
     finally:
-        engine_client = app.state.engine_client
         timeout = engine_client.vllm_config.shutdown_timeout
         mode = "abort" if timeout == 0 else "drain"
         logger.info(
