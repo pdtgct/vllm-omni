@@ -67,6 +67,9 @@ from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
+from vllm.entrypoints.serve.instrumentator.health import (
+    health as vllm_health,
+)
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
@@ -276,7 +279,13 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     return getattr(engine_client, "vllm_config", None)
 
 
-def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None):
+def _remove_route_from_app(
+    app,
+    path: str,
+    methods: set[str] | None = None,
+    *,
+    endpoint: Any | None = None,
+):
     """Remove a route from the app by path and optionally by methods.
 
     OMNI: used to override upstream /v1/chat/completions with omni behavior.
@@ -284,6 +293,8 @@ def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None
     routes_to_remove = []
     for route in app.routes:
         if isinstance(route, Route) and route.path == path:
+            if endpoint is not None and route.endpoint is not endpoint:
+                continue
             if methods is None or (hasattr(route, "methods") and route.methods & methods):
                 routes_to_remove.append(route)
 
@@ -658,6 +669,13 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        # @spec ING-VEH-020
+        _remove_route_from_app(
+            app,
+            "/health",
+            {"GET"},
+            endpoint=vllm_health,
+        )
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
