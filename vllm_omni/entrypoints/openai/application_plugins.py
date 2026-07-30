@@ -14,17 +14,17 @@ import asyncio
 import json
 import math
 import threading
-from builtins import BaseExceptionGroup
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
 from importlib import metadata
 from types import TracebackType
-from typing import Any, Protocol, Self
+from typing import Any, Protocol
 
 APPLICATION_PLUGIN_ENTRY_POINT_GROUP = "vllm_omni.application_plugins"
-APPLICATION_PLUGIN_OPERATIONAL_PATHS = frozenset({"/health", "/metrics"})
+APPLICATION_PLUGIN_OPERATIONAL_PATHS = frozenset({"/health", "/live", "/metrics"})
+DEFAULT_APPLICATION_PLUGIN_STARTUP_TIMEOUT = 60.0
 DEFAULT_WS_MAX_SIZE = 16 * 1024 * 1024
 ApplicationASGI = Callable[[Any, Any, Any], Awaitable[None]]
 ApplicationASGIWrapper = Callable[[ApplicationASGI], ApplicationASGI]
@@ -51,11 +51,18 @@ class ApplicationAdmissionState(Enum):
     OPEN = "open"
 
 
-class ApplicationAdmissionView(Protocol):
-    """Read-only projection of the host-owned admission linearization point."""
+class AdmissionLease(Protocol):
+    """One admitted application owner registration."""
 
-    def is_open(self) -> bool:
-        """Return whether application inference can create an owner."""
+    def release(self) -> None:
+        """Release this owner registration idempotently."""
+
+
+class ApplicationAdmissionView(Protocol):
+    """Acquisition-only projection of the host admission controller."""
+
+    def try_acquire(self) -> AdmissionLease | None:
+        """Atomically register one owner, or reject it after closure."""
 
 
 class ApplicationAdmission(Protocol):
@@ -67,10 +74,7 @@ class ApplicationAdmission(Protocol):
 
     @property
     def view(self) -> ApplicationAdmissionView:
-        """Return the stable read-only projection exposed outside the host."""
-
-    def is_open(self) -> bool:
-        """Return whether application inference can create an owner."""
+        """Return the stable acquisition-only external capability."""
 
     async def open_after_http_listener_bound(self) -> None:
         """Make the one host-owned readiness transition after HTTP binds."""
@@ -105,7 +109,10 @@ class ApplicationPlugin(Protocol):
 
     config_optional: bool
 
-    def __call__(self, context: ApplicationPluginContext) -> ApplicationPluginParticipant:
+    def __call__(
+        self,
+        context: ApplicationPluginContext,
+    ) -> ApplicationPluginParticipant:
         """Return the selected plugin's async lifetime context manager."""
 
 
@@ -113,7 +120,13 @@ class ApplicationPluginParticipant(
     AbstractAsyncContextManager["ApplicationPluginParticipant"],
     Protocol,
 ):
-    """One selected plugin's generic readiness and drain participant."""
+    """One selected plugin's readiness, failure, and drain participant."""
+
+    async def wait_ready(self) -> None:
+        """Attest that owned resources are bound and locally reachable."""
+
+    async def wait_failed(self) -> None:
+        """Raise the first owned-resource failure and never return normally."""
 
     async def mark_serving(self) -> None:
         """Observe that host application admission is now open."""
@@ -126,7 +139,10 @@ class ApplicationPluginParticipant(
         """Return this participant's finite shutdown grace in seconds."""
 
 
-ApplicationPluginEntryPoint = Callable[[ApplicationPluginContext], ApplicationPluginParticipant]
+ApplicationPluginEntryPoint = Callable[
+    [ApplicationPluginContext],
+    ApplicationPluginParticipant,
+]
 
 
 @dataclass(frozen=True)
@@ -138,10 +154,13 @@ class SelectedApplicationPlugin:
     config: str | None
 
 
-class ApplicationPluginLifetime(AbstractAsyncContextManager["ApplicationPluginLifetime"], Protocol):
+class ApplicationPluginLifetime(
+    AbstractAsyncContextManager["ApplicationPluginLifetime"],
+    Protocol,
+):
     """Selected-plugin lifetime controlled by the generic API-server host."""
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> ApplicationPluginLifetime:
         """Enter selected plugins in explicit CLI order."""
 
     async def __aexit__(
@@ -151,6 +170,12 @@ class ApplicationPluginLifetime(AbstractAsyncContextManager["ApplicationPluginLi
         traceback: TracebackType | None,
     ) -> None:
         """Unwind every entered plugin in reverse order."""
+
+    async def wait_ready(self) -> None:
+        """Await all participant readiness attestations concurrently."""
+
+    async def wait_failed(self) -> None:
+        """Raise the first supervised participant failure."""
 
     async def mark_serving(self) -> None:
         """Tell selected plugins that host admission is now open."""
@@ -163,6 +188,19 @@ class ApplicationPluginLifetime(AbstractAsyncContextManager["ApplicationPluginLi
         """Return the finite shared HTTP/plugin shutdown grace."""
 
 
+class ApplicationPluginError(RuntimeError):
+    """Python-3.10-compatible aggregate for independent lifecycle faults."""
+
+    def __init__(
+        self,
+        message: str,
+        exceptions: Sequence[BaseException],
+    ) -> None:
+        self.exceptions = tuple(exceptions)
+        detail = "; ".join(str(error) for error in self.exceptions)
+        super().__init__(f"{message}: {detail}" if detail else message)
+
+
 def add_application_plugin_args(parser: argparse.ArgumentParser) -> None:
     """Add repeatable generic application-plugin selection CLI arguments."""
     parser.add_argument(
@@ -170,14 +208,14 @@ def add_application_plugin_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="NAME",
-        help="Explicitly enable one application plugin entry point (repeatable).",
+        help=("Explicitly enable one application plugin entry point (repeatable)."),
     )
     parser.add_argument(
         "--application-plugin-config",
         action="append",
         default=[],
         metavar="NAME=VALUE",
-        help="Opaque configuration for one selected application plugin (repeatable).",
+        help=("Opaque configuration for one selected application plugin (repeatable)."),
     )
     parser.add_argument(
         "--ws-max-size",
@@ -185,6 +223,13 @@ def add_application_plugin_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_WS_MAX_SIZE,
         metavar="BYTES",
         help="Maximum accepted WebSocket message size in bytes.",
+    )
+    parser.add_argument(
+        "--application-plugin-startup-timeout",
+        type=_positive_float,
+        default=DEFAULT_APPLICATION_PLUGIN_STARTUP_TIMEOUT,
+        metavar="SECONDS",
+        help=("One aggregate deadline for selected application-plugin entry and readiness."),
     )
 
 
@@ -196,18 +241,21 @@ def _positive_integer(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    """Parse one finite positive duration for the API server."""
+    parsed = float(value)
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("value must be finite and positive")
+    return parsed
+
+
 def validate_application_plugin_options(
     selected_names: Sequence[str],
     config_values: Sequence[str],
     *,
     api_server_worker_count: int,
 ) -> Mapping[str, str | None]:
-    """Validate explicit plugin selection and opaque keyed configuration.
-
-    The contract rejects duplicate selected names, duplicate config keys,
-    config for unselected names, and a selected plugin with any API-worker
-    count other than one.
-    """
+    """Validate explicit plugin selection and opaque keyed configuration."""
     if len(set(selected_names)) != len(selected_names):
         raise ValueError("duplicate selected application plugin name")
     if selected_names and api_server_worker_count != 1:
@@ -260,36 +308,33 @@ def discover_application_plugins(
 
 def create_application_admission() -> ApplicationAdmission:
     """Create the host-owned admission state, initially closed."""
+    # @spec ING-VEH-016, ING-VEH-019
     return _ApplicationAdmission()
-
-
-def defer_engine_shutdown_until_application_drain(
-    engine: Any,
-    admission: ApplicationAdmission,
-) -> Any:
-    """Proxy launcher shutdown so the engine context exits after owner drain."""
-    return _DrainOrderedEngineClient(engine, admission)
 
 
 def prepare_application_plugin_asgi_wrappers(
     app: Any,
+    *,
+    admission: ApplicationAdmissionView | None = None,
 ) -> ApplicationASGIComposition:
     """Prepare one stable plugin slot inside the host middleware boundary."""
+    # @spec ING-VEH-019, ING-VEH-021, ING-VEH-024
     router = getattr(app, "router", None)
     if not callable(router):
         raise TypeError("application host router must be callable")
     middleware_stack = getattr(app, "middleware_stack", None)
-    admission = getattr(getattr(app, "state", None), "application_admission", None)
-    if admission is not None:
-        admission = getattr(admission, "view", admission)
-        if not callable(getattr(admission, "is_open", None)):
-            raise TypeError("application admission view must expose is_open()")
+    if admission is not None and not callable(getattr(admission, "try_acquire", None)):
+        raise TypeError("application admission view must expose try_acquire()")
     slot = _ApplicationASGICompositionSlot(router, admission)
 
     try:
         app.router = slot
         if middleware_stack is not None:
-            build_middleware_stack = getattr(app, "build_middleware_stack", None)
+            build_middleware_stack = getattr(
+                app,
+                "build_middleware_stack",
+                None,
+            )
             if not callable(build_middleware_stack):
                 raise TypeError("application host must expose a callable build_middleware_stack")
             rebuilt_stack = build_middleware_stack()
@@ -341,7 +386,10 @@ class _ApplicationASGICompositionSlot:
         self._require_prepared("seal application ASGI wrappers")
         installed: ApplicationASGI = self._host_router
         if self._admission is not None:
-            installed = _ApplicationAdmissionGuard(installed, self._admission)
+            installed = _ApplicationAdmissionGuard(
+                installed,
+                self._admission,
+            )
         try:
             for wrapper in reversed(self._wrappers):
                 installed = wrapper(installed)
@@ -376,7 +424,7 @@ class _ApplicationASGICompositionSlot:
 
 
 class _ApplicationAdmissionGuard:
-    """Innermost guard that rejects application work while admission is closed."""
+    """Innermost guard that atomically admits each original-router scope."""
 
     def __init__(
         self,
@@ -389,39 +437,71 @@ class _ApplicationAdmissionGuard:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         scope_type = scope.get("type")
         path = scope.get("path", "")
-        if (
-            scope_type not in {"http", "websocket"}
-            or path in APPLICATION_PLUGIN_OPERATIONAL_PATHS
-            or self._admission.is_open()
-        ):
+        if scope_type not in {"http", "websocket"} or path in APPLICATION_PLUGIN_OPERATIONAL_PATHS:
             await self._host_router(scope, receive, send)
             return
-        if scope_type == "websocket":
-            await send({"type": "websocket.close", "code": 1013})
+
+        lease = self._admission.try_acquire()
+        if lease is None:
+            if scope_type == "websocket":
+                await _reject_websocket_before_accept(scope, send)
+            else:
+                await _reject_http(send)
             return
 
-        body = json.dumps(
-            {
-                "error": {
-                    "message": "Application inference is unavailable",
-                    "type": "ServiceUnavailableError",
-                    "param": None,
-                    "code": 503,
-                }
-            },
-            separators=(",", ":"),
-        ).encode()
+        try:
+            await self._host_router(scope, receive, send)
+        finally:
+            lease.release()
+
+
+async def _reject_websocket_before_accept(scope: Any, send: Any) -> None:
+    extensions = scope.get("extensions", {})
+    if "websocket.http.response" in extensions:
+        body = b"Application inference is unavailable"
         await send(
             {
-                "type": "http.response.start",
+                "type": "websocket.http.response.start",
                 "status": 503,
                 "headers": [
-                    (b"content-type", b"application/json"),
+                    (b"content-type", b"text/plain; charset=utf-8"),
                     (b"content-length", str(len(body)).encode()),
                 ],
             }
         )
-        await send({"type": "http.response.body", "body": body})
+        await send(
+            {
+                "type": "websocket.http.response.body",
+                "body": body,
+            }
+        )
+        return
+    await send({"type": "websocket.close"})
+
+
+async def _reject_http(send: Any) -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": "Application inference is unavailable",
+                "type": "ServiceUnavailableError",
+                "param": None,
+                "code": 503,
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 class _EntryScopedApplicationASGIInstaller:
@@ -445,12 +525,8 @@ def application_plugin_lifetime(
     plugins: Sequence[SelectedApplicationPlugin],
     host_context: ApplicationPluginHostContext,
 ) -> ApplicationPluginLifetime:
-    """Enter plugins in CLI order and unwind them in reverse order.
-
-    The host nests this lifetime inside the engine context, closes admission
-    before the shared owner drain, and opens admission only after every
-    selected listener and the host HTTP listener are bound.
-    """
+    """Create the CLI-ordered, host-supervised participant lifetime."""
+    # @spec ING-VEH-010, ING-VEH-017, ING-VEH-018, ING-VEH-022
     return _ManagedApplicationPluginLifetime(plugins, host_context)
 
 
@@ -460,6 +536,7 @@ class _ApplicationAdmission:
     def __init__(self) -> None:
         self._state = ApplicationAdmissionState.CLOSED
         self._opened_once = False
+        self._active_owners = 0
         self._lock = threading.Lock()
         self._view = _ReadOnlyApplicationAdmissionView(self)
 
@@ -471,9 +548,6 @@ class _ApplicationAdmission:
     @property
     def view(self) -> ApplicationAdmissionView:
         return self._view
-
-    def is_open(self) -> bool:
-        return self.state is ApplicationAdmissionState.OPEN
 
     async def open_after_http_listener_bound(self) -> None:
         """Perform the one host-owned readiness transition."""
@@ -488,48 +562,66 @@ class _ApplicationAdmission:
         self.close_from_launcher_thread()
 
     def close_from_launcher_thread(self) -> None:
-        """Perform the synchronous OPEN→CLOSED shutdown transition."""
+        """Perform the synchronous OPEN->CLOSED shutdown transition."""
         with self._lock:
             self._state = ApplicationAdmissionState.CLOSED
 
+    def try_acquire(self) -> AdmissionLease | None:
+        """Check admission and register one owner under the same lock."""
+        with self._lock:
+            if self._state is not ApplicationAdmissionState.OPEN:
+                return None
+            self._active_owners += 1
+        return _ApplicationAdmissionLease(self)
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active_owners <= 0:
+                raise RuntimeError("application admission owner underflow")
+            self._active_owners -= 1
+
+
+class _ApplicationAdmissionLease:
+    """Unique, idempotently releasable application owner registration."""
+
+    __slots__ = ("_admission", "_lock", "_released")
+
+    def __init__(self, admission: _ApplicationAdmission) -> None:
+        self._admission = admission
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._admission.release()
+
 
 class _ReadOnlyApplicationAdmissionView:
-    """Stable capability exposing only the admission predicate."""
+    """Stable capability exposing only atomic owner acquisition."""
 
     __slots__ = ("_admission",)
 
     def __init__(self, admission: _ApplicationAdmission) -> None:
         self._admission = admission
 
-    def is_open(self) -> bool:
-        return self._admission.is_open()
+    def try_acquire(self) -> AdmissionLease | None:
+        return self._admission.try_acquire()
 
 
-class _DrainOrderedEngineClient:
-    """Delegate engine work while suppressing launcher's eager signal stop."""
+@dataclass
+class _EnteredParticipant:
+    """One entered context and its validated bounded-shutdown contract."""
 
-    def __init__(
-        self,
-        engine: Any,
-        admission: ApplicationAdmission,
-    ) -> None:
-        self._engine = engine
-        self._admission = admission
-        self.shutdown_requested = False
-        self.shutdown_timeout: float | None = None
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._engine, name)
-
-    def shutdown(self, timeout: float | None = None) -> None:
-        """Record shutdown; the enclosing engine context performs it later."""
-        self._admission.close_from_launcher_thread()
-        self.shutdown_requested = True
-        self.shutdown_timeout = timeout
+    manager: ApplicationPluginParticipant
+    participant: ApplicationPluginParticipant
+    shutdown_grace: float
 
 
 class _ManagedApplicationPluginLifetime:
-    """Enter selected plugins in order and coordinate their generic lifecycle."""
+    """Enter selected plugins and supervise their owned resources."""
 
     def __init__(
         self,
@@ -538,58 +630,144 @@ class _ManagedApplicationPluginLifetime:
     ) -> None:
         self._plugins = plugins
         self._host_context = host_context
-        self._participants: list[ApplicationPluginParticipant] = []
-        self._shutdown_graces: list[float] = []
-        self._exit_stack = AsyncExitStack()
+        self._entered: list[_EnteredParticipant] = []
+        self._failure_tasks: list[asyncio.Task[None]] = []
+        self._orderly_shutdown = False
+        self._drained = False
+        self._exited = False
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> _ManagedApplicationPluginLifetime:
         try:
             for selected in self._plugins:
-                scoped_installer = _EntryScopedApplicationASGIInstaller(self._host_context.install_asgi_wrapper)
-                try:
-                    context = ApplicationPluginContext(
-                        app=self._host_context.app,
-                        engine_client=self._host_context.engine_client,
-                        admission=self._host_context.admission,
-                        install_asgi_wrapper=scoped_installer,
-                        plugin_name=selected.name,
-                        config=selected.config,
-                    )
-                    participant = selected.entry_point(context)
-                    await self._exit_stack.enter_async_context(participant)
-                    shutdown_grace = _validate_shutdown_grace(participant.shutdown_grace)
-                    self._participants.append(participant)
-                    self._shutdown_graces.append(shutdown_grace)
-                finally:
-                    scoped_installer.close()
-        except BaseException:
-            await self._exit_stack.aclose()
+                await self._enter_one(selected)
+        except BaseException as primary:
+            cleanup_errors = await self._exit_all(None, None, None)
+            if cleanup_errors:
+                _retain_secondary_errors(primary, cleanup_errors)
             raise
         return self
 
+    async def _enter_one(self, selected: SelectedApplicationPlugin) -> None:
+        scoped_installer = _EntryScopedApplicationASGIInstaller(self._host_context.install_asgi_wrapper)
+        try:
+            context = ApplicationPluginContext(
+                app=self._host_context.app,
+                engine_client=self._host_context.engine_client,
+                admission=self._host_context.admission,
+                install_asgi_wrapper=scoped_installer,
+                plugin_name=selected.name,
+                config=selected.config,
+            )
+            manager = selected.entry_point(context)
+            participant = await manager.__aenter__()
+            try:
+                shutdown_grace = _validate_shutdown_grace(participant.shutdown_grace)
+            except BaseException:
+                await manager.__aexit__(None, None, None)
+                raise
+            self._entered.append(
+                _EnteredParticipant(
+                    manager=manager,
+                    participant=participant,
+                    shutdown_grace=shutdown_grace,
+                )
+            )
+            self._failure_tasks.append(asyncio.create_task(self._supervise_failure(selected.name, participant)))
+        finally:
+            scoped_installer.close()
+
+    async def _supervise_failure(
+        self,
+        name: str,
+        participant: ApplicationPluginParticipant,
+    ) -> None:
+        try:
+            await participant.wait_failed()
+        except asyncio.CancelledError:
+            if self._orderly_shutdown:
+                raise
+            raise RuntimeError(f"application plugin failure supervisor cancelled: {name}") from None
+        raise RuntimeError(f"application plugin wait_failed() returned normally: {name}")
+
+    async def wait_ready(self) -> None:
+        """Await readiness while giving an already-latched failure priority."""
+        if not self._entered:
+            return
+        ready_tasks = [asyncio.create_task(item.participant.wait_ready()) for item in self._entered]
+        ready_group: asyncio.Future[list[None]] = asyncio.gather(*ready_tasks)
+        failure_wait = asyncio.create_task(self.wait_failed())
+        try:
+            done, _ = await asyncio.wait(
+                set[asyncio.Future[Any]]((ready_group, failure_wait)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failure_wait in done:
+                ready_group.cancel()
+                await asyncio.gather(ready_group, return_exceptions=True)
+                await failure_wait
+            await ready_group
+            await asyncio.sleep(0)
+            if any(task.done() for task in self._failure_tasks):
+                await self.wait_failed()
+        finally:
+            if not failure_wait.done():
+                failure_wait.cancel()
+            await asyncio.gather(failure_wait, return_exceptions=True)
+            for task in ready_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*ready_tasks, return_exceptions=True)
+
+    async def wait_failed(self) -> None:
+        """Raise the first participant failure, including an early one."""
+        pending = list(self._failure_tasks)
+        while pending:
+            done, _ = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            pending = [task for task in pending if task not in done]
+            for task in self._failure_tasks:
+                if task not in done:
+                    continue
+                if task.cancelled() and self._orderly_shutdown:
+                    continue
+                await task
+                raise AssertionError("a completed failure supervisor returned normally")
+        await asyncio.Future()
+
     async def mark_serving(self) -> None:
         """Notify every selected plugin that host admission is open."""
-        for participant in self._participants:
-            await participant.mark_serving()
+        for item in self._entered:
+            await item.participant.mark_serving()
 
     async def quiesce_and_drain(self) -> None:
-        """Ask selected plugins to quiesce before reverse-order exit."""
+        """Cancel supervision, then independently bound every reverse drain."""
+        if self._drained:
+            return
+        self._drained = True
+        await self._stop_supervision()
         errors: list[BaseException] = []
-        for participant, shutdown_grace in reversed(list(zip(self._participants, self._shutdown_graces, strict=True))):
+        for item in reversed(self._entered):
             try:
-                async with asyncio.timeout(shutdown_grace):
-                    await participant.quiesce_and_drain()
+                await _wait_for_with_timeout(
+                    item.participant.quiesce_and_drain(),
+                    item.shutdown_grace,
+                )
             except BaseException as error:
                 errors.append(error)
         if errors:
-            raise BaseExceptionGroup("application plugin drain failed", errors)
+            raise ApplicationPluginError(
+                "application plugin drain failed",
+                errors,
+            )
 
     @property
     def shutdown_grace(self) -> float:
         """Use the longest finite selected-plugin grace for HTTP draining."""
-        if not self._shutdown_graces:
+        if not self._entered:
             return 0.0
-        return max(self._shutdown_graces)
+        return max(item.shutdown_grace for item in self._entered)
 
     async def __aexit__(
         self,
@@ -597,7 +775,74 @@ class _ManagedApplicationPluginLifetime:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        await self._exit_stack.__aexit__(exc_type, exc_value, traceback)
+        errors = await self._exit_all(exc_type, exc_value, traceback)
+        if errors:
+            if exc_value is not None:
+                _retain_secondary_errors(exc_value, errors)
+                return
+            raise ApplicationPluginError(
+                "application plugin exit failed",
+                errors,
+            )
+
+    async def _stop_supervision(self) -> None:
+        self._orderly_shutdown = True
+        for task in self._failure_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*self._failure_tasks, return_exceptions=True)
+
+    async def _exit_all(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> list[BaseException]:
+        if self._exited:
+            return []
+        self._exited = True
+        await self._stop_supervision()
+        errors: list[BaseException] = []
+        for item in reversed(self._entered):
+            try:
+                await _wait_for_with_timeout(
+                    item.manager.__aexit__(
+                        exc_type,
+                        exc_value,
+                        traceback,
+                    ),
+                    item.shutdown_grace,
+                )
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
+
+def _retain_secondary_errors(
+    primary: BaseException,
+    errors: Sequence[BaseException],
+) -> None:
+    """Attach cleanup diagnostics without replacing the primary failure."""
+    retained = tuple(getattr(primary, "application_plugin_secondary_errors", ()))
+    try:
+        setattr(
+            primary,
+            "application_plugin_secondary_errors",
+            retained + tuple(errors),
+        )
+    except (AttributeError, TypeError):
+        pass
+
+
+async def _wait_for_with_timeout(
+    awaitable: Awaitable[Any],
+    timeout: float,
+) -> None:
+    """Normalize Python 3.10's asyncio timeout to built-in TimeoutError."""
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError("application plugin lifecycle operation timed out") from exc
 
 
 def _validate_shutdown_grace(value: float) -> float:
