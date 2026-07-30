@@ -352,7 +352,7 @@ def _build_server(
 
     config = uvicorn.Config(app, **uvicorn_kwargs)
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
-    config.h11_max_header_count = h11_max_header_count
+    config.h11_max_header_count = h11_max_header_count  # type: ignore[attr-defined]
     config.load()
     server = uvicorn.Server(config)
     app.state.server = server
