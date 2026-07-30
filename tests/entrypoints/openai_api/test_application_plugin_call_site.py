@@ -970,6 +970,49 @@ def test_builtin_health_replacement_preserves_plugin_collision_detection() -> No
         )
 
 
+def test_vllm_metrics_route_pair_preserves_plugin_collision_detection() -> None:
+    """vLLM's two-route metrics exposure is one host-owned surface."""
+    # @spec ING-VEH-010, ING-VEH-020, ING-VEH-023
+    async def metrics():
+        return "metrics"
+
+    app = FastAPI()
+    app.add_api_route("/health", api_server.vllm_health, methods=["GET"])
+    app.add_api_route("/metrics", metrics, methods=["GET"])
+    app.add_api_route("/metrics", metrics, methods=["GET"])
+    api_server._remove_route_from_app(
+        app,
+        "/health",
+        {"GET"},
+        endpoint=api_server.vllm_health,
+    )
+    app.include_router(api_server.router)
+
+    api_server._install_and_validate_application_operations_routes(app)
+
+    shadowed_app = FastAPI()
+    shadowed_app.add_api_route(
+        "/health",
+        api_server.vllm_health,
+        methods=["GET"],
+    )
+    shadowed_app.add_api_route("/metrics", metrics, methods=["GET"])
+    shadowed_app.add_api_route("/metrics", metrics, methods=["GET"])
+    shadowed_app.add_api_route("/metrics", metrics, methods=["GET"])
+    api_server._remove_route_from_app(
+        shadowed_app,
+        "/health",
+        {"GET"},
+        endpoint=api_server.vllm_health,
+    )
+    shadowed_app.include_router(api_server.router)
+
+    with pytest.raises(RuntimeError, match="operations route collision: /metrics"):
+        api_server._install_and_validate_application_operations_routes(
+            shadowed_app
+        )
+
+
 @pytest.mark.asyncio
 async def test_observer_and_orchestrator_sink_exist_before_participant_entry(
     monkeypatch,
