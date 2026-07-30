@@ -9,7 +9,6 @@ import ast
 import asyncio
 import importlib.util
 import sys
-from builtins import BaseExceptionGroup
 from contextlib import asynccontextmanager
 from dataclasses import fields
 from pathlib import Path
@@ -59,13 +58,14 @@ def _host_context(admission):
 
 
 def test_per_entry_context_preserves_host_identity_and_scopes_opaque_config() -> None:
-    """Each plugin gets only generic values and a read-only admission view."""
+    """Each plugin gets generic values and atomic admission acquisition."""
+    # @spec ING-VEH-003, ING-VEH-019
 
-    class AdmissionView:
-        def is_open(self) -> bool:
-            return False
+    class Admission:
+        def try_acquire(self):
+            return None
 
-    admission = AdmissionView()
+    admission = Admission()
     app = object()
     engine_client = object()
 
@@ -93,6 +93,8 @@ def test_per_entry_context_preserves_host_identity_and_scopes_opaque_config() ->
     }
     assert not hasattr(context, "host_internal")
     assert not hasattr(context, "host_options")
+    assert callable(context.admission.try_acquire)
+    assert not hasattr(context.admission, "is_open")
     assert not hasattr(context.admission, "open_after_http_listener_bound")
     assert not hasattr(context.admission, "close_before_owner_drain")
     assert not hasattr(context.admission, "close_from_launcher_thread")
@@ -251,23 +253,50 @@ def test_prepared_asgi_slot_restores_host_if_eager_rebuild_fails() -> None:
 
 @pytest.mark.asyncio
 async def test_closed_admission_guard_blocks_native_work_but_keeps_ops_live() -> None:
-    """The innermost guard projects 503/1013 before the host router."""
+    """The guard acquires atomically and preserves operational scopes."""
+    # @spec ING-VEH-019, ING-VEH-020, ING-VEH-024
     routed: list[tuple[str, str]] = []
     wrapped: list[str] = []
     sent: list[dict[str, object]] = []
+    acquired: list[str] = []
+    released: list[str] = []
 
     class Router:
         async def __call__(self, scope, receive, send) -> None:
             del receive, send
+            if scope["path"] not in {"/health", "/live", "/metrics"}:
+                assert acquired == [scope["path"]]
+                assert released == []
             routed.append((scope["type"], scope["path"]))
 
-    admission = application_plugins.create_application_admission()
+    class Lease:
+        def __init__(self, path: str) -> None:
+            self._path = path
+
+        def release(self) -> None:
+            released.append(self._path)
+
+    class Admission:
+        def __init__(self) -> None:
+            self.open = False
+            self.path = ""
+
+        def try_acquire(self):
+            if not self.open:
+                return None
+            acquired.append(self.path)
+            return Lease(self.path)
+
+    admission = Admission()
     app = SimpleNamespace(
         router=Router(),
         middleware_stack=None,
-        state=SimpleNamespace(application_admission=admission),
+        state=SimpleNamespace(),
     )
-    slot = application_plugins.prepare_application_plugin_asgi_wrappers(app)
+    slot = application_plugins.prepare_application_plugin_asgi_wrappers(
+        app,
+        admission=admission,
+    )
 
     def wrapper(inner):
         async def installed(scope, receive, send) -> None:
@@ -285,46 +314,247 @@ async def test_closed_admission_guard_blocks_native_work_but_keeps_ops_live() ->
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
 
-    for path in ("/health", "/metrics"):
+    for path in ("/health", "/live", "/metrics"):
         await app.router(
             {"type": "http", "method": "GET", "path": path},
             receive,
             send,
         )
-    assert routed == [("http", "/health"), ("http", "/metrics")]
+    assert routed == [
+        ("http", "/health"),
+        ("http", "/live"),
+        ("http", "/metrics"),
+    ]
 
     await app.router(
         {"type": "http", "method": "GET", "path": "/v1/models"},
         receive,
         send,
     )
-    assert routed == [("http", "/health"), ("http", "/metrics")]
+    assert routed == [
+        ("http", "/health"),
+        ("http", "/live"),
+        ("http", "/metrics"),
+    ]
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 503
 
     sent.clear()
     await app.router(
-        {"type": "websocket", "path": "/v1/realtime"},
+        {
+            "type": "websocket",
+            "path": "/v1/realtime",
+            "extensions": {"websocket.http.response": {}},
+        },
         receive,
         send,
     )
-    assert routed == [("http", "/health"), ("http", "/metrics")]
-    assert sent == [{"type": "websocket.close", "code": 1013}]
+    assert routed == [
+        ("http", "/health"),
+        ("http", "/live"),
+        ("http", "/metrics"),
+    ]
+    assert sent[0]["type"] == "websocket.http.response.start"
+    assert sent[0]["status"] == 503
+    assert sent[-1]["type"] == "websocket.http.response.body"
 
-    await admission.open_after_http_listener_bound()
+    admission.open = True
+    admission.path = "/v1/models"
+    acquired.clear()
+    released.clear()
     await app.router(
         {"type": "http", "method": "GET", "path": "/v1/models"},
         receive,
         send,
     )
     assert routed[-1] == ("http", "/v1/models")
+    assert acquired == ["/v1/models"]
+    assert released == ["/v1/models"]
     assert wrapped == [
         "/health",
+        "/live",
         "/metrics",
         "/v1/models",
         "/v1/realtime",
         "/v1/models",
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_guard_releases_lease_when_the_inner_scope_fails() -> None:
+    """A handler exception cannot leak an admitted owner."""
+    # @spec ING-VEH-019
+    released = 0
+
+    class Lease:
+        def release(self) -> None:
+            nonlocal released
+            released += 1
+
+    class Admission:
+        def try_acquire(self):
+            return Lease()
+
+    class BrokenRouter:
+        async def __call__(self, scope, receive, send) -> None:
+            del scope, receive, send
+            raise RuntimeError("handler failed")
+
+    app = SimpleNamespace(
+        router=BrokenRouter(),
+        middleware_stack=None,
+        state=SimpleNamespace(),
+    )
+    slot = application_plugins.prepare_application_plugin_asgi_wrappers(
+        app,
+        admission=Admission(),
+    )
+    slot.seal()
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+        await app.router(
+            {"type": "http", "method": "POST", "path": "/v1/work"},
+            None,
+            None,
+        )
+
+    assert released == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_wrapper_claims_or_delegates_without_double_acquisition() -> None:
+    """Claimed and passthrough scopes each acquire exactly once."""
+    # @spec ING-VEH-019, ING-VEH-021, ING-VEH-024
+    acquired: list[str] = []
+    released: list[str] = []
+    routed: list[str] = []
+
+    class Lease:
+        def __init__(self, path: str) -> None:
+            self._path = path
+
+        def release(self) -> None:
+            released.append(self._path)
+
+    class Admission:
+        def __init__(self) -> None:
+            self.path = ""
+
+        def try_acquire(self):
+            acquired.append(self.path)
+            return Lease(self.path)
+
+    admission = Admission()
+
+    class Router:
+        async def __call__(self, scope, receive, send) -> None:
+            del receive, send
+            routed.append(scope["path"])
+
+    app = SimpleNamespace(
+        router=Router(),
+        middleware_stack=None,
+        state=SimpleNamespace(),
+    )
+    slot = application_plugins.prepare_application_plugin_asgi_wrappers(
+        app,
+        admission=admission,
+    )
+
+    def wrapper(inner):
+        async def dispatch(scope, receive, send) -> None:
+            admission.path = scope["path"]
+            if scope["path"] == "/claimed":
+                lease = admission.try_acquire()
+                assert lease is not None
+                try:
+                    return
+                finally:
+                    lease.release()
+            await inner(scope, receive, send)
+
+        return dispatch
+
+    slot.install(wrapper)
+    slot.seal()
+
+    admission.path = "/claimed"
+    await app.router(
+        {"type": "http", "path": "/claimed"},
+        None,
+        None,
+    )
+    admission.path = "/passthrough"
+    await app.router(
+        {"type": "http", "path": "/passthrough"},
+        None,
+        None,
+    )
+    admission.path = "/health"
+    await app.router(
+        {"type": "http", "path": "/health"},
+        None,
+        None,
+    )
+
+    assert acquired == ["/claimed", "/passthrough"]
+    assert released == ["/claimed", "/passthrough"]
+    assert routed == ["/passthrough", "/health"]
+
+
+@pytest.mark.asyncio
+async def test_close_preserves_admitted_scope_but_rejects_the_next_scope() -> None:
+    """Closure blocks new owners without cancelling an admitted lease."""
+    # @spec ING-VEH-016, ING-VEH-019
+    entered = asyncio.Event()
+    release_handler = asyncio.Event()
+    completed = False
+    sent: list[dict[str, object]] = []
+
+    class Router:
+        async def __call__(self, scope, receive, send) -> None:
+            del scope, receive, send
+            nonlocal completed
+            entered.set()
+            await release_handler.wait()
+            completed = True
+
+    admission = application_plugins.create_application_admission()
+    await admission.open_after_http_listener_bound()
+    app = SimpleNamespace(
+        router=Router(),
+        middleware_stack=None,
+        state=SimpleNamespace(),
+    )
+    slot = application_plugins.prepare_application_plugin_asgi_wrappers(
+        app,
+        admission=admission.view,
+    )
+    slot.seal()
+
+    admitted = asyncio.create_task(
+        app.router(
+            {"type": "http", "method": "POST", "path": "/v1/work"},
+            None,
+            None,
+        )
+    )
+    await entered.wait()
+    admission.close_from_launcher_thread()
+    release_handler.set()
+    await admitted
+    assert completed
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    await app.router(
+        {"type": "http", "method": "POST", "path": "/v1/later"},
+        None,
+        send,
+    )
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 503
 
 
 def test_selection_requires_explicit_unique_names_and_keyed_config() -> None:
@@ -348,6 +578,7 @@ def test_selection_requires_explicit_unique_names_and_keyed_config() -> None:
 
 def test_cli_arguments_preserve_repeatable_selection_and_keyed_config() -> None:
     """plugin selection/config is explicit at the CLI boundary."""
+    # @spec ING-VEH-003, ING-VEH-018
     parser = argparse.ArgumentParser()
 
     application_plugins.add_application_plugin_args(parser)
@@ -364,11 +595,21 @@ def test_cli_arguments_preserve_repeatable_selection_and_keyed_config() -> None:
             "second=",
             "--ws-max-size",
             "2097152",
+            "--application-plugin-startup-timeout",
+            "12.5",
         ]
     )
     assert args.application_plugin == ["first", "second"]
     assert args.application_plugin_config == ["first=first.toml", "second="]
     assert args.ws_max_size == 2097152
+    assert args.application_plugin_startup_timeout == 12.5
+
+    defaults = parser.parse_args([])
+    assert defaults.application_plugin_startup_timeout == 60.0
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--application-plugin-startup-timeout", "0"],
+        )
 
 
 def test_installation_does_not_activate_an_unselected_entry_point(monkeypatch) -> None:
@@ -478,19 +719,46 @@ def test_omni_cli_keeps_plugin_mode_single_process_and_self_describing() -> None
 
 @pytest.mark.asyncio
 async def test_host_opens_admission_once_after_composed_listener_readiness() -> None:
-    """a host-owned CLOSED->OPEN transition linearizes readiness."""
+    """Only an atomic lease can authorize work after the host transition."""
+    # @spec ING-VEH-016, ING-VEH-019
     admission = application_plugins.create_application_admission()
 
     assert admission.state is ApplicationAdmissionState.CLOSED
-    assert not admission.is_open()
+    assert admission.view.try_acquire() is None
+    assert not hasattr(admission.view, "is_open")
     await admission.open_after_http_listener_bound()
     assert admission.state is ApplicationAdmissionState.OPEN
-    assert admission.is_open()
+    lease = admission.view.try_acquire()
+    assert lease is not None
+    lease.release()
+    lease.release()
+    await admission.close_before_owner_drain()
+    assert admission.view.try_acquire() is None
+
+
+def test_admission_close_linearizes_before_all_later_acquisitions() -> None:
+    """A completed close makes every later owner registration fail."""
+    # @spec ING-VEH-016, ING-VEH-019
+    admission = application_plugins.create_application_admission()
+    asyncio.run(admission.open_after_http_listener_bound())
+
+    admitted_before_close = admission.view.try_acquire()
+    assert admitted_before_close is not None
+    admission.close_from_launcher_thread()
+
+    later = [admission.view.try_acquire() for _ in range(64)]
+    assert later == [None] * 64
+    admitted_before_close.release()
+    admitted_before_close.release()
+
+    with pytest.raises(RuntimeError, match="reopen"):
+        asyncio.run(admission.open_after_http_listener_bound())
 
 
 @pytest.mark.asyncio
 async def test_lifetime_scopes_config_signals_serving_then_drains_before_reverse_unwind() -> None:
     """host owns per-entry context and lifecycle signals."""
+    # @spec ING-VEH-018, ING-VEH-022
     events: list[str] = []
     admission = FakeAdmission(events)
     host_context, _, _, _ = _host_context(admission)
@@ -512,15 +780,18 @@ async def test_lifetime_scopes_config_signals_serving_then_drains_before_reverse
         SelectedApplicationPlugin("second", second, None),
     ]
     async with application_plugins.application_plugin_lifetime(plugins, host_context) as lifetime:
-        await host_context.admission.open_after_http_listener_bound()
+        await lifetime.wait_ready()
+        events.append("admission:open")
         await lifetime.mark_serving()
         events.append("serving")
-        await host_context.admission.close_before_owner_drain()
+        events.append("admission:closed")
         await lifetime.quiesce_and_drain()
 
     assert events == [
         "enter:first",
         "enter:second",
+        "ready:first",
+        "ready:second",
         "admission:open",
         "serving:first",
         "serving:second",
@@ -531,6 +802,112 @@ async def test_lifetime_scopes_config_signals_serving_then_drains_before_reverse
         "exit:second",
         "exit:first",
     ]
+
+
+@pytest.mark.asyncio
+async def test_readiness_is_concurrent_after_all_participants_enter() -> None:
+    """Readiness cannot serialize listeners that mutually await startup."""
+    # @spec ING-VEH-018
+    events: list[str] = []
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    host_context, _, _, _ = _host_context(FakeAdmission(events))
+
+    class ConcurrentReadyParticipant(FakeParticipant):
+        def __init__(
+            self,
+            events: list[str],
+            name: str,
+            mine: asyncio.Event,
+            peer: asyncio.Event,
+        ) -> None:
+            super().__init__(events, name)
+            self._mine = mine
+            self._peer = peer
+
+        async def wait_ready(self) -> None:
+            self.events.append(f"ready-start:{self.name}")
+            self._mine.set()
+            await self._peer.wait()
+            self.events.append(f"ready-done:{self.name}")
+
+    selected = [
+        SelectedApplicationPlugin(
+            "first",
+            lambda context: ConcurrentReadyParticipant(
+                events,
+                context.plugin_name,
+                first_started,
+                second_started,
+            ),
+            None,
+        ),
+        SelectedApplicationPlugin(
+            "second",
+            lambda context: ConcurrentReadyParticipant(
+                events,
+                context.plugin_name,
+                second_started,
+                first_started,
+            ),
+            None,
+        ),
+    ]
+
+    async with application_plugins.application_plugin_lifetime(
+        selected,
+        host_context,
+    ) as lifetime:
+        await asyncio.wait_for(lifetime.wait_ready(), timeout=0.25)
+
+    assert events[:2] == ["enter:first", "enter:second"]
+    assert {"ready-start:first", "ready-start:second"} <= set(events)
+    assert {"ready-done:first", "ready-done:second"} <= set(events)
+
+
+@pytest.mark.asyncio
+async def test_preawait_failure_is_latched_and_normal_return_is_failure() -> None:
+    """Failure supervision cannot miss an early task death."""
+    # @spec ING-VEH-017, ING-VEH-018
+    events: list[str] = []
+    host_context, _, _, _ = _host_context(FakeAdmission(events))
+
+    class EarlyFailure(FakeParticipant):
+        async def wait_failed(self):
+            raise RuntimeError("listener failed")
+
+    selected = [
+        SelectedApplicationPlugin(
+            "failed",
+            lambda context: EarlyFailure(events, context.plugin_name),
+            None,
+        )
+    ]
+    async with application_plugins.application_plugin_lifetime(
+        selected,
+        host_context,
+    ) as lifetime:
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="listener failed"):
+            await lifetime.wait_failed()
+
+    class UnexpectedReturn(FakeParticipant):
+        async def wait_failed(self):
+            return None
+
+    selected = [
+        SelectedApplicationPlugin(
+            "returned",
+            lambda context: UnexpectedReturn(events, context.plugin_name),
+            None,
+        )
+    ]
+    async with application_plugins.application_plugin_lifetime(
+        selected,
+        host_context,
+    ) as lifetime:
+        with pytest.raises(RuntimeError, match="returned"):
+            await lifetime.wait_failed()
 
 
 @pytest.mark.asyncio
@@ -701,9 +1078,9 @@ def test_drain_attempts_every_participant_and_grace_is_finite() -> None:
         ]
         async with application_plugins.application_plugin_lifetime(plugins, host_context) as lifetime:
             assert lifetime.shutdown_grace == 1.0
-            with pytest.raises(BaseExceptionGroup) as error:
+            with pytest.raises(BaseException) as error:
                 await lifetime.quiesce_and_drain()
-            assert len(error.value.exceptions) == 2
+            assert len(getattr(error.value, "exceptions", ())) == 2
         assert events[2:4] == ["drain:second", "drain:first"]
 
     asyncio.run(exercise())
@@ -780,55 +1157,103 @@ def test_each_participant_drain_is_timeboxed_and_all_are_attempted() -> None:
             SelectedApplicationPlugin("hanging", hanging, None),
         ]
         async with application_plugins.application_plugin_lifetime(selected, host_context) as lifetime:
-            with pytest.raises(BaseExceptionGroup) as error:
+            with pytest.raises(BaseException) as error:
                 await asyncio.wait_for(
                     lifetime.quiesce_and_drain(),
                     timeout=0.25,
                 )
-            assert any(isinstance(item, TimeoutError) for item in error.value.exceptions)
-            assert any(isinstance(item, RuntimeError) for item in error.value.exceptions)
+            errors = getattr(error.value, "exceptions", ())
+            assert any(isinstance(item, TimeoutError) for item in errors)
+            assert any(isinstance(item, RuntimeError) for item in errors)
 
         assert events[2:4] == ["drain:hanging", "drain:failing"]
 
     asyncio.run(exercise())
 
 
-def test_plugin_defers_launcher_engine_shutdown_until_context_exit() -> None:
-    """signals cannot stop the engine before owner drain."""
+def test_each_participant_exit_is_timeboxed_and_all_are_attempted() -> None:
+    """A hung context exit cannot strand an earlier participant."""
+    # @spec ING-VEH-017, ING-VEH-022
 
-    class Engine:
-        marker = object()
+    class FailingExit(FakeParticipant):
+        async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+            del exc_type, exc_value, traceback
+            self.events.append(f"exit:{self.name}")
+            raise RuntimeError(self.name)
 
-        def __init__(self) -> None:
-            self.calls: list[float | None] = []
+    class HangingExit(FakeParticipant):
+        @property
+        def shutdown_grace(self) -> float:
+            return 0.01
 
-        def shutdown(self, timeout: float | None = None) -> None:
-            self.calls.append(timeout)
+        async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+            del exc_type, exc_value, traceback
+            self.events.append(f"exit:{self.name}")
+            await asyncio.Future()
 
-    engine = Engine()
-    admission = application_plugins.create_application_admission()
-    asyncio.run(admission.open_after_http_listener_bound())
-    proxy = application_plugins.defer_engine_shutdown_until_application_drain(engine, admission)
-    proxy.shutdown(timeout=12.0)
+    async def exercise() -> None:
+        events: list[str] = []
+        host_context, _, _, _ = _host_context(FakeAdmission(events))
+        selected = [
+            SelectedApplicationPlugin(
+                "failing",
+                lambda context: FailingExit(events, context.plugin_name),
+                None,
+            ),
+            SelectedApplicationPlugin(
+                "hanging",
+                lambda context: HangingExit(events, context.plugin_name),
+                None,
+            ),
+        ]
 
-    assert proxy.marker is engine.marker
-    assert proxy.shutdown_requested
-    assert proxy.shutdown_timeout == 12.0
-    assert engine.calls == []
-    assert admission.is_open() is False
+        async def run_lifetime() -> None:
+            async with application_plugins.application_plugin_lifetime(
+                selected,
+                host_context,
+            ):
+                pass
+
+        with pytest.raises(BaseException) as error:
+            await asyncio.wait_for(run_lifetime(), timeout=0.25)
+
+        errors = getattr(error.value, "exceptions", ())
+        assert any(isinstance(item, TimeoutError) for item in errors)
+        assert any(isinstance(item, RuntimeError) for item in errors)
+        assert events[-2:] == ["exit:hanging", "exit:failing"]
+
+    asyncio.run(exercise())
+
+
+def test_supervision_module_remains_python_310_compatible() -> None:
+    """The host protocol must not import Python-3.11-only runtime APIs."""
+    # @spec ING-VEH-018
+    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
+    imported_names = {
+        (node.module if isinstance(node, ast.ImportFrom) else None, alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    attributes = {
+        (node.value.id, node.attr)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+    }
+
+    assert ("builtins", "BaseExceptionGroup") not in imported_names
+    assert ("asyncio", "timeout") not in attributes
+    assert ("typing", "Self") not in imported_names
 
 
 class FakeAdmission:
-    """Records the host lifecycle ordering."""
+    """Atomic admission capability used by lifetime-only tests."""
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    async def open_after_http_listener_bound(self) -> None:
-        self.events.append("admission:open")
-
-    async def close_before_owner_drain(self) -> None:
-        self.events.append("admission:closed")
+    def try_acquire(self):
+        return None
 
 
 class FakeEntryPoint:
@@ -868,6 +1293,12 @@ class FakeParticipant:
 
     async def mark_serving(self) -> None:
         self.events.append(f"serving:{self.name}")
+
+    async def wait_ready(self) -> None:
+        self.events.append(f"ready:{self.name}")
+
+    async def wait_failed(self):
+        await asyncio.Future()
 
     async def quiesce_and_drain(self) -> None:
         self.events.append(f"drain:{self.name}")
