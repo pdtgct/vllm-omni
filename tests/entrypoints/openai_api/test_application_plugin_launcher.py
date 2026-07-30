@@ -172,3 +172,71 @@ async def test_real_launcher_orders_programmatic_shutdown_barriers() -> None:
     assert events.index("shutdown-requested") < events.index("participant-drain")
     assert events.index("participant-drain") < events.index("participant-exit")
     assert events.index("participant-exit") < events.index("engine-shutdown")
+
+
+@pytest.mark.asyncio
+async def test_launcher_retains_engine_ownership_across_http_lifespan_exit() -> None:
+    """HTTP teardown cannot invalidate the engine reference needed afterward."""
+    # @spec ING-VEH-017
+    launcher = _load_launcher()
+    events: list[str] = []
+    bound = asyncio.Event()
+
+    class Engine:
+        errored = False
+        is_running = True
+        vllm_config = SimpleNamespace(shutdown_timeout=0.01)
+
+        def shutdown(self, timeout=None) -> None:
+            assert timeout == 0.01
+            events.append("engine-shutdown")
+
+    class Hook:
+        async def on_bound(self) -> None:
+            bound.set()
+
+        def on_shutdown_requested(self, cause=None) -> None:
+            del cause
+
+        async def before_http_shutdown(self) -> None:
+            return
+
+        async def before_engine_shutdown(self) -> None:
+            del app.state
+            events.append("http-state-released")
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+    app = FastAPI()
+    app.state.engine_client = Engine()
+    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen_socket.bind(("127.0.0.1", 0))
+    listen_socket.listen()
+    listen_socket.setblocking(False)
+    host, port = listen_socket.getsockname()
+
+    serve_task = asyncio.create_task(
+        launcher.serve_http(
+            app,
+            listen_socket,
+            lifecycle_hook=Hook(),
+            host=host,
+            port=port,
+            log_level="error",
+            lifespan="off",
+        )
+    )
+    try:
+        await asyncio.wait_for(bound.wait(), timeout=2)
+        app.state.server.should_exit = True
+        shutdown = await asyncio.wait_for(serve_task, timeout=2)
+        await shutdown
+    finally:
+        if not serve_task.done():
+            serve_task.cancel()
+            await asyncio.gather(serve_task, return_exceptions=True)
+        listen_socket.close()
+
+    assert events == ["http-state-released", "engine-shutdown"]
