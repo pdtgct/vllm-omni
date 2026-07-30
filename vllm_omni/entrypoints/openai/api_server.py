@@ -461,6 +461,16 @@ _APPLICATION_SERVER_ONLY_ARGS = (
 
 def _engine_args_without_application_options(args: Any) -> Any:
     """Copy CLI args without API-server-only application policy."""
+    # @spec ING-VEH-003
+    if isinstance(args, TrackingNamespace):
+        unfiltered_args = Namespace(**vars(args))
+        for name in _APPLICATION_SERVER_ONLY_ARGS:
+            vars(unfiltered_args).pop(name, None)
+        explicit_keys = args.explicit_keys.difference(
+            _APPLICATION_SERVER_ONLY_ARGS
+        )
+        return TrackingNamespace(unfiltered_args, frozenset(explicit_keys))
+
     engine_args = copy.copy(args)
     for name in _APPLICATION_SERVER_ONLY_ARGS:
         if hasattr(engine_args, name):
