@@ -514,9 +514,12 @@ def _install_and_validate_application_operations_routes(app: Any) -> None:
             by_path.setdefault(path, []).append(route)
     if by_path.get("/live"):
         raise RuntimeError("application plugin operations route collision: /live")
-    for path in ("/health", "/metrics"):
-        if len(by_path.get(path, ())) > 1:
-            raise RuntimeError(f"application plugin operations route collision: {path}")
+    if len(by_path.get("/health", ())) > 1:
+        raise RuntimeError("application plugin operations route collision: /health")
+    # vLLM exposes metrics through both Instrumentator and a redirect-free
+    # ASGI mount. Any third route is foreign to that host-owned pair.
+    if len(by_path.get("/metrics", ())) > 2:
+        raise RuntimeError("application plugin operations route collision: /metrics")
     app.add_api_route(
         "/live",
         _application_live,
