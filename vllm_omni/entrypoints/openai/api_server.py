@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import base64
+import copy
 import dataclasses
 import io
 import json
@@ -34,7 +35,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
-from vllm.entrypoints.launcher import serve_http, terminate_if_errored
+from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -94,14 +95,15 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.launcher import serve_http
 from vllm_omni.entrypoints.openai.application_plugins import (
     DEFAULT_WS_MAX_SIZE,
     ApplicationASGIComposition,
     ApplicationPluginHostContext,
+    ApplicationPluginLifetime,
     SelectedApplicationPlugin,
     application_plugin_lifetime,
     create_application_admission,
-    defer_engine_shutdown_until_application_drain,
     discover_application_plugins,
     prepare_application_plugin_asgi_wrappers,
     validate_application_plugin_options,
@@ -449,6 +451,127 @@ class _DiffusionServingModels:
 # Server entry points
 
 
+_APPLICATION_SERVER_ONLY_ARGS = (
+    "application_plugin",
+    "application_plugin_config",
+    "application_plugin_startup_timeout",
+    "ws_max_size",
+)
+
+
+def _engine_args_without_application_options(args: Any) -> Any:
+    """Copy CLI args without API-server-only application policy."""
+    engine_args = copy.copy(args)
+    for name in _APPLICATION_SERVER_ONLY_ARGS:
+        if hasattr(engine_args, name):
+            delattr(engine_args, name)
+    return engine_args
+
+
+async def _initialize_endpoint_plugin_state(
+    app: Any,
+    engine_client: Any,
+    args: Any,
+) -> None:
+    """Complete upstream EndpointPlugin phase B on retained instances."""
+    # @spec ING-VEH-023
+    for plugin in getattr(app.state, "endpoint_plugins", ()):
+        await plugin.init_state(engine_client, app.state, args)
+
+
+async def _application_live() -> Response:
+    """Report process liveness independently from application readiness."""
+    return Response(status_code=HTTPStatus.OK.value)
+
+
+def _install_and_validate_application_operations_routes(app: Any) -> None:
+    """Reserve host operations routes before selected participants enter."""
+    by_path: dict[str, list[Any]] = {}
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if path in {"/health", "/live", "/metrics"}:
+            by_path.setdefault(path, []).append(route)
+    if by_path.get("/live"):
+        raise RuntimeError("application plugin operations route collision: /live")
+    for path in ("/health", "/metrics"):
+        if len(by_path.get(path, ())) > 1:
+            raise RuntimeError(f"application plugin operations route collision: {path}")
+    app.add_api_route(
+        "/live",
+        _application_live,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+
+
+class _ApplicationServerLifecycleHook:
+    """Bridge host admission and participant barriers into the launcher."""
+
+    def __init__(
+        self,
+        admission: Any,
+        lifetime: ApplicationPluginLifetime,
+    ) -> None:
+        self._admission = admission
+        self._lifetime = lifetime
+        self._bound_lock = asyncio.Lock()
+        self._bound = False
+        self._ready = False
+        self._drain_task: asyncio.Task[None] | None = None
+        self._exit_task: asyncio.Task[None] | None = None
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    @property
+    def shutdown_grace(self) -> float:
+        return self._lifetime.shutdown_grace
+
+    async def on_bound(self) -> None:
+        """Linearize composed readiness once after the HTTP listener binds."""
+        # @spec ING-VEH-016, ING-VEH-018, ING-VEH-020
+        async with self._bound_lock:
+            if self._bound:
+                return
+            await self._admission.open_after_http_listener_bound()
+            try:
+                await self._lifetime.mark_serving()
+            except BaseException:
+                self._admission.close_from_launcher_thread()
+                raise
+            self._ready = True
+            self._bound = True
+
+    def on_shutdown_requested(
+        self,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Close admission synchronously before any awaited shutdown work."""
+        # @spec ING-VEH-017, ING-VEH-020
+        del cause
+        self._ready = False
+        self._admission.close_from_launcher_thread()
+
+    async def before_http_shutdown(self) -> None:
+        """Drain participants once, sharing the result across callers."""
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain())
+        await asyncio.shield(self._drain_task)
+
+    async def _drain(self) -> None:
+        await self._admission.close_before_owner_drain()
+        await self._lifetime.quiesce_and_drain()
+
+    async def before_engine_shutdown(self) -> None:
+        """Exit participant contexts once after HTTP has stopped."""
+        if self._exit_task is None:
+            self._exit_task = asyncio.create_task(self._lifetime.__aexit__(None, None, None))
+        await asyncio.shield(self._exit_task)
+
+    async def wait_failed(self) -> None:
+        await self._lifetime.wait_failed()
+
+
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server.
 
@@ -499,8 +622,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    selected_plugin_names = list(getattr(args, "application_plugin", []))
+    engine_args = _engine_args_without_application_options(args)
     async with build_async_omni(
-        args,
+        engine_args,
         client_config=client_config,
     ) as engine_client:
         supported_tasks: tuple[str, ...]
@@ -515,11 +640,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 supported_tasks = ("generate",)
 
         selected_plugin_names = list(getattr(args, "application_plugin", []))
-        application_admission = (
-            create_application_admission()
-            if selected_plugin_names
-            else None
-        )
+        application_admission = create_application_admission() if selected_plugin_names else None
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
@@ -536,15 +657,23 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         asgi_composition: ApplicationASGIComposition | None = None
         if application_admission is not None:
             try:
-                # @spec ING-VEH-003, ING-VEH-010, ING-VEH-016
-                app.state.application_admission = application_admission.view
-                asgi_composition = prepare_application_plugin_asgi_wrappers(app)
+                # @spec ING-VEH-010, ING-VEH-019, ING-VEH-020, ING-VEH-024
+                _install_and_validate_application_operations_routes(app)
+                asgi_composition = prepare_application_plugin_asgi_wrappers(
+                    app,
+                    admission=application_admission.view,
+                )
             except BaseException:
                 sock.close()
                 raise
 
         try:
             await omni_init_app_state(engine_client, app.state, args)
+            await _initialize_endpoint_plugin_state(
+                app,
+                engine_client,
+                args,
+            )
 
             # After initializing the app state, shut down any endpoints that
             # are model specific
@@ -603,41 +732,21 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     scope["state"]["request_timestamp"] = time.time()
                 await self._inner(scope, receive, send)
 
-        class _LauncherState:
-            """Expose a launcher-only engine proxy without mutating app state."""
-
-            def __init__(self, state: Any, launcher_engine: Any) -> None:
-                self._state = state
-                self._launcher_engine = launcher_engine
-
-            def __getattr__(self, name: str) -> Any:
-                if name == "engine_client":
-                    return self._launcher_engine
-                return getattr(self._state, name)
-
-            def __setattr__(self, name: str, value: Any) -> None:
-                if name in {"_state", "_launcher_engine"}:
-                    object.__setattr__(self, name, value)
-                else:
-                    setattr(self._state, name, value)
-
         plugin_context: ApplicationPluginHostContext | None = None
         selected_plugins: list[SelectedApplicationPlugin] = []
-        launcher_engine = engine_client
 
-        async def run_http_server(plugin_lifetime=None) -> None:
-            assert plugin_lifetime is None or plugin_context is not None
+        async def run_http_server(
+            lifecycle_hook: _ApplicationServerLifecycleHook | None = None,
+        ) -> None:
             launcher_app = _TimestampMiddleware(app)
-            if plugin_context is not None:
-                launcher_app.state = _LauncherState(app.state, launcher_engine)
             server_options = dict(uvicorn_kwargs)
             server_options.pop("ws_max_size", None)
             host_shutdown_grace = server_options.pop(
                 "timeout_graceful_shutdown",
                 None,
             )
-            if plugin_lifetime is not None:
-                plugin_shutdown_grace = plugin_lifetime.shutdown_grace
+            if lifecycle_hook is not None:
+                plugin_shutdown_grace = lifecycle_hook.shutdown_grace
                 if (
                     isinstance(host_shutdown_grace, (int, float))
                     and not isinstance(host_shutdown_grace, bool)
@@ -648,9 +757,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                         plugin_shutdown_grace,
                         float(host_shutdown_grace),
                     )
-                server_options["timeout_graceful_shutdown"] = (
-                    plugin_shutdown_grace
-                )
+                server_options["timeout_graceful_shutdown"] = plugin_shutdown_grace
             serve_call = serve_http(
                 launcher_app,
                 sock=sock,
@@ -670,58 +777,15 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 h11_max_incomplete_event_size=(args.h11_max_incomplete_event_size),
                 h11_max_header_count=args.h11_max_header_count,
                 ws_max_size=getattr(args, "ws_max_size", DEFAULT_WS_MAX_SIZE),
+                lifecycle_hook=lifecycle_hook,
                 **server_options,
             )
-            if plugin_lifetime is None:
+            if lifecycle_hook is None:
                 shutdown = await serve_call
                 await shutdown
                 return
-
-            assert application_admission is not None
-            serve_task = asyncio.create_task(serve_call)
-            drain_task: asyncio.Task[None] | None = None
-            shutdown_task: asyncio.Task[None] | None = None
-
-            async def quiesce_on_http_shutdown() -> None:
-                while application_admission.is_open():
-                    server = getattr(app.state, "server", None)
-                    if serve_task.done() or (server is not None and server.should_exit):
-                        await application_admission.close_before_owner_drain()
-                        break
-                    await asyncio.sleep(0.01)
-                await plugin_lifetime.quiesce_and_drain()
-
-            try:
-                await _wait_for_http_listener_bound(
-                    app,
-                    serve_task,
-                    timeout=getattr(args, "init_timeout", 600),
-                )
-                await application_admission.open_after_http_listener_bound()
-                if serve_task.done():
-                    raise RuntimeError("HTTP serving ended during readiness transition")
-                await plugin_lifetime.mark_serving()
-                drain_task = asyncio.create_task(quiesce_on_http_shutdown())
-                shutdown = await serve_task
-                await application_admission.close_before_owner_drain()
-                await asyncio.sleep(0)
-                await drain_task
-                shutdown_task = asyncio.create_task(shutdown)
-                await asyncio.shield(shutdown_task)
-            finally:
-                await application_admission.close_before_owner_drain()
-                if drain_task is None:
-                    drain_task = asyncio.create_task(plugin_lifetime.quiesce_and_drain())
-                if not serve_task.done():
-                    serve_task.cancel()
-                serve_result = await asyncio.gather(serve_task, return_exceptions=True)
-                if shutdown_task is None and serve_result:
-                    late_shutdown = serve_result[0]
-                    if late_shutdown is not None and not isinstance(late_shutdown, BaseException):
-                        shutdown_task = asyncio.create_task(late_shutdown)
-                tasks = [task for task in (shutdown_task, drain_task) if task is not None]
-                if tasks:
-                    await asyncio.gather(*tasks)
+            shutdown = await serve_call
+            await shutdown
 
         try:
             if selected_plugin_names:
@@ -741,11 +805,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                         raise ValueError(f"application plugin requires configuration: {name}")
                     selected_plugins.append(SelectedApplicationPlugin(name, entry_point, config))
 
-                # @spec ING-VEH-003, ING-VEH-014, ING-VEH-016
-                launcher_engine = defer_engine_shutdown_until_application_drain(
-                    engine_client,
-                    application_admission,
-                )
                 plugin_context = ApplicationPluginHostContext(
                     app=app,
                     engine_client=engine_client,
@@ -756,10 +815,62 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             if plugin_context is None:
                 await run_http_server()
             else:
-                async with application_plugin_lifetime(selected_plugins, plugin_context) as plugin_lifetime:
+                plugin_lifetime = application_plugin_lifetime(
+                    selected_plugins,
+                    plugin_context,
+                )
+                lifecycle_hook: _ApplicationServerLifecycleHook | None = None
+                entered = False
+                try:
+                    startup_timeout = float(
+                        getattr(
+                            args,
+                            "application_plugin_startup_timeout",
+                            60.0,
+                        )
+                    )
+                    startup_deadline = asyncio.get_running_loop().time() + startup_timeout
+                    await asyncio.wait_for(
+                        plugin_lifetime.__aenter__(),
+                        timeout=max(
+                            0.0,
+                            startup_deadline - asyncio.get_running_loop().time(),
+                        ),
+                    )
+                    entered = True
+                    lifecycle_hook = _ApplicationServerLifecycleHook(
+                        application_admission,
+                        plugin_lifetime,
+                    )
+                    app.state._application_lifecycle_ready = lifecycle_hook.is_ready
+                    await asyncio.wait_for(
+                        plugin_lifetime.wait_ready(),
+                        timeout=max(
+                            0.0,
+                            startup_deadline - asyncio.get_running_loop().time(),
+                        ),
+                    )
                     assert asgi_composition is not None
                     asgi_composition.seal()
-                    await run_http_server(plugin_lifetime)
+                    await run_http_server(lifecycle_hook)
+                except BaseException as primary:
+                    if lifecycle_hook is not None:
+                        lifecycle_hook.on_shutdown_requested(primary)
+                        try:
+                            await lifecycle_hook.before_http_shutdown()
+                        except BaseException:
+                            logger.exception("Application plugin startup rollback drain failed")
+                        try:
+                            await lifecycle_hook.before_engine_shutdown()
+                        except BaseException:
+                            logger.exception("Application plugin startup rollback exit failed")
+                    elif entered:
+                        await plugin_lifetime.__aexit__(
+                            type(primary),
+                            primary,
+                            primary.__traceback__,
+                        )
+                    raise
         except BaseException:
             if asgi_composition is not None:
                 asgi_composition.fail()
@@ -772,33 +883,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     serving_speech.shutdown()
             finally:
                 sock.close()
-
-
-async def _wait_for_http_listener_bound(
-    app: Any,
-    serve_task: asyncio.Task,
-    *,
-    timeout: float,
-) -> None:
-    """Wait for Uvicorn startup without awaiting its serving lifetime."""
-
-    async def poll() -> None:
-        while True:
-            if serve_task.done():
-                shutdown_task = await serve_task
-                if shutdown_task is not None:
-                    await shutdown_task
-                raise RuntimeError("HTTP serving ended before the listener became ready")
-            server = getattr(app.state, "server", None)
-            if server is not None and server.started:
-                if serve_task.done():
-                    continue
-                return
-            await asyncio.sleep(0.01)
-
-    # asyncio.timeout is 3.11+; wait_for carries the same cancel-and-raise
-    # semantics for this single awaited poll loop on Python 3.10.
-    await asyncio.wait_for(poll(), timeout)
 
 
 @asynccontextmanager
@@ -1967,9 +2051,7 @@ async def realtime_websocket(websocket: WebSocket):
     # generic ASGI wrapper owns it for every native scope.
     observer = streaming_install.resolve_installed_observer(websocket.app.state)
     park_token_id = getattr(serving, "park_token_id", None)
-    connection = RealtimeConnection(
-        websocket, serving, observer=observer, park_token_id=park_token_id
-    )
+    connection = RealtimeConnection(websocket, serving, observer=observer, park_token_id=park_token_id)
     await connection.handle_connection()
 
 
@@ -2016,6 +2098,16 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
+        application_ready = getattr(
+            raw_request.app.state,
+            "_application_lifecycle_ready",
+            None,
+        )
+        if callable(application_ready) and not application_ready():
+            return JSONResponse(
+                content={"status": "unready"},
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
         return JSONResponse(content={"status": "healthy"})
     except EngineDeadError:
         return JSONResponse(
