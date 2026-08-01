@@ -102,8 +102,8 @@ def _load_source_module(name: str, path: Path) -> ModuleType:
     return module
 
 
-# @spec ENV-MIG-004
 def test_repository_source_targets_python310_import_surface() -> None:
+    # @spec ENV-MIG-004
     findings: list[str] = []
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.py")):
@@ -116,7 +116,6 @@ def test_repository_source_targets_python310_import_surface() -> None:
     assert not findings, "\n" + "\n".join(findings)
 
 
-# @spec ENV-MIG-004
 @pytest.mark.parametrize(  # type: ignore[untyped-decorator]
     ("source", "expected"),
     [
@@ -131,14 +130,15 @@ def test_repository_source_targets_python310_import_surface() -> None:
 def test_python310_scan_rejects_runtime_incompatibilities(
     source: str, expected: str
 ) -> None:
+    # @spec ENV-MIG-004
     assert any(
         expected in finding
         for finding in _python311_references(source, "probe.py")
     )
 
 
-# @spec ENV-MIG-004
 def test_python310_compatibility_modules_import_with_stable_semantics() -> None:
+    # @spec ENV-MIG-004
     output_modality = _load_source_module(
         "python310_output_modality",
         ROOT / "vllm_omni" / "engine" / "output_modality.py",
