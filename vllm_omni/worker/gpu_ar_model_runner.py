@@ -24,6 +24,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -46,6 +47,13 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.persistent_state import (
+    allocate_runner_persistent_state,
+    build_persistent_state_batch,
+    discover_persistent_state_specs,
+    partition_persistent_state_config,
+    reshape_runner_persistent_state,
+)
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
@@ -328,6 +336,88 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Add purpose-named persistent state to ordinary core discovery."""
+
+        from vllm_omni.model_executor.persistent_state import (
+            PersistentStateLayerBase,
+            PersistentStateSpec,
+        )
+
+        specs = super().get_kv_cache_spec()
+        persistent_specs = discover_persistent_state_specs(self.vllm_config)
+        if any(not isinstance(spec, PersistentStateSpec) for spec in persistent_specs.values()):
+            raise TypeError("persistent-state discovery returned an unsupported spec")
+        if set(specs) & set(persistent_specs):
+            raise RuntimeError("persistent-state layer collides with core cache discovery")
+        # Keep the purpose-named layer type visible at this pin-guarded seam.
+        assert PersistentStateLayerBase is not None
+        specs.update(persistent_specs)
+        return specs
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+    ) -> None:
+        """Partition custom state before core attention/Mamba initialization."""
+
+        from vllm_omni.model_executor.persistent_state import PersistentStateSpec
+
+        persistent_groups = [
+            group for group in kv_cache_config.kv_cache_groups if isinstance(group.kv_cache_spec, PersistentStateSpec)
+        ]
+        partition = partition_persistent_state_config(kv_cache_config)
+        if len(persistent_groups) > 1:
+            raise ValueError("persistent-state profile permits exactly one state group")
+        self._omni_full_kv_cache_config = kv_cache_config
+        super().initialize_kv_cache(
+            partition.ordinary_config,
+            is_profiling=is_profiling,
+        )
+        self._persistent_state_storage = allocate_runner_persistent_state(
+            self,
+            partition,
+        )
+
+    def _reshape_kv_cache_tensors(
+        self,
+        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> dict[str, torch.Tensor]:
+        """Handle persistent state and delegate ordinary cache groups to core."""
+
+        from vllm_omni.model_executor.persistent_state import PersistentStateSpec
+
+        full_config = getattr(
+            self,
+            "_omni_full_kv_cache_config",
+            self.kv_cache_config,
+        )
+        partition = partition_persistent_state_config(full_config)
+        state_layer_names = set(partition.state_group.layer_names) if partition.state_group is not None else set()
+        ordinary_raw = {name: tensor for name, tensor in kv_cache_raw_tensors.items() if name not in state_layer_names}
+        original_config = self.kv_cache_config
+        self.kv_cache_config = partition.ordinary_config
+        try:
+            reshaped = super()._reshape_kv_cache_tensors(
+                ordinary_raw,
+                kernel_block_sizes,
+            )
+        finally:
+            self.kv_cache_config = original_config
+        if partition.state_group is not None:
+            spec = partition.state_group.kv_cache_spec
+            assert isinstance(spec, PersistentStateSpec)
+            raw = kv_cache_raw_tensors[partition.state_group.layer_names[0]]
+            self._persistent_state_storage = reshape_runner_persistent_state(spec, raw)
+        return reshaped
+
+    def _build_persistent_state_batch(self, rows: Any) -> Any:
+        """Use the runner-neutral state projection without owning its lease."""
+
+        return build_persistent_state_batch(rows)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
