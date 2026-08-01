@@ -1020,6 +1020,7 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
     assert pool.get_bound_replica_id("req-0") is None
 
 
+# @spec PORT-INT-012
 @pytest.mark.asyncio
 async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
@@ -1041,6 +1042,7 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         target_logger.setLevel(prev_level)
 
     assert not stage0.abort_calls
+    assert pool.output_processor.abort_calls == [["missing-req"]]
     assert "abort: no live binding for req=missing-req in stage-0" in caplog.text
 
 

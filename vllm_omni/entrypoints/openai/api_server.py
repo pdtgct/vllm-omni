@@ -515,7 +515,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
-
         # Start background processes
         await STORAGE_MANAGER.start()
 

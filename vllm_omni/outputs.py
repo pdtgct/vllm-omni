@@ -26,6 +26,10 @@ class OmniConnectorOutput:
         stage_recv_req_ids: Request IDs that received batch stage inputs.
         has_pending_kv_work: True if the mixin has pending, active, or
             completed KV transfers that the scheduler should account for.
+        model_status: Transaction status bits keyed by request ID, consumed
+            at the normal scheduler boundary.
+        model_failed_req_ids: Status-bearing requests the model classified
+            terminal after request/generation validation.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -34,6 +38,8 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    model_status: dict[str, int] = field(default_factory=dict)
+    model_failed_req_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
