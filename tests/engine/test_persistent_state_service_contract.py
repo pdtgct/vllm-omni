@@ -392,6 +392,10 @@ def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
         "persistent_state_tombstone_ttl_s": 600.0,
         "persistent_state_max_tombstones": 32,
         "persistent_state_pending_claim_timeout_s": 15.0,
+        "session_configuration_timeout_s": 10.0,
+        "session_finalization_timeout_s": 40.0,
+        "accepted_audio_capacity_samples": 480_000,
+        "max_retained_transcript_bytes": 1 << 20,
     }
     resolved = PersistentStateRuntimeConfig.from_vllm_config(
         SimpleNamespace(additional_config=values)
@@ -400,6 +404,9 @@ def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
     assert resolved.tombstone_ttl_s == 600.0
     assert resolved.max_tombstones == 32
     assert resolved.cleanup_queue_capacity == 8
+    assert resolved.session_idle_timeout_s == 60.0
+    assert resolved.accepted_audio_budget_s == 30.0
+    assert resolved.safe_finalization_timeout_s == pytest.approx(32.24)
 
     for key in values:
         incomplete = dict(values)
@@ -408,6 +415,13 @@ def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
             PersistentStateRuntimeConfig.from_vllm_config(
                 SimpleNamespace(additional_config=incomplete)
             )
+
+    too_short = dict(values)
+    too_short["session_finalization_timeout_s"] = 32.0
+    with pytest.raises(ValueError, match="safe drain bound"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=too_short)
+        )
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -473,6 +487,10 @@ def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
         "persistent_state_tombstone_ttl_s": 10.0,
         "persistent_state_max_tombstones": 2,
         "persistent_state_pending_claim_timeout_s": 15.0,
+        "session_configuration_timeout_s": 10.0,
+        "session_finalization_timeout_s": 40.0,
+        "accepted_audio_capacity_samples": 480_000,
+        "max_retained_transcript_bytes": 1 << 20,
     }
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)
@@ -534,6 +552,10 @@ def _state_core_for_cleanup_tests() -> tuple[Any, Any, Any]:
         "persistent_state_tombstone_ttl_s": 10.0,
         "persistent_state_max_tombstones": 4,
         "persistent_state_pending_claim_timeout_s": 15.0,
+        "session_configuration_timeout_s": 10.0,
+        "session_finalization_timeout_s": 40.0,
+        "accepted_audio_capacity_samples": 480_000,
+        "max_retained_transcript_bytes": 1 << 20,
     }
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)

@@ -179,6 +179,14 @@ class FakeAsyncOmni:
         self._state_generation = 0
         self.state_releases: list[dict[str, Any]] = []
         self.pending_claim_timeout_s = 3600.0
+        self.runtime_config = SimpleNamespace(
+            accepted_audio_budget_s=30.0,
+            accepted_audio_capacity_samples=480_000,
+            max_retained_transcript_bytes=1 << 20,
+            max_session_samples=None,
+            session_idle_timeout_s=3600.0,
+            session_finalization_timeout_s=3600.0,
+        )
 
     @property
     def inventory(self) -> dict[str, str]:

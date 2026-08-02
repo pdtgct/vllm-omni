@@ -36,18 +36,15 @@ _NEMOTRON_STREAMING_ARCHITECTURES = frozenset({"Nemotron3_5AsrForRNNT"})
 
 
 class NemotronServingRealtime(OpenAIServingRealtime):
-    """Threads the installed PORT-OBS-003 observer and the PORT-SESS-001
-    accepted-audio budget into the natively (ledgerless) constructed
-    session.
+    """Thread the installed observer and runtime envelope into native serving.
 
     Phase-6 round 2, Q2 (lead-decided): no vLLM-core change and no
     contextvar side channel. This fork-owned subclass overrides
-    ``transcribe_realtime`` with the SAME body as upstream
-    ``OpenAIServingRealtime.transcribe_realtime`` — pinned vLLM v0.24.0
-    @ ee0da84ab,
-    ``vllm/entrypoints/speech_to_text/realtime/serving.py`` lines 55-89
-    — except it passes ``observer``/``accepted_audio_budget_s`` through
-    to ``buffer_realtime_audio``'s widened optional keyword-only params.
+    ``transcribe_realtime`` with the same body as upstream
+    ``OpenAIServingRealtime.transcribe_realtime`` at vLLM v0.25.0
+    (``702f4814fe54fabff350d43cb753ae3e47c0c276``), except it passes the
+    observer, accepted-audio capacity, and correlation identity through
+    ``buffer_realtime_audio``'s widened optional keyword-only parameters.
     The fork owns both this subclass and the model classmethod's
     widened signature, so no vLLM core file changes.
 
@@ -63,15 +60,27 @@ class NemotronServingRealtime(OpenAIServingRealtime):
         *args: Any,
         observer: Any = None,
         accepted_audio_budget_s: float | None = None,
+        accepted_audio_capacity_samples: int | None = None,
+        max_retained_transcript_bytes: int | None = None,
+        max_session_duration_s: float | None = None,
+        session_configuration_timeout_s: float | None = None,
+        session_idle_timeout_s: float | None = None,
+        session_finalization_timeout_s: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        # PORT-OBS-003/PORT-SESS-001: resolved once at construction
+        # PORT-OBS-003/PORT-SESS-001/PORT-SESS-005: resolved once at construction
         # (after install — see api_server.py's construction site) and
         # threaded through on every call; absent (``None``) reproduces
         # today's inert behavior exactly.
         self._observer = observer
         self._accepted_audio_budget_s = accepted_audio_budget_s
+        self.accepted_audio_capacity_samples = accepted_audio_capacity_samples
+        self.max_retained_transcript_bytes = max_retained_transcript_bytes
+        self.max_session_duration_s = max_session_duration_s
+        self.session_configuration_timeout_s = session_configuration_timeout_s
+        self.session_idle_timeout_s = session_idle_timeout_s
+        self.session_finalization_timeout_s = session_finalization_timeout_s
 
     @functools.cached_property
     def _model_declares_widened_buffer_kwargs(self) -> bool:

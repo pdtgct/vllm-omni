@@ -129,6 +129,7 @@ class PersistentStateService:
         tombstone_ttl_s: float = 3600.0,
         max_tombstones: int = 4096,
         pending_claim_timeout_s: float = 30.0,
+        runtime_config: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
@@ -157,6 +158,7 @@ class PersistentStateService:
         self._tombstone_ttl_s = tombstone_ttl_s
         self._max_tombstones = max_tombstones
         self._pending_claim_timeout_s = pending_claim_timeout_s
+        self._runtime_config = runtime_config
         self._monotonic = monotonic
         self._operations: dict[str, asyncio.Future[Any]] = {}
         self._operation_expires_at: dict[str, float] = {}
@@ -192,6 +194,12 @@ class PersistentStateService:
         """Return the fingerprinted reserved-before-claim recovery bound."""
 
         return self._pending_claim_timeout_s
+
+    @property
+    def runtime_config(self) -> Any | None:
+        """Return the resolved process envelope used by serving adapters."""
+
+        return self._runtime_config
 
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""

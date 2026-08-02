@@ -230,6 +230,14 @@ class FakeAsyncOmni:
         self.pending_cleanup_calls: list[Any] = []
         self.pending_cleanup_wins = True
         self.pending_claim_timeout_s = 3600.0
+        self.runtime_config = SimpleNamespace(
+            accepted_audio_budget_s=30.0,
+            accepted_audio_capacity_samples=480_000,
+            max_retained_transcript_bytes=1 << 20,
+            max_session_samples=None,
+            session_idle_timeout_s=3600.0,
+            session_finalization_timeout_s=3600.0,
+        )
 
     @property
     def inventory(self) -> dict[str, str]:
@@ -504,6 +512,82 @@ def test_factory_pending_claim_timeout_releases_through_lease_owner() -> None:
         assert engine.state_releases[0]["reason"] == "pending_claim_timeout"
         await lease.release()
         assert len(engine.state_releases) == 1
+
+    _run(scenario())
+
+
+# @spec PORT-SESS-005, PORT-STATE-014
+def test_factory_idle_timeout_aborts_and_releases_once() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        engine.runtime_config.session_idle_timeout_s = 0.01
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
+        await asyncio.sleep(0.03)
+
+        assert len(engine.state_releases) == 1
+        assert engine.state_releases[0]["reason"] == "idle_timeout"
+        with pytest.raises(TimeoutError, match="idle_timeout"):
+            await lease.feed(_audio(_CHUNK))
+        assert engine.request_ids == []
+        await lease.release()
+        assert len(engine.state_releases) == 1
+
+    _run(scenario())
+
+
+# @spec PORT-SESS-005
+def test_rearming_idle_timeout_fences_the_superseded_timer() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+        stale_generation = lease._session_lifecycle_generation
+
+        lease._arm_session_lifecycle_timeout("idle")
+        await lease._expire_session_lifecycle(
+            "idle",
+            0.0,
+            stale_generation,
+        )
+
+        assert lease._session_lifecycle_expired is False
+        assert engine.state_releases == []
+        await lease.release()
+
+    _run(scenario())
+
+
+# @spec PORT-INT-005
+def test_factory_rejects_state_service_without_runtime_envelope() -> None:
+    engine = FakeAsyncOmni()
+    engine.runtime_config = None
+
+    with pytest.raises(ValueError, match="resolved streaming runtime envelope"):
+        NemotronSessionFactory(engine=engine)
+
+
+# @spec PORT-SESS-005, PORT-STATE-014
+def test_factory_finalization_timeout_aborts_without_terminal_result() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni(script=lambda _item, _index: [])
+        engine.runtime_config.session_finalization_timeout_s = 0.01
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
+        async def render(prompt: Any) -> Any:
+            return SimpleNamespace(prompt=prompt)
+
+        lease._render = render
+
+        with pytest.raises(TimeoutError, match="finalization_timeout"):
+            await lease.flush()
+
+        assert engine.aborted == [lease.request_id]
+        assert len(engine.state_releases) == 1
+        assert engine.state_releases[0]["reason"] == "finalization_timeout"
+        assert lease._terminal_result is None
 
     _run(scenario())
 

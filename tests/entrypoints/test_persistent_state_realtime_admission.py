@@ -28,15 +28,23 @@ def _persistent_state_runtime_values() -> dict[str, int | float]:
         "persistent_state_tombstone_ttl_s": 600.0,
         "persistent_state_max_tombstones": 16,
         "persistent_state_pending_claim_timeout_s": 15.0,
+        "session_configuration_timeout_s": 10.0,
+        "session_finalization_timeout_s": 40.0,
+        "accepted_audio_capacity_samples": 480_000,
+        "max_retained_transcript_bytes": 1 << 20,
     }
 
 
 class _WebSocket:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.closed: list[int] = []
 
     async def send_text(self, value: str) -> None:
         self.sent.append(json.loads(value))
+
+    async def close(self, *, code: int) -> None:
+        self.closed.append(code)
 
 
 class _Service:
@@ -47,6 +55,14 @@ class _Service:
         self.pending_cleanup_wins = True
         self.pending_claim_timeout_s = 30.0
         self.lease = object()
+        self.runtime_config = SimpleNamespace(
+            accepted_audio_budget_s=30.0,
+            accepted_audio_capacity_samples=480_000,
+            max_retained_transcript_bytes=1 << 20,
+            max_session_samples=None,
+            session_idle_timeout_s=60.0,
+            session_finalization_timeout_s=40.0,
+        )
 
     async def reserve(self, **kwargs: Any) -> object:
         self.reserve_calls.append(kwargs)
@@ -72,6 +88,12 @@ class _Engine:
 class _Serving:
     def __init__(self, engine: _Engine) -> None:
         self.engine_client = engine
+        self.session_configuration_timeout_s = 30.0
+        self.session_idle_timeout_s = 3600.0
+        self.session_finalization_timeout_s = 3600.0
+        self.accepted_audio_capacity_samples = 480_000
+        self.max_retained_transcript_bytes = 1 << 20
+        self.max_session_duration_s = None
 
     def _is_model_supported(self, model: str | None) -> bool:
         return model == "nemotron-asr"
@@ -169,6 +191,99 @@ async def test_pending_claim_timeout_never_releases_a_claimed_generation() -> No
     assert service.release_calls == []
     await connection.cleanup()
     assert len(service.release_calls) == 1
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_idle_timeout_aborts_and_releases_through_the_same_owner() -> None:
+    # @spec PORT-SESS-005 / PORT-STATE-014
+    connection, websocket, service = _connection()
+    connection._session_idle_timeout_s = 0.01
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+    await asyncio.sleep(0.03)
+
+    assert websocket.sent[-1]["code"] == "idle_timeout"
+    assert websocket.closed == [1008]
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "idle_timeout"
+    await connection.cleanup()
+    assert len(service.release_calls) == 1
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_rearming_idle_timeout_fences_the_superseded_timer() -> None:
+    # @spec PORT-SESS-005
+    connection, _websocket, service = _connection()
+    connection._session_idle_timeout_s = 3600.0
+    connection._arm_session_lifecycle_timeout("idle")
+    stale_generation = connection._session_lifecycle_generation
+
+    connection._arm_session_lifecycle_timeout("idle")
+    await connection._expire_session_lifecycle(
+        "idle",
+        0.0,
+        stale_generation,
+    )
+
+    assert connection._session_lifecycle_expired is False
+    assert service.release_calls == []
+    await connection.cleanup()
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_configuration_timeout_releases_a_late_reserve_result() -> None:
+    # @spec PORT-SESS-012 / PORT-STATE-014
+    connection, websocket, service = _connection()
+    connection.session_configuration_timeout = 0.01
+    allow_reserve = asyncio.Event()
+
+    async def delayed_reserve(**kwargs: Any) -> object:
+        service.reserve_calls.append(kwargs)
+        await allow_reserve.wait()
+        return service.lease
+
+    service.reserve = delayed_reserve  # type: ignore[method-assign]
+    connection._configuration_timeout_task = asyncio.create_task(
+        connection._configuration_timeout()
+    )
+    configure = asyncio.create_task(
+        connection.handle_event(
+            {"type": "session.update", "model": "nemotron-asr"}
+        )
+    )
+    await asyncio.sleep(0.02)
+    allow_reserve.set()
+    await configure
+
+    assert websocket.sent[-1]["code"] == "model_not_validated"
+    assert websocket.closed == [1008]
+    assert connection._is_model_validated is False
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "configuration_timeout"
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_finalization_timeout_emits_no_success_and_releases_once() -> None:
+    # @spec PORT-SESS-005 / PORT-OBS-006
+    connection, websocket, service = _connection()
+    connection._session_finalization_timeout_s = 0.01
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    connection._nemotron_session = SimpleNamespace(session_key="session-a")
+
+    async def running_generation() -> None:
+        await asyncio.sleep(60.0)
+
+    connection.generation_task = asyncio.create_task(running_generation())
+    connection._arm_session_lifecycle_timeout("finalization")
+    await asyncio.sleep(0.03)
+
+    assert websocket.sent[-1]["code"] == "finalization_timeout"
+    assert all(event["type"] != "transcription.done" for event in websocket.sent)
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "finalization_timeout"
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]

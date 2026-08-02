@@ -744,6 +744,7 @@ async def _install_persistent_state_service(
         tombstone_ttl_s=runtime.tombstone_ttl_s,
         max_tombstones=runtime.max_tombstones,
         pending_claim_timeout_s=runtime.pending_claim_timeout_s,
+        runtime_config=runtime,
     )
     try:
         await service.check_health()
@@ -798,11 +799,45 @@ def _install_streaming_observer_and_build_realtime_serving(
         persistent_state_service.install_metrics(
             installed_streaming_observer.metrics
         )
+    runtime = (
+        getattr(persistent_state_service, "runtime_config", None)
+        if persistent_state_service is not None
+        else None
+    )
     state.openai_serving_realtime = NemotronServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
         request_logger=request_logger,
         observer=installed_streaming_observer,
+        accepted_audio_budget_s=(
+            runtime.accepted_audio_budget_s if runtime is not None else None
+        ),
+        accepted_audio_capacity_samples=(
+            runtime.accepted_audio_capacity_samples
+            if runtime is not None
+            else None
+        ),
+        max_retained_transcript_bytes=(
+            runtime.max_retained_transcript_bytes
+            if runtime is not None
+            else None
+        ),
+        max_session_duration_s=(
+            runtime.max_session_duration_s if runtime is not None else None
+        ),
+        session_configuration_timeout_s=(
+            runtime.session_configuration_timeout_s
+            if runtime is not None
+            else None
+        ),
+        session_idle_timeout_s=(
+            runtime.session_idle_timeout_s if runtime is not None else None
+        ),
+        session_finalization_timeout_s=(
+            runtime.session_finalization_timeout_s
+            if runtime is not None
+            else None
+        ),
     )
     logger.info(
         "Streaming metrics observer installed (model_name=%s, log_stats=%s)",

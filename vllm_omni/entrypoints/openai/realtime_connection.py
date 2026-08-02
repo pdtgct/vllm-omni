@@ -62,18 +62,70 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_release_done = False
         self._state_cleanup_lock = asyncio.Lock()
         self._pending_claim_task: asyncio.Task[None] | None = None
+        self._session_lifecycle_task: asyncio.Task[None] | None = None
+        self._retired_lifecycle_tasks: set[asyncio.Task[None]] = set()
+        self._session_lifecycle_generation = 0
+        self._session_lifecycle_expired = False
+        self._configuration_timed_out = False
         self._nemotron_session: NemotronRealtimeSession | None = None
         self._native_fifo_event = asyncio.Event()
         self._native_finalized = False
         self._segment_generation = 0
         self._streaming_session_finished = False
         self._streaming_finish_reason = "aborted"
+        self._terminal_code: str | None = None
+        configured_timeout = getattr(
+            self.serving, "session_configuration_timeout_s", None
+        )
+        if self._persistent_state_service is not None and configured_timeout is None:
+            raise ValueError(
+                "persistent-state serving requires session_configuration_timeout_s"
+            )
         self.session_configuration_timeout = float(
-            getattr(self.serving, "session_configuration_timeout_s", 30.0)
+            30.0 if configured_timeout is None else configured_timeout
         )
         if self.session_configuration_timeout <= 0:
             raise ValueError("session_configuration_timeout must be positive")
         self._configuration_timeout_task: asyncio.Task[None] | None = None
+        self._session_idle_timeout_s = getattr(
+            self.serving, "session_idle_timeout_s", None
+        )
+        self._session_finalization_timeout_s = getattr(
+            self.serving, "session_finalization_timeout_s", None
+        )
+        self._accepted_audio_capacity_samples = getattr(
+            self.serving, "accepted_audio_capacity_samples", None
+        )
+        configured_transcript_bytes = getattr(
+            self.serving, "max_retained_transcript_bytes", None
+        )
+        self.max_retained_transcript_bytes = (
+            1 << 20
+            if configured_transcript_bytes is None
+            and self._persistent_state_service is None
+            else configured_transcript_bytes
+        )
+        max_session_duration_s = getattr(
+            self.serving, "max_session_duration_s", None
+        )
+        self._max_session_samples = (
+            None
+            if max_session_duration_s is None
+            else int(float(max_session_duration_s) * 16_000)
+        )
+        if self._persistent_state_service is not None:
+            required = {
+                "session_idle_timeout_s": self._session_idle_timeout_s,
+                "session_finalization_timeout_s": self._session_finalization_timeout_s,
+                "accepted_audio_capacity_samples": self._accepted_audio_capacity_samples,
+                "max_retained_transcript_bytes": self.max_retained_transcript_bytes,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "persistent-state serving runtime envelope is incomplete: "
+                    f"missing {missing}"
+                )
         # PORT-OBS-003: the connection adapter observes chunk terminal
         # disposition (`_run_generation`) and connection-layer open
         # rejections (`_check_model`) at this layer, but it does NOT own
@@ -111,6 +163,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         await asyncio.sleep(self.session_configuration_timeout)
         if self._is_model_validated:
             return
+        self._configuration_timed_out = True
         await self.send_error(
             "Model session configuration timed out.",
             "model_not_validated",
@@ -243,6 +296,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 )
                 return
             try:
+                if getattr(self, "_session_lifecycle_expired", False):
+                    raise RuntimeError("session lifecycle has expired")
                 audio_bytes = base64.b64decode(event["audio"], validate=True)
                 audio_array = (
                     np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
@@ -257,6 +312,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 logger.exception("Failed to accept realtime audio")
                 await self.send_error("Invalid audio data", "invalid_audio")
                 return
+            self._arm_session_lifecycle_timeout("idle")
             self._native_fifo_event.set()
             if self.generation_task is None or self.generation_task.done():
                 await self.start_generation()
@@ -269,8 +325,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                 )
                 return
             if bool(event.get("final", False)):
+                if getattr(self, "_session_lifecycle_expired", False):
+                    await self.send_error(
+                        "Session lifecycle has expired.",
+                        "session_expired",
+                    )
+                    return
                 session.begin_finalize()
                 self._native_finalized = True
+                self._arm_session_lifecycle_timeout("finalization")
             else:
                 session.force_segment()
             self._native_fifo_event.set()
@@ -340,6 +403,9 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_operation_id = release_operation_id
         self._state_session_key = session_key
         self._arm_pending_claim_timeout()
+        if self._configuration_timed_out:
+            await self._release_state_lease("configuration_timeout")
+            return
         try:
             model_config = getattr(self.serving, "model_config", None)
             if model_config is not None:
@@ -366,19 +432,22 @@ class RealtimeConnection(VllmRealtimeConnection):
                     lease_generation=generation,
                     observer=self._observer,
                     accepted_audio_budget_s=float(
-                        getattr(
-                            self.serving,
-                            "_accepted_audio_budget_s",
-                            None,
-                        )
-                        or 30.0
+                        self._accepted_audio_capacity_samples / 16_000
                     ),
+                    accepted_audio_capacity_samples=int(
+                        self._accepted_audio_capacity_samples
+                    ),
+                    max_retained_transcript_bytes=int(
+                        self.max_retained_transcript_bytes
+                    ),
+                    max_session_samples=self._max_session_samples,
                 )
                 self._park_token_id = self._nemotron_session.park_token_id
         except Exception:
             await self._release_state_lease("configuration_error")
             raise
         self._is_model_validated = True
+        self._arm_session_lifecycle_timeout("idle")
         if self._configuration_timeout_task is not None:
             self._configuration_timeout_task.cancel()
 
@@ -520,9 +589,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        transcript_limit = getattr(
+            self, "max_retained_transcript_bytes", None
+        )
         transcript = BoundedTranscript(
             max_retained_bytes=int(
-                getattr(self, "max_retained_transcript_bytes", 1 << 20)
+                (1 << 20) if transcript_limit is None else transcript_limit
             ),
             fragment_overhead_bytes=0,
             terminal_headroom_bytes=0,
@@ -666,6 +738,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 # terminal send: transport delivery is not part of model
                 # completion (PORT-OBS-006; review round F3).
                 model_finalized = True
+                await self._cancel_session_lifecycle_timeout()
 
             if self._is_connected:
                 usage = UsageInfo(
@@ -751,7 +824,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                         remaining,
                     )
                     reason = "error"
-                if not self._streaming_session_finished:
+                if not getattr(self, "_streaming_session_finished", False):
                     observe_safely(
                         observer.session_finished,
                         session_key=request_id,
@@ -804,12 +877,90 @@ class RealtimeConnection(VllmRealtimeConnection):
             name=f"persistent-state-claim-{self.connection_id}",
         )
 
+    async def _cancel_session_lifecycle_timeout(self) -> None:
+        task = getattr(self, "_session_lifecycle_task", None)
+        self._session_lifecycle_task = None
+        self._session_lifecycle_generation = (
+            getattr(self, "_session_lifecycle_generation", 0) + 1
+        )
+        current = asyncio.current_task()
+        retired = getattr(self, "_retired_lifecycle_tasks", set())
+        tasks = list(retired)
+        retired.clear()
+        if task is not None:
+            tasks.append(task)
+        waiters = []
+        for candidate in tasks:
+            if candidate is current:
+                continue
+            candidate.cancel()
+            waiters.append(candidate)
+        if waiters:
+            await asyncio.gather(*waiters, return_exceptions=True)
+
+    def _arm_session_lifecycle_timeout(self, kind: str) -> None:
+        if getattr(self, "_session_lifecycle_expired", False):
+            raise RuntimeError("session lifecycle has expired")
+        task = getattr(self, "_session_lifecycle_task", None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            retired = getattr(self, "_retired_lifecycle_tasks", None)
+            if retired is None:
+                retired = set()
+                self._retired_lifecycle_tasks = retired
+            retired.add(task)
+            task.add_done_callback(retired.discard)
+        timeout_s = (
+            getattr(self, "_session_idle_timeout_s", None)
+            if kind == "idle"
+            else getattr(self, "_session_finalization_timeout_s", None)
+        )
+        if timeout_s is None:
+            return
+        generation = getattr(self, "_session_lifecycle_generation", 0) + 1
+        self._session_lifecycle_generation = generation
+        self._session_lifecycle_task = asyncio.create_task(
+            self._expire_session_lifecycle(
+                kind,
+                float(timeout_s),
+                generation,
+            ),
+            name=f"realtime-{kind}-{self.connection_id}",
+        )
+
+    async def _expire_session_lifecycle(
+        self,
+        kind: str,
+        timeout_s: float,
+        generation: int,
+    ) -> None:
+        await asyncio.sleep(timeout_s)
+        if (
+            generation
+            != getattr(self, "_session_lifecycle_generation", 0)
+            or getattr(self, "_session_lifecycle_expired", False)
+        ):
+            return
+        self._session_lifecycle_expired = True
+        code = "idle_timeout" if kind == "idle" else "finalization_timeout"
+        self._streaming_finish_reason = (
+            "aborted" if kind == "idle" else "error"
+        )
+        self._terminal_code = code
+        if self._is_connected:
+            await self.send_error(code, code)
+        await self.cleanup()
+        self._is_connected = False
+        close = getattr(self.websocket, "close", None)
+        if close is not None:
+            await close(code=1008)
+
     def _finish_streaming_session_once(self, reason: str) -> None:
         session = self._nemotron_session
         if (
             session is not None
             and self._observer is not None
-            and not self._streaming_session_finished
+            and not getattr(self, "_streaming_session_finished", False)
         ):
             outcome = "aborted" if reason == "aborted" else "error"
             observe_safely(
@@ -891,6 +1042,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     async def cleanup(self):
         """Release resident state exactly once after transport cleanup begins."""
+        await self._cancel_session_lifecycle_timeout()
         generation_task = self.generation_task
         await super().cleanup()
         if generation_task is not None:
@@ -903,7 +1055,9 @@ class RealtimeConnection(VllmRealtimeConnection):
                     configuration_task,
                     return_exceptions=True,
                 )
-        await self._release_state_lease("connection_cleanup")
+        await self._release_state_lease(
+            getattr(self, "_terminal_code", None) or "connection_cleanup"
+        )
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))

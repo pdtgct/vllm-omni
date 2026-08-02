@@ -145,6 +145,8 @@ class NemotronSessionLease:
         persistent_state_service: Any | None = None,
         state_lease: Any | None = None,
         release_operation_id: str | None = None,
+        idle_timeout_s: float | None = None,
+        finalization_timeout_s: float | None = None,
     ) -> None:
         """Bind one validated model-local session to the engine."""
         ledger = session.ledger
@@ -177,8 +179,16 @@ class NemotronSessionLease:
         self._aborted = False
         self._released = False
         self._session_finished_observed = False
+        self._terminal_reason: str | None = None
+        self._terminal_code: str | None = None
         self._state_cleanup_lock = asyncio.Lock()
         self._pending_claim_task: asyncio.Task[None] | None = None
+        self._session_lifecycle_task: asyncio.Task[None] | None = None
+        self._retired_lifecycle_tasks: set[asyncio.Task[None]] = set()
+        self._session_lifecycle_generation = 0
+        self._session_lifecycle_expired = False
+        self._idle_timeout_s = idle_timeout_s
+        self._finalization_timeout_s = finalization_timeout_s
         if (
             self._persistent_state_service is not None
             and self._state_lease is not None
@@ -190,6 +200,8 @@ class NemotronSessionLease:
                 self._expire_pending_claim(timeout_s),
                 name=f"persistent-state-claim-{request_id}",
             )
+        if self._idle_timeout_s is not None:
+            self._arm_session_lifecycle_timeout("idle")
 
     @property
     def session(self) -> NemotronRealtimeSession:
@@ -219,8 +231,8 @@ class NemotronSessionLease:
         Returns:
             One cumulative hypothesis per completed carrier, in order.
         """
-        self._ensure_started()
         self._require_live()
+        self._ensure_started()
         if self._active_segment_callback is not None:
             raise RuntimeError("feed calls must be serialized")
         self._active_segment_callback = on_segment
@@ -244,8 +256,8 @@ class NemotronSessionLease:
 
     async def force_segment(self) -> None:
         """Queue one ordered semantic boundary without accepting samples."""
-        self._ensure_started()
         self._require_live()
+        self._ensure_started()
         self._session.force_segment()
         # Wake the stream consumer; empty arrays are internal control wakes
         # and never enter accepted-audio accounting.
@@ -255,6 +267,7 @@ class NemotronSessionLease:
 
     async def flush(self) -> TerminalResult:
         """Drain the final-tail and return all terminal output."""
+        self._require_live()
         self._ensure_started()
         if self._aborted:
             raise RuntimeError("the session was aborted")
@@ -267,6 +280,7 @@ class NemotronSessionLease:
 
     async def update_locale(self, locale: str) -> None:
         """Validate and select the locale for the next carrier mint."""
+        self._require_live()
         self._session.select_prompt(locale)
 
     async def abort(self) -> None:
@@ -299,10 +313,16 @@ class NemotronSessionLease:
             if timer is not None and timer is not asyncio.current_task():
                 timer.cancel()
                 await asyncio.gather(timer, return_exceptions=True)
+            await self._cancel_session_lifecycle_timeout()
             if self._task is not None and not self._task.done():
                 await self.abort()
             self._observe_session_finished_once(
-                "aborted" if self._aborted or not self._ended else "completed"
+                self._terminal_reason
+                or (
+                    "aborted"
+                    if self._aborted or not self._ended
+                    else "completed"
+                )
             )
             if (
                 self._persistent_state_service is not None
@@ -312,9 +332,74 @@ class NemotronSessionLease:
                 await self._persistent_state_service.release(
                     operation_id=self._release_operation_id,
                     lease=self._state_lease,
-                    reason="session_release",
+                    reason=self._terminal_code or "session_release",
                 )
             self._released = True
+
+    async def _cancel_session_lifecycle_timeout(self) -> None:
+        task = self._session_lifecycle_task
+        self._session_lifecycle_task = None
+        self._session_lifecycle_generation += 1
+        current = asyncio.current_task()
+        tasks = list(self._retired_lifecycle_tasks)
+        self._retired_lifecycle_tasks.clear()
+        if task is not None:
+            tasks.append(task)
+        waiters = []
+        for candidate in tasks:
+            if candidate is current:
+                continue
+            candidate.cancel()
+            waiters.append(candidate)
+        if waiters:
+            await asyncio.gather(*waiters, return_exceptions=True)
+
+    def _arm_session_lifecycle_timeout(self, kind: str) -> None:
+        if self._session_lifecycle_expired:
+            raise RuntimeError("session lifecycle has expired")
+        task = self._session_lifecycle_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            self._retired_lifecycle_tasks.add(task)
+            task.add_done_callback(self._retired_lifecycle_tasks.discard)
+        timeout_s = (
+            self._idle_timeout_s
+            if kind == "idle"
+            else self._finalization_timeout_s
+        )
+        if timeout_s is None:
+            return
+        self._session_lifecycle_generation += 1
+        generation = self._session_lifecycle_generation
+        self._session_lifecycle_task = asyncio.create_task(
+            self._expire_session_lifecycle(
+                kind,
+                float(timeout_s),
+                generation,
+            ),
+            name=f"nemotron-{kind}-{self._request_id}",
+        )
+
+    async def _expire_session_lifecycle(
+        self,
+        kind: str,
+        timeout_s: float,
+        generation: int,
+    ) -> None:
+        await asyncio.sleep(timeout_s)
+        if (
+            generation != self._session_lifecycle_generation
+            or self._session_lifecycle_expired
+        ):
+            return
+        self._session_lifecycle_expired = True
+        code = "idle_timeout" if kind == "idle" else "finalization_timeout"
+        self._terminal_reason = "aborted" if kind == "idle" else "error"
+        self._terminal_code = code
+        self._error = TimeoutError(code)
+        if kind == "idle":
+            self._aborted = True
+        await self.release()
 
     def _observe_session_finished_once(self, reason: str) -> None:
         if self._session_finished_observed:
@@ -367,6 +452,8 @@ class NemotronSessionLease:
 
     def _require_live(self) -> None:
         """Reject work no consumer can acknowledge."""
+        if self._session_lifecycle_expired:
+            raise self._error or RuntimeError("session lifecycle has expired")
         if self._aborted:
             raise RuntimeError("the session was aborted")
         if self._audio_closed:
@@ -377,10 +464,16 @@ class NemotronSessionLease:
     async def _drain(self) -> None:
         """Close accepted audio and wait for generation end."""
         if not self._audio_closed:
+            if self._session_lifecycle_expired:
+                raise self._error or RuntimeError(
+                    "session lifecycle has expired"
+                )
             self._session.begin_finalize()
             self._audio_closed = True
             self._audio.put_nowait(None)
+            self._arm_session_lifecycle_timeout("finalization")
         await self._done.wait()
+        await self._cancel_session_lifecycle_timeout()
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
         if self._error is not None:
@@ -400,7 +493,15 @@ class NemotronSessionLease:
             buffer_stream,
         )
 
-        prompts = buffer_stream(self._audio_frames(), self._input_stream, self._session)
+        prompts = buffer_stream(
+            self._audio_frames(),
+            self._input_stream,
+            self._session,
+            before_audio_accept=lambda: self._require_unexpired_lifecycle(),
+            on_audio_accepted=lambda: self._arm_session_lifecycle_timeout(
+                "idle"
+            ),
+        )
         async for prompt in prompts:
             streaming_input = await render(prompt)
             if self._state_lease is not None:
@@ -425,6 +526,10 @@ class NemotronSessionLease:
                 rendered_prompt["additional_information"] = information
                 streaming_input.prompt = rendered_prompt
             yield streaming_input
+
+    def _require_unexpired_lifecycle(self) -> None:
+        if self._session_lifecycle_expired:
+            raise self._error or RuntimeError("session lifecycle has expired")
 
     async def _consume(self) -> None:
         """Drive generation and resolve ledger tickets at legal parks."""
@@ -522,7 +627,9 @@ class NemotronSessionLease:
             # ``self._aborted`` is already correctly set by the time this
             # runs even under an abort/finish race, because ``abort()``
             # sets it BEFORE cancelling (and awaiting) this same task.
-            if self._aborted:
+            if self._terminal_reason is not None:
+                reason = self._terminal_reason
+            elif self._aborted:
                 reason = "aborted"
             elif self._error is not None or not finalized:
                 reason = "error"
@@ -543,6 +650,7 @@ class NemotronSessionFactory:
         max_pending_carriers: int | None = None,
         request_id_prefix: str = "nemotron-session",
         observer: StreamingObserver | None = None,
+        runtime_config: Any | None = None,
     ) -> None:
         self._engine = engine
         if persistent_state_service is None:
@@ -550,9 +658,19 @@ class NemotronSessionFactory:
             if getter is not None:
                 persistent_state_service = getter()
         self._persistent_state_service = persistent_state_service
+        if runtime_config is None and persistent_state_service is not None:
+            runtime_config = getattr(
+                persistent_state_service, "runtime_config", None
+            )
+        if persistent_state_service is not None and runtime_config is None:
+            raise ValueError(
+                "persistent-state session factory requires the resolved "
+                "streaming runtime envelope"
+            )
+        self._runtime_config = runtime_config
         self._max_pending_carriers = max_pending_carriers
         self._request_id_prefix = request_id_prefix
-        # PORT-OBS-003 stub: injected at every session this factory opens
+        # PORT-OBS-003: injected at every session this factory opens
         # ("the transport-neutral factory/lease binding, which injects the
         # same observer at session construction"). Not yet consumed by
         # NemotronRealtimeSession beyond storage.
@@ -578,6 +696,19 @@ class NemotronSessionFactory:
         # Validate every caller-controlled value before consuming manager
         # capacity.  The service-bound construction below stamps the
         # acknowledged lease identity into the otherwise identical session.
+        runtime = self._runtime_config
+        session_limits: dict[str, Any] = {}
+        if runtime is not None:
+            session_limits = {
+                "accepted_audio_budget_s": runtime.accepted_audio_budget_s,
+                "accepted_audio_capacity_samples": (
+                    runtime.accepted_audio_capacity_samples
+                ),
+                "max_retained_transcript_bytes": (
+                    runtime.max_retained_transcript_bytes
+                ),
+                "max_session_samples": runtime.max_session_samples,
+            }
         NemotronRealtimeSession.from_model_config(
             self._engine.model_config,
             cadence=cadence,
@@ -586,6 +717,7 @@ class NemotronSessionFactory:
             with_ledger=True,
             max_pending_carriers=self._max_pending_carriers,
             observer=None,
+            **session_limits,
         )
         service = self._persistent_state_service
         if service is None:
@@ -619,6 +751,7 @@ class NemotronSessionFactory:
                 request_id=request_id,
                 engine_epoch=str(state_lease.engine_epoch),
                 lease_generation=int(state_lease.generation),
+                **session_limits,
             )
             return NemotronSessionLease(
                 engine=self._engine,
@@ -627,6 +760,16 @@ class NemotronSessionFactory:
                 persistent_state_service=service,
                 state_lease=state_lease,
                 release_operation_id=release_operation_id,
+                idle_timeout_s=(
+                    runtime.session_idle_timeout_s
+                    if runtime is not None
+                    else None
+                ),
+                finalization_timeout_s=(
+                    runtime.session_finalization_timeout_s
+                    if runtime is not None
+                    else None
+                ),
             )
         except BaseException:
             await service.release(

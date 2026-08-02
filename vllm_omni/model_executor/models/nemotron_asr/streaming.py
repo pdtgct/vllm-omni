@@ -12,7 +12,7 @@ it — via the thin ``SupportsRealtime.buffer_realtime_audio`` classmethod
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import numpy as np
@@ -71,6 +71,8 @@ async def buffer_stream(
     accepted_audio_budget_s: float | None = None,
     session_key: str | None = None,
     final_tail_ready_stamp_s: float | None = None,
+    before_audio_accept: Callable[[], None] | None = None,
+    on_audio_accepted: Callable[[], None] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Chunk client audio: one yield = one StreamingUpdate.
 
@@ -98,6 +100,12 @@ async def buffer_stream(
             (that session's own configured budget governs). ``None``
             (the default) leaves :data:`ACCEPTED_AUDIO_BUDGET_DEFAULT_S`
             in force, keeping today's behavior exactly.
+        before_audio_accept: Optional synchronous lifecycle fence invoked
+            immediately before the session mutates accepted-audio state.
+        on_audio_accepted: Optional synchronous lifecycle callback invoked
+            immediately after whole-piece acceptance succeeds. Together
+            these callbacks linearize idle-timeout expiry against acceptance
+            without holding a lock across an engine or transport await.
 
     Raises:
         ValueError: If a piece would push the session's accepted-audio
@@ -207,7 +215,11 @@ async def buffer_stream(
         prior_sequences = {
             unit.logical_sequence for unit in authority.ready_units
         }
+        if before_audio_accept is not None:
+            before_audio_accept()
         session.accept_audio(frame)
+        if on_audio_accepted is not None:
+            on_audio_accepted()
         new_units = tuple(
             unit
             for unit in authority.ready_units
