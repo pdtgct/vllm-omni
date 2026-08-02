@@ -139,6 +139,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
+        self._persistent_state_service: Any | None = None
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         self._sleeping_tags: set[str] = set()
@@ -273,6 +274,7 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        request_id_already_unique: bool = False,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -308,7 +310,11 @@ class AsyncOmni(EngineClient, OmniBase):
         # and non-empty, similar to vLLM's input processor. The suffix is used
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
-        request_id = self._get_unique_request_id(external_request_id)
+        if request_id_already_unique:
+            if not request_id:
+                raise ValueError("an already-unique request id cannot be empty")
+        else:
+            request_id = self._get_unique_request_id(external_request_id)
 
         # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:
@@ -1156,11 +1162,29 @@ class AsyncOmni(EngineClient, OmniBase):
     async def check_health(self) -> None:
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
+        persistent_state = self._persistent_state_service
+        if persistent_state is not None:
+            await persistent_state.check_health()
+
+    def install_persistent_state_service(self, service: Any) -> None:
+        """Install one exact API-process persistent-state owner."""
+        if self._persistent_state_service is not None:
+            raise RuntimeError("persistent state service already installed")
+        self._persistent_state_service = service
+
+    def get_persistent_state_service(self) -> Any:
+        """Return the installed service or fail closed before admission."""
+        if self._persistent_state_service is None:
+            raise RuntimeError("persistent state service is not installed")
+        return self._persistent_state_service
 
     # ==================== Shutdown ====================
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
+        persistent_state = self._persistent_state_service
+        if persistent_state is not None:
+            persistent_state.shutdown()
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None

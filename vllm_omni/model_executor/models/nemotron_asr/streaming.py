@@ -13,7 +13,6 @@ it — via the thin ``SupportsRealtime.buffer_realtime_audio`` classmethod
 from __future__ import annotations
 
 import time
-from collections import deque
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -22,6 +21,7 @@ import numpy as np
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     ADMISSION_EPOCH_MODULUS_MS,
     ENVELOPE_HEADER_FIELDS,
+    FRONTEND_CONSTANTS,
 )
 from vllm_omni.model_executor.models.nemotron_asr.session import (
     NemotronRealtimeSession,
@@ -29,12 +29,6 @@ from vllm_omni.model_executor.models.nemotron_asr.session import (
 
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
-# Any non-placeholder token reaches ``advance_model_rows`` as a
-# non-CHUNK control. Token zero matches AsyncOmni's request-lifecycle
-# marker while remaining a separate, resumable PORT update here.
-_FLUSH_TOKEN_ID = 0
-
-
 def _admission_ms_mod() -> int:
     """The acceptance wall-clock stamp (design §Ingress-deadline
     plumbing): milliseconds since epoch, modulo
@@ -81,6 +75,10 @@ async def buffer_stream(
     audio_stream: Any,
     input_stream: Any,
     model_config: Any,
+    *,
+    observer: Any = None,
+    accepted_audio_budget_s: float | None = None,
+    session_key: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Chunk client audio: one yield = one StreamingUpdate.
 
@@ -96,13 +94,26 @@ async def buffer_stream(
     # riding the model_config position (PORT-RTC-001); anything else is
     # the channel-less standard path, whose defaults live only in the
     # factory.
-    session = (
-        model_config
-        if isinstance(model_config, NemotronRealtimeSession)
-        else NemotronRealtimeSession.from_model_config(model_config)
-    )
+    if isinstance(model_config, NemotronRealtimeSession):
+        session = model_config
+    else:
+        accepted_audio_capacity_samples = None
+        if accepted_audio_budget_s is not None:
+            if accepted_audio_budget_s <= 0:
+                raise ValueError("accepted_audio_budget_s must be positive")
+            accepted_audio_capacity_samples = int(
+                accepted_audio_budget_s * FRONTEND_CONSTANTS["sample_rate"]
+            )
+        session = NemotronRealtimeSession.from_model_config(
+            model_config,
+            accepted_audio_capacity_samples=accepted_audio_capacity_samples,
+            request_id=session_key or "unbound",
+        )
+    # Observation is installed by the app-owned serving adapter.  Accepting
+    # it here preserves the model-generic SupportsRealtime call contract
+    # without coupling this engine-free segmenter to Prometheus.
+    del observer
     geometry = session.geometry
-    chunk_samples = geometry.chunk_samples
     geometry_id = geometry.geometry_id
     park_id = session.park_token_id
     placeholder_id = session.audio_chunk_token_id
@@ -114,84 +125,107 @@ async def buffer_stream(
             if park_id in ids:
                 return
 
-    sequence = 0
+    authority = session.accepted_audio
 
-    def prompt(chunk: np.ndarray, *, final_tail: bool, admission_ms_mod: int) -> dict[str, Any]:
+    def prompt(unit: Any) -> dict[str, Any]:
         # TokensPrompt shape: one placeholder token per chunk
         # (PORT-INT-003 / D-BU-1) — a bare multi_modal_data dict is
         # invalid on the real render path. The mm payload is the minted
         # ENVELOPE (header + raw samples), the serving tier's twin
         # admission record (design §Phase-6c transaction seams).
-        nonlocal sequence
+        if unit.kind == "forced_eou":
+            if session.eou_token_id is None:
+                raise ValueError("forced endpoint lacks an EOU control token")
+            return {"prompt_token_ids": [session.eou_token_id]}
         # The session-control prompt is re-read at each mint so the
         # last valid update ordered before mint is the one stamped
         # (PORT-LID-001); a live per-session config view (ING-VEH-007)
         # makes mid-session locale updates visible exactly here.
         envelope = mint_envelope(
-            chunk,
+            unit.samples,
             geometry_id=geometry_id,
-            final_tail=final_tail,
+            final_tail=unit.kind == "final_tail",
             prompt_index=session.prompt_index,
-            chunk_sequence=sequence,
-            admission_ms_mod=admission_ms_mod,
+            chunk_sequence=unit.carrier_sequence,
+            admission_ms_mod=unit.admission_ms_mod,
         )
-        sequence += 1
         return {
             "prompt_token_ids": [placeholder_id],
             "multi_modal_data": {"audio": envelope},
         }
 
-    buffer = np.zeros(0, dtype=np.float32)
-    # Detection (stamping a completed cadence's admission time) and
-    # delivery (yielding behind hold_until_park backpressure) are
-    # deliberately DECOUPLED: PORT-SESS-001 requires a ready unit's
-    # timestamp to reflect when its audio truly completed, "even
-    # behind an in-flight CHUNK" — so every chunk completable from
-    # the buffer is stamped in one synchronous pass (no ``await``
-    # between completion and stamping), then drained through the
-    # hold in FIFO order. Without this, a second chunk completed in
-    # the same burst would only be stamped when the generator resumes
-    # after the first chunk's hold — understating its true queuing
-    # delay exactly in the case the LLD calls out.
-    ready: deque[tuple[np.ndarray, int]] = deque()
-    yielded = False
+    async def dispatch_ready() -> AsyncGenerator[dict[str, Any], None]:
+        while authority.ready_units:
+            unit = authority.dispatch_next()
+            if unit is None:
+                raise RuntimeError("ready audio could not become in-flight")
+            yield prompt(unit)
+            await hold_until_park()
+            authority.park(
+                request_id=authority.request_id,
+                engine_epoch=authority.engine_epoch,
+                lease_generation=authority.lease_generation,
+                logical_sequence=unit.logical_sequence,
+                carrier_sequence=unit.carrier_sequence,
+            )
+
+    # Acceptance and ready-stamping are synchronous under the session's
+    # single authority. Every cadence completed by one caller piece is
+    # therefore visible before the first corresponding prompt is yielded,
+    # while delivery remains park-gated and FIFO.
     async for frame in audio_stream:
-        buffer = np.concatenate([buffer, frame])
-        while buffer.shape[0] >= chunk_samples:
-            chunk, buffer = buffer[:chunk_samples], buffer[chunk_samples:]
-            stamp = _admission_ms_mod()
-            ready.append((chunk, stamp))
-            # The ticket exists before the prompt is yielded, so a park
-            # returned immediately after cannot outrun its handle
-            # (PORT-RTC-002); the call is synchronous, leaving the
-            # stamp-then-drain pass await-free.
-            if ledger is not None:
-                ledger.mint(final_tail=False, admission_ms_mod=stamp)
+        if frame.shape[0] == 0:
+            async for rendered in dispatch_ready():
+                yield rendered
+            continue
+        prior_sequences = {
+            unit.logical_sequence for unit in authority.ready_units
+        }
+        session.accept_audio(frame)
+        new_units = tuple(
+            unit
+            for unit in authority.ready_units
+            if unit.logical_sequence not in prior_sequences
+        )
+        if ledger is not None:
+            for unit in new_units:
+                if unit.kind != "forced_eou":
+                    ledger.mint(
+                        final_tail=unit.kind == "final_tail",
+                        admission_ms_mod=unit.admission_ms_mod,
+                    )
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
-        while ready:
-            chunk, admission_ms_mod = ready.popleft()
-            if yielded:
-                await hold_until_park()
-            yield prompt(chunk, final_tail=False, admission_ms_mod=admission_ms_mod)
-            yielded = True
+        async for rendered in dispatch_ready():
+            yield rendered
+
     # Finalization is an explicit protocol transaction even when the
     # residual is shorter than the frontend's minimum commit or is
     # exactly zero. The frontend owns the zero-frame decision; the
     # session transition still needs the final marker (PORT-SESS-003).
-    if yielded:
-        await hold_until_park()
-    tail_stamp = _admission_ms_mod()
-    if ledger is not None:
-        ledger.mint(final_tail=True, admission_ms_mod=tail_stamp)
-    yield prompt(buffer, final_tail=True, admission_ms_mod=tail_stamp)
+    if not authority.snapshot().finalizing:
+        session.begin_finalize()
+    ready_tail = next(
+        (
+            unit
+            for unit in reversed(authority.ready_units)
+            if unit.kind == "final_tail"
+        ),
+        None,
+    )
+    if ledger is not None and ready_tail is not None:
+        ledger.mint(
+            final_tail=True,
+            admission_ms_mod=ready_tail.admission_ms_mod,
+        )
+    async for rendered in dispatch_ready():
+        yield rendered
     # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003
     # The engine's later non-resumable end marker closes the request
     # without guaranteeing a model step. PORT therefore submits its
     # model-level FLUSH explicitly, after the final-tail transaction
     # has committed at legal park.
-    await hold_until_park()
-    yield {"prompt_token_ids": [_FLUSH_TOKEN_ID]}
+    yield {"prompt_token_ids": [session.flush_token_id]}
     # The generic AsyncOmni end marker is queued only after this
     # model-level barrier has itself committed. Otherwise a lifecycle
     # close could overtake an accepted-but-unprocessed FLUSH.

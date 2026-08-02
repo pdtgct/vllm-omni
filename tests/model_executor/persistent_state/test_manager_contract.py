@@ -75,6 +75,10 @@ def test_continuations_retain_binding_and_free_is_idempotent(
     monkeypatch.setattr(block_pool, "free_blocks", record_free)
     manager.free("request-1")
     manager.free("request-1")
+    assert freed == []
+
+    manager.drop_lease("request-1")
+    manager.drop_lease("request-1")
 
     assert len(freed) == 1
 
@@ -87,6 +91,7 @@ def test_reused_physical_slot_gets_a_fresh_generation() -> None:
     manager.allocate_new_blocks("request-1", 1, 1)
     first_binding = state_binding_pair(manager, "request-1")
     manager.free("request-1")
+    manager.drop_lease("request-1")
 
     manager.allocate_new_blocks("request-2", 10_000, 10_000)
     second_binding = state_binding_pair(manager, "request-2")

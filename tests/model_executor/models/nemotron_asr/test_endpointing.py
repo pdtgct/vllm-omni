@@ -10,6 +10,7 @@ import inspect
 from typing import Any, NoReturn
 
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -414,6 +415,86 @@ def test_model_eou_winning_same_generation_coalesces_queued_force() -> None:
     assert forced.output_ids == (103,)
     assert forced.completion is None
     assert forced.next_book.segment_generation == 1
+
+
+def test_tensor_endpoint_transition_matches_strict_reference_boundary() -> None:
+    # @spec PORT-SEG-002 / PORT-SEG-003 / PORT-SEG-007
+    module = _module()
+    history = torch.zeros(1, 8, dtype=torch.int32)
+    book = torch.zeros(1, 6, dtype=torch.int32)
+    counts = torch.tensor([[1, 0, 0, 0, 0, 0]], dtype=torch.int32)
+    tokens = torch.zeros(1, 10, dtype=torch.int32)
+    tokens[0, 0] = 7
+
+    transition = module.observe_chunk_tensors(
+        history=history,
+        book=book,
+        frame_emission_counts=counts,
+        valid_frame_lengths=torch.tensor([6]),
+        token_ids=tokens,
+        token_lengths=torch.tensor([1], dtype=torch.int32),
+        final_tail=torch.tensor([False]),
+        mode=torch.tensor([1]),
+        threshold_frames=torch.tensor([3]),
+        residue_frames=torch.tensor([2]),
+        eou_token_id=19,
+        row_clean=torch.tensor([True]),
+    )
+
+    assert transition.is_eou.tolist() == [True]
+    assert transition.token_ids[0, :2].tolist() == [7, 19]
+    assert transition.token_lengths.tolist() == [2]
+    assert transition.book[0, 2:5].tolist() == [0, 1, 0]
+
+
+def test_tensor_endpoint_equality_does_not_fire_and_final_tail_is_inert() -> None:
+    # @spec PORT-SEG-002 / PORT-SEG-003
+    module = _module()
+    common = dict(
+        history=torch.zeros(2, 8, dtype=torch.int32),
+        book=torch.zeros(2, 6, dtype=torch.int32),
+        frame_emission_counts=torch.tensor(
+            [[1, 0, 0, 0, 0], [1, 0, 0, 0, 0]], dtype=torch.int32
+        ),
+        valid_frame_lengths=torch.tensor([4, 5]),
+        token_ids=torch.zeros(2, 10, dtype=torch.int32),
+        token_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        final_tail=torch.tensor([False, True]),
+        mode=torch.tensor([1, 1]),
+        threshold_frames=torch.tensor([3, 3]),
+        residue_frames=torch.tensor([2, 2]),
+        eou_token_id=19,
+        row_clean=torch.tensor([True, True]),
+    )
+    common["token_ids"][:, 0] = 7
+
+    transition = module.observe_chunk_tensors(**common)
+
+    assert transition.is_eou.tolist() == [False, False]
+    assert transition.token_lengths.tolist() == [1, 1]
+    assert transition.book[1].tolist() == [0, 0, 0, 0, 0, 0]
+
+
+def test_tensor_forced_endpoint_advances_only_a_nonempty_segment() -> None:
+    # @spec PORT-SEG-004 / PORT-SEG-007
+    module = _module()
+    book = torch.zeros(2, 6, dtype=torch.int32)
+    book[:, 2] = 1
+    book[:, 3] = torch.tensor([4, 7])
+    book[:, 4] = torch.tensor([1, 0])
+    book[:, 5] = 9
+
+    transition = module.apply_forced_eou_tensors(
+        book=book,
+        selected_rows=torch.tensor([True, True]),
+    )
+
+    assert transition.is_eou.tolist() == [True, False]
+    assert transition.book[:, 2].tolist() == [0, 0]
+    assert transition.book[:, 3].tolist() == [5, 7]
+    assert transition.book[:, 4].tolist() == [0, 0]
+    assert transition.book[:, 5].tolist() == [0, 0]
+    assert book[:, 3].tolist() == [4, 7]
 
 
 def test_stale_forced_generation_is_ignored_and_preserves_book() -> None:

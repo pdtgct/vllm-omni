@@ -24,11 +24,23 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
+    ENVELOPE_HEADER_SLOTS,
     DecodeRequest,
     DecodeResolver,
+    EmissionAdapter,
+    HostStaging,
     ResolvedDecode,
+    make_mrv1_adapter,
+)
+from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
+    BoundedCommitSink,
+    resolve_status_reports,
+)
+from vllm_omni.model_executor.models.nemotron_asr.convert import (
+    LID_REQUIRED_PATTERN,
 )
 from vllm_omni.model_executor.models.nemotron_asr.decode_dispatch import (
     SYNC_FREE_ARMS,
@@ -43,9 +55,25 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
     PromptConditioner,
     resolve_prompt_index,
 )
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    CADENCES,
+)
+from vllm_omni.model_executor.models.nemotron_asr.plan import (
+    ObservedRow,
+    PlanContextSlot,
+    SessionRegistry,
+    prepare_plan_context,
+    reject_unsupported_outer_graph_mode,
+    resolve_row_envelope_header,
+)
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+)
+from vllm_omni.model_executor.models.nemotron_asr.processor import (
+    NemotronASRDummyInputsBuilder,
+    NemotronASRMultiModalProcessor,
+    NemotronASRProcessingInfo,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
@@ -53,6 +81,12 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     Predictor,
     greedy_decode_chunk,
 )
+from vllm_omni.model_executor.models.nemotron_asr.state_profile import (
+    NemotronStatePools,
+    build_nemotron_persistent_state_spec,
+    project_nemotron_state_pools,
+)
+from vllm_omni.model_executor.persistent_state import PersistentStateLayerBase
 
 #: The largest published chunk (1120 ms) emits 14 encoder frames — the
 #: replay queue page's per-chunk worst case.
@@ -220,10 +254,498 @@ def load_core_from_dump(
 
 __all__ = [
     "NemotronASRCore",
+    "NemotronASRForRNNT",
     "apply_policy_dtypes",
     "load_core_from_dump",
     "resolve_prompt_index",
 ]
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    NemotronASRMultiModalProcessor,
+    info=NemotronASRProcessingInfo,
+    dummy_inputs=NemotronASRDummyInputsBuilder,
+)
+class NemotronASRForRNNT(nn.Module):
+    """Engine-facing cache-aware RNN-T over one aggregate state page."""
+
+    supports_multimodal = True
+    requires_raw_input_tokens = True
+    supports_realtime = True
+    supports_transcription_only = False
+    supports_persistent_state = True
+    realtime_max_tokens = 142
+    num_logits = 13_092
+
+    def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
+        super().__init__()
+        if vllm_config is None:
+            raise ValueError("NemotronASRForRNNT requires vllm_config")
+        hf_config = vllm_config.model_config.hf_config
+        from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+            validate_prompt_dictionary,
+        )
+
+        validate_prompt_dictionary(
+            getattr(hf_config, "prompt_dictionary", None),
+            getattr(hf_config, "num_prompts", None),
+        )
+        reject_unsupported_outer_graph_mode(
+            getattr(vllm_config, "compilation_config", None)
+        )
+        self.config = hf_config
+        self.num_logits = int(hf_config.vocab_size)
+        policy = FP32_BRINGUP
+        self.core = NemotronASRCore(
+            vocab_size=hf_config.num_asr_labels,
+            att_context=(
+                hf_config.att_context_left,
+                hf_config.att_context_right,
+            ),
+            enc_hidden=hf_config.d_model,
+            n_layers=hf_config.n_layers,
+            pred_hidden=hf_config.pred_hidden,
+            pred_rnn_layers=hf_config.pred_rnn_layers,
+            joint_hidden=hf_config.joint_hidden,
+            num_prompts=hf_config.num_prompts,
+            filterbank=torch.zeros(_N_MELS, _STFT_FREQ_BINS),
+            window=torch.zeros(_WIN_LENGTH),
+            policy=policy,
+        )
+        state_prefix = f"{prefix}.persistent_state" if prefix else "persistent_state"
+        self._persistent_state_layer = PersistentStateLayerBase(
+            build_nemotron_persistent_state_spec(hf_config),
+            prefix=state_prefix,
+            vllm_config=vllm_config,
+        )
+        self._state_pools_cache: NemotronStatePools | None = None
+        self._registry = SessionRegistry()
+        self._plan_slot = PlanContextSlot()
+        self._plan_step = 0
+        self._emission_adapter: EmissionAdapter = make_mrv1_adapter(
+            hidden_size=hf_config.hidden_size,
+            park_id=hf_config.eos_token_id,
+            blank_id=self.core.blank_id,
+        )
+        self._decode_resolver = build_decode_resolver(hf_config)
+        self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        self._commit_sink: BoundedCommitSink | None = None
+        self._host_staging: HostStaging | None = None
+
+    def _state_pools(self) -> NemotronStatePools:
+        if self._state_pools_cache is None:
+            self._state_pools_cache = project_nemotron_state_pools(
+                self._persistent_state_layer.persistent_state_storage,
+                n_layers=len(self.core.encoder.layers),
+            )
+        return self._state_pools_cache
+
+    def load_weights(self, weights: Any) -> set[str]:
+        """Strictly load the converted checkpoint tree."""
+
+        expected: dict[str, torch.Tensor] = dict(self.core.named_parameters())
+        expected.update(self.core.named_buffers())
+        required = set(self.core.state_dict())
+        consumed: set[str] = set()
+        for name, tensor in weights:
+            if name not in expected:
+                raise ValueError(f"unexpected weight {name!r}")
+            target = expected[name]
+            tensor = self._normalize_checkpoint_tensor(name, tensor)
+            if tuple(target.shape) != tuple(tensor.shape):
+                raise ValueError(
+                    f"shape mismatch for {name!r}: expected "
+                    f"{tuple(target.shape)}, got {tuple(tensor.shape)}"
+                )
+            with torch.no_grad():
+                target.copy_(tensor)
+            consumed.add(name)
+        missing = required - consumed
+        lid_missing = sorted(
+            name for name in missing if LID_REQUIRED_PATTERN.search(name)
+        )
+        if lid_missing:
+            raise ValueError(
+                f"LID weights absent ({lid_missing}); conditioned "
+                "transcription never degrades silently"
+            )
+        if missing:
+            raise ValueError(
+                f"{len(missing)} expected weights not provided, e.g. "
+                f"{sorted(missing)[:3]}"
+            )
+        return {f"core.{name}" for name in consumed}
+
+    @staticmethod
+    def _normalize_checkpoint_tensor(
+        name: str,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the publisher's one explicit storage-to-runtime reshape."""
+
+        if name == "featurizer.fb" and tensor.ndim == 3 and tensor.shape[0] == 1:
+            return tensor[0]
+        return tensor
+
+    @classmethod
+    async def buffer_realtime_audio(
+        cls,
+        audio_stream: Any,
+        input_stream: Any,
+        model_config: Any,
+        *,
+        observer: Any = None,
+        accepted_audio_budget_s: float | None = None,
+        session_key: str | None = None,
+    ) -> Any:
+        from vllm_omni.model_executor.models.nemotron_asr.streaming import (
+            buffer_stream,
+        )
+
+        async for update in buffer_stream(
+            audio_stream,
+            input_stream,
+            model_config,
+            observer=observer,
+            accepted_audio_budget_s=accepted_audio_budget_s,
+            session_key=session_key,
+        ):
+            yield update
+
+    def prepare_row_plan_context(
+        self,
+        *,
+        req_ids: Any,
+        token_ids_cpu: Any,
+        num_computed_tokens_cpu: Any,
+        num_scheduled_tokens: Any,
+        requests: Any,
+        scheduled_encoder_inputs: Any,
+    ) -> None:
+        """MRV1 oracle projection into the common transaction plan."""
+
+        rows: list[ObservedRow] = []
+        for index, request_id in enumerate(req_ids):
+            if int(num_scheduled_tokens[index]) != 1:
+                raise ValueError("every streaming row must be single-token")
+            computed = int(num_computed_tokens_cpu[index])
+            token = int(token_ids_cpu[index, computed])
+            request = requests[request_id]
+            groups = request.block_ids
+            if len(groups) != 1 or len(groups[0]) != 1:
+                raise ValueError("persistent state requires one slot per request")
+            endpoint_mode, endpoint_threshold, endpoint_residue = (
+                self._endpoint_controls(request)
+            )
+            rows.append(
+                ObservedRow(
+                    request_id=str(request_id),
+                    block_id=int(groups[0][0]),
+                    scheduled_token_id=token,
+                    has_prior_state=computed > 0,
+                    envelope_header=resolve_row_envelope_header(
+                        scheduled_token_id=token,
+                        placeholder_id=int(self.config.audio_chunk_token_id),
+                        num_computed_tokens=computed,
+                        mm_features=request.mm_features,
+                        scheduled_encoder_input_ids=scheduled_encoder_inputs.get(
+                            request_id, ()
+                        ),
+                    ),
+                    endpoint_mode=endpoint_mode,
+                    endpoint_threshold_frames=endpoint_threshold,
+                    endpoint_residue_frames=endpoint_residue,
+                )
+            )
+        self._stage_plan(rows, resident_request_ids=tuple(str(value) for value in requests))
+
+    def _stage_plan(
+        self,
+        rows: list[ObservedRow],
+        *,
+        resident_request_ids: tuple[str, ...],
+    ) -> Any:
+        import time
+
+        if self._commit_sink is not None and self._commit_sink.has_staged:
+            raise RuntimeError("previous transaction status was not consumed")
+        self._plan_step += 1
+        context = prepare_plan_context(
+            self._registry,
+            rows,
+            resident_request_ids=resident_request_ids,
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            num_prompts=int(self.core.lid.num_prompts),
+            num_geometries=len(CADENCES),
+            now_ns=time.time_ns(),
+            step=self._plan_step,
+        )
+        self._plan_slot.stage(context)
+        return context
+
+    @staticmethod
+    def _endpoint_controls(request: Any) -> tuple[int, int, int]:
+        information = getattr(request, "additional_information", None)
+        if not isinstance(information, dict):
+            information = getattr(information, "entries", None)
+        if not isinstance(information, dict):
+            return 0, 0, 0
+        policy = information.get("endpoint_policy")
+        if not isinstance(policy, dict):
+            return 0, 0, 0
+        mode_name = policy.get("mode")
+        if mode_name not in ("disabled", "greedy_blank"):
+            raise ValueError("request carries an unknown endpoint mode")
+        mode = 1 if mode_name == "greedy_blank" else 0
+        threshold = int(policy.get("threshold_frames", 0))
+        residue = int(policy.get("residue_frames", 0))
+        if threshold < 0 or residue < 0:
+            raise ValueError("request carries an invalid endpoint policy")
+        return mode, threshold, residue
+
+    def _stage_v2_projection(self, projection: Any) -> Any:
+        input_batch = projection.input_batch
+        metadata = projection.request_metadata
+        if metadata is None:
+            raise RuntimeError("MRv2 projection omitted request metadata")
+        rows: list[ObservedRow] = []
+        for index, (request_id, binding) in enumerate(
+            zip(projection.req_ids, projection.bindings)
+        ):
+            if int(input_batch.num_scheduled_tokens[index]) != 1:
+                raise ValueError("every streaming row must be single-token")
+            request = metadata[request_id]
+            token_ids = request.prefill_token_ids or request.prompt_token_ids
+            if token_ids is None:
+                raise RuntimeError("MRv2 request has no token authority")
+            computed = int(input_batch.num_computed_tokens_np[index])
+            if not 0 <= computed < len(token_ids):
+                raise RuntimeError("MRv2 scheduled token is outside request data")
+            token = int(token_ids[computed])
+            endpoint_mode, endpoint_threshold, endpoint_residue = (
+                self._endpoint_controls(request)
+            )
+            rows.append(
+                ObservedRow(
+                    request_id=request_id,
+                    block_id=int(binding.slot_id),
+                    scheduled_token_id=token,
+                    has_prior_state=not bool(binding.fresh),
+                    envelope_header=resolve_row_envelope_header(
+                        scheduled_token_id=token,
+                        placeholder_id=int(self.config.audio_chunk_token_id),
+                        num_computed_tokens=computed,
+                        mm_features=request.mm_features,
+                        scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(
+                            request_id, ()
+                        ),
+                    ),
+                    endpoint_mode=endpoint_mode,
+                    endpoint_threshold_frames=endpoint_threshold,
+                    endpoint_residue_frames=endpoint_residue,
+                )
+            )
+        storage = self._persistent_state_layer.persistent_state_storage
+        for binding in projection.bindings:
+            if binding.fresh:
+                storage.initialize_fresh_state_slot(
+                    int(binding.slot_id),
+                    int(binding.generation),
+                )
+        return self._stage_plan(
+            rows,
+            resident_request_ids=tuple(projection.req_states.req_id_to_index),
+        )
+
+    def warmup_resident_state(self) -> None:
+        """Warm every fixed-shape scatter specialization before admission."""
+
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            warmup_advance_model_rows_scatter,
+        )
+
+        pools = self._state_pools()
+        if pools.channel[0].device.type != "cuda":
+            return
+        warmup_advance_model_rows_scatter(
+            channel_pools=list(pools.channel),
+            time_pools=list(pools.convolution),
+            len_pools=list(pools.valid_length),
+            h_pool=pools.predictor_h,
+            c_pool=pools.predictor_c,
+            queue_pool=pools.replay_queue,
+            book_pool=pools.replay_book,
+            frontend_raw_pool=pools.frontend_raw,
+            frontend_mel_pool=pools.frontend_mel,
+            frontend_counter_pool=pools.frontend_counters,
+            endpoint_history_pool=pools.endpoint_history,
+            endpoint_book_pool=pools.endpoint_book,
+        )
+
+    def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
+        if self._commit_sink is None:
+            self._commit_sink = BoundedCommitSink(
+                self._registry,
+                max_rows=self._max_num_seqs,
+                device=device,
+            )
+        return self._commit_sink
+
+    def _ensure_host_staging(self) -> HostStaging:
+        if self._host_staging is None:
+            self._host_staging = HostStaging(self._max_num_seqs)
+        return self._host_staging
+
+    def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+        sink = self._commit_sink
+        if sink is None or not sink.has_staged:
+            return {}, set()
+        reports, _records, lease_ok = sink.collect()
+        return resolve_status_reports(
+            self._registry,
+            reports,
+            lease_ok=lease_ok,
+        )
+
+    def embed_multimodal(self, **kwargs: Any) -> Any:
+        audios = kwargs.get("audio")
+        if audios is None:
+            raise ValueError("embed_multimodal expects an 'audio' item")
+        device = next(self.parameters()).device
+        hidden = int(self.config.hidden_size)
+        rows = []
+        for chunk in audios:
+            envelope = (
+                chunk
+                if isinstance(chunk, torch.Tensor)
+                else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
+            ).reshape(-1).to(dtype=torch.float32)
+            if envelope.shape[0] < ENVELOPE_HEADER_SLOTS:
+                raise ValueError("audio envelope is smaller than its header")
+            if envelope.shape[0] > hidden:
+                raise ValueError("audio envelope exceeds carrier width")
+            row = torch.zeros(hidden, dtype=torch.float32)
+            row[: envelope.shape[0]] = envelope
+            rows.append(row.to(device).unsqueeze(0))
+        return rows
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from vllm_omni.model_executor.models.nemotron_asr.forward_ops import (
+            merge_mm_embeddings,
+        )
+
+        hidden = int(self.config.hidden_size)
+        if multimodal_embeddings is None or is_multimodal is None:
+            return torch.zeros(
+                input_ids.shape[0],
+                hidden,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+        return merge_mm_embeddings(
+            input_ids,
+            multimodal_embeddings,
+            is_multimodal,
+            hidden_size=hidden,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        persistent_state_projection: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del positions, intermediate_tensors, kwargs
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            advance_model_rows,
+        )
+        from vllm_omni.model_executor.models.nemotron_asr.plan import (
+            build_row_plan,
+        )
+
+        if input_ids is None or inputs_embeds is None:
+            raise RuntimeError("Nemotron forward requires raw ids and embeddings")
+        if persistent_state_projection is not None:
+            context = self._stage_v2_projection(persistent_state_projection)
+            num_decodes = 0
+            num_prefills = len(context.request_ids)
+        else:
+            context = self._plan_slot.consume()
+            num_decodes = int(context.has_prior_state.sum().item())
+            num_prefills = len(context.request_ids) - num_decodes
+        pools = self._state_pools()
+        plan = build_row_plan(
+            context,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            null_block_id=int(NULL_BLOCK_ID),
+            num_pool_blocks=int(pools.replay_queue.shape[0]),
+        )
+        return advance_model_rows(
+            self.core,
+            input_ids.long(),
+            inputs_embeds,
+            plan,
+            channel_pools=list(pools.channel),
+            time_pools=list(pools.convolution),
+            len_pools=list(pools.valid_length),
+            h_pool=pools.predictor_h,
+            c_pool=pools.predictor_c,
+            queue_pool=pools.replay_queue,
+            book_pool=pools.replay_book,
+            frontend_raw_pool=pools.frontend_raw,
+            frontend_mel_pool=pools.frontend_mel,
+            frontend_counter_pool=pools.frontend_counters,
+            endpoint_history_pool=pools.endpoint_history,
+            endpoint_book_pool=pools.endpoint_book,
+            eou_token_id=int(self.config.eou_token_id),
+            adapter=self._emission_adapter,
+            decode_resolver=self._decode_resolver,
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            park_id=int(self.config.eos_token_id),
+            commit_sink=self._ensure_commit_sink(inputs_embeds.device),
+            staging=self._ensure_host_staging(),
+        )
+
+    def consume_batch_stats(self) -> list[tuple[str, int]] | None:
+        from vllm_omni.model_executor.models.nemotron_asr.advance import (
+            consume_batch_stats,
+        )
+
+        return consume_batch_stats()
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: Any = None,
+    ) -> torch.Tensor:
+        del sampling_metadata
+        from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+            forced_logits_rows,
+            read_decision_carrier,
+        )
+
+        ids = read_decision_carrier(hidden_states)
+        return forced_logits_rows(ids, num_logits=self.num_logits)
+
+    @classmethod
+    def get_model_state_cls(cls) -> type[Any]:
+        from vllm_omni.model_executor.models.nemotron_asr.model_state_v2 import (
+            NemotronASRModelState,
+        )
+
+        return NemotronASRModelState
 
 
 def build_decode_resolver(hf_config: Any) -> DecodeResolver:
@@ -247,8 +769,8 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
             not-yet-supported table path.
     """
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
-        decode_compact_active,
-        decode_dense_masked,
+        decode_compact_active_frames,
+        decode_dense_masked_frames,
     )
 
     arm = getattr(hf_config, "decode_dispatch_arm", None)
@@ -268,8 +790,8 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
             "decode_dispatch_arm for the bring-up lane"
         )
     arms = {
-        "dense-eager": decode_dense_masked,
-        "compact-eager": decode_compact_active,
+        "dense-eager": decode_dense_masked_frames,
+        "compact-eager": decode_compact_active_frames,
     }
     if arm not in arms:
         raise ValueError(f"unknown decode_dispatch_arm {arm!r} (known: {sorted(arms)})")

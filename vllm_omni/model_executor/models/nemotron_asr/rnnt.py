@@ -48,6 +48,17 @@ class DecodeState:
     last_label: torch.Tensor
 
 
+@dataclass
+class FrameAlignedDecode:
+    """Dense decode output with one endpoint symbol source per frame."""
+
+    token_ids: torch.Tensor
+    token_lengths: torch.Tensor
+    state: DecodeState
+    frame_emission_counts: torch.Tensor
+    frame_final_labels: torch.Tensor
+
+
 class Predictor(nn.Module):
     """Embedding + LSTM prediction network (blank-as-pad)."""
 
@@ -245,6 +256,28 @@ def decode_compact_active(
         ``token_ids`` ``(B, T_pad * max_symbols)`` int32 padded,
         ``token_lengths`` ``(B,)`` int32, and the advanced state.
     """
+    result = decode_compact_active_frames(
+        enc_frames,
+        enc_lengths,
+        predictor,
+        joint,
+        state,
+        max_symbols=max_symbols,
+    )
+    return result.token_ids, result.token_lengths, result.state
+
+
+def decode_compact_active_frames(
+    enc_frames: torch.Tensor,
+    enc_lengths: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    state: DecodeState,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> FrameAlignedDecode:
+    """Compact-active decode retaining the endpoint symbol per frame."""
+
     batch, t_pad, _ = enc_frames.shape
     device = enc_frames.device
     blank = predictor.blank_id
@@ -255,6 +288,12 @@ def decode_compact_active(
     last_label = state.last_label.clone()
     token_ids = torch.zeros(batch, t_pad * max_symbols, dtype=torch.int32, device=device)
     token_lengths = torch.zeros(batch, dtype=torch.long, device=device)
+    frame_emission_counts = torch.zeros(
+        batch, t_pad, dtype=torch.int32, device=device
+    )
+    frame_final_labels = torch.full(
+        (batch, t_pad), blank, dtype=torch.int32, device=device
+    )
     pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
     for t in range(t_pad):
         frame = enc_frames[:, t]
@@ -271,6 +310,8 @@ def decode_compact_active(
             elabels = labels[emit]
             token_ids[erows, token_lengths[erows]] = elabels.to(torch.int32)
             token_lengths[erows] += 1
+            frame_emission_counts[erows, t] += 1
+            frame_final_labels[erows, t] = elabels.to(torch.int32)
             last_label[erows] = elabels
             # Commit the state that produced this pred_out, emitters
             # only; blank never advances the predictor.
@@ -282,10 +323,12 @@ def decode_compact_active(
             pred_c[:, erows] = new_c
             active = torch.zeros_like(active)
             active[erows] = True
-    return (
-        token_ids,
-        token_lengths.to(torch.int32),
-        DecodeState(h=h, c=c, last_label=last_label),
+    return FrameAlignedDecode(
+        token_ids=token_ids,
+        token_lengths=token_lengths.to(torch.int32),
+        state=DecodeState(h=h, c=c, last_label=last_label),
+        frame_emission_counts=frame_emission_counts,
+        frame_final_labels=frame_final_labels,
     )
 
 
@@ -333,6 +376,28 @@ def decode_dense_masked(
         ``token_ids`` ``(B, T_pad * max_symbols)`` int32 padded,
         ``token_lengths`` ``(B,)`` int32, and the advanced state.
     """
+    result = decode_dense_masked_frames(
+        enc_frames,
+        enc_lengths,
+        predictor,
+        joint,
+        state,
+        max_symbols=max_symbols,
+    )
+    return result.token_ids, result.token_lengths, result.state
+
+
+# @spec PORT-DEC-001, PORT-SEG-002
+def decode_dense_masked_frames(
+    enc_frames: torch.Tensor,
+    enc_lengths: torch.Tensor,
+    predictor: Predictor,
+    joint: Joint,
+    state: DecodeState,
+    *,
+    max_symbols: int = MAX_SYMBOLS_PER_STEP,
+) -> FrameAlignedDecode:
+    """Run dense decode and retain one final label per encoder frame."""
     batch, t_pad, _ = enc_frames.shape
     device = enc_frames.device
     blank = predictor.blank_id
@@ -343,6 +408,18 @@ def decode_dense_masked(
     capacity = max(t_pad * max_symbols, 1)
     token_ids = torch.zeros(batch, t_pad * max_symbols, dtype=torch.int32, device=device)
     token_lengths = torch.zeros(batch, dtype=torch.long, device=device)
+    frame_emission_counts = torch.zeros(
+        batch,
+        t_pad,
+        dtype=torch.int32,
+        device=device,
+    )
+    frame_final_labels = torch.full(
+        (batch, t_pad),
+        blank,
+        dtype=torch.int32,
+        device=device,
+    )
     pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
     for t in range(t_pad):
         frame = enc_frames[:, t]
@@ -362,6 +439,12 @@ def decode_dense_masked(
                 ),
             )
             token_lengths = token_lengths + emit.long()
+            frame_emission_counts[:, t] += emit.to(torch.int32)
+            frame_final_labels[:, t] = torch.where(
+                emit,
+                labels.to(torch.int32),
+                frame_final_labels[:, t],
+            )
             gate = emit.view(1, -1, 1)
             last_label = torch.where(emit, labels, last_label)
             # Commit the state that produced this pred_out, emitters
@@ -373,10 +456,12 @@ def decode_dense_masked(
             pred_h = torch.where(gate, new_h, pred_h)
             pred_c = torch.where(gate, new_c, pred_c)
             active = emit
-    return (
-        token_ids,
-        token_lengths.to(torch.int32),
-        DecodeState(h=h, c=c, last_label=last_label),
+    return FrameAlignedDecode(
+        token_ids=token_ids,
+        token_lengths=token_lengths.to(torch.int32),
+        state=DecodeState(h=h, c=c, last_label=last_label),
+        frame_emission_counts=frame_emission_counts,
+        frame_final_labels=frame_final_labels,
     )
 
 

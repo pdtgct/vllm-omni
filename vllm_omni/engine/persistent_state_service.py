@@ -1,0 +1,446 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""API-process ownership for model-defined persistent-state leases.
+
+The service deliberately uses EngineCore's existing named utility boundary.
+It does not introduce a new wire protocol, expose physical slots, or make
+the API process authoritative for resident state.  The engine-core manager
+commits every transition; this object serializes admission and projects the
+committed result back into the serving process.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Literal
+
+StateLocation = Literal["resident", "offloaded", "absent"]
+
+
+class PersistentStateServiceError(RuntimeError):
+    """Base failure raised by the persistent-state admission service."""
+
+
+class PersistentStateCapacityExhausted(PersistentStateServiceError):  # noqa: N818
+    """The manager has no admissible resident slot."""
+
+
+class PersistentStateServiceUnavailable(PersistentStateServiceError):  # noqa: N818
+    """The service cannot currently establish authoritative state."""
+
+
+class PersistentStateIndeterminate(PersistentStateServiceError):  # noqa: N818
+    """A submitted operation could not be reconciled authoritatively."""
+
+
+@dataclass(frozen=True)
+class StateLocationEvent:
+    """Content-free projection of one committed location transition."""
+
+    engine_epoch: str
+    session_key: str
+    generation: int
+    location: StateLocation
+    transition: str
+
+
+@dataclass(frozen=True)
+class StateLease:
+    """Opaque logical binding; physical slot identity never crosses RPC."""
+
+    engine_epoch: str
+    session_key: str
+    generation: int
+    schema_id: str
+    profile_id: str
+    location: StateLocation
+    binding_token: str
+
+
+@dataclass(frozen=True)
+class StateReserveResult:
+    """Post-commit reserve projection returned by EngineCore."""
+
+    operation_id: str
+    manager_revision: int
+    resident_count: int
+    lease: StateLease
+    location_event: StateLocationEvent
+
+
+@dataclass(frozen=True)
+class StateReleaseResult:
+    """Post-commit release projection returned by EngineCore."""
+
+    operation_id: str
+    manager_revision: int
+    resident_count: int
+    location_event: StateLocationEvent
+
+
+@dataclass(frozen=True)
+class _ReserveCommand:
+    operation_id: str
+    session_key: str
+    schema_id: str
+    profile_id: str
+    future: asyncio.Future[StateReserveResult]
+
+
+@dataclass(frozen=True)
+class _ReleaseCommand:
+    operation_id: str
+    lease: StateLease
+    reason: str
+    future: asyncio.Future[StateReleaseResult]
+
+
+class PersistentStateService:
+    """Bounded, cleanup-priority bridge to one stage's state manager.
+
+    Admission starts closed.  The first operation performs a capability
+    inventory handshake through ``persistent_state_snapshot`` and only then
+    opens admission.  Cleanup has its own queue and is always checked before
+    reserve work, so a saturated admission lane cannot starve slot returns.
+    Duplicate operation ids coalesce onto one future and therefore cannot
+    commit parallel reserve or release attempts.
+    """
+
+    def __init__(
+        self,
+        stage_client: Any,
+        *,
+        reserve_queue_capacity: int = 64,
+        cleanup_queue_capacity: int = 256,
+        operation_timeout_s: float = 10.0,
+        reconciliation_timeout_s: float = 30.0,
+    ) -> None:
+        if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
+            raise ValueError("persistent-state queue capacities must be positive")
+        if operation_timeout_s <= 0 or reconciliation_timeout_s <= 0:
+            raise ValueError("persistent-state timeouts must be positive")
+        self._stage_client = stage_client
+        self.reserve_queue: asyncio.Queue[_ReserveCommand] = asyncio.Queue(
+            maxsize=reserve_queue_capacity
+        )
+        self.cleanup_queue: asyncio.Queue[_ReleaseCommand] = asyncio.Queue(
+            maxsize=cleanup_queue_capacity
+        )
+        self._operation_timeout_s = operation_timeout_s
+        self._reconciliation_timeout_s = reconciliation_timeout_s
+        self._operations: dict[str, asyncio.Future[Any]] = {}
+        self._queue_event = asyncio.Event()
+        self._startup_lock: asyncio.Lock | None = None
+        self._dispatcher_task: asyncio.Task[None] | None = None
+        self._ready = False
+        self._admission_open = False
+        self._engine_epoch: str | None = None
+        self._inventory: dict[str, Any] | None = None
+        self._fatal_error: BaseException | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Whether capability inventory is known and admission is open."""
+        return self._ready and self._admission_open and self._fatal_error is None
+
+    @property
+    def inventory(self) -> dict[str, Any] | None:
+        """Return a copy of the current content-free capability inventory."""
+        return None if self._inventory is None else dict(self._inventory)
+
+    def close_admission(self) -> None:
+        """Close new admission without discarding cleanup authority."""
+        self._admission_open = False
+
+    def shutdown(self) -> None:
+        """Close admission and cancel the API-owned dispatcher task."""
+
+        self.close_admission()
+        task = self._dispatcher_task
+        self._dispatcher_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def engine_epoch_changed(self, engine_epoch: str) -> None:
+        """Fail closed when a new engine epoch invalidates every live lease."""
+        self.close_admission()
+        self._ready = False
+        self._fatal_error = PersistentStateServiceUnavailable(
+            "persistent-state engine epoch changed; live leases are invalid"
+        )
+        self._engine_epoch = engine_epoch
+
+    async def _ensure_started(self) -> None:
+        if self._startup_lock is None:
+            self._startup_lock = asyncio.Lock()
+        async with self._startup_lock:
+            if self._fatal_error is not None:
+                raise PersistentStateServiceUnavailable(str(self._fatal_error))
+            if not self._ready:
+                snapshot = await self._stage_client.call_utility_async(
+                    "persistent_state_snapshot"
+                )
+                capabilities = set(snapshot.get("capabilities", ()))
+                if "resident" not in capabilities:
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state capability inventory lacks resident state"
+                    )
+                engine_epoch = str(snapshot["engine_epoch"])
+                if self._engine_epoch is not None and engine_epoch != self._engine_epoch:
+                    self.engine_epoch_changed(engine_epoch)
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state engine epoch changed during snapshot"
+                    )
+                self._engine_epoch = engine_epoch
+                self._inventory = dict(snapshot)
+                self._ready = True
+                self._admission_open = True
+            if self._dispatcher_task is None or self._dispatcher_task.done():
+                self._dispatcher_task = asyncio.create_task(
+                    self._dispatch(), name="persistent-state-dispatch"
+                )
+
+    async def check_health(self) -> None:
+        """Require a completed inventory handshake and open admission."""
+        await self._ensure_started()
+        if not self.ready:
+            raise PersistentStateServiceUnavailable(
+                "persistent-state admission is closed"
+            )
+
+    def _coalesced_future(
+        self, operation_id: str
+    ) -> asyncio.Future[Any] | None:
+        return self._operations.get(operation_id)
+
+    async def reserve(
+        self,
+        *,
+        operation_id: str,
+        session_key: str,
+        schema_id: str,
+        profile_id: str,
+    ) -> StateLease:
+        """Reserve once, reconciling the same operation after timeout."""
+        await self._ensure_started()
+        if not self._admission_open:
+            raise PersistentStateServiceUnavailable(
+                "persistent-state admission is closed"
+            )
+        shared = self._coalesced_future(operation_id)
+        if shared is None:
+            future: asyncio.Future[StateReserveResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._operations[operation_id] = future
+            try:
+                self.reserve_queue.put_nowait(
+                    _ReserveCommand(
+                        operation_id,
+                        session_key,
+                        schema_id,
+                        profile_id,
+                        future,
+                    )
+                )
+            except asyncio.QueueFull as error:
+                self._operations.pop(operation_id, None)
+                raise PersistentStateCapacityExhausted(
+                    "persistent-state reserve queue is full"
+                ) from error
+            self._queue_event.set()
+            shared = future
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(shared), timeout=self._operation_timeout_s
+            )
+        except asyncio.TimeoutError:
+            # Submission may already be committed.  Close admission and
+            # reconcile this same operation id; never mint a parallel attempt.
+            self.close_admission()
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(shared),
+                    timeout=self._reconciliation_timeout_s,
+                )
+            except asyncio.TimeoutError as error:
+                raise PersistentStateIndeterminate(
+                    "persistent-state reserve reconciliation remained indeterminate"
+                ) from error
+            self._admission_open = True
+        if not isinstance(result, StateReserveResult):
+            raise PersistentStateServiceUnavailable(
+                "persistent-state reserve returned an invalid result"
+            )
+        return result.lease
+
+    async def release(
+        self,
+        *,
+        operation_id: str,
+        lease: StateLease,
+        reason: str,
+    ) -> StateReleaseResult:
+        """Return a lease once through the cleanup-priority lane."""
+        await self._ensure_started()
+        shared = self._coalesced_future(operation_id)
+        if shared is None:
+            future: asyncio.Future[StateReleaseResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._operations[operation_id] = future
+            try:
+                self.cleanup_queue.put_nowait(
+                    _ReleaseCommand(operation_id, lease, reason, future)
+                )
+            except asyncio.QueueFull as error:
+                self._operations.pop(operation_id, None)
+                self.close_admission()
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state cleanup queue is full"
+                ) from error
+            self._queue_event.set()
+            shared = future
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(shared), timeout=self._reconciliation_timeout_s
+            )
+        except asyncio.TimeoutError as error:
+            self.close_admission()
+            raise PersistentStateIndeterminate(
+                "persistent-state release reconciliation remained indeterminate"
+            ) from error
+        if not isinstance(result, StateReleaseResult):
+            raise PersistentStateServiceUnavailable(
+                "persistent-state release returned an invalid result"
+            )
+        return result
+
+    async def _dispatch(self) -> None:
+        """Drain cleanup_queue before reserve_queue on every turn."""
+        while True:
+            await self._queue_event.wait()
+            self._queue_event.clear()
+            while True:
+                command: _ReserveCommand | _ReleaseCommand | None = None
+                try:
+                    command = self.cleanup_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    try:
+                        command = self.reserve_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                if isinstance(command, _ReleaseCommand):
+                    await self._execute_release(command)
+                    self.cleanup_queue.task_done()
+                else:
+                    await self._execute_reserve(command)
+                    self.reserve_queue.task_done()
+                if not self.cleanup_queue.empty() or not self.reserve_queue.empty():
+                    self._queue_event.set()
+
+    async def _execute_reserve(self, command: _ReserveCommand) -> None:
+        try:
+            raw = await self._stage_client.call_utility_async(
+                "persistent_state_reserve",
+                command.operation_id,
+                command.session_key,
+                command.schema_id,
+                command.profile_id,
+            )
+            result = self._decode_reserve(raw)
+            if result.lease.engine_epoch != self._engine_epoch:
+                self.engine_epoch_changed(result.lease.engine_epoch)
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state reserve crossed an engine epoch"
+                )
+        except BaseException as error:
+            mapped = self._map_error(error)
+            if not command.future.done():
+                command.future.set_exception(mapped)
+        else:
+            if not command.future.done():
+                command.future.set_result(result)
+
+    async def _execute_release(self, command: _ReleaseCommand) -> None:
+        try:
+            raw = await self._stage_client.call_utility_async(
+                "persistent_state_release",
+                command.operation_id,
+                self._lease_payload(command.lease),
+                command.reason,
+            )
+            result = self._decode_release(raw)
+            if result.location_event.engine_epoch != self._engine_epoch:
+                self.engine_epoch_changed(result.location_event.engine_epoch)
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state release crossed an engine epoch"
+                )
+        except BaseException as error:
+            mapped = self._map_error(error)
+            if not command.future.done():
+                command.future.set_exception(mapped)
+        else:
+            if not command.future.done():
+                command.future.set_result(result)
+
+    @staticmethod
+    def _map_error(error: BaseException) -> PersistentStateServiceError:
+        if isinstance(error, PersistentStateServiceError):
+            return error
+        message = str(error)
+        if "capacity" in message.lower():
+            return PersistentStateCapacityExhausted(message)
+        return PersistentStateServiceUnavailable(message)
+
+    @staticmethod
+    def _lease_payload(lease: StateLease) -> dict[str, Any]:
+        return {
+            "engine_epoch": lease.engine_epoch,
+            "session_key": lease.session_key,
+            "generation": lease.generation,
+            "schema_id": lease.schema_id,
+            "profile_id": lease.profile_id,
+            "location": lease.location,
+            "binding_token": lease.binding_token,
+        }
+
+    @staticmethod
+    def _decode_location(raw: dict[str, Any]) -> StateLocationEvent:
+        return StateLocationEvent(
+            engine_epoch=str(raw["engine_epoch"]),
+            session_key=str(raw["session_key"]),
+            generation=int(raw["generation"]),
+            location=raw["location"],
+            transition=str(raw["transition"]),
+        )
+
+    @classmethod
+    def _decode_reserve(cls, raw: dict[str, Any]) -> StateReserveResult:
+        lease_raw = raw["lease"]
+        lease = StateLease(
+            engine_epoch=str(lease_raw["engine_epoch"]),
+            session_key=str(lease_raw["session_key"]),
+            generation=int(lease_raw["generation"]),
+            schema_id=str(lease_raw["schema_id"]),
+            profile_id=str(lease_raw["profile_id"]),
+            location=lease_raw["location"],
+            binding_token=str(lease_raw["binding_token"]),
+        )
+        return StateReserveResult(
+            operation_id=str(raw["operation_id"]),
+            manager_revision=int(raw["manager_revision"]),
+            resident_count=int(raw["resident_count"]),
+            lease=lease,
+            location_event=cls._decode_location(raw["location_event"]),
+        )
+
+    @classmethod
+    def _decode_release(cls, raw: dict[str, Any]) -> StateReleaseResult:
+        return StateReleaseResult(
+            operation_id=str(raw["operation_id"]),
+            manager_revision=int(raw["manager_revision"]),
+            resident_count=int(raw["resident_count"]),
+            location_event=cls._decode_location(raw["location_event"]),
+        )

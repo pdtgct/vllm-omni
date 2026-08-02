@@ -87,6 +87,17 @@ def _expected_inventory() -> list[dict[str, Any]]:
             _entry("frontend.mel_tail", [128, 9], "float32"),
         )
     )
+    entries.append(_entry("decode.layers.0.replay.queue", [140], "int32"))
+    for name, init in (
+        ("queue_head", "zeros"),
+        ("queue_length", "zeros"),
+        ("last_label", "blank_label"),
+        ("prompt", "admitted_prompt"),
+        ("geometry", "admitted_geometry"),
+        ("pending_echo", "zeros"),
+        ("expected_label", "zeros"),
+    ):
+        entries.append(_entry(f"decode.layers.0.replay.book.{name}", [1], "int32", init))
     for counter in (
         "total_valid_samples",
         "committed_mel_frames",
@@ -103,19 +114,8 @@ def _expected_inventory() -> list[dict[str, Any]]:
         (
             _entry("predictor.layers.0.lstm_state.h", [2, 640], "float32"),
             _entry("predictor.layers.0.lstm_state.c", [2, 640], "float32"),
-            _entry("decode.layers.0.replay.queue", [140], "int32"),
         )
     )
-    for name, init in (
-        ("queue_head", "zeros"),
-        ("queue_length", "zeros"),
-        ("last_label", "blank_label"),
-        ("prompt", "admitted_prompt"),
-        ("geometry", "admitted_geometry"),
-        ("pending_echo", "zeros"),
-        ("expected_label", "zeros"),
-    ):
-        entries.append(_entry(f"decode.layers.0.replay.book.{name}", [1], "int32", init))
     entries.append(_entry("endpoint.history", [12], "int32"))
     for name in (
         "history_length",

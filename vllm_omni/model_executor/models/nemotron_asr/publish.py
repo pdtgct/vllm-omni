@@ -68,6 +68,8 @@ _MANIFEST_FILES = (
 #: placeholder = V+2 (author_config enforces > V and distinctness).
 _PARK_OFFSET = 1
 _PLACEHOLDER_OFFSET = 2
+_EOU_OFFSET = 3
+_FLUSH_OFFSET = 4
 #: The chunk-envelope carrier width: the header slots + the largest
 #: admitted raw cadence (1120 ms at 16 kHz = 17,920 samples). DERIVED
 #: from the manifests, never a copied constant — author_geometry_
@@ -141,6 +143,8 @@ def publish(
         converted,
         eos_token_id=v + _PARK_OFFSET,
         audio_chunk_token_id=v + _PLACEHOLDER_OFFSET,
+        eou_token_id=v + _EOU_OFFSET,
+        flush_token_id=v + _FLUSH_OFFSET,
         hidden_size=_HIDDEN_SIZE,
         reference_vocab_size=reference_vocab_size,
     )
@@ -151,6 +155,9 @@ def publish(
         hidden_size=cfg_dict["hidden_size"],
         eos_token_id=cfg_dict["eos_token_id"],
         audio_chunk_token_id=cfg_dict["audio_chunk_token_id"],
+        eou_token_id=cfg_dict["eou_token_id"],
+        flush_token_id=cfg_dict["flush_token_id"],
+        endpoint_history_capacity_frames=12,
         n_layers=cfg_dict["n_layers"],
         num_prompts=num_prompts,
         prompt_dictionary=prompt_dictionary,
@@ -203,6 +210,8 @@ def publish(
                 "vocab_size": cfg_dict["vocab_size"],
                 "eos_token_id": cfg_dict["eos_token_id"],
                 "audio_chunk_token_id": cfg_dict["audio_chunk_token_id"],
+                "eou_token_id": cfg_dict["eou_token_id"],
+                "flush_token_id": cfg_dict["flush_token_id"],
                 "hidden_size": cfg_dict["hidden_size"],
                 "n_layers": cfg_dict["n_layers"],
                 "architectures": cfg_dict["architectures"],

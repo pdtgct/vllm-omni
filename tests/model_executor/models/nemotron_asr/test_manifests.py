@@ -127,6 +127,31 @@ def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
             "init": "zeros",
         }
     )
+    entries.append(
+        {
+            "name": "decode.layers.0.replay.queue",
+            "shape": [140],
+            "dtype": "int32",
+            "init": "zeros",
+        }
+    )
+    for name, init in (
+        ("queue_head", "zeros"),
+        ("queue_length", "zeros"),
+        ("last_label", "blank_label"),
+        ("prompt", "admitted_prompt"),
+        ("geometry", "admitted_geometry"),
+        ("pending_echo", "zeros"),
+        ("expected_label", "zeros"),
+    ):
+        entries.append(
+            {
+                "name": f"decode.layers.0.replay.book.{name}",
+                "shape": [1],
+                "dtype": "int32",
+                "init": init,
+            }
+        )
     for counter in (
         "total_valid_samples",
         "committed_mel_frames",
@@ -152,31 +177,6 @@ def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
                 "shape": [cfg.pred_rnn_layers, cfg.pred_hidden],
                 "dtype": "float32",
                 "init": "zeros",
-            }
-        )
-    entries.append(
-        {
-            "name": "decode.layers.0.replay.queue",
-            "shape": [140],
-            "dtype": "int32",
-            "init": "zeros",
-        }
-    )
-    for name, init in (
-        ("queue_head", "zeros"),
-        ("queue_length", "zeros"),
-        ("last_label", "blank_label"),
-        ("prompt", "admitted_prompt"),
-        ("geometry", "admitted_geometry"),
-        ("pending_echo", "zeros"),
-        ("expected_label", "zeros"),
-    ):
-        entries.append(
-            {
-                "name": f"decode.layers.0.replay.book.{name}",
-                "shape": [1],
-                "dtype": "int32",
-                "init": init,
             }
         )
     entries.append(

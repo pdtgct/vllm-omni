@@ -1,0 +1,3 @@
+model: null
+model_stage: LLM_AR
+scheduler_cls: vllm_omni.model_executor.models.nemotron_asr.scheduler.NemotronASRScheduler

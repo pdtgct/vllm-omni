@@ -173,6 +173,9 @@ class ObservedRow:
     scheduled_token_id: int
     has_prior_state: bool
     envelope_header: tuple[float, ...] | None
+    endpoint_mode: int = 0
+    endpoint_threshold_frames: int = 0
+    endpoint_residue_frames: int = 0
 
 
 @dataclass(frozen=True)
@@ -196,6 +199,9 @@ class PlanContext:
     admission_generation: torch.Tensor
     ready_deadline_ns: torch.Tensor
     live_block_ids: torch.Tensor
+    endpoint_mode: torch.Tensor
+    endpoint_threshold_frames: torch.Tensor
+    endpoint_residue_frames: torch.Tensor
 
 
 @dataclass
@@ -576,6 +582,17 @@ def prepare_plan_context(
         admission_generation=torch.tensor([b.admission_generation for b in bindings], dtype=torch.int64),
         ready_deadline_ns=torch.tensor([b.ready_deadline_ns for b in bindings], dtype=torch.int64),
         live_block_ids=torch.tensor(registry.live_block_ids(), dtype=torch.int64),
+        endpoint_mode=torch.tensor(
+            [row.endpoint_mode for row in rows], dtype=torch.int64
+        ),
+        endpoint_threshold_frames=torch.tensor(
+            [row.endpoint_threshold_frames for row in rows],
+            dtype=torch.int64,
+        ),
+        endpoint_residue_frames=torch.tensor(
+            [row.endpoint_residue_frames for row in rows],
+            dtype=torch.int64,
+        ),
     )
 
 
@@ -647,4 +664,7 @@ def build_row_plan(
         request_ids=context.request_ids,
         execution_tier=execution_tier,
         bindings=context.bindings,
+        endpoint_mode=context.endpoint_mode,
+        endpoint_threshold_frames=context.endpoint_threshold_frames,
+        endpoint_residue_frames=context.endpoint_residue_frames,
     )

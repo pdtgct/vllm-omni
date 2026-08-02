@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_ar_model_runner_v2 import GPUARModelRunnerV2
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
@@ -111,13 +112,13 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUARWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-
         # Construct the model runner
-        self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
+        runner_cls = (
+            GPUARModelRunnerV2
+            if self.use_v2_model_runner
+            else GPUARModelRunner
+        )
+        self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

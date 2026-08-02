@@ -237,6 +237,8 @@ def author_config(
     *,
     eos_token_id: int,
     audio_chunk_token_id: int,
+    eou_token_id: int,
+    flush_token_id: int,
     hidden_size: int,
     reference_vocab_size: int | None = None,
 ) -> dict:
@@ -264,12 +266,15 @@ def author_config(
             f"the derived V={v} (checkpoint tensors win — settle the "
             "metadata, do not proceed)"
         )
-    if eos_token_id == audio_chunk_token_id:
-        raise ConversionError(f"park and placeholder ids must be distinct; both are {eos_token_id}")
-    for label, sid in (
+    controls = (
         ("eos_token_id/park", eos_token_id),
         ("audio_chunk_token_id/placeholder", audio_chunk_token_id),
-    ):
+        ("eou_token_id/eou", eou_token_id),
+        ("flush_token_id/flush", flush_token_id),
+    )
+    if len({sid for _, sid in controls}) != len(controls):
+        raise ConversionError("park, placeholder, EOU, and FLUSH ids must be distinct")
+    for label, sid in controls:
         # ids 0..V-1 are labels and V is blank, so a minted special
         # must be strictly past blank (> V), not merely >= V.
         if sid <= v:
@@ -279,7 +284,7 @@ def author_config(
             )
     # vocab_size is the logit width: it must cover every id, specials
     # included (contiguous V, V+1 gives V+2).
-    vocab_size = max(v, eos_token_id + 1, audio_chunk_token_id + 1)
+    vocab_size = max(v, *(sid + 1 for _, sid in controls))
     return {
         "architectures": [ARCHITECTURE],
         "model_type": MODEL_TYPE,
@@ -288,6 +293,8 @@ def author_config(
         "hidden_size": hidden_size,
         "eos_token_id": eos_token_id,
         "audio_chunk_token_id": audio_chunk_token_id,
+        "eou_token_id": eou_token_id,
+        "flush_token_id": flush_token_id,
         "torch_dtype": "float32",
         "n_layers": n_layers,
     }

@@ -19,10 +19,18 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from vllm_omni.model_executor.models.nemotron_asr.transcript import (
+    SegmentCompletion,
+    TerminalResult,
+)
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+    from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
+        EndpointPolicy,
+    )
     from vllm_omni.model_executor.models.nemotron_asr.session import (
         NemotronRealtimeSession,
         ReceiptLedger,
@@ -32,6 +40,7 @@ if TYPE_CHECKING:
 
 Render = Callable[[Any], Awaitable[Any]]
 AcceptanceCallback = Callable[[int], None]
+SegmentCallback = Callable[[SegmentCompletion], None]
 
 
 @runtime_checkable
@@ -43,12 +52,17 @@ class SessionLease(Protocol):
         samples: FloatSamples,
         *,
         on_accepted: AcceptanceCallback | None = None,
+        on_segment: SegmentCallback | None = None,
     ) -> list[str]:
         """Submit one whole piece and return completed hypotheses."""
         ...
 
-    async def flush(self) -> str:
-        """Drain the final-tail and return the final transcript."""
+    async def force_segment(self) -> None:
+        """Queue one semantic segment boundary."""
+        ...
+
+    async def flush(self) -> TerminalResult:
+        """Drain the final-tail and return the terminal result."""
         ...
 
     async def update_locale(self, locale: str) -> None:
@@ -72,7 +86,13 @@ class SessionLease(Protocol):
 class SessionFactory(Protocol):
     """Construct transport-neutral sessions at caller-selected geometry."""
 
-    async def open(self, *, cadence: str, locale: str) -> SessionLease:
+    async def open(
+        self,
+        *,
+        cadence: str,
+        locale: str,
+        endpoint_policy: EndpointPolicy | None = None,
+    ) -> SessionLease:
         """Open one engine session after validating model controls."""
         ...
 
@@ -120,6 +140,9 @@ class NemotronSessionLease:
         session: NemotronRealtimeSession,
         request_id: str,
         render: Render | None = None,
+        persistent_state_service: Any | None = None,
+        state_lease: Any | None = None,
+        release_operation_id: str | None = None,
     ) -> None:
         """Bind one validated model-local session to the engine."""
         ledger = session.ledger
@@ -134,16 +157,21 @@ class NemotronSessionLease:
         self._ledger: ReceiptLedger = ledger
         self._request_id = request_id
         self._render = render
+        self._persistent_state_service = persistent_state_service
+        self._state_lease = state_lease
+        self._release_operation_id = release_operation_id
         self._park_id = session.park_token_id
         self._audio: asyncio.Queue[Any] = asyncio.Queue()
         self._input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self._done = asyncio.Event()
-        self._text = ""
+        self._terminal_result: TerminalResult | None = None
+        self._active_segment_callback: SegmentCallback | None = None
         self._error: BaseException | None = None
         self._ended = False
         self._audio_closed = False
         self._flush_parked = False
+        self._segment_generation = 0
         self._aborted = False
         self._released = False
 
@@ -162,6 +190,7 @@ class NemotronSessionLease:
         samples: FloatSamples,
         *,
         on_accepted: AcceptanceCallback | None = None,
+        on_segment: SegmentCallback | None = None,
     ) -> list[str]:
         """Submit one whole piece and await its completed carriers.
 
@@ -176,22 +205,39 @@ class NemotronSessionLease:
         """
         self._ensure_started()
         self._require_live()
+        if self._active_segment_callback is not None:
+            raise RuntimeError("feed calls must be serialized")
+        self._active_segment_callback = on_segment
         self._audio.put_nowait(samples)
-        receipt = await self._ledger.next_piece()
-        if on_accepted is not None:
-            on_accepted(len(samples))
-
-        results: list[str] = []
         try:
+            receipt = await self._ledger.next_piece()
+            if on_accepted is not None:
+                on_accepted(len(samples))
+
+            results: list[str] = []
             for ticket in receipt.tickets:
                 results.append(await ticket.done)
+            return results
         finally:
-            for ticket in receipt.tickets:
-                if ticket.done.done() and not ticket.done.cancelled():
-                    ticket.done.exception()
-        return results
+            self._active_segment_callback = None
+            receipt = locals().get("receipt")
+            if receipt is not None:
+                for ticket in receipt.tickets:
+                    if ticket.done.done() and not ticket.done.cancelled():
+                        ticket.done.exception()
 
-    async def flush(self) -> str:
+    async def force_segment(self) -> None:
+        """Queue one ordered semantic boundary without accepting samples."""
+        self._ensure_started()
+        self._require_live()
+        self._session.force_segment()
+        # Wake the stream consumer; empty arrays are internal control wakes
+        # and never enter accepted-audio accounting.
+        import numpy as np
+
+        self._audio.put_nowait(np.empty(0, dtype=np.float32))
+
+    async def flush(self) -> TerminalResult:
         """Drain the final-tail and return all terminal output."""
         self._ensure_started()
         if self._aborted:
@@ -199,7 +245,9 @@ class NemotronSessionLease:
         if self._done.is_set() and not self._audio_closed:
             raise self._error or RuntimeError("generation ended before the session's normal finalization")
         await self._drain()
-        return self._text
+        if self._terminal_result is None:
+            raise RuntimeError("terminal result was not produced")
+        return self._terminal_result
 
     async def update_locale(self, locale: str) -> None:
         """Validate and select the locale for the next carrier mint."""
@@ -227,16 +275,20 @@ class NemotronSessionLease:
         await self._drain()
 
     async def release(self) -> None:
-        """Release this lease exactly once.
-
-        The current engine exposes no separate provider reservation
-        handle. Keeping this idempotent operation in the contract lets a
-        future provider-owned reservation attach here without changing
-        transports or the model lifecycle.
-        """
+        """Release the exact manager lease once through its cleanup lane."""
         if self._released:
             return
         self._released = True
+        if (
+            self._persistent_state_service is not None
+            and self._state_lease is not None
+            and self._release_operation_id is not None
+        ):
+            await self._persistent_state_service.release(
+                operation_id=self._release_operation_id,
+                lease=self._state_lease,
+                reason="session_release",
+            )
 
     def _ensure_started(self) -> None:
         """Start the background engine consumer on first use."""
@@ -255,6 +307,7 @@ class NemotronSessionLease:
     async def _drain(self) -> None:
         """Close accepted audio and wait for generation end."""
         if not self._audio_closed:
+            self._session.begin_finalize()
             self._audio_closed = True
             self._audio.put_nowait(None)
         await self._done.wait()
@@ -279,7 +332,29 @@ class NemotronSessionLease:
 
         prompts = buffer_stream(self._audio_frames(), self._input_stream, self._session)
         async for prompt in prompts:
-            yield await render(prompt)
+            streaming_input = await render(prompt)
+            if self._state_lease is not None:
+                rendered_prompt = dict(streaming_input.prompt)
+                information = dict(
+                    rendered_prompt.get("additional_information") or {}
+                )
+                information["persistent_state_binding"] = {
+                    "engine_epoch": self._state_lease.engine_epoch,
+                    "session_key": self._state_lease.session_key,
+                    "generation": self._state_lease.generation,
+                    "schema_id": self._state_lease.schema_id,
+                    "profile_id": self._state_lease.profile_id,
+                    "binding_token": self._state_lease.binding_token,
+                }
+                policy = self._session.endpoint_policy
+                information["endpoint_policy"] = {
+                    "mode": policy.mode,
+                    "threshold_frames": policy.threshold_frames,
+                    "residue_frames": policy.residue_frames,
+                }
+                rendered_prompt["additional_information"] = information
+                streaming_input.prompt = rendered_prompt
+            yield streaming_input
 
     async def _consume(self) -> None:
         """Drive generation and resolve ledger tickets at legal parks."""
@@ -298,12 +373,41 @@ class NemotronSessionLease:
                     continue
                 first = stage_outputs[0]
                 ids = list(first.token_ids)
+                in_flight = self._session.accepted_audio.in_flight_unit
                 if ids:
                     self._input_stream.put_nowait(ids)
-                self._text += first.text or ""
+                self._session.transcript.commit_result(first.text or "")
+                completion = getattr(output, "segment_completion", None)
+                if completion is None and self._session.eou_token_id in ids:
+                    self._segment_generation += 1
+                    completion = SegmentCompletion(
+                        generation=self._segment_generation,
+                        text="",
+                        reason=(
+                            "forced"
+                            if getattr(in_flight, "kind", None) == "forced_eou"
+                            else "model"
+                        ),
+                    )
+                if completion is not None:
+                    self._segment_generation = max(
+                        self._segment_generation,
+                        int(completion.generation),
+                    )
+                    committed_completion = self._session.transcript.complete_segment(
+                        generation=int(completion.generation),
+                        reason=completion.reason,
+                    )
+                    if (
+                        committed_completion is not None
+                        and self._active_segment_callback is not None
+                    ):
+                        self._active_segment_callback(completion)
                 if self._park_id in ids:
                     if self._ledger.pending:
-                        self._ledger.complete_next(self._text)
+                        self._ledger.complete_next(
+                            self._session.transcript.complete_text
+                        )
                     elif self._audio_closed and not self._flush_parked:
                         # @spec PORT-RTC-002, PORT-RTC-005
                         # Explicit FLUSH has no carrier ticket. Its park
@@ -312,6 +416,7 @@ class NemotronSessionLease:
                         self._flush_parked = True
                     else:
                         raise RuntimeError("park arrived without a carrier ticket or terminal FLUSH (PORT-RTC-002)")
+            self._terminal_result = self._session.transcript.finish_terminal()
             self._ended = True
         except Exception as error:
             self._error = error
@@ -331,28 +436,87 @@ class NemotronSessionFactory:
         self,
         *,
         engine: Any,
+        persistent_state_service: Any | None = None,
         max_pending_carriers: int | None = None,
         request_id_prefix: str = "nemotron-session",
     ) -> None:
         self._engine = engine
+        if persistent_state_service is None:
+            getter = getattr(engine, "get_persistent_state_service", None)
+            if getter is not None:
+                persistent_state_service = getter()
+        self._persistent_state_service = persistent_state_service
         self._max_pending_carriers = max_pending_carriers
         self._request_id_prefix = request_id_prefix
 
-    async def open(self, *, cadence: str, locale: str) -> NemotronSessionLease:
+    @property
+    def persistent_state_service(self) -> Any | None:
+        """The engine-installed admission authority, without side effects."""
+        return self._persistent_state_service
+
+    async def open(
+        self,
+        *,
+        cadence: str,
+        locale: str,
+        endpoint_policy: EndpointPolicy | None = None,
+    ) -> NemotronSessionLease:
         """Validate model controls and construct one ordinary session."""
         from vllm_omni.model_executor.models.nemotron_asr.session import (
             NemotronRealtimeSession,
         )
 
-        session = NemotronRealtimeSession.from_model_config(
+        # Validate every caller-controlled value before consuming manager
+        # capacity.  The service-bound construction below stamps the
+        # acknowledged lease identity into the otherwise identical session.
+        NemotronRealtimeSession.from_model_config(
             self._engine.model_config,
             cadence=cadence,
             locale=locale,
+            endpoint_policy=endpoint_policy,
             with_ledger=True,
             max_pending_carriers=self._max_pending_carriers,
         )
-        return NemotronSessionLease(
-            engine=self._engine,
-            session=session,
-            request_id=f"{self._request_id_prefix}-{uuid4()}",
+        service = self._persistent_state_service
+        if service is None:
+            raise RuntimeError("persistent-state service is not installed")
+        check_health = getattr(service, "check_health", None)
+        if check_health is not None:
+            await check_health()
+        inventory = getattr(service, "inventory", None) or {}
+        request_id = f"{self._request_id_prefix}-{uuid4()}"
+        reserve_operation_id = uuid4().hex
+        release_operation_id = uuid4().hex
+        state_lease = await service.reserve(
+            operation_id=reserve_operation_id,
+            session_key=request_id,
+            schema_id=str(inventory.get("schema_id", "state-manifest-v1")),
+            profile_id=str(inventory.get("profile_id", "default")),
         )
+        try:
+            session = NemotronRealtimeSession.from_model_config(
+                self._engine.model_config,
+                cadence=cadence,
+                locale=locale,
+                endpoint_policy=endpoint_policy,
+                with_ledger=True,
+                max_pending_carriers=self._max_pending_carriers,
+                request_id=request_id,
+                engine_epoch=str(state_lease.engine_epoch),
+                lease_generation=int(state_lease.generation),
+            )
+            return NemotronSessionLease(
+                engine=self._engine,
+                session=session,
+                request_id=request_id,
+                persistent_state_service=service,
+                state_lease=state_lease,
+                release_operation_id=release_operation_id,
+            )
+        except BaseException:
+            await service.release(
+                operation_id=release_operation_id,
+                lease=state_lease,
+                reason="configuration_error",
+            )
+            raise

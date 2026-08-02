@@ -699,6 +699,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         the existing session with the next streaming update at other stages.
 
         Discards the last sampled output token from the prior input chunk at stage 0.
+        The inherited stage-zero implementation performs
+        ``session.prompt_token_ids.extend``; model schedulers that need a
+        bounded replacement policy override this method explicitly.
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)

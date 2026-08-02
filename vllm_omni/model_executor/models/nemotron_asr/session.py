@@ -23,13 +23,22 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import (
+    AcceptedAudioAuthority,
+    AcceptedPiece,
+)
 from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
     validate_prompt_dictionary,
 )
+from vllm_omni.model_executor.models.nemotron_asr.endpointing import EndpointPolicy
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
     FRONTEND_CONSTANTS,
     RAW_SAMPLES_PER_CHUNK,
+    SESSION_LIMITS,
+)
+from vllm_omni.model_executor.models.nemotron_asr.transcript import (
+    BoundedTranscript,
 )
 
 #: The channel-less standard serving path has no per-session admission
@@ -43,6 +52,10 @@ DEFAULT_LOCALE = "auto"
 #: the backlog bound is RFC-1's own contract and depends on no consumer
 #: invariant.
 LEDGER_BACKLOG_S = 30.0
+DEFAULT_ACCEPTED_AUDIO_CAPACITY_S = 30.0
+DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES = 1 << 20
+DEFAULT_TRANSCRIPT_FRAGMENT_OVERHEAD_BYTES = 16
+DEFAULT_TRANSCRIPT_TERMINAL_HEADROOM_BYTES = 4_096
 
 _SAMPLE_RATE_HZ: int = int(FRONTEND_CONSTANTS["sample_rate"])
 #: Geometry ids follow manifests.CADENCES order (PORT-SESS-002: the
@@ -425,6 +438,11 @@ class NemotronRealtimeSession:
         geometry: AdmittedGeometry,
         park_token_id: int,
         audio_chunk_token_id: int,
+        eou_token_id: int | None,
+        flush_token_id: int,
+        endpoint_policy: EndpointPolicy,
+        accepted_audio: AcceptedAudioAuthority,
+        transcript: BoundedTranscript,
         prompts: dict[str, int],
         prompt_index: int,
         ledger: ReceiptLedger | None = None,
@@ -432,6 +450,11 @@ class NemotronRealtimeSession:
         self._geometry = geometry
         self._park_token_id = park_token_id
         self._audio_chunk_token_id = audio_chunk_token_id
+        self._eou_token_id = eou_token_id
+        self._flush_token_id = flush_token_id
+        self._endpoint_policy = endpoint_policy
+        self._accepted_audio = accepted_audio
+        self._transcript = transcript
         self._prompts = dict(prompts)
         self._prompt_index = prompt_index
         self._ledger = ledger
@@ -445,6 +468,16 @@ class NemotronRealtimeSession:
         locale: str = DEFAULT_LOCALE,
         with_ledger: bool = False,
         max_pending_carriers: int | None = None,
+        endpoint_policy: EndpointPolicy | None = None,
+        endpoint_history_capacity_frames: int | None = None,
+        accepted_audio_capacity_samples: int | None = None,
+        max_retained_transcript_bytes: int = DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES,
+        transcript_fragment_overhead_bytes: int = DEFAULT_TRANSCRIPT_FRAGMENT_OVERHEAD_BYTES,
+        transcript_terminal_headroom_bytes: int = DEFAULT_TRANSCRIPT_TERMINAL_HEADROOM_BYTES,
+        request_id: str = "unbound",
+        engine_epoch: str = "unbound",
+        lease_generation: int = 0,
+        max_session_samples: int | None = None,
     ) -> NemotronRealtimeSession:
         """Build a session from the served checkpoint's configuration.
 
@@ -478,6 +511,85 @@ class NemotronRealtimeSession:
             getattr(hf, "num_prompts", None),
         )
         resolved_locale = resolve_checkpoint_locale(locale, prompts)
+        park_token_id = _require_token_id(
+            getattr(hf, "eos_token_id", None),
+            "eos_token_id",
+        )
+        audio_chunk_token_id = _require_token_id(
+            getattr(hf, "audio_chunk_token_id", None),
+            "audio_chunk_token_id",
+        )
+
+        installed_capacity = endpoint_history_capacity_frames
+        if installed_capacity is None:
+            installed_capacity = int(
+                getattr(hf, "endpoint_history_capacity_frames", 12)
+            )
+        if installed_capacity <= 0:
+            raise ValueError("endpoint history capacity must be positive")
+
+        explicit_endpointing = endpoint_policy is not None
+        eou_value = getattr(hf, "eou_token_id", None)
+        flush_value = getattr(hf, "flush_token_id", None)
+        if explicit_endpointing or eou_value is not None or flush_value is not None:
+            eou_token_id = _require_token_id(eou_value, "eou_token_id")
+            flush_token_id = _require_token_id(flush_value, "flush_token_id")
+            controls = (
+                park_token_id,
+                audio_chunk_token_id,
+                eou_token_id,
+                flush_token_id,
+            )
+            if len(set(controls)) != len(controls):
+                raise ValueError("session control token ids must be distinct")
+            num_asr_labels = getattr(hf, "num_asr_labels", None)
+            if isinstance(num_asr_labels, int) and any(
+                token_id <= num_asr_labels for token_id in controls
+            ):
+                raise ValueError("session control token id overlaps label space")
+            vocab_size = getattr(hf, "vocab_size", None)
+            if isinstance(vocab_size, int) and max(controls) >= vocab_size:
+                raise ValueError("session control token id exceeds vocabulary")
+        else:
+            # Compatibility for model-generic callers that do not select
+            # endpointing.  New Nemotron serving always supplies all controls.
+            eou_token_id = None
+            flush_token_id = 0
+
+        if endpoint_policy is None:
+            endpoint_policy = EndpointPolicy.resolve(
+                mode="disabled",
+                stop_history_ms=None,
+                residue_frames=0,
+                frame_stride_ms=80,
+                history_capacity_frames=installed_capacity,
+            )
+        if endpoint_policy.history_capacity_frames > installed_capacity:
+            raise ValueError(
+                "endpoint policy exceeds installed history capacity"
+            )
+
+        if accepted_audio_capacity_samples is None:
+            accepted_audio_capacity_samples = int(
+                DEFAULT_ACCEPTED_AUDIO_CAPACITY_S * _SAMPLE_RATE_HZ
+            )
+        accepted_audio = AcceptedAudioAuthority(
+            request_id=request_id,
+            engine_epoch=engine_epoch,
+            lease_generation=lease_generation,
+            chunk_samples=geometry.chunk_samples,
+            capacity_samples=accepted_audio_capacity_samples,
+            carrier_sequence_modulus=int(
+                SESSION_LIMITS["carrier_sequence_modulus"]
+            ),
+            max_session_samples=max_session_samples,
+        )
+        accepted_audio.update_locale(resolved_locale)
+        transcript = BoundedTranscript(
+            max_retained_bytes=max_retained_transcript_bytes,
+            fragment_overhead_bytes=transcript_fragment_overhead_bytes,
+            terminal_headroom_bytes=transcript_terminal_headroom_bytes,
+        )
         ledger = None
         if with_ledger:
             if max_pending_carriers is None:
@@ -485,11 +597,13 @@ class NemotronRealtimeSession:
             ledger = ReceiptLedger(max_pending_carriers=max_pending_carriers)
         return cls(
             geometry=geometry,
-            park_token_id=_require_token_id(getattr(hf, "eos_token_id", None), "eos_token_id"),
-            audio_chunk_token_id=_require_token_id(
-                getattr(hf, "audio_chunk_token_id", None),
-                "audio_chunk_token_id",
-            ),
+            park_token_id=park_token_id,
+            audio_chunk_token_id=audio_chunk_token_id,
+            eou_token_id=eou_token_id,
+            flush_token_id=flush_token_id,
+            endpoint_policy=endpoint_policy,
+            accepted_audio=accepted_audio,
+            transcript=transcript,
             prompts=prompts,
             prompt_index=prompts[resolved_locale],
             ledger=ledger,
@@ -509,6 +623,31 @@ class NemotronRealtimeSession:
     def audio_chunk_token_id(self) -> int:
         """The minted carrier's placeholder token id."""
         return self._audio_chunk_token_id
+
+    @property
+    def eou_token_id(self) -> int | None:
+        """The checkpoint's semantic end-of-utterance control id."""
+        return self._eou_token_id
+
+    @property
+    def flush_token_id(self) -> int:
+        """The checkpoint's finalization control id."""
+        return self._flush_token_id
+
+    @property
+    def endpoint_policy(self) -> EndpointPolicy:
+        """The immutable endpoint policy selected at admission."""
+        return self._endpoint_policy
+
+    @property
+    def accepted_audio(self) -> AcceptedAudioAuthority:
+        """The sole bounded accepted-audio and control authority."""
+        return self._accepted_audio
+
+    @property
+    def transcript(self) -> BoundedTranscript:
+        """The sole bounded terminal-output authority."""
+        return self._transcript
 
     @property
     def prompt_index(self) -> int:
@@ -536,6 +675,36 @@ class NemotronRealtimeSession:
                 stands (PORT-LID-001).
         """
         resolved_locale = resolve_checkpoint_locale(locale, self._prompts)
+        self._accepted_audio.update_locale(resolved_locale)
         index = self._prompts[resolved_locale]
         self._prompt_index = index
         return index
+
+    def accept_audio(self, samples: Any) -> AcceptedPiece:
+        """Atomically accept one whole application-audio piece."""
+        return self._accepted_audio.accept(samples)
+
+    def force_segment(self) -> None:
+        """Queue one ordered, zero-sample semantic boundary barrier."""
+        if self._eou_token_id is None:
+            raise ValueError("endpointing controls are not configured")
+        self._accepted_audio.force_segment()
+
+    def begin_finalize(self) -> None:
+        """Close audio acceptance and queue exactly one final tail."""
+        self._accepted_audio.begin_finalize()
+
+
+# @spec PORT-RTC-003
+def create_nemotron_session_factory(engine: Any) -> Any:
+    """Create the public factory with the engine's exact installed service.
+
+    Construction performs no reservation.  Each later ``open`` owns its
+    admission operation and lease lifetime.
+    """
+    from vllm_omni.entrypoints.nemotron_session import NemotronSessionFactory
+
+    return NemotronSessionFactory(
+        engine=engine,
+        persistent_state_service=engine.get_persistent_state_service(),
+    )

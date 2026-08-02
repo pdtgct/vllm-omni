@@ -150,7 +150,7 @@ SESSION_LIMITS: dict[str, int] = {
     "max_symbols_per_step": 10,
     "max_frames_per_chunk": 14,
     "queue_capacity": 140,
-    "max_session_chunks": 2**24 - 1,
+    "carrier_sequence_modulus": 2**24,
 }
 
 
@@ -266,6 +266,27 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
             "init": "zeros",
         }
     )
+    # The replay group precedes the int64 frontend counters deliberately.
+    # Its 28-byte scalar book closes the 4-byte alignment remainder left by
+    # the frontend float buffers, so the one aggregate page needs no hidden
+    # padding and retains the manifest's exact 6,314,936-byte footprint.
+    entries.append(
+        {
+            "name": "decode.layers.0.replay.queue",
+            "shape": [SESSION_LIMITS["queue_capacity"]],
+            "dtype": "int32",
+            "init": "zeros",
+        }
+    )
+    for name, init in BOOK_FIELDS:
+        entries.append(
+            {
+                "name": f"decode.layers.0.replay.book.{name}",
+                "shape": [1],
+                "dtype": "int32",
+                "init": init,
+            }
+        )
     for counter in FRONTEND_COUNTER_FIELDS:
         entries.append(
             {
@@ -286,19 +307,26 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
         )
     entries.append(
         {
-            "name": "decode.layers.0.replay.queue",
-            "shape": [SESSION_LIMITS["queue_capacity"]],
+            "name": "endpoint.history",
+            "shape": [config.endpoint_history_capacity_frames],
             "dtype": "int32",
             "init": "zeros",
         }
     )
-    for name, init in BOOK_FIELDS:
+    for name in (
+        "history_length",
+        "history_head",
+        "endpoint_armed",
+        "segment_generation",
+        "segment_has_output",
+        "pending_forced_generation",
+    ):
         entries.append(
             {
-                "name": f"decode.layers.0.replay.book.{name}",
+                "name": f"endpoint.book.{name}",
                 "shape": [1],
                 "dtype": "int32",
-                "init": init,
+                "init": "zeros",
             }
         )
     return {
@@ -355,6 +383,12 @@ def author_geometry_manifest(config: Any) -> dict[str, Any]:
         },
         "carrier_width": config.hidden_size,
         "frontend": FRONTEND_CONSTANTS,
+        "endpoint": {
+            "algorithm": "cache-aware-greedy-blank-v1",
+            "installed_modes": ["disabled", "greedy_blank"],
+            "frame_stride_ms": 80,
+            "history_capacity_frames": config.endpoint_history_capacity_frames,
+        },
     }
 
 
@@ -376,7 +410,7 @@ def author_transition_manifest(config: Any) -> dict[str, Any]:
     return {
         "schema": "transition-manifest-v1",
         "transition": "advance_session-v1",
-        "roles": ["CHUNK", "REPLAY", "FLUSH"],
+        "roles": ["CHUNK", "REPLAY", "EOU", "FLUSH"],
         "chunk_roles_entering_transition": ["CHUNK"],
         "session_first_init": "metadata-books-zero-scratch",
         "encode_overlap": "pre-encode-cache-on-non-first-chunks",
@@ -406,7 +440,7 @@ def author_emission_manifest(config: Any) -> dict[str, Any]:
             label: {
                 "max_valid_encoder_frames": right + 1,
                 "max_symbols_per_step": symbols,
-                "max_emission_tokens": (right + 1) * symbols + 1,
+                "max_emission_tokens": (right + 1) * symbols + 2,
             }
             for label, (_, right) in CADENCES.items()
         },

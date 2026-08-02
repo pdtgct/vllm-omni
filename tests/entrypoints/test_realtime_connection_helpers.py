@@ -346,6 +346,7 @@ def _native_event_connection() -> tuple[RealtimeConnection, _NativeSessionRecord
     connection._max_audio_filesize_mb = 30
     connection.audio_queue = asyncio.Queue()
     connection.generation_task = _LiveGenerationTask()
+    connection._native_fifo_event = asyncio.Event()
 
     async def _send_error(_message: str, _error_type: str) -> None:
         pytest.fail("valid native control unexpectedly emitted an error")
@@ -370,6 +371,7 @@ async def test_native_append_submits_directly_to_bounded_session_authority() -> 
     assert len(session.audio) == 1
     assert session.audio[0].dtype == np.float32
     np.testing.assert_allclose(session.audio[0], [0.0, 0.5, -0.5])
+    assert connection._native_fifo_event.is_set()
     assert connection.audio_queue.empty()
 
 

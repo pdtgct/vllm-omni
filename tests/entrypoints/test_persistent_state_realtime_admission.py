@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -207,3 +208,86 @@ def test_session_factory_retrieves_the_exact_service_without_reserving() -> None
     assert factory.persistent_state_service is service
     assert service.reserve_calls == []
     assert not hasattr(factory, "open_ephemeral")
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_app_state_inventories_service_before_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-INT-013, PORT-STATE-004, PORT-STATE-015
+    from vllm.model_executor import model_loader
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import (
+        _install_persistent_state_service,
+    )
+
+    class _PersistentModel:
+        supports_persistent_state = True
+
+    class _Stage:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
+            del args
+            self.calls.append(name)
+            return {
+                "engine_epoch": "epoch-1",
+                "manager_revision": 0,
+                "resident_count": 0,
+                "effective_capacity": 4,
+                "capabilities": ["resident"],
+                "schema_id": "schema",
+                "profile_id": "profile",
+            }
+
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda _config: _PersistentModel)
+    engine = object.__new__(AsyncOmni)
+    stage = _Stage()
+    engine.engine = SimpleNamespace(stage_clients=[stage])
+    engine._persistent_state_service = None
+
+    await _install_persistent_state_service(
+        engine,
+        SimpleNamespace(model_config=object()),
+    )
+
+    service = engine.get_persistent_state_service()
+    assert stage.calls == ["persistent_state_snapshot"]
+    assert service.ready is True
+    service.shutdown()
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_failed_inventory_never_installs_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-INT-013, PORT-STATE-015
+    from vllm.model_executor import model_loader
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import (
+        _install_persistent_state_service,
+    )
+
+    class _PersistentModel:
+        supports_persistent_state = True
+
+    class _Stage:
+        async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
+            del name, args
+            raise RuntimeError("inventory failed")
+
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda _config: _PersistentModel)
+    engine = object.__new__(AsyncOmni)
+    engine.engine = SimpleNamespace(stage_clients=[_Stage()])
+    engine._persistent_state_service = None
+
+    with pytest.raises(RuntimeError, match="inventory failed"):
+        await _install_persistent_state_service(
+            engine,
+            SimpleNamespace(model_config=object()),
+        )
+
+    assert engine._persistent_state_service is None

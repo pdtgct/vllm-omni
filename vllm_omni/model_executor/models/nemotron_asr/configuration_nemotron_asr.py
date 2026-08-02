@@ -93,6 +93,9 @@ class NemotronASRConfig(PretrainedConfig):
         hidden_size: int = _CARRIER_WIDTH,
         eos_token_id: int | None = None,
         audio_chunk_token_id: int | None = None,
+        eou_token_id: int | None = None,
+        flush_token_id: int | None = None,
+        endpoint_history_capacity_frames: int = 12,
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
@@ -121,6 +124,32 @@ class NemotronASRConfig(PretrainedConfig):
         self.num_asr_labels = num_asr_labels
         self.hidden_size = hidden_size
         self.audio_chunk_token_id = audio_chunk_token_id
+        self.eou_token_id = eou_token_id
+        self.flush_token_id = flush_token_id
+        self.endpoint_history_capacity_frames = endpoint_history_capacity_frames
+        controls = (
+            eos_token_id,
+            audio_chunk_token_id,
+            eou_token_id,
+            flush_token_id,
+        )
+        if any(value is not None for value in controls):
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in controls
+            ):
+                raise ValueError("all four control token ids must be integers")
+            typed_controls = tuple(int(value) for value in controls)
+            if len(set(typed_controls)) != len(typed_controls):
+                raise ValueError("control token ids must be pairwise distinct")
+            if min(typed_controls) <= num_asr_labels:
+                raise ValueError(
+                    "control token ids must be outside the label and blank space"
+                )
+            if vocab_size <= max(typed_controls):
+                raise ValueError("vocab_size must cover every control token id")
+        if endpoint_history_capacity_frames <= 0:
+            raise ValueError("endpoint history capacity must be positive")
         # Startup decode policy is part of the served artifact, not a
         # process-local default. Preserve all three fields through HF
         # serialization so build_decode_resolver sees the declaration

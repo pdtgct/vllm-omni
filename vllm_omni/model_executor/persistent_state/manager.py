@@ -101,6 +101,7 @@ class PersistentStateManager(SingleTypeKVCacheManager):
         self.replica = replica
         self.engine_epoch = engine_epoch
         self._bindings: dict[str, StateBinding] = {}
+        self._terminal_request_ids: set[str] = set()
         self._used_request_ids: set[str] = set()
         self._next_generation = 1
 
@@ -179,11 +180,28 @@ class PersistentStateManager(SingleTypeKVCacheManager):
         return binding
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
-        self._bindings.pop(request_id, None)
+        if request_id in self._bindings:
+            self._terminal_request_ids.add(request_id)
+            return []
         return super().pop_blocks_for_free(request_id)
 
     def free(self, request_id: str) -> None:
-        # Base free is idempotent because pop returns [] after the first call.
+        # Scheduler terminality never owns physical persistent-state cleanup.
+        if request_id in self._bindings:
+            self._terminal_request_ids.add(request_id)
+            return
+        super().free(request_id)
+
+    def mark_terminal(self, request_id: str) -> None:
+        """Record scheduler terminality without returning the slot."""
+        if request_id in self._bindings:
+            self._terminal_request_ids.add(request_id)
+
+    def drop_lease(self, request_id: str) -> None:
+        """Return one API-released lease's slot exactly once."""
+        if self._bindings.pop(request_id, None) is None:
+            return
+        self._terminal_request_ids.discard(request_id)
         super().free(request_id)
 
     @classmethod

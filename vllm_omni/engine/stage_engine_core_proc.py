@@ -11,6 +11,7 @@ import contextlib
 import os
 import signal
 from typing import Any
+from uuid import uuid4
 
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
@@ -50,6 +51,189 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def _persistent_state_manager(self) -> Any:
+        from vllm_omni.model_executor.persistent_state.manager import (
+            PersistentStateManager,
+        )
+
+        managers = self.scheduler.kv_cache_manager.coordinator.single_type_managers
+        matches = [
+            manager
+            for manager in managers
+            if isinstance(manager, PersistentStateManager)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "persistent_state requires exactly one resident manager"
+            )
+        return matches[0]
+
+    def _persistent_state_control(self) -> dict[str, Any]:
+        control = getattr(self, "_persistent_state_control_state", None)
+        if control is None:
+            manager = self._persistent_state_manager()
+            control = {
+                "engine_epoch": manager.engine_epoch,
+                "revision": 0,
+                "operations": {},
+                "pending": {},
+                "claimed": {},
+            }
+            self._persistent_state_control_state = control
+            self.scheduler.persistent_state_registry = self
+        return control
+
+    def persistent_state_snapshot(self) -> dict[str, Any]:
+        """Return the resident capability inventory without state content."""
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        return {
+            "engine_epoch": control["engine_epoch"],
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "effective_capacity": manager.effective_capacity,
+            "capabilities": ["resident"],
+            "schema_id": manager.persistent_state_spec.schema_id,
+            "profile_id": manager.profile_id,
+        }
+
+    def persistent_state_reserve(
+        self,
+        operation_id: str,
+        session_key: str,
+        schema_id: str,
+        profile_id: str,
+    ) -> dict[str, Any]:
+        """Commit one pending persistent_state lease before audio admission."""
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        previous = control["operations"].get(operation_id)
+        if previous is not None:
+            return previous
+        if schema_id != manager.persistent_state_spec.schema_id:
+            raise ValueError("persistent_state schema mismatch")
+        if profile_id != manager.profile_id:
+            raise ValueError("persistent_state profile mismatch")
+        manager.allocate_new_blocks(session_key, 1, 1)
+        binding = manager.get_state_binding(session_key)
+        if binding is None:
+            raise RuntimeError("persistent_state reservation lacks binding")
+        binding_token = uuid4().hex
+        lease = {
+            "engine_epoch": binding.engine_epoch,
+            "session_key": session_key,
+            "generation": binding.generation,
+            "schema_id": binding.schema_id,
+            "profile_id": binding.profile_id,
+            "location": "resident",
+            "binding_token": binding_token,
+        }
+        control["pending"][binding_token] = binding
+        control["revision"] += 1
+        result = {
+            "operation_id": operation_id,
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "lease": lease,
+            "location_event": {
+                "engine_epoch": binding.engine_epoch,
+                "session_key": session_key,
+                "generation": binding.generation,
+                "location": "resident",
+                "transition": "reserved",
+            },
+        }
+        control["operations"][operation_id] = result
+        return result
+
+    def claim_pending_lease(
+        self,
+        *,
+        engine_epoch: str,
+        session_key: str,
+        generation: int,
+        schema_id: str,
+        profile_id: str,
+        binding_token: str | None = None,
+    ) -> Any:
+        """Atomically join the initial scheduler ADD to a pending lease."""
+        control = self._persistent_state_control()
+        if binding_token is None:
+            candidates = list(control["pending"].items())
+            matches = [
+                item
+                for item in candidates
+                if item[1].request_id == session_key
+            ]
+            if len(matches) != 1:
+                raise ValueError("persistent_state pending claim is ambiguous")
+            binding_token, binding = matches[0]
+        else:
+            binding = control["pending"].get(binding_token)
+        expected = (
+            engine_epoch,
+            session_key,
+            generation,
+            schema_id,
+            profile_id,
+        )
+        actual = (
+            binding.engine_epoch,
+            binding.request_id,
+            binding.generation,
+            binding.schema_id,
+            binding.profile_id,
+        ) if binding is not None else None
+        if actual != expected:
+            raise ValueError("persistent_state pending claim mismatch")
+        control["pending"].pop(binding_token)
+        control["claimed"][binding_token] = binding
+        return binding
+
+    def mark_terminal(self, binding: Any) -> None:
+        """Record model terminality while API cleanup retains ownership."""
+        self._persistent_state_manager().mark_terminal(binding.request_id)
+
+    def persistent_state_release(
+        self,
+        operation_id: str,
+        lease: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Commit one idempotent persistent_state physical cleanup."""
+        del reason
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        previous = control["operations"].get(operation_id)
+        if previous is not None:
+            return previous
+        binding_token = lease["binding_token"]
+        binding = control["pending"].pop(binding_token, None)
+        if binding is None:
+            binding = control["claimed"].pop(binding_token, None)
+        if binding is not None:
+            manager.drop_lease(binding.request_id)
+            generation = binding.generation
+            session_key = binding.request_id
+        else:
+            generation = int(lease["generation"])
+            session_key = str(lease["session_key"])
+        control["revision"] += 1
+        result = {
+            "operation_id": operation_id,
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "location_event": {
+                "engine_epoch": control["engine_epoch"],
+                "session_key": session_key,
+                "generation": generation,
+                "location": "absent",
+                "transition": "released",
+            },
+        }
+        control["operations"][operation_id] = result
+        return result
 
     @staticmethod
     def run_stage_core(

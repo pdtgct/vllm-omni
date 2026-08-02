@@ -225,6 +225,32 @@ class FakeAsyncOmni:
         self.aborted: list[str] = []
         self.request_ids: list[str] = []
         self.sampling: Any = None
+        self._state_generation = 0
+        self.state_releases: list[dict[str, Any]] = []
+
+    @property
+    def inventory(self) -> dict[str, str]:
+        return {"schema_id": "state-manifest-v1", "profile_id": "default"}
+
+    def get_persistent_state_service(self) -> FakeAsyncOmni:
+        return self
+
+    async def check_health(self) -> None:
+        return None
+
+    async def reserve(self, **kwargs: Any) -> Any:
+        self._state_generation += 1
+        return SimpleNamespace(
+            engine_epoch="test-epoch",
+            session_key=kwargs["session_key"],
+            generation=self._state_generation,
+            schema_id=kwargs["schema_id"],
+            profile_id=kwargs["profile_id"],
+            binding_token=f"binding-{self._state_generation}",
+        )
+
+    async def release(self, **kwargs: Any) -> None:
+        self.state_releases.append(kwargs)
 
     async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
         self.request_ids.append(request_id)

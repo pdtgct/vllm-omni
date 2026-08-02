@@ -4,6 +4,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.model_executor.persistent_state.manager import StateBinding
 
 
 @dataclass
@@ -94,3 +95,4 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    persistent_state_bindings: dict[str, StateBinding] = field(default_factory=dict)
