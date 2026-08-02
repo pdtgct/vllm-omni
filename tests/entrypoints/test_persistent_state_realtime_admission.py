@@ -17,6 +17,19 @@ from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _persistent_state_runtime_values() -> dict[str, int | float]:
+    return {
+        "persistent_state_safety_reserve_slots": 1,
+        "max_resident_sessions": 4,
+        "persistent_state_reserve_queue_capacity": 4,
+        "persistent_state_operation_timeout_s": 10.0,
+        "persistent_state_reconciliation_timeout_s": 30.0,
+        "persistent_state_tombstone_ttl_s": 600.0,
+        "persistent_state_max_tombstones": 16,
+        "persistent_state_pending_claim_timeout_s": 15.0,
+    }
+
+
 class _WebSocket:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -255,7 +268,10 @@ async def test_app_state_inventories_service_before_install(
 
     await _install_persistent_state_service(
         engine,
-        SimpleNamespace(model_config=object()),
+        SimpleNamespace(
+            model_config=object(),
+            additional_config=_persistent_state_runtime_values(),
+        ),
     )
 
     service = engine.get_persistent_state_service()
@@ -292,7 +308,10 @@ async def test_failed_inventory_never_installs_service(
     with pytest.raises(RuntimeError, match="inventory failed"):
         await _install_persistent_state_service(
             engine,
-            SimpleNamespace(model_config=object()),
+            SimpleNamespace(
+                model_config=object(),
+                additional_config=_persistent_state_runtime_values(),
+            ),
         )
 
     assert engine._persistent_state_service is None

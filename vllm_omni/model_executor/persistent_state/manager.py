@@ -104,6 +104,48 @@ class PersistentStateManager(SingleTypeKVCacheManager):
         self._terminal_request_ids: set[str] = set()
         self._used_request_ids: set[str] = set()
         self._next_generation = 1
+        self._capacity_configured = False
+
+    def configure_capacity(
+        self,
+        *,
+        safety_reserve_slots: int,
+        max_resident_sessions: int,
+    ) -> None:
+        """Apply the fingerprinted operator limits before first admission."""
+
+        if safety_reserve_slots < 0:
+            raise ValueError("persistent-state safety reserve cannot be negative")
+        if max_resident_sessions <= 0:
+            raise ValueError("persistent-state configured capacity must be positive")
+        if self._capacity_configured:
+            if (
+                self.safety_reserve_slots != safety_reserve_slots
+                or self.max_resident_sessions != max_resident_sessions
+            ):
+                raise RuntimeError(
+                    "persistent-state capacity configuration changed"
+                )
+            return
+        if self._bindings:
+            raise RuntimeError(
+                "persistent-state capacity cannot change after admission"
+            )
+
+        usable_capacity = self.physical_capacity - safety_reserve_slots
+        if usable_capacity <= 0:
+            raise ValueError("persistent-state reserve leaves zero usable capacity")
+        self.safety_reserve_slots = safety_reserve_slots
+        self.max_resident_sessions = max_resident_sessions
+        self.configured_limit = max_resident_sessions
+        self.effective_capacity = min(usable_capacity, max_resident_sessions)
+        if max_resident_sessions > usable_capacity:
+            logger.warning(
+                "Clamping persistent-state capacity from %d to %d slots",
+                max_resident_sessions,
+                usable_capacity,
+            )
+        self._capacity_configured = True
 
     # @spec PORT-STATE-011
     def get_num_blocks_to_allocate(

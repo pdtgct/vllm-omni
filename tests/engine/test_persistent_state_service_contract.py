@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -215,3 +217,248 @@ def test_engine_epoch_change_is_a_named_admission_closed_transition() -> None:
     assert "engine_epoch_changed" in source
     assert "close_admission" in source or "admission.close" in source
     assert "snapshot" in source
+
+
+@dataclass
+class _Clock:
+    now: float = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _TombstoneStage:
+    def __init__(self) -> None:
+        self.reserve_calls = 0
+        self.release_calls = 0
+        self.resident = 0
+        self.revision = 0
+
+    async def call_utility_async(
+        self, name: str, *args: Any
+    ) -> dict[str, Any]:
+        if name == "persistent_state_snapshot":
+            return {
+                "engine_epoch": "epoch-a",
+                "manager_revision": self.revision,
+                "resident_count": self.resident,
+                "physical_capacity": 4,
+                "safety_reserve": 0,
+                "configured_limit": 1,
+                "effective_capacity": 1,
+                "stage": 0,
+                "replica": 0,
+                "capabilities": ["resident"],
+                "schema_id": "schema-a",
+                "profile_id": "profile-a",
+                "persistent_state_tombstone_ttl_s": 10.0,
+                "persistent_state_max_tombstones": 2,
+            }
+        if name == "persistent_state_reserve":
+            operation_id, session_key, schema_id, profile_id = args
+            self.reserve_calls += 1
+            self.resident += 1
+            self.revision += 1
+            lease = {
+                "engine_epoch": "epoch-a",
+                "session_key": session_key,
+                "generation": self.reserve_calls,
+                "schema_id": schema_id,
+                "profile_id": profile_id,
+                "location": "resident",
+                "binding_token": f"binding-{self.reserve_calls}",
+            }
+            return {
+                "operation_id": operation_id,
+                "manager_revision": self.revision,
+                "resident_count": self.resident,
+                "lease": lease,
+                "location_event": {
+                    "engine_epoch": "epoch-a",
+                    "session_key": session_key,
+                    "generation": self.reserve_calls,
+                    "location": "resident",
+                    "transition": "reserved",
+                },
+            }
+        if name == "persistent_state_release":
+            operation_id, lease, _reason = args
+            self.release_calls += 1
+            self.resident -= 1
+            self.revision += 1
+            return {
+                "operation_id": operation_id,
+                "manager_revision": self.revision,
+                "resident_count": self.resident,
+                "location_event": {
+                    "engine_epoch": "epoch-a",
+                    "session_key": lease["session_key"],
+                    "generation": lease["generation"],
+                    "location": "absent",
+                    "transition": "released",
+                },
+            }
+        raise AssertionError(name)
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_completed_operations_are_bounded_tombstones_and_retry_exactly() -> None:
+    # @spec PORT-STATE-012 / PORT-STATE-013
+    module = _service_module()
+    clock = _Clock()
+    stage = _TombstoneStage()
+    service = module.PersistentStateService(
+        stage,
+        tombstone_ttl_s=10.0,
+        max_tombstones=2,
+        monotonic=clock,
+    )
+
+    lease = await service.reserve(
+        operation_id="reserve-a",
+        session_key="session-a",
+        schema_id="schema-a",
+        profile_id="profile-a",
+    )
+    duplicate = await service.reserve(
+        operation_id="reserve-a",
+        session_key="session-a",
+        schema_id="schema-a",
+        profile_id="profile-a",
+    )
+    assert duplicate == lease
+    assert stage.reserve_calls == 1
+
+    with pytest.raises(
+        module.PersistentStateServiceUnavailable,
+        match="tombstone|operation horizon",
+    ):
+        await service.reserve(
+            operation_id="reserve-b",
+            session_key="session-b",
+            schema_id="schema-a",
+            profile_id="profile-a",
+        )
+
+    first_release = await service.release(
+        operation_id="release-a",
+        lease=lease,
+        reason="test",
+    )
+    duplicate_release = await service.release(
+        operation_id="release-a",
+        lease=lease,
+        reason="test",
+    )
+    assert duplicate_release == first_release
+    assert stage.release_calls == 1
+
+    clock.now += 10.0
+    await service.reserve(
+        operation_id="reserve-b",
+        session_key="session-b",
+        schema_id="schema-a",
+        profile_id="profile-a",
+    )
+    assert stage.reserve_calls == 2
+    service.shutdown()
+
+
+def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
+    # @spec PORT-STATE-012 / PORT-STATE-013 / ENV-MIG-009
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    values = {
+        "persistent_state_safety_reserve_slots": 1,
+        "max_resident_sessions": 8,
+        "persistent_state_reserve_queue_capacity": 8,
+        "persistent_state_operation_timeout_s": 10.0,
+        "persistent_state_reconciliation_timeout_s": 30.0,
+        "persistent_state_tombstone_ttl_s": 600.0,
+        "persistent_state_max_tombstones": 32,
+        "persistent_state_pending_claim_timeout_s": 15.0,
+    }
+    resolved = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config=values)
+    )
+
+    assert resolved.tombstone_ttl_s == 600.0
+    assert resolved.max_tombstones == 32
+    assert resolved.cleanup_queue_capacity == 8
+
+    for key in values:
+        incomplete = dict(values)
+        incomplete.pop(key)
+        with pytest.raises(ValueError, match=key):
+            PersistentStateRuntimeConfig.from_vllm_config(
+                SimpleNamespace(additional_config=incomplete)
+            )
+
+
+def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-STATE-012 / PORT-STATE-013 / PORT-STATE-015
+    import vllm_omni.engine.stage_engine_core_proc as core_module
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    clock = _Clock()
+    monkeypatch.setattr(core_module.time, "monotonic", clock)
+    manager, _, spec = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=3
+    )
+    runtime_values = {
+        "persistent_state_safety_reserve_slots": 1,
+        "max_resident_sessions": 1,
+        "persistent_state_reserve_queue_capacity": 1,
+        "persistent_state_operation_timeout_s": 10.0,
+        "persistent_state_reconciliation_timeout_s": 30.0,
+        "persistent_state_tombstone_ttl_s": 10.0,
+        "persistent_state_max_tombstones": 2,
+        "persistent_state_pending_claim_timeout_s": 15.0,
+    }
+    core = object.__new__(StageEngineCoreProc)
+    core.vllm_config = SimpleNamespace(additional_config=runtime_values)
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=(manager,))
+        )
+    )
+
+    first = core.persistent_state_reserve(
+        "reserve-a", "session-a", spec.schema_id, "default"
+    )
+    assert (
+        core.persistent_state_reserve(
+            "reserve-a", "session-a", spec.schema_id, "default"
+        )
+        == first
+    )
+    with pytest.raises(RuntimeError, match="tombstone horizon"):
+        core.persistent_state_reserve(
+            "reserve-b", "session-b", spec.schema_id, "default"
+        )
+
+    released = core.persistent_state_release(
+        "release-a", first["lease"], "test"
+    )
+    assert (
+        core.persistent_state_release(
+            "release-a", first["lease"], "test"
+        )
+        == released
+    )
+    assert len(core._persistent_state_control_state["operations"]) == 2
+
+    clock.now += 10.0
+    second = core.persistent_state_reserve(
+        "reserve-b", "session-b", spec.schema_id, "default"
+    )
+    assert second["lease"]["session_key"] == "session-b"
+    assert len(core._persistent_state_control_state["operations"]) == 1

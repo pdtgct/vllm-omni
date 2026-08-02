@@ -727,11 +727,23 @@ async def _install_persistent_state_service(
             "persistent state currently requires exactly one stage"
         )
 
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
     from vllm_omni.engine.persistent_state_service import (
         PersistentStateService,
     )
 
-    service = PersistentStateService(stage_clients[0])
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
+    service = PersistentStateService(
+        stage_clients[0],
+        reserve_queue_capacity=runtime.reserve_queue_capacity,
+        cleanup_queue_capacity=runtime.cleanup_queue_capacity,
+        operation_timeout_s=runtime.operation_timeout_s,
+        reconciliation_timeout_s=runtime.reconciliation_timeout_s,
+        tombstone_ttl_s=runtime.tombstone_ttl_s,
+        max_tombstones=runtime.max_tombstones,
+    )
     try:
         await service.check_health()
     except BaseException:

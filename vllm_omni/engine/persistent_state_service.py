@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -118,11 +120,18 @@ class PersistentStateService:
         cleanup_queue_capacity: int = 256,
         operation_timeout_s: float = 10.0,
         reconciliation_timeout_s: float = 30.0,
+        tombstone_ttl_s: float = 3600.0,
+        max_tombstones: int = 4096,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
             raise ValueError("persistent-state queue capacities must be positive")
         if operation_timeout_s <= 0 or reconciliation_timeout_s <= 0:
             raise ValueError("persistent-state timeouts must be positive")
+        if tombstone_ttl_s <= 0:
+            raise ValueError("persistent-state tombstone TTL must be positive")
+        if max_tombstones <= 0:
+            raise ValueError("persistent-state tombstone count must be positive")
         self._stage_client = stage_client
         self.reserve_queue: asyncio.Queue[_ReserveCommand] = asyncio.Queue(
             maxsize=reserve_queue_capacity
@@ -132,12 +141,17 @@ class PersistentStateService:
         )
         self._operation_timeout_s = operation_timeout_s
         self._reconciliation_timeout_s = reconciliation_timeout_s
+        self._tombstone_ttl_s = tombstone_ttl_s
+        self._max_tombstones = max_tombstones
+        self._monotonic = monotonic
         self._operations: dict[str, asyncio.Future[Any]] = {}
+        self._operation_expires_at: dict[str, float] = {}
         self._queue_event = asyncio.Event()
         self._startup_lock: asyncio.Lock | None = None
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._ready = False
         self._admission_open = False
+        self._tombstone_admission_blocked = False
         self._engine_epoch: str | None = None
         self._inventory: dict[str, Any] | None = None
         self._metrics_sink: Any | None = None
@@ -146,7 +160,12 @@ class PersistentStateService:
     @property
     def ready(self) -> bool:
         """Whether capability inventory is known and admission is open."""
-        return self._ready and self._admission_open and self._fatal_error is None
+        return (
+            self._ready
+            and self._admission_open
+            and not self._tombstone_admission_blocked
+            and self._fatal_error is None
+        )
 
     @property
     def inventory(self) -> dict[str, Any] | None:
@@ -156,6 +175,54 @@ class PersistentStateService:
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""
         self._admission_open = False
+
+    def _prune_operation_tombstones(self) -> None:
+        """Forget only completed operations whose retry horizon expired."""
+
+        now = self._monotonic()
+        expired = [
+            operation_id
+            for operation_id, expires_at in self._operation_expires_at.items()
+            if expires_at <= now
+        ]
+        for operation_id in expired:
+            future = self._operations.get(operation_id)
+            if future is not None and future.done():
+                self._operations.pop(operation_id, None)
+                self._operation_expires_at.pop(operation_id, None)
+
+    def _refresh_tombstone_admission(self) -> None:
+        """Reserve release-tombstone headroom for every resident lease."""
+
+        self._prune_operation_tombstones()
+        resident_count = 0
+        if self._inventory is not None:
+            resident_count = int(self._inventory.get("resident_count", 0))
+        # A new session consumes one reserve tombstone immediately and one
+        # release tombstone eventually. Existing resident leases each retain
+        # one cleanup slot. This invariant lets release remain available even
+        # when new admission is closed by the operation horizon.
+        self._tombstone_admission_blocked = (
+            len(self._operation_expires_at) + resident_count + 2
+            > self._max_tombstones
+        )
+
+    def _track_operation(
+        self,
+        operation_id: str,
+        future: asyncio.Future[Any],
+    ) -> None:
+        """Retain one completed future as the exact retry tombstone."""
+
+        self._operations[operation_id] = future
+
+        def completed(_future: asyncio.Future[Any]) -> None:
+            self._operation_expires_at[operation_id] = (
+                self._monotonic() + self._tombstone_ttl_s
+            )
+            self._refresh_tombstone_admission()
+
+        future.add_done_callback(completed)
 
     def install_metrics(self, metrics_sink: Any) -> None:
         """Attach the app-owned non-authoritative metric sink exactly once."""
@@ -261,8 +328,28 @@ class PersistentStateService:
                     )
                 self._engine_epoch = engine_epoch
                 self._inventory = dict(snapshot)
+                if self._max_tombstones < 2 * int(snapshot["effective_capacity"]):
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state tombstone count cannot reserve cleanup "
+                        "headroom for effective capacity"
+                    )
+                advertised_ttl = snapshot.get(
+                    "persistent_state_tombstone_ttl_s"
+                )
+                advertised_max = snapshot.get(
+                    "persistent_state_max_tombstones"
+                )
+                if advertised_ttl is not None and float(advertised_ttl) != self._tombstone_ttl_s:
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state tombstone TTL disagrees across processes"
+                    )
+                if advertised_max is not None and int(advertised_max) != self._max_tombstones:
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state tombstone count disagrees across processes"
+                    )
                 self._ready = True
                 self._admission_open = True
+                self._refresh_tombstone_admission()
                 self._project_inventory()
             if self._dispatcher_task is None or self._dispatcher_task.done():
                 self._dispatcher_task = asyncio.create_task(
@@ -272,6 +359,7 @@ class PersistentStateService:
     async def check_health(self) -> None:
         """Require a completed inventory handshake and open admission."""
         await self._ensure_started()
+        self._refresh_tombstone_admission()
         if not self.ready:
             raise PersistentStateServiceUnavailable(
                 "persistent-state admission is closed"
@@ -288,6 +376,7 @@ class PersistentStateService:
     def _coalesced_future(
         self, operation_id: str
     ) -> asyncio.Future[Any] | None:
+        self._prune_operation_tombstones()
         return self._operations.get(operation_id)
 
     async def reserve(
@@ -304,17 +393,21 @@ class PersistentStateService:
         except PersistentStateServiceUnavailable:
             self._observe_admission_rejection("unavailable")
             raise
-        if not self._admission_open:
-            self._observe_admission_rejection("unavailable")
-            raise PersistentStateServiceUnavailable(
-                "persistent-state admission is closed"
-            )
         shared = self._coalesced_future(operation_id)
         if shared is None:
+            self._refresh_tombstone_admission()
+            if not self.ready:
+                self._observe_admission_rejection("unavailable")
+                reason = (
+                    "persistent-state operation tombstone horizon is full"
+                    if self._tombstone_admission_blocked
+                    else "persistent-state admission is closed"
+                )
+                raise PersistentStateServiceUnavailable(reason)
             future: asyncio.Future[StateReserveResult] = (
                 asyncio.get_running_loop().create_future()
             )
-            self._operations[operation_id] = future
+            self._track_operation(operation_id, future)
             try:
                 self.reserve_queue.put_nowait(
                     _ReserveCommand(
@@ -327,6 +420,7 @@ class PersistentStateService:
                 )
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
+                self._operation_expires_at.pop(operation_id, None)
                 self._observe_admission_rejection("unavailable")
                 raise PersistentStateServiceUnavailable(
                     "persistent-state reserve queue is full"
@@ -375,13 +469,14 @@ class PersistentStateService:
             future: asyncio.Future[StateReleaseResult] = (
                 asyncio.get_running_loop().create_future()
             )
-            self._operations[operation_id] = future
+            self._track_operation(operation_id, future)
             try:
                 self.cleanup_queue.put_nowait(
                     _ReleaseCommand(operation_id, lease, reason, future)
                 )
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
+                self._operation_expires_at.pop(operation_id, None)
                 self.close_admission()
                 raise PersistentStateServiceUnavailable(
                     "persistent-state cleanup queue is full"
