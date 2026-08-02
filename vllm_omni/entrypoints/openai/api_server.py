@@ -461,6 +461,10 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
 async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
     """Run a single API server worker."""
 
+    api_server_count = getattr(args, "api_server_count", None)
+    worker_count = api_server_count if api_server_count is not None else 1
+    streaming_install.assert_single_api_server_invariant(worker_count)
+
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:

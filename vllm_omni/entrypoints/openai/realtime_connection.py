@@ -160,7 +160,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
-        if self._nemotron_session is None:
+        if getattr(self, "_nemotron_session", None) is None:
             request_id = f"rt-{self.connection_id}-{uuid4()}"
             audio_stream = self.audio_stream_generator()
             input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
@@ -217,7 +217,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                 "model_not_validated",
             )
             return
-        if event_type == "session.update" and self._persistent_state_service is not None:
+        if (
+            event_type == "session.update"
+            and getattr(self, "_persistent_state_service", None) is not None
+        ):
             # Definitive capacity_exhausted/service_unavailable denials leave
             # transport connected and _is_model_validated=False.  The helper
             # sets _is_model_validated = True only after the same operation_id

@@ -100,7 +100,7 @@ async def buffer_stream(
             in force, keeping today's behavior exactly.
 
     Raises:
-        RuntimeError: If a piece would push the session's accepted-audio
+        ValueError: If a piece would push the session's accepted-audio
             queue occupancy past ``session.accepted_audio_budget_s``
             (design §Park, Finalization, and Backpressure, Decision 1,
             amended PORT-SESS-001) — the whole piece is rejected before
@@ -183,12 +183,6 @@ async def buffer_stream(
             if unit is None:
                 raise RuntimeError("ready audio could not become in-flight")
             handle = session.take_ready_handle(unit.logical_sequence)
-            if ledger is not None and unit.kind != "forced_eou":
-                ledger.mint(
-                    final_tail=unit.kind == "final_tail",
-                    admission_ms_mod=unit.admission_ms_mod,
-                    handle=handle,
-                )
             if active_observer is not None and handle is not None:
                 observe_safely(active_observer.unit_minted, handle)
             yield prompt(unit)
@@ -210,18 +204,23 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        try:
-            session.accept_audio(frame)
-        except ValueError as error:
-            if "buffer_overflow" not in str(error):
-                raise
-            raise RuntimeError(
-                "accepted-audio queue occupancy would exceed the "
-                f"session's accepted_audio_budget_s="
-                f"{session.accepted_audio_budget_s}; the whole piece is "
-                "rejected before any of its complete cadences are accepted "
-                "(PORT-SESS-001)"
-            ) from error
+        prior_sequences = {
+            unit.logical_sequence for unit in authority.ready_units
+        }
+        session.accept_audio(frame)
+        new_units = tuple(
+            unit
+            for unit in authority.ready_units
+            if unit.logical_sequence not in prior_sequences
+        )
+        if ledger is not None:
+            for unit in new_units:
+                if unit.kind != "forced_eou":
+                    ledger.mint(
+                        final_tail=unit.kind == "final_tail",
+                        admission_ms_mod=unit.admission_ms_mod,
+                        handle=session.ready_handle(unit.logical_sequence),
+                    )
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
         async for rendered in dispatch_ready():
@@ -237,6 +236,20 @@ async def buffer_stream(
             else int(final_tail_ready_stamp_s * 1_000_000_000)
         )
         session.begin_finalize(finalize_at_ns=finalize_at_ns)
+    final_tail = next(
+        (
+            unit
+            for unit in reversed(authority.ready_units)
+            if unit.kind == "final_tail"
+        ),
+        None,
+    )
+    if ledger is not None and final_tail is not None:
+        ledger.mint(
+            final_tail=True,
+            admission_ms_mod=final_tail.admission_ms_mod,
+            handle=session.ready_handle(final_tail.logical_sequence),
+        )
     async for rendered in dispatch_ready():
         yield rendered
     # @spec PORT-DEC-009, PORT-REGIME-004, PORT-SESS-003

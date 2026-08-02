@@ -581,7 +581,7 @@ def test_native_piece_exceeding_the_budget_is_rejected_whole_before_acceptance()
             queue.put_nowait([PARK_ID])
         return fake
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match="buffer_overflow"):
         _run(scenario())
 
 
@@ -595,7 +595,7 @@ def test_native_rejected_piece_accrues_no_accepted_audio_seconds() -> None:
         try:
             async for _prompt in agen:
                 queue.put_nowait([PARK_ID])
-        except RuntimeError:
+        except ValueError:
             pass
         return fake
 
@@ -613,7 +613,7 @@ def test_native_rejected_piece_emits_exactly_one_input_queue_overflow() -> None:
         try:
             async for _prompt in agen:
                 queue.put_nowait([PARK_ID])
-        except RuntimeError:
+        except ValueError:
             pass
         return fake
 

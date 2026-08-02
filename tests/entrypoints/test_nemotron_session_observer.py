@@ -176,6 +176,32 @@ class FakeAsyncOmni:
         self.stop_after = stop_after
         self.prompts: list[Any] = []
         self.aborted: list[str] = []
+        self._state_generation = 0
+        self.state_releases: list[dict[str, Any]] = []
+
+    @property
+    def inventory(self) -> dict[str, str]:
+        return {"schema_id": "state-manifest-v1", "profile_id": "default"}
+
+    def get_persistent_state_service(self) -> FakeAsyncOmni:
+        return self
+
+    async def check_health(self) -> None:
+        return None
+
+    async def reserve(self, **kwargs: Any) -> Any:
+        self._state_generation += 1
+        return SimpleNamespace(
+            engine_epoch="test-epoch",
+            session_key=kwargs["session_key"],
+            generation=self._state_generation,
+            schema_id=kwargs["schema_id"],
+            profile_id=kwargs["profile_id"],
+            binding_token=f"binding-{self._state_generation}",
+        )
+
+    async def release(self, **kwargs: Any) -> None:
+        self.state_releases.append(kwargs)
 
     async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
         index = 0
@@ -543,7 +569,7 @@ def test_leased_piece_exceeding_the_budget_is_rejected_whole_before_acceptance()
             request_id="rt-obs-budget-1",
             render=_passthrough_render,
         )
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError, match="buffer_overflow"):
             await _wait(lease.feed(_audio(_CHUNK * 5)))
         await _wait(lease.abort())
         await lease.release()
@@ -573,7 +599,7 @@ def test_leased_rejected_piece_accrues_no_accepted_audio_seconds() -> None:
         )
         try:
             await _wait(lease.feed(_audio(_CHUNK * 5)))
-        except RuntimeError:
+        except ValueError:
             pass
         await _wait(lease.abort())
         await lease.release()
@@ -605,7 +631,7 @@ def test_leased_rejected_piece_emits_exactly_one_input_queue_overflow() -> None:
         )
         try:
             await _wait(lease.feed(_audio(_CHUNK * 5)))
-        except RuntimeError:
+        except ValueError:
             pass
         await _wait(lease.abort())
         await lease.release()
@@ -643,7 +669,7 @@ def test_leased_session_follows_ordinary_terminal_clearing_after_budget_rejectio
         )
         try:
             await _wait(lease.feed(_audio(_CHUNK * 5)))
-        except RuntimeError:
+        except ValueError:
             pass
         await _wait(lease.abort())
         await lease.release()
@@ -706,10 +732,10 @@ def test_leased_occupancy_lifecycle_never_caps_lifetime_cumulative_audio() -> No
 class _RaisingObserver:
     """Every call raises — the sink failure this test proves is swallowed."""
 
-    def session_opened(self, *, cadence_ms: str) -> None:
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
         raise RuntimeError("sink boom: session_opened")
 
-    def session_finished(self, *, cadence_ms: str, reason: str) -> None:
+    def session_finished(self, *, session_key: str, reason: str) -> None:
         raise RuntimeError("sink boom: session_finished")
 
     def session_open_rejected(self, *, reason: str) -> None:
@@ -752,7 +778,7 @@ def test_observer_sink_failure_never_propagates_into_feed_or_flush() -> None:
     """A raising observer must not fail feed()/flush() — observation is
     non-authoritative and nonfatal at every call site (PORT-OBS-002)."""
 
-    async def scenario() -> tuple[list[str], str]:
+    async def scenario() -> tuple[list[str], Any]:
         engine = FakeAsyncOmni()
         session = NemotronRealtimeSession.from_model_config(
             _hf(), cadence=_CADENCE, locale="auto", with_ledger=True, observer=_RaisingObserver(),
@@ -774,7 +800,7 @@ def test_observer_sink_failure_never_propagates_into_feed_or_flush() -> None:
     # despite every observer call raising.
     results, text = _run(scenario())
     assert results == [" w0"]
-    assert text == " w0 w1"
+    assert text.complete_text == " w0 w1"
 
 
 # ---------------------------------------------------------------------------

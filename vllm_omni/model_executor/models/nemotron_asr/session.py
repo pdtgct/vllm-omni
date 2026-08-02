@@ -958,6 +958,10 @@ class NemotronRealtimeSession:
         """Consume the observer handle paired with one dispatched unit."""
         return self._ready_handles.pop(logical_sequence, None)
 
+    def ready_handle(self, logical_sequence: int) -> Any:
+        """Return the observer handle without advancing mint ownership."""
+        return self._ready_handles.get(logical_sequence)
+
 
 # @spec PORT-RTC-003
 def create_nemotron_session_factory(engine: Any) -> Any:
