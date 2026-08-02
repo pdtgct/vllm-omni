@@ -47,6 +47,7 @@ import pytest
 
 from vllm_omni.entrypoints.openai import realtime_connection as realtime_connection_mod
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.session_lifecycle import SessionLifecycleDeadline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -212,6 +213,15 @@ def _connection(
     connection.audio_queue = asyncio.Queue()
     connection._observer = observer
     connection._park_token_id = park_token_id
+
+    async def _inert_expiry(_kind: str) -> None:
+        return None
+
+    connection._session_lifecycle = SessionLifecycleDeadline(
+        idle_timeout_s=None,
+        finalization_timeout_s=None,
+        on_expire=_inert_expiry,
+    )
 
     sent_events: list[Any] = []
     sent_json: list[dict[str, Any]] = []
@@ -774,6 +784,7 @@ def test_manager_projection_uses_the_same_installed_metrics_instance() -> None:
     class _RecordingService:
         def __init__(self) -> None:
             self.received: Any = None
+            self.runtime_config = SimpleNamespace(accepted_audio_budget_s=30.0)
 
         def install_metrics(self, metrics: Any) -> None:
             self.received = metrics
@@ -790,6 +801,31 @@ def test_manager_projection_uses_the_same_installed_metrics_instance() -> None:
     installed = streaming_install.resolve_installed_observer(state)
     assert installed is not None
     assert state.persistent_state_service.received is installed.metrics
+    assert (
+        state.openai_serving_realtime.runtime_config
+        is state.persistent_state_service.runtime_config
+    )
+
+
+# @spec PORT-INT-005, PORT-SESS-005
+def test_realtime_serving_accepts_one_immutable_runtime_envelope() -> None:
+    import inspect
+
+    from vllm_omni.entrypoints.openai.serving_realtime import (
+        NemotronServingRealtime,
+    )
+
+    parameters = inspect.signature(NemotronServingRealtime.__init__).parameters
+    assert "runtime_config" in parameters
+    assert {
+        "accepted_audio_budget_s",
+        "accepted_audio_capacity_samples",
+        "max_retained_transcript_bytes",
+        "max_session_duration_s",
+        "session_configuration_timeout_s",
+        "session_idle_timeout_s",
+        "session_finalization_timeout_s",
+    }.isdisjoint(parameters)
 
 
 def test_async_omni_engine_declares_the_orchestrator_binding() -> None:
@@ -910,7 +946,13 @@ def _serving_realtime(*, observer: Any, accepted_audio_budget_s: float | None) -
     # touching vLLM's real model registry.
     serving.__dict__["model_cls"] = fake_model_cls
     serving._observer = observer
-    serving._accepted_audio_budget_s = accepted_audio_budget_s
+    serving.runtime_config = (
+        None
+        if accepted_audio_budget_s is None
+        else SimpleNamespace(
+            accepted_audio_budget_s=accepted_audio_budget_s
+        )
+    )
     return serving, fake_model_cls
 
 
@@ -988,7 +1030,7 @@ async def test_unwidened_model_receives_the_exact_upstream_call() -> None:
     model_cls = _UnwidenedModelCls()
     serving.__dict__["model_cls"] = model_cls
     serving._observer = _RecordingObserver()
-    serving._accepted_audio_budget_s = 30.0
+    serving.runtime_config = SimpleNamespace(accepted_audio_budget_s=30.0)
 
     # Must not raise TypeError despite an installed observer + budget.
     async for _ in serving.transcribe_realtime(_empty_audio_stream(), asyncio.Queue()):
@@ -1047,6 +1089,15 @@ async def test_start_generation_mints_one_identity_for_serving_and_engine() -> N
     connection._observer = None
     connection._park_token_id = None
     connection.generation_task = None
+
+    async def _inert_expiry(_kind: str) -> None:
+        return None
+
+    connection._session_lifecycle = SessionLifecycleDeadline(
+        idle_timeout_s=None,
+        finalization_timeout_s=None,
+        on_expire=_inert_expiry,
+    )
 
     async def _audio() -> AsyncGenerator[Any, None]:
         return

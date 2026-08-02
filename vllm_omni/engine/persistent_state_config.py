@@ -12,6 +12,16 @@ from typing import Any
 _RFC1_SAMPLE_RATE_HZ = 16_000
 _RFC1_MAX_CADENCE_S = 1.120
 _RFC1_FINALIZATION_SERVICE_INTERVALS = 2
+_UNPREFIXED_STREAMING_KEYS = frozenset(
+    {
+        "session_configuration_timeout_s",
+        "session_idle_timeout_s",
+        "session_finalization_timeout_s",
+        "accepted_audio_capacity_samples",
+        "max_retained_transcript_bytes",
+        "max_session_duration_s",
+    }
+)
 
 
 def _required_int(
@@ -120,6 +130,12 @@ class PersistentStateRuntimeConfig:
             raise ValueError(
                 "persistent-state runtime limits require additional_config"
             )
+        unprefixed = sorted(_UNPREFIXED_STREAMING_KEYS.intersection(raw))
+        if unprefixed:
+            raise ValueError(
+                "streaming serving keys in additional_config require the "
+                f"streaming_ prefix: {unprefixed}"
+            )
         operation_timeout_s = _required_duration(
             raw, "persistent_state_operation_timeout_s"
         )
@@ -131,12 +147,11 @@ class PersistentStateRuntimeConfig:
                 "persistent_state_reconciliation_timeout_s must be no shorter "
                 "than persistent_state_operation_timeout_s"
             )
-        session_idle_timeout_s = _optional_duration(
-            raw,
-            "session_idle_timeout_s",
-            default=60.0,
+        session_idle_timeout_s = (
+            _required_duration(raw, "streaming_session_idle_timeout_s")
+            if "streaming_session_idle_timeout_s" in raw
+            else 60.0
         )
-        assert session_idle_timeout_s is not None
         resolved = cls(
             safety_reserve_slots=_required_int(
                 raw,
@@ -163,21 +178,25 @@ class PersistentStateRuntimeConfig:
                 raw, "persistent_state_pending_claim_timeout_s"
             ),
             session_configuration_timeout_s=_required_duration(
-                raw, "session_configuration_timeout_s"
+                raw, "streaming_session_configuration_timeout_s"
             ),
             session_idle_timeout_s=session_idle_timeout_s,
             session_finalization_timeout_s=_required_duration(
-                raw, "session_finalization_timeout_s"
+                raw, "streaming_session_finalization_timeout_s"
             ),
             accepted_audio_capacity_samples=_required_int(
-                raw, "accepted_audio_capacity_samples", minimum=1
+                raw,
+                "streaming_accepted_audio_capacity_samples",
+                minimum=1,
             ),
             max_retained_transcript_bytes=_required_int(
-                raw, "max_retained_transcript_bytes", minimum=1
+                raw,
+                "streaming_max_retained_transcript_bytes",
+                minimum=1,
             ),
             max_session_duration_s=_optional_duration(
                 raw,
-                "max_session_duration_s",
+                "streaming_max_session_duration_s",
                 default=None,
             ),
         )
@@ -186,7 +205,8 @@ class PersistentStateRuntimeConfig:
             < resolved.safe_finalization_timeout_s
         ):
             raise ValueError(
-                "session_finalization_timeout_s must be at least the safe "
+                "streaming_session_finalization_timeout_s must be at least "
+                "the safe "
                 f"drain bound {resolved.safe_finalization_timeout_s:.3f}s"
             )
         return resolved

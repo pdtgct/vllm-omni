@@ -22,8 +22,21 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.session_lifecycle import SessionLifecycleDeadline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+async def _inert_expiry(_kind: str) -> None:
+    return None
+
+
+def _inert_lifecycle() -> SessionLifecycleDeadline:
+    return SessionLifecycleDeadline(
+        idle_timeout_s=None,
+        finalization_timeout_s=None,
+        on_expire=_inert_expiry,
+    )
 
 
 @pytest.fixture
@@ -287,6 +300,7 @@ def _realtime_generation_connection(
     connection._is_connected = True
     connection.audio_queue = asyncio.Queue()
     connection.max_retained_transcript_bytes = 1_024
+    connection._session_lifecycle = _inert_lifecycle()
 
     sent_events: list[Any] = []
     sent_json: list[dict[str, Any]] = []
@@ -347,6 +361,7 @@ def _native_event_connection() -> tuple[RealtimeConnection, _NativeSessionRecord
     connection.audio_queue = asyncio.Queue()
     connection.generation_task = _LiveGenerationTask()
     connection._native_fifo_event = asyncio.Event()
+    connection._session_lifecycle = _inert_lifecycle()
 
     async def _send_error(_message: str, _error_type: str) -> None:
         pytest.fail("valid native control unexpectedly emitted an error")

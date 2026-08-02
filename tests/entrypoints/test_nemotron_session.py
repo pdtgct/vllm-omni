@@ -313,6 +313,7 @@ def test_open_realtime_validates_caller_cadence_and_locale() -> None:
         engine = FakeAsyncOmni()
         factory = NemotronSessionFactory(engine=engine)
         lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
         assert lease.session.geometry.cadence == _CADENCE
         assert lease.session.prompt_index == PROMPTS["en-US"]
         assert lease.session.ledger is not None
@@ -543,18 +544,51 @@ def test_rearming_idle_timeout_fences_the_superseded_timer() -> None:
         engine = FakeAsyncOmni()
         factory = NemotronSessionFactory(engine=engine)
         lease = await factory.open(cadence=_CADENCE, locale="en-US")
-        stale_generation = lease._session_lifecycle_generation
+        stale_generation = lease._session_lifecycle.generation
 
         lease._arm_session_lifecycle_timeout("idle")
-        await lease._expire_session_lifecycle(
-            "idle",
-            0.0,
+        lease._session_lifecycle._deadline_reached(
             stale_generation,
+            "idle",
         )
+        await asyncio.sleep(0)
 
-        assert lease._session_lifecycle_expired is False
+        assert lease._session_lifecycle.expired is False
         assert engine.state_releases == []
         await lease.release()
+
+    _run(scenario())
+
+
+# @spec PORT-SESS-005
+def test_factory_feed_rearms_deadline_without_replacing_asyncio_tasks() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
+        class RenderedPrompt:
+            def __init__(self, prompt: Any) -> None:
+                self.prompt = prompt
+
+            def __contains__(self, key: str) -> bool:
+                return key in self.prompt
+
+        async def render(prompt: Any) -> Any:
+            return RenderedPrompt(prompt)
+
+        lease._render = render
+
+        try:
+            await _wait(lease.feed(_audio(_CHUNK)))
+            tasks_after_first_accept = asyncio.all_tasks()
+            for _ in range(3):
+                await _wait(lease.feed(_audio(_CHUNK)))
+
+            assert asyncio.all_tasks() == tasks_after_first_accept
+        finally:
+            await lease.abort()
+            await lease.release()
 
     _run(scenario())
 
@@ -571,8 +605,30 @@ def test_factory_rejects_state_service_without_runtime_envelope() -> None:
 # @spec PORT-SESS-005, PORT-STATE-014
 def test_factory_finalization_timeout_aborts_without_terminal_result() -> None:
     async def scenario() -> None:
-        engine = FakeAsyncOmni(script=lambda _item, _index: [])
-        engine.runtime_config.session_finalization_timeout_s = 0.01
+        class HeldGenerationEngine(FakeAsyncOmni):
+            def __init__(self) -> None:
+                super().__init__()
+                self.generation_started = asyncio.Event()
+                self.hold_generation = asyncio.Event()
+
+            async def generate(
+                self,
+                *,
+                prompt: Any,
+                request_id: str,
+                sampling_params_list: Any,
+            ) -> Any:
+                self.request_ids.append(request_id)
+                self.sampling = sampling_params_list
+                async for item in prompt:
+                    self.prompts.append(item)
+                    self.generation_started.set()
+                    await self.hold_generation.wait()
+                if False:  # pragma: no cover - marks this as async generator
+                    yield None
+
+        engine = HeldGenerationEngine()
+        engine.runtime_config.session_finalization_timeout_s = 3600.0
         factory = NemotronSessionFactory(engine=engine)
         lease = await factory.open(cadence=_CADENCE, locale="en-US")
 
@@ -581,8 +637,12 @@ def test_factory_finalization_timeout_aborts_without_terminal_result() -> None:
 
         lease._render = render
 
+        flush = asyncio.create_task(lease.flush())
+        await asyncio.wait_for(engine.generation_started.wait(), timeout=1.0)
+        lease._session_lifecycle._finalization_timeout_s = 0.01
+        lease._arm_session_lifecycle_timeout("finalization")
         with pytest.raises(TimeoutError, match="finalization_timeout"):
-            await lease.flush()
+            await flush
 
         assert engine.aborted == [lease.request_id]
         assert len(engine.state_releases) == 1

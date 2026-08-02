@@ -20,6 +20,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from vllm_omni.entrypoints.session_lifecycle import (
+    SessionLifecycleDeadline,
+    SessionLifecycleKind,
+)
 from vllm_omni.model_executor.models.nemotron_asr.transcript import (
     SegmentCompletion,
     TerminalResult,
@@ -183,12 +187,11 @@ class NemotronSessionLease:
         self._terminal_code: str | None = None
         self._state_cleanup_lock = asyncio.Lock()
         self._pending_claim_task: asyncio.Task[None] | None = None
-        self._session_lifecycle_task: asyncio.Task[None] | None = None
-        self._retired_lifecycle_tasks: set[asyncio.Task[None]] = set()
-        self._session_lifecycle_generation = 0
-        self._session_lifecycle_expired = False
-        self._idle_timeout_s = idle_timeout_s
-        self._finalization_timeout_s = finalization_timeout_s
+        self._session_lifecycle = SessionLifecycleDeadline(
+            idle_timeout_s=idle_timeout_s,
+            finalization_timeout_s=finalization_timeout_s,
+            on_expire=self._expire_session_lifecycle,
+        )
         if (
             self._persistent_state_service is not None
             and self._state_lease is not None
@@ -200,8 +203,7 @@ class NemotronSessionLease:
                 self._expire_pending_claim(timeout_s),
                 name=f"persistent-state-claim-{request_id}",
             )
-        if self._idle_timeout_s is not None:
-            self._arm_session_lifecycle_timeout("idle")
+        self._arm_session_lifecycle_timeout("idle")
 
     @property
     def session(self) -> NemotronRealtimeSession:
@@ -337,62 +339,18 @@ class NemotronSessionLease:
             self._released = True
 
     async def _cancel_session_lifecycle_timeout(self) -> None:
-        task = self._session_lifecycle_task
-        self._session_lifecycle_task = None
-        self._session_lifecycle_generation += 1
-        current = asyncio.current_task()
-        tasks = list(self._retired_lifecycle_tasks)
-        self._retired_lifecycle_tasks.clear()
-        if task is not None:
-            tasks.append(task)
-        waiters = []
-        for candidate in tasks:
-            if candidate is current:
-                continue
-            candidate.cancel()
-            waiters.append(candidate)
-        if waiters:
-            await asyncio.gather(*waiters, return_exceptions=True)
+        await self._session_lifecycle.close()
 
-    def _arm_session_lifecycle_timeout(self, kind: str) -> None:
-        if self._session_lifecycle_expired:
-            raise RuntimeError("session lifecycle has expired")
-        task = self._session_lifecycle_task
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            self._retired_lifecycle_tasks.add(task)
-            task.add_done_callback(self._retired_lifecycle_tasks.discard)
-        timeout_s = (
-            self._idle_timeout_s
-            if kind == "idle"
-            else self._finalization_timeout_s
-        )
-        if timeout_s is None:
-            return
-        self._session_lifecycle_generation += 1
-        generation = self._session_lifecycle_generation
-        self._session_lifecycle_task = asyncio.create_task(
-            self._expire_session_lifecycle(
-                kind,
-                float(timeout_s),
-                generation,
-            ),
-            name=f"nemotron-{kind}-{self._request_id}",
-        )
+    def _arm_session_lifecycle_timeout(
+        self,
+        kind: SessionLifecycleKind,
+    ) -> None:
+        self._session_lifecycle.arm(kind)
 
     async def _expire_session_lifecycle(
         self,
-        kind: str,
-        timeout_s: float,
-        generation: int,
+        kind: SessionLifecycleKind,
     ) -> None:
-        await asyncio.sleep(timeout_s)
-        if (
-            generation != self._session_lifecycle_generation
-            or self._session_lifecycle_expired
-        ):
-            return
-        self._session_lifecycle_expired = True
         code = "idle_timeout" if kind == "idle" else "finalization_timeout"
         self._terminal_reason = "aborted" if kind == "idle" else "error"
         self._terminal_code = code
@@ -452,7 +410,7 @@ class NemotronSessionLease:
 
     def _require_live(self) -> None:
         """Reject work no consumer can acknowledge."""
-        if self._session_lifecycle_expired:
+        if self._session_lifecycle.expired:
             raise self._error or RuntimeError("session lifecycle has expired")
         if self._aborted:
             raise RuntimeError("the session was aborted")
@@ -464,7 +422,7 @@ class NemotronSessionLease:
     async def _drain(self) -> None:
         """Close accepted audio and wait for generation end."""
         if not self._audio_closed:
-            if self._session_lifecycle_expired:
+            if self._session_lifecycle.expired:
                 raise self._error or RuntimeError(
                     "session lifecycle has expired"
                 )
@@ -528,7 +486,7 @@ class NemotronSessionLease:
             yield streaming_input
 
     def _require_unexpired_lifecycle(self) -> None:
-        if self._session_lifecycle_expired:
+        if self._session_lifecycle.expired:
             raise self._error or RuntimeError("session lifecycle has expired")
 
     async def _consume(self) -> None:

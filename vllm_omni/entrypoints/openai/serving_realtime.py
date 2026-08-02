@@ -59,13 +59,7 @@ class NemotronServingRealtime(OpenAIServingRealtime):
         self,
         *args: Any,
         observer: Any = None,
-        accepted_audio_budget_s: float | None = None,
-        accepted_audio_capacity_samples: int | None = None,
-        max_retained_transcript_bytes: int | None = None,
-        max_session_duration_s: float | None = None,
-        session_configuration_timeout_s: float | None = None,
-        session_idle_timeout_s: float | None = None,
-        session_finalization_timeout_s: float | None = None,
+        runtime_config: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -74,13 +68,7 @@ class NemotronServingRealtime(OpenAIServingRealtime):
         # threaded through on every call; absent (``None``) reproduces
         # today's inert behavior exactly.
         self._observer = observer
-        self._accepted_audio_budget_s = accepted_audio_budget_s
-        self.accepted_audio_capacity_samples = accepted_audio_capacity_samples
-        self.max_retained_transcript_bytes = max_retained_transcript_bytes
-        self.max_session_duration_s = max_session_duration_s
-        self.session_configuration_timeout_s = session_configuration_timeout_s
-        self.session_idle_timeout_s = session_idle_timeout_s
-        self.session_finalization_timeout_s = session_finalization_timeout_s
+        self.runtime_config = runtime_config
 
     @functools.cached_property
     def _model_declares_widened_buffer_kwargs(self) -> bool:
@@ -160,7 +148,11 @@ class NemotronServingRealtime(OpenAIServingRealtime):
                 input_stream,
                 model_config,
                 observer=self._observer,
-                accepted_audio_budget_s=self._accepted_audio_budget_s,
+                accepted_audio_budget_s=(
+                    self.runtime_config.accepted_audio_budget_s
+                    if self.runtime_config is not None
+                    else None
+                ),
                 session_key=session_key,
             )
         else:

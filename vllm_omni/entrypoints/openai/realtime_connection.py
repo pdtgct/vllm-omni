@@ -22,6 +22,10 @@ from vllm_omni.engine.persistent_state_service import (
     StateLease,
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.session_lifecycle import (
+    SessionLifecycleDeadline,
+    SessionLifecycleKind,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.streaming_transport import observe_safely
 from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
@@ -62,10 +66,6 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_release_done = False
         self._state_cleanup_lock = asyncio.Lock()
         self._pending_claim_task: asyncio.Task[None] | None = None
-        self._session_lifecycle_task: asyncio.Task[None] | None = None
-        self._retired_lifecycle_tasks: set[asyncio.Task[None]] = set()
-        self._session_lifecycle_generation = 0
-        self._session_lifecycle_expired = False
         self._configuration_timed_out = False
         self._nemotron_session: NemotronRealtimeSession | None = None
         self._native_fifo_event = asyncio.Event()
@@ -74,58 +74,45 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._streaming_session_finished = False
         self._streaming_finish_reason = "aborted"
         self._terminal_code: str | None = None
-        configured_timeout = getattr(
-            self.serving, "session_configuration_timeout_s", None
+        runtime = getattr(self.serving, "runtime_config", None)
+        service_runtime = getattr(
+            self._persistent_state_service,
+            "runtime_config",
+            None,
         )
-        if self._persistent_state_service is not None and configured_timeout is None:
+        if self._persistent_state_service is not None and runtime is None:
             raise ValueError(
-                "persistent-state serving requires session_configuration_timeout_s"
+                "persistent-state serving requires its resolved runtime envelope"
             )
+        if service_runtime is not None and runtime is not service_runtime:
+            raise ValueError(
+                "persistent-state serving and service runtime envelopes differ"
+            )
+        self._runtime_config = runtime
+        configured_timeout = (
+            runtime.session_configuration_timeout_s
+            if runtime is not None
+            else None
+        )
         self.session_configuration_timeout = float(
             30.0 if configured_timeout is None else configured_timeout
         )
         if self.session_configuration_timeout <= 0:
             raise ValueError("session_configuration_timeout must be positive")
         self._configuration_timeout_task: asyncio.Task[None] | None = None
-        self._session_idle_timeout_s = getattr(
-            self.serving, "session_idle_timeout_s", None
+        self._session_lifecycle = SessionLifecycleDeadline(
+            idle_timeout_s=(
+                runtime.session_idle_timeout_s
+                if runtime is not None
+                else None
+            ),
+            finalization_timeout_s=(
+                runtime.session_finalization_timeout_s
+                if runtime is not None
+                else None
+            ),
+            on_expire=self._expire_session_lifecycle,
         )
-        self._session_finalization_timeout_s = getattr(
-            self.serving, "session_finalization_timeout_s", None
-        )
-        self._accepted_audio_capacity_samples = getattr(
-            self.serving, "accepted_audio_capacity_samples", None
-        )
-        configured_transcript_bytes = getattr(
-            self.serving, "max_retained_transcript_bytes", None
-        )
-        self.max_retained_transcript_bytes = (
-            1 << 20
-            if configured_transcript_bytes is None
-            and self._persistent_state_service is None
-            else configured_transcript_bytes
-        )
-        max_session_duration_s = getattr(
-            self.serving, "max_session_duration_s", None
-        )
-        self._max_session_samples = (
-            None
-            if max_session_duration_s is None
-            else int(float(max_session_duration_s) * 16_000)
-        )
-        if self._persistent_state_service is not None:
-            required = {
-                "session_idle_timeout_s": self._session_idle_timeout_s,
-                "session_finalization_timeout_s": self._session_finalization_timeout_s,
-                "accepted_audio_capacity_samples": self._accepted_audio_capacity_samples,
-                "max_retained_transcript_bytes": self.max_retained_transcript_bytes,
-            }
-            missing = [name for name, value in required.items() if value is None]
-            if missing:
-                raise ValueError(
-                    "persistent-state serving runtime envelope is incomplete: "
-                    f"missing {missing}"
-                )
         # PORT-OBS-003: the connection adapter observes chunk terminal
         # disposition (`_run_generation`) and connection-layer open
         # rejections (`_check_model`) at this layer, but it does NOT own
@@ -295,9 +282,13 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "model_not_validated",
                 )
                 return
+            if self._session_lifecycle.expired:
+                await self.send_error(
+                    "Session lifecycle has expired.",
+                    "session_expired",
+                )
+                return
             try:
-                if getattr(self, "_session_lifecycle_expired", False):
-                    raise RuntimeError("session lifecycle has expired")
                 audio_bytes = base64.b64decode(event["audio"], validate=True)
                 audio_array = (
                     np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
@@ -325,7 +316,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 )
                 return
             if bool(event.get("final", False)):
-                if getattr(self, "_session_lifecycle_expired", False):
+                if self._session_lifecycle.expired:
                     await self.send_error(
                         "Session lifecycle has expired.",
                         "session_expired",
@@ -409,6 +400,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         try:
             model_config = getattr(self.serving, "model_config", None)
             if model_config is not None:
+                runtime = self._runtime_config
+                if runtime is None:
+                    raise RuntimeError(
+                        "admitted persistent-state session has no runtime envelope"
+                    )
                 endpoint = event.get("endpointing") or {}
                 hf = getattr(model_config, "hf_config", model_config)
                 endpoint_policy = EndpointPolicy.resolve(
@@ -432,15 +428,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                     lease_generation=generation,
                     observer=self._observer,
                     accepted_audio_budget_s=float(
-                        self._accepted_audio_capacity_samples / 16_000
+                        runtime.accepted_audio_budget_s
                     ),
                     accepted_audio_capacity_samples=int(
-                        self._accepted_audio_capacity_samples
+                        runtime.accepted_audio_capacity_samples
                     ),
                     max_retained_transcript_bytes=int(
-                        self.max_retained_transcript_bytes
+                        runtime.max_retained_transcript_bytes
                     ),
-                    max_session_samples=self._max_session_samples,
+                    max_session_samples=runtime.max_session_samples,
                 )
                 self._park_token_id = self._nemotron_session.park_token_id
         except Exception:
@@ -589,8 +585,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
-        transcript_limit = getattr(
-            self, "max_retained_transcript_bytes", None
+        runtime = getattr(self, "_runtime_config", None)
+        transcript_limit = (
+            runtime.max_retained_transcript_bytes
+            if runtime is not None
+            else getattr(self, "max_retained_transcript_bytes", None)
         )
         transcript = BoundedTranscript(
             max_retained_bytes=int(
@@ -878,70 +877,18 @@ class RealtimeConnection(VllmRealtimeConnection):
         )
 
     async def _cancel_session_lifecycle_timeout(self) -> None:
-        task = getattr(self, "_session_lifecycle_task", None)
-        self._session_lifecycle_task = None
-        self._session_lifecycle_generation = (
-            getattr(self, "_session_lifecycle_generation", 0) + 1
-        )
-        current = asyncio.current_task()
-        retired = getattr(self, "_retired_lifecycle_tasks", set())
-        tasks = list(retired)
-        retired.clear()
-        if task is not None:
-            tasks.append(task)
-        waiters = []
-        for candidate in tasks:
-            if candidate is current:
-                continue
-            candidate.cancel()
-            waiters.append(candidate)
-        if waiters:
-            await asyncio.gather(*waiters, return_exceptions=True)
+        await self._session_lifecycle.close()
 
-    def _arm_session_lifecycle_timeout(self, kind: str) -> None:
-        if getattr(self, "_session_lifecycle_expired", False):
-            raise RuntimeError("session lifecycle has expired")
-        task = getattr(self, "_session_lifecycle_task", None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            retired = getattr(self, "_retired_lifecycle_tasks", None)
-            if retired is None:
-                retired = set()
-                self._retired_lifecycle_tasks = retired
-            retired.add(task)
-            task.add_done_callback(retired.discard)
-        timeout_s = (
-            getattr(self, "_session_idle_timeout_s", None)
-            if kind == "idle"
-            else getattr(self, "_session_finalization_timeout_s", None)
-        )
-        if timeout_s is None:
-            return
-        generation = getattr(self, "_session_lifecycle_generation", 0) + 1
-        self._session_lifecycle_generation = generation
-        self._session_lifecycle_task = asyncio.create_task(
-            self._expire_session_lifecycle(
-                kind,
-                float(timeout_s),
-                generation,
-            ),
-            name=f"realtime-{kind}-{self.connection_id}",
-        )
+    def _arm_session_lifecycle_timeout(
+        self,
+        kind: SessionLifecycleKind,
+    ) -> None:
+        self._session_lifecycle.arm(kind)
 
     async def _expire_session_lifecycle(
         self,
-        kind: str,
-        timeout_s: float,
-        generation: int,
+        kind: SessionLifecycleKind,
     ) -> None:
-        await asyncio.sleep(timeout_s)
-        if (
-            generation
-            != getattr(self, "_session_lifecycle_generation", 0)
-            or getattr(self, "_session_lifecycle_expired", False)
-        ):
-            return
-        self._session_lifecycle_expired = True
         code = "idle_timeout" if kind == "idle" else "finalization_timeout"
         self._streaming_finish_reason = (
             "aborted" if kind == "idle" else "error"

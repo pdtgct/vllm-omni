@@ -809,35 +809,7 @@ def _install_streaming_observer_and_build_realtime_serving(
         models=state.openai_serving_models,
         request_logger=request_logger,
         observer=installed_streaming_observer,
-        accepted_audio_budget_s=(
-            runtime.accepted_audio_budget_s if runtime is not None else None
-        ),
-        accepted_audio_capacity_samples=(
-            runtime.accepted_audio_capacity_samples
-            if runtime is not None
-            else None
-        ),
-        max_retained_transcript_bytes=(
-            runtime.max_retained_transcript_bytes
-            if runtime is not None
-            else None
-        ),
-        max_session_duration_s=(
-            runtime.max_session_duration_s if runtime is not None else None
-        ),
-        session_configuration_timeout_s=(
-            runtime.session_configuration_timeout_s
-            if runtime is not None
-            else None
-        ),
-        session_idle_timeout_s=(
-            runtime.session_idle_timeout_s if runtime is not None else None
-        ),
-        session_finalization_timeout_s=(
-            runtime.session_finalization_timeout_s
-            if runtime is not None
-            else None
-        ),
+        runtime_config=runtime,
     )
     logger.info(
         "Streaming metrics observer installed (model_name=%s, log_stats=%s)",

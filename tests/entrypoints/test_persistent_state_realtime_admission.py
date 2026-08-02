@@ -28,10 +28,10 @@ def _persistent_state_runtime_values() -> dict[str, int | float]:
         "persistent_state_tombstone_ttl_s": 600.0,
         "persistent_state_max_tombstones": 16,
         "persistent_state_pending_claim_timeout_s": 15.0,
-        "session_configuration_timeout_s": 10.0,
-        "session_finalization_timeout_s": 40.0,
-        "accepted_audio_capacity_samples": 480_000,
-        "max_retained_transcript_bytes": 1 << 20,
+        "streaming_session_configuration_timeout_s": 10.0,
+        "streaming_session_finalization_timeout_s": 40.0,
+        "streaming_accepted_audio_capacity_samples": 480_000,
+        "streaming_max_retained_transcript_bytes": 1 << 20,
     }
 
 
@@ -60,6 +60,7 @@ class _Service:
             accepted_audio_capacity_samples=480_000,
             max_retained_transcript_bytes=1 << 20,
             max_session_samples=None,
+            session_configuration_timeout_s=30.0,
             session_idle_timeout_s=60.0,
             session_finalization_timeout_s=40.0,
         )
@@ -88,12 +89,7 @@ class _Engine:
 class _Serving:
     def __init__(self, engine: _Engine) -> None:
         self.engine_client = engine
-        self.session_configuration_timeout_s = 30.0
-        self.session_idle_timeout_s = 3600.0
-        self.session_finalization_timeout_s = 3600.0
-        self.accepted_audio_capacity_samples = 480_000
-        self.max_retained_transcript_bytes = 1 << 20
-        self.max_session_duration_s = None
+        self.runtime_config = engine.service.runtime_config
 
     def _is_model_supported(self, model: str | None) -> bool:
         return model == "nemotron-asr"
@@ -197,7 +193,7 @@ async def test_pending_claim_timeout_never_releases_a_claimed_generation() -> No
 async def test_idle_timeout_aborts_and_releases_through_the_same_owner() -> None:
     # @spec PORT-SESS-005 / PORT-STATE-014
     connection, websocket, service = _connection()
-    connection._session_idle_timeout_s = 0.01
+    connection._session_lifecycle._idle_timeout_s = 0.01
 
     await connection.handle_event(
         {"type": "session.update", "model": "nemotron-asr"}
@@ -213,21 +209,38 @@ async def test_idle_timeout_aborts_and_releases_through_the_same_owner() -> None
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_audio_after_lifecycle_expiry_reports_session_expired() -> None:
+    # @spec PORT-SESS-005
+    connection, websocket, service = _connection()
+    connection._is_model_validated = True
+    connection._nemotron_session = SimpleNamespace()
+    connection._session_lifecycle._expired = True
+    audio = base64.b64encode(b"\x01\x00").decode()
+
+    await connection.handle_event(
+        {"type": "input_audio_buffer.append", "audio": audio}
+    )
+
+    assert websocket.sent[-1]["code"] == "session_expired"
+    assert service.release_calls == []
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_rearming_idle_timeout_fences_the_superseded_timer() -> None:
     # @spec PORT-SESS-005
     connection, _websocket, service = _connection()
-    connection._session_idle_timeout_s = 3600.0
+    connection._session_lifecycle._idle_timeout_s = 3600.0
     connection._arm_session_lifecycle_timeout("idle")
-    stale_generation = connection._session_lifecycle_generation
+    stale_generation = connection._session_lifecycle.generation
 
     connection._arm_session_lifecycle_timeout("idle")
-    await connection._expire_session_lifecycle(
-        "idle",
-        0.0,
+    connection._session_lifecycle._deadline_reached(
         stale_generation,
+        "idle",
     )
+    await asyncio.sleep(0)
 
-    assert connection._session_lifecycle_expired is False
+    assert connection._session_lifecycle.expired is False
     assert service.release_calls == []
     await connection.cleanup()
 
@@ -268,7 +281,7 @@ async def test_configuration_timeout_releases_a_late_reserve_result() -> None:
 async def test_finalization_timeout_emits_no_success_and_releases_once() -> None:
     # @spec PORT-SESS-005 / PORT-OBS-006
     connection, websocket, service = _connection()
-    connection._session_finalization_timeout_s = 0.01
+    connection._session_lifecycle._finalization_timeout_s = 0.01
     connection._state_lease = service.lease
     connection._state_operation_id = "release-op"
     connection._nemotron_session = SimpleNamespace(session_key="session-a")
