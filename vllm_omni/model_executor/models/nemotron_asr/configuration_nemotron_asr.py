@@ -13,15 +13,11 @@ values are produced by the conversion publisher
 
 from transformers import PretrainedConfig
 
+from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     ENVELOPE_HEADER_FIELDS,
     RAW_SAMPLES_PER_CHUNK,
 )
-
-#: The architecture string — the single source of truth shared by the
-#: registry, the pipeline, the publisher, and ``config.json``'s
-#: ``architectures[0]``. Imported, never re-spelled.
-ARCHITECTURE = "Nemotron3_5AsrForRNNT"
 
 MODEL_TYPE = "nemotron_asr"
 
@@ -134,18 +130,13 @@ class NemotronASRConfig(PretrainedConfig):
             flush_token_id,
         )
         if any(value is not None for value in controls):
-            if any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in controls
-            ):
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in controls):
                 raise ValueError("all four control token ids must be integers")
             typed_controls = tuple(int(value) for value in controls)
             if len(set(typed_controls)) != len(typed_controls):
                 raise ValueError("control token ids must be pairwise distinct")
             if min(typed_controls) <= num_asr_labels:
-                raise ValueError(
-                    "control token ids must be outside the label and blank space"
-                )
+                raise ValueError("control token ids must be outside the label and blank space")
             if vocab_size <= max(typed_controls):
                 raise ValueError("vocab_size must cover every control token id")
         if endpoint_history_capacity_frames <= 0:

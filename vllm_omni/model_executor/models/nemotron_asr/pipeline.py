@@ -18,6 +18,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
 )
@@ -29,7 +30,7 @@ _MAX_BURST_TOKENS = 14 * MAX_SYMBOLS_PER_STEP + 1
 
 NEMOTRON_ASR_PIPELINE = PipelineConfig(
     model_type="nemotron_asr",
-    model_arch="Nemotron3_5AsrForRNNT",
+    model_arch=ARCHITECTURE,
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -40,10 +41,7 @@ NEMOTRON_ASR_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
-            scheduler_cls=(
-                "vllm_omni.model_executor.models.nemotron_asr.scheduler."
-                "NemotronASRScheduler"
-            ),
+            scheduler_cls=("vllm_omni.model_executor.models.nemotron_asr.scheduler.NemotronASRScheduler"),
             sampling_constraints={
                 # The greedy pin (PORT-DEC-005): RNN-T greedy decode;
                 # replay steps argmax forced-logits rows.

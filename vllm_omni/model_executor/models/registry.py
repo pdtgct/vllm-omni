@@ -5,7 +5,17 @@ from vllm.model_executor.models.registry import (
     _resolve_module_name,
 )
 
+from vllm_omni.model_executor.models.nemotron_asr.identity import (
+    ARCHITECTURE as NEMOTRON_ASR_ARCHITECTURE,
+)
+
 _OMNI_MODELS = {
+    # @spec PORT-INT-001
+    NEMOTRON_ASR_ARCHITECTURE: (
+        "nemotron_asr",
+        "nemotron_asr",
+        "NemotronASRForRNNT",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

@@ -22,10 +22,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
-    ARCHITECTURE,
-    MODEL_TYPE,
-)
+from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import MODEL_TYPE
+from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
 
 Transform = Callable[[torch.Tensor], torch.Tensor]
 
