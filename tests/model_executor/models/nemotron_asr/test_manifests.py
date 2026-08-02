@@ -61,6 +61,7 @@ def _checkpoint_config() -> Any:
         pred_hidden=640,
         n_mels=128,
         hidden_size=17_927,  # >= 7 header slots + 17,920 raw samples
+        endpoint_history_capacity_frames=12,
     )
 
 
@@ -76,6 +77,7 @@ def _tiny_config() -> Any:
         pred_hidden=16,
         n_mels=16,
         hidden_size=17_927,
+        endpoint_history_capacity_frames=5,
     )
 
 
@@ -177,6 +179,30 @@ def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
                 "init": init,
             }
         )
+    entries.append(
+        {
+            "name": "endpoint.history",
+            "shape": [cfg.endpoint_history_capacity_frames],
+            "dtype": "int32",
+            "init": "zeros",
+        }
+    )
+    for name in (
+        "history_length",
+        "history_head",
+        "endpoint_armed",
+        "segment_generation",
+        "segment_has_output",
+        "pending_forced_generation",
+    ):
+        entries.append(
+            {
+                "name": f"endpoint.book.{name}",
+                "shape": [1],
+                "dtype": "int32",
+                "init": "zeros",
+            }
+        )
     return entries
 
 
@@ -268,15 +294,16 @@ def test_frontend_constants_pin_the_checkpoint_featurizer() -> None:
 
 
 def test_session_limits_are_fp32_representable() -> None:
-    # @spec PORT-REGIME-001
+    # @spec PORT-INT-004
     # Every envelope header integer must be exact in FP32.
     limits = manifests.SESSION_LIMITS
-    assert limits["max_session_chunks"] == 2**24 - 1
+    assert limits["carrier_sequence_modulus"] == 2**24
+    assert "max_session_chunks" not in limits
     assert limits["queue_capacity"] == (limits["max_symbols_per_step"] * limits["max_frames_per_chunk"])
 
 
 def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
-    # @spec PORT-STATE-009
+    # @spec PORT-STATE-009 / PORT-STATE-021 / PORT-SEG-001
     # Per-layer: channel (56*1024*4=229376) + time (1024*8*4=32768) +
     # valid (1*4=4) = 262148 bytes/layer; * 24 layers = 6,291,552.
     per_layer = 56 * 1024 * 4 + 1024 * 8 * 4 + 4
@@ -287,10 +314,14 @@ def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
     # Predictor h/c: 2 * (2*640*4) = 10,240; queue 140*4 = 560;
     # 7-slot int32 book = 28.
     total = 6_291_552 + 12_484 + 10_240 + 560 + 28
-    # The PORT-STATE-009 / A8-decided FP32 bring-up pin.
+    # Installed endpoint capacity 12: 12 int32 ring slots + six int32
+    # book fields. The pre-endpoint A8 subtotal remains independently
+    # auditable and no endpoint state can hide in a side store.
+    endpoint = 12 * 4 + 6 * 4
     assert total == 6_314_864
+    assert endpoint == 72
     entries = _expected_entries(_checkpoint_config())
-    assert sum(_entry_bytes(e) for e in entries) == 6_314_864
+    assert sum(_entry_bytes(e) for e in entries) == 6_314_936
 
 
 def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
@@ -349,7 +380,7 @@ def test_author_state_manifest_produces_the_exact_canonical_layout() -> None:
     authored = manifests.author_state_manifest(_checkpoint_config())
     expected = _expected_state_manifest(_checkpoint_config())
     assert authored == expected
-    assert authored["total_page_bytes"] == 6_314_864
+    assert authored["total_page_bytes"] == 6_314_936
 
 
 def test_author_state_manifest_derives_from_config_not_the_checkpoint() -> None:
@@ -404,6 +435,12 @@ def test_author_geometry_manifest_produces_the_exact_manifest() -> None:
         },
         "carrier_width": 17_927,
         "frontend": manifests.FRONTEND_CONSTANTS,
+        "endpoint": {
+            "algorithm": "cache-aware-greedy-blank-v1",
+            "installed_modes": ["disabled", "greedy_blank"],
+            "frame_stride_ms": 80,
+            "history_capacity_frames": 12,
+        },
     }
 
 
@@ -421,7 +458,7 @@ def test_author_transition_manifest_produces_the_exact_manifest() -> None:
     assert authored == {
         "schema": "transition-manifest-v1",
         "transition": "advance_session-v1",
-        "roles": ["CHUNK", "REPLAY", "FLUSH"],
+        "roles": ["CHUNK", "REPLAY", "EOU", "FLUSH"],
         "chunk_roles_entering_transition": ["CHUNK"],
         "session_first_init": "metadata-books-zero-scratch",
         "encode_overlap": "pre-encode-cache-on-non-first-chunks",
@@ -437,7 +474,7 @@ def test_author_emission_manifest_produces_the_exact_manifest() -> None:
         label: {
             "max_valid_encoder_frames": right + 1,
             "max_symbols_per_step": 10,
-            "max_emission_tokens": (right + 1) * 10 + 1,
+            "max_emission_tokens": (right + 1) * 10 + 2,
         }
         for label, (_, right) in manifests.CADENCES.items()
     }
@@ -446,9 +483,9 @@ def test_author_emission_manifest_produces_the_exact_manifest() -> None:
         "limits": manifests.SESSION_LIMITS,
         "per_geometry": per_geometry,
     }
-    # Spot-check the budget formula's + 1 park slot at both extremes.
-    assert authored["per_geometry"]["80ms"]["max_emission_tokens"] == 11
-    assert authored["per_geometry"]["1120ms"]["max_emission_tokens"] == 141
+    # One optional EOU and one park are independent of the full label budget.
+    assert authored["per_geometry"]["80ms"]["max_emission_tokens"] == 12
+    assert authored["per_geometry"]["1120ms"]["max_emission_tokens"] == 142
 
 
 # ---- PORT-INT-005: checkpoint profile -------------------------------------
@@ -548,7 +585,7 @@ def test_verify_state_manifest_accepts_matching_registered_specs() -> None:
     [
         (
             lambda m, s: m["entries"].pop(),
-            "decode.layers.0.replay.book.expected_label",
+            "endpoint.book.pending_forced_generation",
         ),
         (
             lambda m, s: m["entries"][0].__setitem__("shape", [1, 1]),

@@ -253,7 +253,12 @@ class _RealtimeGenerationEngine:
         return _outputs()
 
 
-def _generation_output(text: str, token_ids: list[int]) -> Any:
+def _generation_output(
+    text: str,
+    token_ids: list[int],
+    *,
+    segment_completion: Any | None = None,
+) -> Any:
     return SimpleNamespace(
         stage_id=0,
         outputs=[
@@ -264,6 +269,7 @@ def _generation_output(text: str, token_ids: list[int]) -> Any:
         ],
         prompt_token_ids=[1],
         multimodal_output=None,
+        segment_completion=segment_completion,
     )
 
 
@@ -280,29 +286,118 @@ def _realtime_generation_connection(
     connection.engine = engine
     connection._is_connected = True
     connection.audio_queue = asyncio.Queue()
+    connection.max_retained_transcript_bytes = 1_024
 
     sent_events: list[Any] = []
     sent_json: list[dict[str, Any]] = []
     sent_errors: list[tuple[str, str]] = []
+    timeline: list[tuple[str, Any]] = []
 
     async def _send(event: Any) -> None:
         sent_events.append(event)
+        timeline.append(("event", event))
 
     async def _send_json(payload: dict[str, Any]) -> None:
         sent_json.append(payload)
+        timeline.append(("json", payload))
 
     async def _send_error(message: str, error_type: str) -> None:
         sent_errors.append((message, error_type))
+        timeline.append(("error", (message, error_type)))
 
     connection.send = _send  # type: ignore[method-assign]
     connection.send_json = _send_json  # type: ignore[method-assign]
     connection.send_error = _send_error  # type: ignore[method-assign]
+    connection._test_timeline = timeline
     return connection, sent_events, sent_json, sent_errors
 
 
 async def _empty_streaming_input() -> AsyncGenerator[Any, None]:
     if False:
         yield None
+
+
+class _LiveGenerationTask:
+    def done(self) -> bool:
+        return False
+
+
+class _NativeSessionRecorder:
+    def __init__(self) -> None:
+        self.audio: list[np.ndarray] = []
+        self.forces = 0
+        self.finalizations = 0
+
+    def accept_audio(self, samples: np.ndarray) -> None:
+        self.audio.append(samples)
+
+    def force_segment(self) -> None:
+        self.forces += 1
+
+    def begin_finalize(self) -> None:
+        self.finalizations += 1
+
+
+def _native_event_connection() -> tuple[RealtimeConnection, _NativeSessionRecorder]:
+    connection = RealtimeConnection.__new__(RealtimeConnection)
+    session = _NativeSessionRecorder()
+    connection._is_model_validated = True
+    connection._nemotron_session = session
+    connection._max_audio_filesize_mb = 30
+    connection.audio_queue = asyncio.Queue()
+    connection.generation_task = _LiveGenerationTask()
+
+    async def _send_error(_message: str, _error_type: str) -> None:
+        pytest.fail("valid native control unexpectedly emitted an error")
+
+    connection.send_error = _send_error  # type: ignore[method-assign]
+    return connection, session
+
+
+# @spec PORT-SESS-001, PORT-SESS-014
+@pytest.mark.asyncio
+async def test_native_append_submits_directly_to_bounded_session_authority() -> None:
+    connection, session = _native_event_connection()
+    pcm = np.array([0, 16_384, -16_384], dtype=np.int16)
+
+    await connection.handle_event(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(pcm.tobytes()).decode("ascii"),
+        }
+    )
+
+    assert len(session.audio) == 1
+    assert session.audio[0].dtype == np.float32
+    np.testing.assert_allclose(session.audio[0], [0.0, 0.5, -0.5])
+    assert connection.audio_queue.empty()
+
+
+# @spec PORT-SEG-004 / PORT-SESS-014
+@pytest.mark.asyncio
+async def test_later_nonfinal_native_commit_queues_forced_segment() -> None:
+    connection, session = _native_event_connection()
+
+    await connection.handle_event(
+        {"type": "input_audio_buffer.commit", "final": False}
+    )
+
+    assert session.forces == 1
+    assert session.finalizations == 0
+
+
+# @spec PORT-SESS-003 / PORT-SESS-014
+@pytest.mark.asyncio
+async def test_final_native_commit_uses_session_finalization_not_queue_sentinel() -> None:
+    connection, session = _native_event_connection()
+
+    await connection.handle_event(
+        {"type": "input_audio_buffer.commit", "final": True}
+    )
+
+    assert session.finalizations == 1
+    assert session.forces == 0
+    assert connection.audio_queue.empty()
 
 
 # @spec ING-LIFE-011
@@ -327,6 +422,7 @@ async def test_successful_empty_terminal_output_emits_one_done_after_deltas() ->
     ]
     assert sent_events[0].delta == "hello"
     assert sent_events[1].text == "hello"
+    assert getattr(sent_events[1], "terminal", None) is True
     assert sent_errors == []
 
 
@@ -364,4 +460,136 @@ async def test_disconnected_generation_emits_no_terminal_event() -> None:
 
     assert sent_events == []
     assert sent_json == []
+    assert sent_errors == []
+
+
+# @spec PORT-SEG-005, PORT-SEG-007
+@pytest.mark.asyncio
+async def test_committed_segment_emits_additive_event_and_generation_continues() -> None:
+    first_segment = SimpleNamespace(generation=1, text="hello", reason="model")
+    engine = _RealtimeGenerationEngine(
+        [
+            _generation_output(
+                "hello",
+                [7, 103, 101],
+                segment_completion=first_segment,
+            ),
+            _generation_output(" again", [8, 101]),
+        ]
+    )
+    connection, sent_events, sent_json, sent_errors = _realtime_generation_connection(engine)
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert [type(event) for event in sent_events] == [
+        TranscriptionDelta,
+        TranscriptionDelta,
+        TranscriptionDone,
+    ]
+    assert [event.delta for event in sent_events[:-1]] == ["hello", " again"]
+    assert sent_events[-1].text == "hello again"
+    assert getattr(sent_events[-1], "terminal", None) is True
+    segment_events = [
+        event for event in sent_json if event.get("type") == "transcription.segment.done"
+    ]
+    assert segment_events == [
+        {
+            "type": "transcription.segment.done",
+            "generation": 1,
+            "text": "hello",
+            "reason": "model",
+            "usage": {
+                "completion_tokens": 3,
+            },
+        }
+    ]
+    assert [
+        (kind, getattr(payload, "type", None) or payload.get("type"))
+        for kind, payload in connection._test_timeline
+    ] == [
+        ("event", "transcription.delta"),
+        ("json", "transcription.segment.done"),
+        ("event", "transcription.delta"),
+        ("event", "transcription.done"),
+    ]
+    assert sent_errors == []
+
+
+# @spec PORT-SESS-003, PORT-SEG-005, PORT-SEG-006
+@pytest.mark.asyncio
+async def test_eou_immediately_before_end_still_emits_one_legacy_terminal() -> None:
+    segment = SimpleNamespace(generation=1, text="hello", reason="forced")
+    engine = _RealtimeGenerationEngine(
+        [
+            _generation_output(
+                "hello",
+                [7, 103, 101],
+                segment_completion=segment,
+            )
+        ]
+    )
+    connection, sent_events, sent_json, sent_errors = _realtime_generation_connection(engine)
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert sum(isinstance(event, TranscriptionDone) for event in sent_events) == 1
+    assert sent_events[-1].text == "hello"
+    assert getattr(sent_events[-1], "terminal", None) is True
+    segment_events = [
+        event for event in sent_json if event.get("type") == "transcription.segment.done"
+    ]
+    assert len(segment_events) == 1
+    assert segment_events[0]["reason"] == "forced"
+    assert sent_errors == []
+
+
+# @spec PORT-STATE-021, PORT-SEG-005
+@pytest.mark.asyncio
+async def test_output_capacity_overflow_publishes_no_part_of_committed_result() -> None:
+    engine = _RealtimeGenerationEngine(
+        [_generation_output("too-large", [7, 101])]
+    )
+    connection, sent_events, sent_json, sent_errors = _realtime_generation_connection(engine)
+    connection.max_retained_transcript_bytes = 1
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert sent_events == []
+    assert sent_errors == [
+        ("output_capacity_exceeded", "output_capacity_exceeded")
+    ]
+    assert not any(
+        event.get("type") == "transcription.segment.done" for event in sent_json
+    )
+
+
+# @spec PORT-SEG-007
+@pytest.mark.asyncio
+async def test_duplicate_segment_generation_publishes_at_most_once() -> None:
+    segment = SimpleNamespace(generation=1, text="hello", reason="model")
+    engine = _RealtimeGenerationEngine(
+        [
+            _generation_output("hello", [7, 103, 101], segment_completion=segment),
+            _generation_output("", [103, 101], segment_completion=segment),
+        ]
+    )
+    connection, _sent_events, sent_json, sent_errors = _realtime_generation_connection(engine)
+
+    await connection._run_generation(
+        _empty_streaming_input(),
+        asyncio.Queue(),
+    )
+
+    assert sum(
+        event.get("type") == "transcription.segment.done" for event in sent_json
+    ) == 1
     assert sent_errors == []

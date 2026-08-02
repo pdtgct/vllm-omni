@@ -139,3 +139,106 @@ def test_sos_is_blank_and_embeds_to_zeros():
     predictor = Predictor(vocab_size=_VOCAB, pred_hidden=_HID, pred_rnn_layers=2)
     sos = torch.tensor([predictor.blank_id])
     assert torch.all(predictor.embed(sos) == 0.0)
+
+
+def _frame_decode_fn():
+    try:
+        from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+            decode_dense_masked_frames,
+        )
+    except ImportError:
+        pytest.fail(
+            "PORT-DEC-001 missing frame-aligned dense decode output",
+            pytrace=False,
+        )
+    return decode_dense_masked_frames
+
+
+def test_frame_aligned_decode_preserves_every_label_and_one_final_per_frame() -> None:
+    # @spec PORT-DEC-001 / PORT-SEG-002
+    predictor, joint = _nets()
+    with torch.no_grad():
+        joint.joint_net[1].bias[predictor.blank_id] = -100.0
+    frames = 3
+    encoded = torch.randn(1, frames, _HID)
+    state = _fresh_state(predictor)
+
+    result = _frame_decode_fn()(
+        encoded,
+        torch.tensor([frames]),
+        predictor,
+        joint,
+        state,
+    )
+
+    assert result.token_lengths.tolist() == [frames * 10]
+    assert result.frame_emission_counts.tolist() == [[10, 10, 10]]
+    assert result.frame_final_labels.shape == (1, frames)
+    for frame in range(frames):
+        offset = frame * 10
+        assert int(result.frame_final_labels[0, frame]) == int(
+            result.token_ids[0, offset + 9]
+        )
+
+
+def test_blank_and_padded_frames_have_dense_blank_symbol_and_zero_count() -> None:
+    # @spec PORT-DEC-001 / PORT-SEG-002
+    predictor, joint = _nets()
+    with torch.no_grad():
+        joint.joint_net[1].bias[predictor.blank_id] = 100.0
+    encoded = torch.randn(2, 4, _HID)
+    state = DecodeState(
+        h=torch.zeros(2, 2, _HID),
+        c=torch.zeros(2, 2, _HID),
+        last_label=torch.full((2,), predictor.blank_id),
+    )
+
+    result = _frame_decode_fn()(
+        encoded,
+        torch.tensor([4, 2]),
+        predictor,
+        joint,
+        state,
+    )
+
+    assert result.token_lengths.tolist() == [0, 0]
+    assert torch.all(result.frame_final_labels == predictor.blank_id)
+    assert result.frame_emission_counts.tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
+
+
+def test_frame_aligned_decode_matches_existing_flattened_dense_contract() -> None:
+    # @spec PORT-DEC-001 / PORT-DEC-008
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked,
+    )
+
+    predictor, joint = _nets(seed=91)
+    torch.manual_seed(92)
+    encoded = torch.randn(3, 5, _HID)
+    lengths = torch.tensor([5, 3, 0])
+    state = DecodeState(
+        h=torch.zeros(2, 3, _HID),
+        c=torch.zeros(2, 3, _HID),
+        last_label=torch.full((3,), predictor.blank_id),
+    )
+
+    legacy_ids, legacy_lengths, legacy_state = decode_dense_masked(
+        encoded,
+        lengths,
+        predictor,
+        joint,
+        state,
+    )
+    result = _frame_decode_fn()(
+        encoded,
+        lengths,
+        predictor,
+        joint,
+        state,
+    )
+
+    torch.testing.assert_close(result.token_ids, legacy_ids)
+    torch.testing.assert_close(result.token_lengths, legacy_lengths)
+    torch.testing.assert_close(result.state.h, legacy_state.h)
+    torch.testing.assert_close(result.state.c, legacy_state.c)
+    torch.testing.assert_close(result.state.last_label, legacy_state.last_label)

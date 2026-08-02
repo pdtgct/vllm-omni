@@ -117,6 +117,7 @@ def test_weight_names_follow_nemo_layout():
 
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (  # noqa: E402
     StreamingCaches,
+    _stream_attention,
     stream_step,
 )
 
@@ -262,3 +263,78 @@ def test_stream_step_window_valid_saturates_per_row() -> None:
             out_width=out_width,
         )
     assert caches.valid.tolist() == [8, 5]
+
+
+def test_streaming_attention_evicts_oldest_frames_after_many_chunks() -> None:
+    # @spec PORT-STATE-006 / PORT-STATE-020 / PORT-STATE-021
+    enc = _tiny(att_context=(8, 1))
+    layer = enc.layers[0]
+    cache = torch.zeros(1, 8, 32)
+    valid = torch.zeros(1, dtype=torch.long)
+    expected = torch.empty(1, 0, 32)
+
+    # One hundred two-frame chunks are twenty-five full context turnovers.
+    # The resident cache must stay fixed-width and retain exactly the newest
+    # eight frames.
+    with torch.no_grad():
+        for sequence in range(100):
+            x = torch.full((1, 2, 32), float(sequence + 1))
+            new_valid = torch.ones(1, 2, dtype=torch.bool)
+            pos_emb = enc.pos_enc(torch.zeros(1, cache.shape[1] + 2, 32))
+            _, cache = _stream_attention(
+                layer,
+                x,
+                cache=cache,
+                valid=valid,
+                pos_emb=pos_emb,
+                new_valid=new_valid,
+                new_lengths=torch.tensor([2]),
+            )
+            expected = torch.cat([expected, x], dim=1)[:, -8:]
+            valid = torch.clamp(valid + 2, max=8)
+
+            assert cache.shape == (1, 8, 32)
+            torch.testing.assert_close(
+                cache[:, -int(valid.item()) :],
+                expected,
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_streaming_attention_eviction_is_row_local_for_mixed_lengths() -> None:
+    # @spec PORT-STATE-006 / PORT-STATE-021
+    enc = _tiny(att_context=(8, 1))
+    layer = enc.layers[0]
+    cache = torch.stack(
+        (
+            torch.arange(8, dtype=torch.float32).view(8, 1).expand(8, 32),
+            (100 + torch.arange(8, dtype=torch.float32)).view(8, 1).expand(8, 32),
+        )
+    )
+    valid = torch.tensor([8, 8])
+    x = torch.stack(
+        (
+            torch.tensor([[8.0], [9.0]]).expand(2, 32),
+            torch.tensor([[108.0], [999.0]]).expand(2, 32),
+        )
+    )
+    new_lengths = torch.tensor([2, 1])
+    new_valid = torch.tensor([[True, True], [True, False]])
+    pos_emb = enc.pos_enc(torch.zeros(1, 10, 32))
+
+    with torch.no_grad():
+        _, advanced = _stream_attention(
+            layer,
+            x,
+            cache=cache,
+            valid=valid,
+            pos_emb=pos_emb,
+            new_valid=new_valid,
+            new_lengths=new_lengths,
+        )
+
+    assert advanced.shape == (2, 8, 32)
+    torch.testing.assert_close(advanced[0, :, 0], torch.arange(2, 10, dtype=torch.float32))
+    torch.testing.assert_close(advanced[1, :, 0], torch.arange(101, 109, dtype=torch.float32))
+    assert 999.0 not in advanced[1, :, 0].tolist()

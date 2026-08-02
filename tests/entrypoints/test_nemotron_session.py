@@ -139,6 +139,8 @@ pytestmark = [pytest.mark.cpu]
 
 PARK_ID = 13088
 PLACEHOLDER_ID = 13089
+EOU_ID = 13090
+FLUSH_ID = 13091
 PROMPTS = {"auto": 101, "en-US": 2, "de-DE": 7}
 #: The admitted cadence the lease tests run at; sample counts come from
 #: the published manifests, never re-derived (arithmetic lives in TESTS
@@ -151,8 +153,13 @@ _LOCALE = "auto"
 
 def _hf(**overrides: Any) -> SimpleNamespace:
     fields: dict[str, Any] = {
+        "num_asr_labels": 13087,
+        "vocab_size": 13092,
         "eos_token_id": PARK_ID,
         "audio_chunk_token_id": PLACEHOLDER_ID,
+        "eou_token_id": EOU_ID,
+        "flush_token_id": FLUSH_ID,
+        "endpoint_history_capacity_frames": 12,
         "prompt_dictionary": dict(PROMPTS),
         "num_prompts": 128,
     }
@@ -181,10 +188,16 @@ def _audio(n: int) -> Any:
 # ---- fakes ---------------------------------------------------------------------
 
 
-def _out(ids: list[int], text: str = "") -> Any:
+def _out(
+    ids: list[int],
+    text: str = "",
+    *,
+    segment_completion: Any | None = None,
+) -> Any:
     return SimpleNamespace(
         stage_id=0,
         outputs=[SimpleNamespace(token_ids=list(ids), text=text)],
+        segment_completion=segment_completion,
     )
 
 
@@ -327,6 +340,40 @@ def test_feed_burst_returns_hypotheses_in_cadence_order() -> None:
     _run(scenario())
 
 
+# @spec PORT-SEG-006, PORT-SEG-007, PORT-RTC-002
+def test_feed_projects_committed_segments_before_returning_park_hypothesis() -> None:
+    async def scenario() -> None:
+        completion = SimpleNamespace(
+            generation=1,
+            text=" hello",
+            reason="model",
+        )
+
+        def segmenting(item: Any, index: int) -> list[Any]:
+            if "multi_modal_data" not in item:
+                return [_out([PARK_ID])]
+            return [
+                _out(
+                    [7, EOU_ID, PARK_ID],
+                    text=" hello",
+                    segment_completion=completion,
+                )
+            ]
+
+        lease, _ = _make_lease(FakeAsyncOmni(script=segmenting))
+        observed: list[Any] = []
+        hypotheses = await _wait(
+            lease.feed(_audio(_CHUNK), on_segment=observed.append)
+        )
+
+        assert hypotheses == [" hello"]
+        assert observed == [completion]
+        await _wait(lease.abort())
+        await lease.release()
+
+    _run(scenario())
+
+
 # @spec PORT-RTC-004, ING-FE-005
 def test_feed_notifies_piece_acceptance_before_carrier_completion() -> None:
     """The callback releases transport credit at receipt, not at park."""
@@ -412,7 +459,10 @@ def test_flush_drains_final_tail_and_returns_final_transcript() -> None:
         engine = FakeAsyncOmni()
         lease, _ = _make_lease(engine)
         assert await _wait(lease.feed(_audio(_CHUNK))) == [" w0"]
-        assert await _wait(lease.flush()) == " w0 w1"
+        terminal = await _wait(lease.flush())
+        assert terminal.complete_text == " w0 w1"
+        assert terminal.completion.reason == "terminal"
+        assert terminal.completion.text == " w0 w1"
         # FLUSH follows the cadence and final tail, but mints no ticket
         # and contributes no transcript text.
         assert len(engine.prompts) == 3
@@ -429,7 +479,10 @@ def test_flush_without_feed_runs_zero_sample_final_tail() -> None:
     async def scenario() -> None:
         engine = FakeAsyncOmni()
         lease, _ = _make_lease(engine)
-        assert await _wait(lease.flush()) == " w0"
+        terminal = await _wait(lease.flush())
+        assert terminal.complete_text == " w0"
+        assert terminal.completion.reason == "terminal"
+        assert terminal.completion.text == " w0"
         assert len(engine.prompts) == 2
         envelope = engine.prompts[0]["multi_modal_data"]["audio"]
         # Envelope header: [version, n_samples, ...] — the explicit

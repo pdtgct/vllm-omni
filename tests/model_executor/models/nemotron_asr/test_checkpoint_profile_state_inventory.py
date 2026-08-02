@@ -34,6 +34,7 @@ def _state_manifest() -> dict[str, Any]:
         pred_rnn_layers=2,
         pred_hidden=640,
         n_mels=128,
+        endpoint_history_capacity_frames=12,
     )
     try:
         return cast(dict[str, Any], manifests.author_state_manifest(config))
@@ -115,6 +116,16 @@ def _expected_inventory() -> list[dict[str, Any]]:
         ("expected_label", "zeros"),
     ):
         entries.append(_entry(f"decode.layers.0.replay.book.{name}", [1], "int32", init))
+    entries.append(_entry("endpoint.history", [12], "int32"))
+    for name in (
+        "history_length",
+        "history_head",
+        "endpoint_armed",
+        "segment_generation",
+        "segment_has_output",
+        "pending_forced_generation",
+    ):
+        entries.append(_entry(f"endpoint.book.{name}", [1], "int32"))
     return entries
 
 
@@ -127,7 +138,7 @@ def _entry_bytes(entry: dict[str, Any]) -> int:
 
 
 def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
-    # @spec PORT-STATE-001 / PORT-ADV-002 / PORT-WGT-004
+    # @spec PORT-STATE-001 / PORT-ADV-002 / PORT-SEG-001 / PORT-WGT-004
     manifest = _state_manifest()
     expected = _expected_inventory()
     entries = manifest["entries"]
@@ -138,7 +149,7 @@ def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
     assert manifest["schema"] == "state-manifest-v1"
     assert manifest["precision_policy"] == "fp32-bringup-v1"
     assert entries == expected
-    assert len(entries) == len({entry["name"] for entry in entries}) == 92
+    assert len(entries) == len({entry["name"] for entry in entries}) == 99
 
     assert sum(entry["name"].endswith(".window.channel") for entry in entries) == 24
     assert sum(entry["name"].endswith(".window.valid") for entry in entries) == 24
@@ -146,7 +157,8 @@ def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
     assert sum(entry["name"].startswith("frontend.") for entry in entries) == 10
     assert sum(entry["name"].startswith("predictor.") for entry in entries) == 2
     assert sum(entry["name"].startswith("decode.") for entry in entries) == 8
+    assert sum(entry["name"].startswith("endpoint.") for entry in entries) == 7
 
     total_bytes = sum(_entry_bytes(entry) for entry in expected)
-    assert total_bytes == 6_314_864
+    assert total_bytes == 6_314_936
     assert manifest["total_page_bytes"] == total_bytes
