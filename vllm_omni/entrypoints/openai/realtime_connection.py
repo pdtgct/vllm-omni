@@ -289,15 +289,19 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         service = self._persistent_state_service
         assert service is not None
-        check_health = getattr(service, "check_health", None)
-        if check_health is not None:
-            await check_health()
-        inventory = getattr(service, "inventory", None) or {}
-        schema_id = str(inventory.get("schema_id", "state-manifest-v1"))
-        profile_id = str(inventory.get("profile_id", "default"))
+        check_health = getattr(
+            service,
+            "check_admission",
+            getattr(service, "check_health", None),
+        )
         reserve_operation_id = uuid4().hex
         session_key = f"rt-{self.connection_id}-{uuid4().hex}"
         try:
+            if check_health is not None:
+                await check_health()
+            inventory = getattr(service, "inventory", None) or {}
+            schema_id = str(inventory.get("schema_id", "state-manifest-v1"))
+            profile_id = str(inventory.get("profile_id", "default"))
             lease = await service.reserve(
                 operation_id=reserve_operation_id,
                 session_key=session_key,

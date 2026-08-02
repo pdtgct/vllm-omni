@@ -527,7 +527,11 @@ class NemotronSessionFactory:
         service = self._persistent_state_service
         if service is None:
             raise RuntimeError("persistent-state service is not installed")
-        check_health = getattr(service, "check_health", None)
+        check_health = getattr(
+            service,
+            "check_admission",
+            getattr(service, "check_health", None),
+        )
         if check_health is not None:
             await check_health()
         inventory = getattr(service, "inventory", None) or {}

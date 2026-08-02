@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OmniStreamingMetrics — production streaming Prometheus families.
 
-PORT-OBS-001..009 (port-specs.md §Capture and observability) and
+PORT-OBS-001..010 (port-specs.md §Capture and observability) and
 port-design.md §Production metric export. Families follow the existing
 metrics-module conventions (``prometheus.py``/``modality.py``): module-level
 singletons registered once on the process default registry, imported only
@@ -55,6 +55,8 @@ _deadline_miss_labels = list(defs.STREAMING_DEADLINE_MISS_LABELS)
 _backlog_labels = list(defs.STREAMING_BACKLOG_LABELS)
 _overflow_labels = list(defs.STREAMING_OVERFLOW_LABELS)
 _open_rejection_labels = list(defs.STREAMING_OPEN_REJECTION_LABELS)
+_admission_rejection_labels = list(defs.STREAMING_ADMISSION_REJECTION_LABELS)
+_persistent_state_slot_labels = list(defs.PERSISTENT_STATE_SLOT_LABELS)
 _input_audio_labels = list(defs.STREAMING_INPUT_AUDIO_LABELS)
 _batch_size_labels = list(defs.STREAMING_BATCH_SIZE_LABELS)
 
@@ -65,7 +67,8 @@ _batch_size_labels = list(defs.STREAMING_BATCH_SIZE_LABELS)
 # ----------------------------------------------------------------------------
 _sessions_active_family = Gauge(
     defs.STREAMING_SESSIONS_ACTIVE,
-    "Active model sessions, native or leased — an upper bound on `resident` until provider admission exists.",
+    "Active model sessions after successful construction; manager resident "
+    "inventory may additionally include preconstruction or cleanup leases.",
     labelnames=_cadence_labels,
 )
 _sessions_finished_family = Counter(
@@ -105,6 +108,16 @@ _open_rejections_family = Counter(
     defs.STREAMING_SESSION_OPEN_REJECTIONS,
     "Session opens denied for request/configuration causes — diagnostic only, never a scaling input.",
     labelnames=_open_rejection_labels,
+)
+_admission_rejections_family = Counter(
+    defs.STREAMING_ADMISSION_REJECTIONS,
+    "Persistent-state admission denied by capacity or service availability.",
+    labelnames=_admission_rejection_labels,
+)
+_persistent_state_slots_family = Gauge(
+    defs.PERSISTENT_STATE_SLOTS,
+    "Manager-sourced persistent-state resident inventory and capacity limits.",
+    labelnames=_persistent_state_slot_labels,
 )
 _input_audio_seconds_family = Counter(
     defs.STREAMING_INPUT_AUDIO_SECONDS,
@@ -170,6 +183,43 @@ class OmniStreamingMetrics:
         if reason not in defs.STREAMING_OPEN_REJECTION_REASONS:
             return
         _open_rejections_family.labels(model_name=self._model_name, reason=reason).inc()
+
+    def inc_admission_rejection(self, reason: str) -> None:
+        """One definitive manager-backed admission denial."""
+        if not self._log_stats:
+            return
+        if reason not in defs.STREAMING_ADMISSION_REJECTION_REASONS:
+            return
+        _admission_rejections_family.labels(
+            model_name=self._model_name,
+            reason=reason,
+        ).inc()
+
+    def observe_persistent_state_slots(
+        self,
+        stage: str,
+        replica: str,
+        inventory: dict[str, int],
+    ) -> None:
+        """Replace the complete manager-sourced slot projection."""
+        if not self._log_stats:
+            return
+        if not stage or not replica:
+            return
+        if set(inventory) != set(defs.PERSISTENT_STATE_SLOT_KINDS):
+            return
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in inventory.values()
+        ):
+            return
+        for kind in defs.PERSISTENT_STATE_SLOT_KINDS:
+            _persistent_state_slots_family.labels(
+                model_name=self._model_name,
+                stage=stage,
+                replica=replica,
+                kind=kind,
+            ).set(inventory[kind])
 
     def inc_input_audio_seconds(self, cadence_ms: str, seconds: float) -> None:
         """Accepted-audio seconds at the common PORT acceptance event."""

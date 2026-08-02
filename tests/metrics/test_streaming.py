@@ -54,6 +54,8 @@ _EXPECTED_FAMILIES: dict[str, tuple[str, tuple[str, ...]]] = {
     defs.STREAMING_BACKLOG_CHUNKS: ("gauge", defs.STREAMING_BACKLOG_LABELS),
     defs.STREAMING_BACKLOG_OVERFLOWS + "_total": ("counter", defs.STREAMING_OVERFLOW_LABELS),
     defs.STREAMING_SESSION_OPEN_REJECTIONS + "_total": ("counter", defs.STREAMING_OPEN_REJECTION_LABELS),
+    defs.STREAMING_ADMISSION_REJECTIONS + "_total": ("counter", defs.STREAMING_ADMISSION_REJECTION_LABELS),
+    defs.PERSISTENT_STATE_SLOTS: ("gauge", defs.PERSISTENT_STATE_SLOT_LABELS),
     defs.STREAMING_INPUT_AUDIO_SECONDS + "_total": ("counter", defs.STREAMING_INPUT_AUDIO_LABELS),
     defs.STREAMING_CHUNK_BATCH_SIZE: ("histogram", defs.STREAMING_BATCH_SIZE_LABELS),
 }
@@ -71,7 +73,7 @@ def scrape() -> str:
 
 class TestFamilyRegistration:
     # @spec PORT-OBS-001
-    def test_all_ten_families_present(self, scrape: str) -> None:
+    def test_all_production_families_present(self, scrape: str) -> None:
         for name in _EXPECTED_FAMILIES:
             assert f"# HELP {name}" in scrape, f"missing streaming family: {name}"
 
@@ -96,6 +98,8 @@ class TestFamilyRegistration:
             defs.STREAMING_BACKLOG_CHUNKS: mod._backlog_family,
             defs.STREAMING_BACKLOG_OVERFLOWS: mod._backlog_overflow_family,
             defs.STREAMING_SESSION_OPEN_REJECTIONS: mod._open_rejections_family,
+            defs.STREAMING_ADMISSION_REJECTIONS: mod._admission_rejections_family,
+            defs.PERSISTENT_STATE_SLOTS: mod._persistent_state_slots_family,
             defs.STREAMING_INPUT_AUDIO_SECONDS: mod._input_audio_seconds_family,
             defs.STREAMING_CHUNK_BATCH_SIZE: mod._chunk_batch_size_family,
         }
@@ -108,6 +112,8 @@ class TestFamilyRegistration:
             defs.STREAMING_BACKLOG_CHUNKS: defs.STREAMING_BACKLOG_LABELS,
             defs.STREAMING_BACKLOG_OVERFLOWS: defs.STREAMING_OVERFLOW_LABELS,
             defs.STREAMING_SESSION_OPEN_REJECTIONS: defs.STREAMING_OPEN_REJECTION_LABELS,
+            defs.STREAMING_ADMISSION_REJECTIONS: defs.STREAMING_ADMISSION_REJECTION_LABELS,
+            defs.PERSISTENT_STATE_SLOTS: defs.PERSISTENT_STATE_SLOT_LABELS,
             defs.STREAMING_INPUT_AUDIO_SECONDS: defs.STREAMING_INPUT_AUDIO_LABELS,
             defs.STREAMING_CHUNK_BATCH_SIZE: defs.STREAMING_BATCH_SIZE_LABELS,
         }
@@ -174,6 +180,23 @@ class TestEnumCompleteness:
     # @spec PORT-OBS-001, PORT-OBS-007
     def test_open_rejection_reasons(self) -> None:
         assert defs.STREAMING_OPEN_REJECTION_REASONS == ("model", "cadence", "locale", "config")
+
+    # @spec PORT-OBS-001, PORT-OBS-007
+    def test_admission_rejection_reasons(self) -> None:
+        assert defs.STREAMING_ADMISSION_REJECTION_REASONS == (
+            "capacity",
+            "unavailable",
+        )
+
+    # @spec PORT-OBS-001, PORT-OBS-010
+    def test_persistent_state_slot_kinds(self) -> None:
+        assert defs.PERSISTENT_STATE_SLOT_KINDS == (
+            "resident",
+            "safety_reserve",
+            "physical_capacity",
+            "configured_limit",
+            "effective_capacity",
+        )
 
     # @spec PORT-OBS-001
     def test_latency_bucket_ladder_is_exact(self) -> None:
@@ -253,6 +276,18 @@ class TestLogStatsGating:
             lambda: metrics.inc_sessions_active("560"),
             lambda: metrics.observe_session_finished("560", "completed"),
             lambda: metrics.inc_open_rejection("model"),
+            lambda: metrics.inc_admission_rejection("capacity"),
+            lambda: metrics.observe_persistent_state_slots(
+                "0",
+                "0",
+                {
+                    "resident": 1,
+                    "safety_reserve": 2,
+                    "physical_capacity": 8,
+                    "configured_limit": 7,
+                    "effective_capacity": 6,
+                },
+            ),
             lambda: metrics.inc_input_audio_seconds("560", 0.56),
             lambda: metrics.observe_chunk_latency("560", "regular", 0.1),
             lambda: metrics.observe_chunk_outcome("560", "regular", "parked"),
@@ -264,6 +299,12 @@ class TestLogStatsGating:
         ]
         for call in calls:
             call()  # must not raise once log_stats gating is implemented
+
+        out = generate_latest(REGISTRY).decode()
+        assert (
+            f'{defs.PERSISTENT_STATE_SLOTS}{{kind="resident",'
+            f'model_name="{_MODEL}"' not in out
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +387,50 @@ class TestEnabledPathScrapeDeltas:
 
         after = _count_value(generate_latest(REGISTRY).decode(), prefix)
         assert after == before + 1.0
+
+    # @spec PORT-OBS-007
+    def test_inc_admission_rejection_produces_exact_counter_delta(self) -> None:
+        metrics = OmniStreamingMetrics(
+            model_name="delta-model-admission", log_stats=True
+        )
+        prefix = (
+            f'{defs.STREAMING_ADMISSION_REJECTIONS}_total{{'
+            'model_name="delta-model-admission",reason="capacity"}'
+        )
+        before = _count_value(generate_latest(REGISTRY).decode(), prefix) or 0.0
+
+        metrics.inc_admission_rejection("capacity")
+
+        after = _count_value(generate_latest(REGISTRY).decode(), prefix)
+        assert after == before + 1.0
+
+    # @spec PORT-OBS-010
+    def test_persistent_state_slots_replace_the_manager_projection(self) -> None:
+        metrics = OmniStreamingMetrics(
+            model_name="delta-model-state-slots", log_stats=True
+        )
+        first = {
+            "resident": 1,
+            "safety_reserve": 2,
+            "physical_capacity": 8,
+            "configured_limit": 7,
+            "effective_capacity": 6,
+        }
+        metrics.observe_persistent_state_slots("0", "0", first)
+
+        for kind, expected in first.items():
+            prefix = (
+                f'{defs.PERSISTENT_STATE_SLOTS}{{kind="{kind}",'
+                'model_name="delta-model-state-slots",replica="0",stage="0"}'
+            )
+            assert _count_value(generate_latest(REGISTRY).decode(), prefix) == expected
+
+        metrics.observe_persistent_state_slots("0", "0", {**first, "resident": 3})
+        resident_prefix = (
+            f'{defs.PERSISTENT_STATE_SLOTS}{{kind="resident",'
+            'model_name="delta-model-state-slots",replica="0",stage="0"}'
+        )
+        assert _count_value(generate_latest(REGISTRY).decode(), resident_prefix) == 3
 
     # @spec PORT-OBS-006
     def test_inc_input_audio_seconds_produces_exact_counter_delta(self) -> None:

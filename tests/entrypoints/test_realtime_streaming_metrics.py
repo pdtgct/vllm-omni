@@ -764,6 +764,34 @@ def test_batch_stat_sink_attaches_through_the_engines_orchestrator_binding() -> 
     assert bare_state.openai_serving_realtime is not None
 
 
+# @spec PORT-OBS-007, PORT-OBS-010
+def test_manager_projection_uses_the_same_installed_metrics_instance() -> None:
+    """The persistent-state service receives the app-owned sink, never a
+    second metrics wrapper with a different model identity or log-stats flag."""
+    from vllm_omni.entrypoints.openai import api_server as api_server_mod
+    from vllm_omni.metrics import streaming_install
+
+    class _RecordingService:
+        def __init__(self) -> None:
+            self.received: Any = None
+
+        def install_metrics(self, metrics: Any) -> None:
+            self.received = metrics
+
+    state = _fake_state_with_registry(model_name="state-projection-model")
+    state.persistent_state_service = _RecordingService()
+
+    api_server_mod._install_streaming_observer_and_build_realtime_serving(
+        state,
+        _fake_engine_client(),
+        request_logger=None,
+    )
+
+    installed = streaming_install.resolve_installed_observer(state)
+    assert installed is not None
+    assert state.persistent_state_service.received is installed.metrics
+
+
 def test_async_omni_engine_declares_the_orchestrator_binding() -> None:
     """`AsyncOmniEngine.__init__` must initialize ``self.orchestrator``
     and the bootstrap must bind the constructed instance — the attach

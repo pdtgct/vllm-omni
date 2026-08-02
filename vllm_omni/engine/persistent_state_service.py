@@ -12,10 +12,13 @@ committed result back into the serving process.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
 StateLocation = Literal["resident", "offloaded", "absent"]
+
+logger = logging.getLogger(__name__)
 
 
 class PersistentStateServiceError(RuntimeError):
@@ -137,6 +140,7 @@ class PersistentStateService:
         self._admission_open = False
         self._engine_epoch: str | None = None
         self._inventory: dict[str, Any] | None = None
+        self._metrics_sink: Any | None = None
         self._fatal_error: BaseException | None = None
 
     @property
@@ -152,6 +156,51 @@ class PersistentStateService:
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""
         self._admission_open = False
+
+    def install_metrics(self, metrics_sink: Any) -> None:
+        """Attach the app-owned non-authoritative metric sink exactly once."""
+        if self._metrics_sink is not None:
+            raise RuntimeError("persistent-state metrics already installed")
+        self._metrics_sink = metrics_sink
+        self._project_inventory()
+
+    def _observe_metrics(self, method_name: str, *args: Any) -> None:
+        sink = self._metrics_sink
+        if sink is None:
+            return
+        try:
+            getattr(sink, method_name)(*args)
+        except Exception:
+            logger.exception(
+                "persistent-state metric observation failed; serving is unaffected"
+            )
+
+    def _project_inventory(self) -> None:
+        inventory = self._inventory
+        if inventory is None or self._metrics_sink is None:
+            return
+        self._observe_metrics(
+            "observe_persistent_state_slots",
+            str(inventory["stage"]),
+            str(inventory["replica"]),
+            {
+                "resident": int(inventory["resident_count"]),
+                "safety_reserve": int(inventory["safety_reserve"]),
+                "physical_capacity": int(inventory["physical_capacity"]),
+                "configured_limit": int(inventory["configured_limit"]),
+                "effective_capacity": int(inventory["effective_capacity"]),
+            },
+        )
+
+    def _observe_admission_rejection(self, reason: str) -> None:
+        self._observe_metrics("inc_admission_rejection", reason)
+
+    def _update_projection(self, *, manager_revision: int, resident_count: int) -> None:
+        if self._inventory is None:
+            return
+        self._inventory["manager_revision"] = manager_revision
+        self._inventory["resident_count"] = resident_count
+        self._project_inventory()
 
     def shutdown(self) -> None:
         """Close admission and cancel the API-owned dispatcher task."""
@@ -186,6 +235,24 @@ class PersistentStateService:
                     raise PersistentStateServiceUnavailable(
                         "persistent-state capability inventory lacks resident state"
                     )
+                required_inventory = {
+                    "manager_revision",
+                    "resident_count",
+                    "physical_capacity",
+                    "safety_reserve",
+                    "configured_limit",
+                    "effective_capacity",
+                    "stage",
+                    "replica",
+                    "schema_id",
+                    "profile_id",
+                }
+                missing_inventory = required_inventory.difference(snapshot)
+                if missing_inventory:
+                    raise PersistentStateServiceUnavailable(
+                        "persistent-state capability inventory is incomplete: "
+                        f"missing {sorted(missing_inventory)}"
+                    )
                 engine_epoch = str(snapshot["engine_epoch"])
                 if self._engine_epoch is not None and engine_epoch != self._engine_epoch:
                     self.engine_epoch_changed(engine_epoch)
@@ -196,6 +263,7 @@ class PersistentStateService:
                 self._inventory = dict(snapshot)
                 self._ready = True
                 self._admission_open = True
+                self._project_inventory()
             if self._dispatcher_task is None or self._dispatcher_task.done():
                 self._dispatcher_task = asyncio.create_task(
                     self._dispatch(), name="persistent-state-dispatch"
@@ -208,6 +276,14 @@ class PersistentStateService:
             raise PersistentStateServiceUnavailable(
                 "persistent-state admission is closed"
             )
+
+    async def check_admission(self) -> None:
+        """Check health for one admission attempt and classify its denial."""
+        try:
+            await self.check_health()
+        except PersistentStateServiceUnavailable:
+            self._observe_admission_rejection("unavailable")
+            raise
 
     def _coalesced_future(
         self, operation_id: str
@@ -223,8 +299,13 @@ class PersistentStateService:
         profile_id: str,
     ) -> StateLease:
         """Reserve once, reconciling the same operation after timeout."""
-        await self._ensure_started()
+        try:
+            await self._ensure_started()
+        except PersistentStateServiceUnavailable:
+            self._observe_admission_rejection("unavailable")
+            raise
         if not self._admission_open:
+            self._observe_admission_rejection("unavailable")
             raise PersistentStateServiceUnavailable(
                 "persistent-state admission is closed"
             )
@@ -246,7 +327,8 @@ class PersistentStateService:
                 )
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
-                raise PersistentStateCapacityExhausted(
+                self._observe_admission_rejection("unavailable")
+                raise PersistentStateServiceUnavailable(
                     "persistent-state reserve queue is full"
                 ) from error
             self._queue_event.set()
@@ -273,6 +355,10 @@ class PersistentStateService:
             raise PersistentStateServiceUnavailable(
                 "persistent-state reserve returned an invalid result"
             )
+        self._update_projection(
+            manager_revision=result.manager_revision,
+            resident_count=result.resident_count,
+        )
         return result.lease
 
     async def release(
@@ -315,6 +401,10 @@ class PersistentStateService:
             raise PersistentStateServiceUnavailable(
                 "persistent-state release returned an invalid result"
             )
+        self._update_projection(
+            manager_revision=result.manager_revision,
+            resident_count=result.resident_count,
+        )
         return result
 
     async def _dispatch(self) -> None:
@@ -355,8 +445,13 @@ class PersistentStateService:
                 raise PersistentStateServiceUnavailable(
                     "persistent-state reserve crossed an engine epoch"
                 )
-        except BaseException as error:
+        except Exception as error:
             mapped = self._map_error(error)
+            self._observe_admission_rejection(
+                "capacity"
+                if isinstance(mapped, PersistentStateCapacityExhausted)
+                else "unavailable"
+            )
             if not command.future.done():
                 command.future.set_exception(mapped)
         else:
@@ -377,7 +472,7 @@ class PersistentStateService:
                 raise PersistentStateServiceUnavailable(
                     "persistent-state release crossed an engine epoch"
                 )
-        except BaseException as error:
+        except Exception as error:
             mapped = self._map_error(error)
             if not command.future.done():
                 command.future.set_exception(mapped)

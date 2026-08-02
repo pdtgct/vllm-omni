@@ -709,14 +709,14 @@ async def build_async_omni_from_stage_config(
 async def _install_persistent_state_service(
     engine_client: EngineClient,
     vllm_config: Any,
-) -> None:
+) -> Any | None:
     """Install and inventory one selected model's state service."""
 
     from vllm.model_executor.model_loader import get_model_cls
 
     model_cls = get_model_cls(vllm_config.model_config)
     if not bool(getattr(model_cls, "supports_persistent_state", False)):
-        return
+        return None
     if not isinstance(engine_client, AsyncOmni):
         raise RuntimeError(
             "persistent state requires the AsyncOmni engine client"
@@ -739,6 +739,7 @@ async def _install_persistent_state_service(
         raise
     engine_client.install_persistent_state_service(service)
     logger.info("Persistent-state service installed and ready")
+    return service
 
 
 def _install_streaming_observer_and_build_realtime_serving(
@@ -779,6 +780,11 @@ def _install_streaming_observer_and_build_realtime_serving(
     installed_streaming_observer = streaming_install.install_streaming_observer(
         state, log_stats=state.log_stats
     )
+    persistent_state_service = getattr(state, "persistent_state_service", None)
+    if persistent_state_service is not None:
+        persistent_state_service.install_metrics(
+            installed_streaming_observer.metrics
+        )
     state.openai_serving_realtime = NemotronServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -917,7 +923,9 @@ async def omni_init_app_state(
     # side effect.  Install and inventory its single API-process service
     # before any serving object can admit audio or readiness can succeed.
     if vllm_config is not None:
-        await _install_persistent_state_service(engine_client, vllm_config)
+        state.persistent_state_service = await _install_persistent_state_service(
+            engine_client, vllm_config
+        )
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
