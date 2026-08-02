@@ -132,6 +132,18 @@ def test_manager_has_no_prefix_or_skipped_block_semantics() -> None:
     assert all(block.block_hash is None for block in manager.req_to_blocks["request-1"])
 
 
+def test_manager_rejects_prefix_caching_at_construction() -> None:
+    """@spec PORT-STATE-011: persistent state never enables prefix reuse."""
+
+    module = require_persistent_state_module()
+    with pytest.raises(ValueError, match="does not support prefix caching"):
+        make_manager(
+            module,
+            enable_caching=True,
+            preserve_exceptions=True,
+        )
+
+
 def test_external_computed_blocks_are_rejected_before_mutation() -> None:
     """@spec PORT-STATE-011: resident-only state rejects core external imports."""
 

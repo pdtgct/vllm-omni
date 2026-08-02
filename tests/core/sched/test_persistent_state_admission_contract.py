@@ -37,21 +37,27 @@ def _module() -> Any:
 
 def test_model_scheduler_is_selected_explicitly_by_stage_configuration() -> None:
     # @spec PORT-STATE-004 / PORT-STATE-019
+    from vllm_omni.config.stage_config import (
+        load_deploy_config,
+        merge_pipeline_deploy,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.pipeline import (
+        NEMOTRON_ASR_PIPELINE,
+    )
+
     scheduler_cls = _module().NemotronASRScheduler
-    stage_config = (
-        _ROOT
-        / "vllm_omni"
-        / "model_executor"
-        / "stage_configs"
-        / "nemotron_asr.yaml"
-    ).read_text()
+    deploy_config = _ROOT / "vllm_omni" / "deploy" / "nemotron_asr.yaml"
+    assert deploy_config.exists()
+    stage_config = merge_pipeline_deploy(
+        NEMOTRON_ASR_PIPELINE,
+        load_deploy_config(deploy_config),
+    )[0].to_omegaconf()
 
     assert issubclass(scheduler_cls, OmniARScheduler)
-    assert (
-        "scheduler_cls: "
-        "vllm_omni.model_executor.models.nemotron_asr.scheduler."
-        "NemotronASRScheduler"
-    ) in stage_config
+    assert stage_config.engine_args.scheduler_cls.endswith(
+        ".scheduler.NemotronASRScheduler"
+    )
+    assert stage_config.engine_args.async_scheduling is False
 
 
 def test_initial_add_claims_exact_pending_binding_before_base_schedule() -> None:

@@ -81,7 +81,11 @@ def _select_parameter(
 
 
 def _construct(
-    cls: type[Any], values: Mapping[str, tuple[Sequence[str], Any]], label: str
+    cls: type[Any],
+    values: Mapping[str, tuple[Sequence[str], Any]],
+    label: str,
+    *,
+    preserve_exceptions: bool = False,
 ) -> Any:
     """Construct a future value using the canonical contract fields."""
 
@@ -114,6 +118,8 @@ def _construct(
     try:
         return cls(**kwargs)
     except Exception as exc:
+        if preserve_exceptions:
+            raise
         _fail(f"Future {label} could not be constructed from the contract fields: {exc}")
 
 
@@ -198,7 +204,11 @@ def make_generic_spec(module: ModuleType, variant: str = "base") -> Any:
 
 
 def make_manager(
-    module: ModuleType, *, num_gpu_blocks: int = 8
+    module: ModuleType,
+    *,
+    num_gpu_blocks: int = 8,
+    enable_caching: bool = False,
+    preserve_exceptions: bool = False,
 ) -> tuple[SingleTypeKVCacheManager, BlockPool, Any]:
     """Construct the future manager over a real vLLM block pool."""
 
@@ -206,7 +216,7 @@ def make_manager(
     manager_cls = require_symbol(module, "PersistentStateManager")
     block_pool = BlockPool(
         num_gpu_blocks=num_gpu_blocks,
-        enable_caching=False,
+        enable_caching=enable_caching,
         hash_block_size=1,
     )
     manager = _construct(
@@ -214,11 +224,12 @@ def make_manager(
         {
             "spec": (("kv_cache_spec", "spec"), spec),
             "block_pool": (("block_pool",), block_pool),
-            "enable_caching": (("enable_caching",), False),
+            "enable_caching": (("enable_caching",), enable_caching),
             "kv_cache_group_id": (("kv_cache_group_id", "group_id"), 0),
             "scheduler_block_size": (("scheduler_block_size",), 1),
         },
         "PersistentStateManager",
+        preserve_exceptions=preserve_exceptions,
     )
     if not isinstance(manager, SingleTypeKVCacheManager):
         _fail("PersistentStateManager must subclass core SingleTypeKVCacheManager")

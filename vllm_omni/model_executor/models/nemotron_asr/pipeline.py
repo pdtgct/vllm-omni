@@ -40,6 +40,10 @@ NEMOTRON_ASR_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
+            scheduler_cls=(
+                "vllm_omni.model_executor.models.nemotron_asr.scheduler."
+                "NemotronASRScheduler"
+            ),
             sampling_constraints={
                 # The greedy pin (PORT-DEC-005): RNN-T greedy decode;
                 # replay steps argmax forced-logits rows.

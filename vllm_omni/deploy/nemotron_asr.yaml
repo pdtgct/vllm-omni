@@ -1,0 +1,10 @@
+# Qualified single-stage bring-up profile for cache-aware streaming ASR.
+pipeline: nemotron_asr
+async_chunk: false
+dtype: float32
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    enforce_eager: true
+    async_scheduling: false

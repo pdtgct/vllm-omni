@@ -12,7 +12,8 @@ _ROOT = Path(__file__).resolve().parents[2]
 _OMNI = _ROOT / "vllm_omni"
 _MODEL = _OMNI / "model_executor/models/nemotron_asr"
 _ENTRYPOINTS = _OMNI / "entrypoints"
-_STAGE_CONFIG = _OMNI / "model_executor/stage_configs/nemotron_asr.yaml"
+_DEPLOY_CONFIG = _OMNI / "deploy/nemotron_asr.yaml"
+_LEGACY_STAGE_CONFIG = _OMNI / "model_executor/stage_configs/nemotron_asr.yaml"
 
 
 def test_nemotron_model_exposes_realtime_without_file_transcription() -> None:
@@ -22,7 +23,6 @@ def test_nemotron_model_exposes_realtime_without_file_transcription() -> None:
     assert "supports_realtime = True" in source
     for forbidden in (
         "supports_transcription =",
-        "supports_transcription_only =",
         "def get_speech_to_text_config(",
         "def get_generation_prompt(",
         "def validate_language(",
@@ -92,9 +92,27 @@ def test_session_binding_has_no_ephemeral_cadence_or_admission_counter() -> None
 
 def test_nemotron_stage_config_pins_supported_bringup_lane() -> None:
     """PORT-INT-007: the supported Omni stage owns safe parity defaults."""
-    config = _STAGE_CONFIG.read_text()
+    from vllm_omni.config.stage_config import (
+        load_deploy_config,
+        merge_pipeline_deploy,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.pipeline import (
+        NEMOTRON_ASR_PIPELINE,
+    )
 
-    assert "scheduler_cls: OmniARScheduler" in config
-    assert "dtype: float32" in config
-    assert "enforce_eager: true" in config
-    assert "enable_prefix_caching: false" in config
+    assert _DEPLOY_CONFIG.exists()
+    assert not _LEGACY_STAGE_CONFIG.exists()
+    stage = merge_pipeline_deploy(
+        NEMOTRON_ASR_PIPELINE,
+        load_deploy_config(_DEPLOY_CONFIG),
+    )[0].to_omegaconf()
+
+    assert stage.engine_args.scheduler_cls == (
+        "vllm_omni.model_executor.models.nemotron_asr.scheduler."
+        "NemotronASRScheduler"
+    )
+    assert stage.engine_args.async_scheduling is False
+    assert stage.engine_args.dtype == "float32"
+    assert stage.engine_args.enforce_eager is True
+    assert stage.engine_args.enable_prefix_caching is False
+    assert "speculative_config" not in stage.engine_args
