@@ -99,6 +99,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 "operations": {},
                 "pending": {},
                 "claimed": {},
+                "cleanup": {},
                 "tombstone_ttl_s": runtime.tombstone_ttl_s,
                 "max_tombstones": runtime.max_tombstones,
             }
@@ -272,6 +273,69 @@ class StageEngineCoreProc(EngineCoreProc):
         control["claimed"][binding_token] = binding
         return binding
 
+    def persistent_state_begin_pending_cleanup(
+        self,
+        lease: dict[str, Any],
+    ) -> bool:
+        """Atomically win cleanup against the initial scheduler claim.
+
+        Returning ``False`` means the scheduler already claimed the exact
+        generation. Returning ``True`` moves a still-pending binding into a
+        cleanup-only state that the scheduler can no longer claim; physical
+        release remains owned by the API cleanup operation.
+        """
+
+        control = self._persistent_state_control()
+        binding_token = str(lease["binding_token"])
+        expected = (
+            str(lease["engine_epoch"]),
+            str(lease["session_key"]),
+            int(lease["generation"]),
+            str(lease["schema_id"]),
+            str(lease["profile_id"]),
+        )
+        binding = control["pending"].get(binding_token)
+        if binding is not None:
+            actual = (
+                binding.engine_epoch,
+                binding.request_id,
+                binding.generation,
+                binding.schema_id,
+                binding.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state pending cleanup mismatch")
+            control["pending"].pop(binding_token)
+            control["cleanup"][binding_token] = binding
+            return True
+
+        cleanup_binding = control["cleanup"].get(binding_token)
+        if cleanup_binding is not None:
+            actual = (
+                cleanup_binding.engine_epoch,
+                cleanup_binding.request_id,
+                cleanup_binding.generation,
+                cleanup_binding.schema_id,
+                cleanup_binding.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state cleanup binding mismatch")
+            return True
+
+        claimed = control["claimed"].get(binding_token)
+        if claimed is not None:
+            actual = (
+                claimed.engine_epoch,
+                claimed.request_id,
+                claimed.generation,
+                claimed.schema_id,
+                claimed.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state claimed cleanup mismatch")
+            return False
+        raise ValueError("persistent_state pending cleanup lease is stale")
+
     def mark_terminal(self, binding: Any) -> None:
         """Record model terminality while API cleanup retains ownership."""
         self._persistent_state_manager().mark_terminal(binding.request_id)
@@ -299,16 +363,43 @@ class StageEngineCoreProc(EngineCoreProc):
                 "persistent-state cleanup tombstone headroom was not reserved"
             )
         binding_token = lease["binding_token"]
-        binding = control["pending"].pop(binding_token, None)
+        binding = control["pending"].get(binding_token)
+        owner = "pending"
         if binding is None:
-            binding = control["claimed"].pop(binding_token, None)
-        if binding is not None:
-            manager.drop_lease(binding.request_id)
-            generation = binding.generation
-            session_key = binding.request_id
-        else:
-            generation = int(lease["generation"])
-            session_key = str(lease["session_key"])
+            binding = control["cleanup"].get(binding_token)
+            owner = "cleanup"
+        if binding is None:
+            claimed = control["claimed"].get(binding_token)
+            if claimed is not None and not manager.is_terminal(
+                claimed.request_id
+            ):
+                raise RuntimeError(
+                    "persistent-state claimed lease is still running"
+                )
+            binding = claimed
+            owner = "claimed"
+        if binding is None:
+            raise ValueError("persistent-state release lease is stale")
+        expected = (
+            str(lease["engine_epoch"]),
+            str(lease["session_key"]),
+            int(lease["generation"]),
+            str(lease["schema_id"]),
+            str(lease["profile_id"]),
+        )
+        actual = (
+            binding.engine_epoch,
+            binding.request_id,
+            binding.generation,
+            binding.schema_id,
+            binding.profile_id,
+        )
+        if actual != expected:
+            raise ValueError("persistent-state release lease mismatch")
+        control[owner].pop(binding_token)
+        manager.drop_lease(binding.request_id)
+        generation = binding.generation
+        session_key = binding.request_id
         control["revision"] += 1
         result = {
             "operation_id": operation_id,

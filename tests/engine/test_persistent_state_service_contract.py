@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 from dataclasses import dataclass
@@ -231,6 +232,8 @@ class _TombstoneStage:
     def __init__(self) -> None:
         self.reserve_calls = 0
         self.release_calls = 0
+        self.pending_cleanup_calls = 0
+        self.release_failures_remaining = 0
         self.resident = 0
         self.revision = 0
 
@@ -282,6 +285,9 @@ class _TombstoneStage:
                 },
             }
         if name == "persistent_state_release":
+            if self.release_failures_remaining:
+                self.release_failures_remaining -= 1
+                raise RuntimeError("claimed lease is still running")
             operation_id, lease, _reason = args
             self.release_calls += 1
             self.resident -= 1
@@ -298,6 +304,9 @@ class _TombstoneStage:
                     "transition": "released",
                 },
             }
+        if name == "persistent_state_begin_pending_cleanup":
+            self.pending_cleanup_calls += 1
+            return True
         raise AssertionError(name)
 
 
@@ -328,6 +337,10 @@ async def test_completed_operations_are_bounded_tombstones_and_retry_exactly() -
     )
     assert duplicate == lease
     assert stage.reserve_calls == 1
+
+    assert await service.claim_pending_cleanup(lease) is True
+    assert await service.claim_pending_cleanup(lease) is True
+    assert stage.pending_cleanup_calls == 2
 
     with pytest.raises(
         module.PersistentStateServiceUnavailable,
@@ -397,6 +410,44 @@ def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
             )
 
 
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_release_operation_can_reconcile_after_transient_terminal_race() -> None:
+    # @spec PORT-STATE-013 / PORT-STATE-014
+    module = _service_module()
+    stage = _TombstoneStage()
+    stage.release_failures_remaining = 1
+    service = module.PersistentStateService(
+        stage,
+        tombstone_ttl_s=10.0,
+        max_tombstones=2,
+    )
+    lease = await service.reserve(
+        operation_id="reserve-a",
+        session_key="session-a",
+        schema_id="schema-a",
+        profile_id="profile-a",
+    )
+
+    with pytest.raises(
+        module.PersistentStateServiceUnavailable,
+        match="still running",
+    ):
+        await service.release(
+            operation_id="release-a",
+            lease=lease,
+            reason="cleanup",
+        )
+    await asyncio.sleep(0)
+    result = await service.release(
+        operation_id="release-a",
+        lease=lease,
+        reason="cleanup",
+    )
+    assert result.resident_count == 0
+    assert stage.release_calls == 1
+    service.shutdown()
+
+
 def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,3 +513,94 @@ def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
     )
     assert second["lease"]["session_key"] == "session-b"
     assert len(core._persistent_state_control_state["operations"]) == 1
+
+
+def _state_core_for_cleanup_tests() -> tuple[Any, Any, Any]:
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    manager, _, spec = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=4
+    )
+    runtime_values = {
+        "persistent_state_safety_reserve_slots": 1,
+        "max_resident_sessions": 2,
+        "persistent_state_reserve_queue_capacity": 2,
+        "persistent_state_operation_timeout_s": 10.0,
+        "persistent_state_reconciliation_timeout_s": 30.0,
+        "persistent_state_tombstone_ttl_s": 10.0,
+        "persistent_state_max_tombstones": 4,
+        "persistent_state_pending_claim_timeout_s": 15.0,
+    }
+    core = object.__new__(StageEngineCoreProc)
+    core.vllm_config = SimpleNamespace(additional_config=runtime_values)
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=(manager,))
+        )
+    )
+    return core, manager, spec
+
+
+def _claim_payload(lease: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: lease[name]
+        for name in (
+            "engine_epoch",
+            "session_key",
+            "generation",
+            "schema_id",
+            "profile_id",
+            "binding_token",
+        )
+    }
+
+
+def test_pending_cleanup_claim_serializes_against_scheduler_claim() -> None:
+    # @spec PORT-STATE-014 / PORT-STATE-019
+    core, manager, spec = _state_core_for_cleanup_tests()
+    reserved = core.persistent_state_reserve(
+        "reserve-a", "session-a", spec.schema_id, "default"
+    )
+    lease = reserved["lease"]
+
+    assert core.persistent_state_begin_pending_cleanup(lease) is True
+    assert core.persistent_state_begin_pending_cleanup(lease) is True
+    with pytest.raises(ValueError, match="pending claim mismatch"):
+        core.claim_pending_lease(**_claim_payload(lease))
+
+    released = core.persistent_state_release(
+        "release-a", lease, "pending_claim_timeout"
+    )
+    assert released["resident_count"] == 0
+    assert manager.get_state_binding("session-a") is None
+    revision = core._persistent_state_control_state["revision"]
+    with pytest.raises(ValueError, match="stale"):
+        core.persistent_state_release(
+            "different-release", lease, "late_duplicate"
+        )
+    assert core._persistent_state_control_state["revision"] == revision
+
+
+def test_claimed_state_cannot_be_released_until_scheduler_terminality() -> None:
+    # @spec PORT-STATE-014 / PORT-STATE-019
+    core, manager, spec = _state_core_for_cleanup_tests()
+    reserved = core.persistent_state_reserve(
+        "reserve-a", "session-a", spec.schema_id, "default"
+    )
+    lease = reserved["lease"]
+    binding = core.claim_pending_lease(**_claim_payload(lease))
+
+    assert core.persistent_state_begin_pending_cleanup(lease) is False
+    with pytest.raises(RuntimeError, match="still running|terminal"):
+        core.persistent_state_release("release-a", lease, "cleanup")
+    assert manager.get_state_binding("session-a") == binding
+
+    core.mark_terminal(binding)
+    released = core.persistent_state_release(
+        "release-a", lease, "cleanup"
+    )
+    assert released["resident_count"] == 0

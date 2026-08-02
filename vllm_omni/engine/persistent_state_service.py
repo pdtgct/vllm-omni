@@ -101,6 +101,12 @@ class _ReleaseCommand:
     future: asyncio.Future[StateReleaseResult]
 
 
+@dataclass(frozen=True)
+class _BeginCleanupCommand:
+    lease: StateLease
+    future: asyncio.Future[bool]
+
+
 class PersistentStateService:
     """Bounded, cleanup-priority bridge to one stage's state manager.
 
@@ -122,11 +128,16 @@ class PersistentStateService:
         reconciliation_timeout_s: float = 30.0,
         tombstone_ttl_s: float = 3600.0,
         max_tombstones: int = 4096,
+        pending_claim_timeout_s: float = 30.0,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
             raise ValueError("persistent-state queue capacities must be positive")
-        if operation_timeout_s <= 0 or reconciliation_timeout_s <= 0:
+        if (
+            operation_timeout_s <= 0
+            or reconciliation_timeout_s <= 0
+            or pending_claim_timeout_s <= 0
+        ):
             raise ValueError("persistent-state timeouts must be positive")
         if tombstone_ttl_s <= 0:
             raise ValueError("persistent-state tombstone TTL must be positive")
@@ -136,16 +147,20 @@ class PersistentStateService:
         self.reserve_queue: asyncio.Queue[_ReserveCommand] = asyncio.Queue(
             maxsize=reserve_queue_capacity
         )
-        self.cleanup_queue: asyncio.Queue[_ReleaseCommand] = asyncio.Queue(
+        self.cleanup_queue: asyncio.Queue[
+            _ReleaseCommand | _BeginCleanupCommand
+        ] = asyncio.Queue(
             maxsize=cleanup_queue_capacity
         )
         self._operation_timeout_s = operation_timeout_s
         self._reconciliation_timeout_s = reconciliation_timeout_s
         self._tombstone_ttl_s = tombstone_ttl_s
         self._max_tombstones = max_tombstones
+        self._pending_claim_timeout_s = pending_claim_timeout_s
         self._monotonic = monotonic
         self._operations: dict[str, asyncio.Future[Any]] = {}
         self._operation_expires_at: dict[str, float] = {}
+        self._pending_cleanup_claims: dict[str, asyncio.Future[bool]] = {}
         self._queue_event = asyncio.Event()
         self._startup_lock: asyncio.Lock | None = None
         self._dispatcher_task: asyncio.Task[None] | None = None
@@ -171,6 +186,12 @@ class PersistentStateService:
     def inventory(self) -> dict[str, Any] | None:
         """Return a copy of the current content-free capability inventory."""
         return None if self._inventory is None else dict(self._inventory)
+
+    @property
+    def pending_claim_timeout_s(self) -> float:
+        """Return the fingerprinted reserved-before-claim recovery bound."""
+
+        return self._pending_claim_timeout_s
 
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""
@@ -211,12 +232,25 @@ class PersistentStateService:
         self,
         operation_id: str,
         future: asyncio.Future[Any],
+        *,
+        retain_error: bool,
     ) -> None:
         """Retain one completed future as the exact retry tombstone."""
 
         self._operations[operation_id] = future
 
         def completed(_future: asyncio.Future[Any]) -> None:
+            if (
+                _future.cancelled()
+                or (
+                    not retain_error
+                    and _future.exception() is not None
+                )
+            ):
+                if self._operations.get(operation_id) is _future:
+                    self._operations.pop(operation_id, None)
+                    self._operation_expires_at.pop(operation_id, None)
+                return
             self._operation_expires_at[operation_id] = (
                 self._monotonic() + self._tombstone_ttl_s
             )
@@ -407,7 +441,11 @@ class PersistentStateService:
             future: asyncio.Future[StateReserveResult] = (
                 asyncio.get_running_loop().create_future()
             )
-            self._track_operation(operation_id, future)
+            self._track_operation(
+                operation_id,
+                future,
+                retain_error=True,
+            )
             try:
                 self.reserve_queue.put_nowait(
                     _ReserveCommand(
@@ -469,7 +507,11 @@ class PersistentStateService:
             future: asyncio.Future[StateReleaseResult] = (
                 asyncio.get_running_loop().create_future()
             )
-            self._track_operation(operation_id, future)
+            self._track_operation(
+                operation_id,
+                future,
+                retain_error=False,
+            )
             try:
                 self.cleanup_queue.put_nowait(
                     _ReleaseCommand(operation_id, lease, reason, future)
@@ -502,13 +544,58 @@ class PersistentStateService:
         )
         return result
 
+    async def claim_pending_cleanup(self, lease: StateLease) -> bool:
+        """Atomically claim API cleanup only while a lease is unclaimed."""
+
+        await self._ensure_started()
+        binding_token = lease.binding_token
+        shared = self._pending_cleanup_claims.get(binding_token)
+        if shared is None:
+            future: asyncio.Future[bool] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._pending_cleanup_claims[binding_token] = future
+
+            def completed(done: asyncio.Future[bool]) -> None:
+                if self._pending_cleanup_claims.get(binding_token) is done:
+                    self._pending_cleanup_claims.pop(binding_token, None)
+
+            future.add_done_callback(completed)
+            try:
+                self.cleanup_queue.put_nowait(
+                    _BeginCleanupCommand(lease, future)
+                )
+            except asyncio.QueueFull as error:
+                self._pending_cleanup_claims.pop(binding_token, None)
+                self.close_admission()
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state cleanup queue is full"
+                ) from error
+            self._queue_event.set()
+            shared = future
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(shared),
+                timeout=self._reconciliation_timeout_s,
+            )
+        except asyncio.TimeoutError as error:
+            self.close_admission()
+            raise PersistentStateIndeterminate(
+                "persistent-state pending cleanup claim remained indeterminate"
+            ) from error
+
     async def _dispatch(self) -> None:
         """Drain cleanup_queue before reserve_queue on every turn."""
         while True:
             await self._queue_event.wait()
             self._queue_event.clear()
             while True:
-                command: _ReserveCommand | _ReleaseCommand | None = None
+                command: (
+                    _ReserveCommand
+                    | _ReleaseCommand
+                    | _BeginCleanupCommand
+                    | None
+                ) = None
                 try:
                     command = self.cleanup_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -518,6 +605,9 @@ class PersistentStateService:
                         break
                 if isinstance(command, _ReleaseCommand):
                     await self._execute_release(command)
+                    self.cleanup_queue.task_done()
+                elif isinstance(command, _BeginCleanupCommand):
+                    await self._execute_begin_cleanup(command)
                     self.cleanup_queue.task_done()
                 else:
                     await self._execute_reserve(command)
@@ -574,6 +664,27 @@ class PersistentStateService:
         else:
             if not command.future.done():
                 command.future.set_result(result)
+
+    async def _execute_begin_cleanup(
+        self,
+        command: _BeginCleanupCommand,
+    ) -> None:
+        try:
+            won = await self._stage_client.call_utility_async(
+                "persistent_state_begin_pending_cleanup",
+                self._lease_payload(command.lease),
+            )
+            if not isinstance(won, bool):
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state pending cleanup returned an invalid result"
+                )
+        except Exception as error:
+            mapped = self._map_error(error)
+            if not command.future.done():
+                command.future.set_exception(mapped)
+        else:
+            if not command.future.done():
+                command.future.set_result(won)
 
     @staticmethod
     def _map_error(error: BaseException) -> PersistentStateServiceError:

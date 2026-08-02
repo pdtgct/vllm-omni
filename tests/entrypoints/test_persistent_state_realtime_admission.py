@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
@@ -42,6 +43,9 @@ class _Service:
     def __init__(self) -> None:
         self.reserve_calls: list[dict[str, Any]] = []
         self.release_calls: list[dict[str, Any]] = []
+        self.pending_cleanup_calls: list[object] = []
+        self.pending_cleanup_wins = True
+        self.pending_claim_timeout_s = 30.0
         self.lease = object()
 
     async def reserve(self, **kwargs: Any) -> object:
@@ -50,6 +54,10 @@ class _Service:
 
     async def release(self, **kwargs: Any) -> None:
         self.release_calls.append(kwargs)
+
+    async def claim_pending_cleanup(self, lease: object) -> bool:
+        self.pending_cleanup_calls.append(lease)
+        return self.pending_cleanup_wins
 
 
 class _Engine:
@@ -125,6 +133,90 @@ async def test_cleanup_is_the_single_idempotent_physical_release_owner() -> None
     assert len(service.release_calls) == 1
     assert service.release_calls[0]["operation_id"] == "release-op"
     assert service.release_calls[0]["lease"] is service.lease
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_pending_claim_timeout_uses_the_same_cleanup_owner_once() -> None:
+    # @spec PORT-STATE-014 / PORT-SESS-011
+    connection, _, service = _connection()
+    service.pending_claim_timeout_s = 0.01
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+    await asyncio.sleep(0.03)
+
+    assert service.pending_cleanup_calls == [service.lease]
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "pending_claim_timeout"
+    await connection.cleanup()
+    assert len(service.release_calls) == 1
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_pending_claim_timeout_never_releases_a_claimed_generation() -> None:
+    # @spec PORT-STATE-014 / PORT-STATE-019
+    connection, _, service = _connection()
+    service.pending_claim_timeout_s = 0.01
+    service.pending_cleanup_wins = False
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+    await asyncio.sleep(0.03)
+
+    assert service.pending_cleanup_calls == [service.lease]
+    assert service.release_calls == []
+    await connection.cleanup()
+    assert len(service.release_calls) == 1
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_cleanup_waits_for_abort_and_decrements_active_before_release() -> None:
+    # @spec PORT-STATE-014 / PORT-OBS-010
+    connection, _, service = _connection()
+    order: list[str] = []
+
+    async def generation() -> None:
+        try:
+            await asyncio.sleep(60.0)
+        finally:
+            order.append("generation_terminal")
+
+    async def release(**kwargs: Any) -> None:
+        order.append("physical_release")
+        service.release_calls.append(kwargs)
+
+    class _Observer:
+        def clear_all_outstanding(
+            self,
+            session_key: str,
+            *,
+            outcome: str,
+        ) -> None:
+            del session_key, outcome
+            order.append("backlog_clear")
+
+        def session_finished(self, *, session_key: str, reason: str) -> None:
+            del session_key, reason
+            order.append("active_decrement")
+
+    service.release = release  # type: ignore[method-assign]
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    connection._nemotron_session = SimpleNamespace(session_key="session-a")
+    connection._observer = _Observer()
+    connection.generation_task = asyncio.create_task(generation())
+    await asyncio.sleep(0)
+
+    await connection.cleanup()
+
+    assert order == [
+        "generation_terminal",
+        "backlog_clear",
+        "active_decrement",
+        "physical_release",
+    ]
 
 
 def test_connection_arms_a_finite_configuration_timeout_at_creation() -> None:

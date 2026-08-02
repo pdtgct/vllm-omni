@@ -227,6 +227,9 @@ class FakeAsyncOmni:
         self.sampling: Any = None
         self._state_generation = 0
         self.state_releases: list[dict[str, Any]] = []
+        self.pending_cleanup_calls: list[Any] = []
+        self.pending_cleanup_wins = True
+        self.pending_claim_timeout_s = 3600.0
 
     @property
     def inventory(self) -> dict[str, str]:
@@ -251,6 +254,10 @@ class FakeAsyncOmni:
 
     async def release(self, **kwargs: Any) -> None:
         self.state_releases.append(kwargs)
+
+    async def claim_pending_cleanup(self, lease: Any) -> bool:
+        self.pending_cleanup_calls.append(lease)
+        return self.pending_cleanup_wins
 
     async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
         self.request_ids.append(request_id)
@@ -294,13 +301,16 @@ def _make_lease(
 
 # @spec PORT-RTC-001, PORT-RTC-003, PORT-LID-001, PORT-SESS-002
 def test_open_realtime_validates_caller_cadence_and_locale() -> None:
-    engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(engine=engine)
-    lease = _run(factory.open(cadence=_CADENCE, locale="en-US"))
-    assert lease.session.geometry.cadence == _CADENCE
-    assert lease.session.prompt_index == PROMPTS["en-US"]
-    assert lease.session.ledger is not None
-    _run(lease.release())
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+        assert lease.session.geometry.cadence == _CADENCE
+        assert lease.session.prompt_index == PROMPTS["en-US"]
+        assert lease.session.ledger is not None
+        await lease.release()
+
+    _run(scenario())
 
 
 # @spec PORT-RTC-001, PORT-RTC-003
@@ -314,13 +324,16 @@ def test_factory_rejects_unknown_controls_without_minting_a_lease() -> None:
 
 
 def test_factory_leases_get_distinct_request_ids() -> None:
-    engine = FakeAsyncOmni()
-    factory = NemotronSessionFactory(engine=engine)
-    a = _run(factory.open(cadence=_CADENCE, locale=_LOCALE))
-    b = _run(factory.open(cadence=_CADENCE, locale=_LOCALE))
-    assert a.request_id != b.request_id
-    _run(a.release())
-    _run(b.release())
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        factory = NemotronSessionFactory(engine=engine)
+        a = await factory.open(cadence=_CADENCE, locale=_LOCALE)
+        b = await factory.open(cadence=_CADENCE, locale=_LOCALE)
+        assert a.request_id != b.request_id
+        await a.release()
+        await b.release()
+
+    _run(scenario())
 
 
 # ---- feed: real ledger tickets over the real segmenter (F6/R2) -----------------
@@ -472,6 +485,25 @@ def test_factory_opens_selected_cadence_without_a_parallel_limiter() -> None:
         assert lease.session.prompt_index == PROMPTS["en-US"]
         await lease.release()
         await lease.release()
+
+    _run(scenario())
+
+
+# @spec PORT-STATE-014, PORT-RTC-003, PORT-RTC-005
+def test_factory_pending_claim_timeout_releases_through_lease_owner() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        engine.pending_claim_timeout_s = 0.01
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
+        await asyncio.sleep(0.03)
+
+        assert len(engine.pending_cleanup_calls) == 1
+        assert len(engine.state_releases) == 1
+        assert engine.state_releases[0]["reason"] == "pending_claim_timeout"
+        await lease.release()
+        assert len(engine.state_releases) == 1
 
     _run(scenario())
 

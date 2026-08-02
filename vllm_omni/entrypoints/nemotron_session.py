@@ -176,6 +176,20 @@ class NemotronSessionLease:
         self._segment_generation = 0
         self._aborted = False
         self._released = False
+        self._session_finished_observed = False
+        self._state_cleanup_lock = asyncio.Lock()
+        self._pending_claim_task: asyncio.Task[None] | None = None
+        if (
+            self._persistent_state_service is not None
+            and self._state_lease is not None
+        ):
+            timeout_s = float(
+                self._persistent_state_service.pending_claim_timeout_s
+            )
+            self._pending_claim_task = asyncio.create_task(
+                self._expire_pending_claim(timeout_s),
+                name=f"persistent-state-claim-{request_id}",
+            )
 
     @property
     def session(self) -> NemotronRealtimeSession:
@@ -278,19 +292,73 @@ class NemotronSessionLease:
 
     async def release(self) -> None:
         """Release the exact manager lease once through its cleanup lane."""
-        if self._released:
-            return
-        self._released = True
-        if (
-            self._persistent_state_service is not None
-            and self._state_lease is not None
-            and self._release_operation_id is not None
-        ):
-            await self._persistent_state_service.release(
-                operation_id=self._release_operation_id,
-                lease=self._state_lease,
-                reason="session_release",
+        async with self._state_cleanup_lock:
+            if self._released:
+                return
+            timer = self._pending_claim_task
+            if timer is not None and timer is not asyncio.current_task():
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+            if self._task is not None and not self._task.done():
+                await self.abort()
+            self._observe_session_finished_once(
+                "aborted" if self._aborted or not self._ended else "completed"
             )
+            if (
+                self._persistent_state_service is not None
+                and self._state_lease is not None
+                and self._release_operation_id is not None
+            ):
+                await self._persistent_state_service.release(
+                    operation_id=self._release_operation_id,
+                    lease=self._state_lease,
+                    reason="session_release",
+                )
+            self._released = True
+
+    def _observe_session_finished_once(self, reason: str) -> None:
+        if self._session_finished_observed:
+            return
+        observer = self._session.observer
+        if observer is None:
+            self._session_finished_observed = True
+            return
+        from vllm_omni.metrics.streaming_transport import observe_safely
+
+        outcome = "aborted" if reason == "aborted" else "error"
+        observe_safely(
+            observer.clear_all_outstanding,
+            self._session.session_key,
+            outcome=outcome,
+        )
+        observe_safely(
+            observer.session_finished,
+            session_key=self._session.session_key,
+            reason=reason,
+        )
+        self._session_finished_observed = True
+
+    async def _expire_pending_claim(self, timeout_s: float) -> None:
+        await asyncio.sleep(timeout_s)
+        service = self._persistent_state_service
+        lease = self._state_lease
+        if service is None or lease is None:
+            return
+        async with self._state_cleanup_lock:
+            if self._released:
+                return
+            won = await service.claim_pending_cleanup(lease)
+            if not won:
+                return
+            await self.abort()
+            self._observe_session_finished_once("error")
+            assert self._release_operation_id is not None
+            await service.release(
+                operation_id=self._release_operation_id,
+                lease=lease,
+                reason="pending_claim_timeout",
+            )
+            self._released = True
 
     def _ensure_started(self) -> None:
         """Start the background engine consumer on first use."""
@@ -454,18 +522,13 @@ class NemotronSessionLease:
             # ``self._aborted`` is already correctly set by the time this
             # runs even under an abort/finish race, because ``abort()``
             # sets it BEFORE cancelling (and awaiting) this same task.
-            if observer is not None:
-                if self._aborted:
-                    reason = "aborted"
-                elif self._error is not None or not finalized:
-                    reason = "error"
-                else:
-                    reason = "completed"
-                observe_safely(
-                    observer.session_finished,
-                    session_key=self._session.session_key,
-                    reason=reason,
-                )
+            if self._aborted:
+                reason = "aborted"
+            elif self._error is not None or not finalized:
+                reason = "error"
+            else:
+                reason = "completed"
+            self._observe_session_finished_once(reason)
 
 
 # @spec PORT-RTC-001, PORT-RTC-003, PORT-RTC-007

@@ -206,6 +206,11 @@ class PersistentStateManager(SingleTypeKVCacheManager):
     def get_state_binding(self, request_id: str) -> StateBinding | None:
         return self._bindings.get(request_id)
 
+    def is_terminal(self, request_id: str) -> bool:
+        """Whether scheduler terminality fenced this resident binding."""
+
+        return request_id in self._terminal_request_ids
+
     def mark_initialized(
         self,
         request_id: str,

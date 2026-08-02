@@ -178,6 +178,7 @@ class FakeAsyncOmni:
         self.aborted: list[str] = []
         self._state_generation = 0
         self.state_releases: list[dict[str, Any]] = []
+        self.pending_claim_timeout_s = 3600.0
 
     @property
     def inventory(self) -> dict[str, str]:
@@ -202,6 +203,10 @@ class FakeAsyncOmni:
 
     async def release(self, **kwargs: Any) -> None:
         self.state_releases.append(kwargs)
+
+    async def claim_pending_cleanup(self, lease: Any) -> bool:
+        del lease
+        return True
 
     async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
         index = 0

@@ -60,6 +60,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_operation_id: str | None = None
         self._state_session_key: str | None = None
         self._state_release_done = False
+        self._state_cleanup_lock = asyncio.Lock()
+        self._pending_claim_task: asyncio.Task[None] | None = None
         self._nemotron_session: NemotronRealtimeSession | None = None
         self._native_fifo_event = asyncio.Event()
         self._native_finalized = False
@@ -100,6 +102,10 @@ class RealtimeConnection(VllmRealtimeConnection):
         finally:
             if self._configuration_timeout_task is not None:
                 self._configuration_timeout_task.cancel()
+                await asyncio.gather(
+                    self._configuration_timeout_task,
+                    return_exceptions=True,
+                )
 
     async def _configuration_timeout(self) -> None:
         await asyncio.sleep(self.session_configuration_timeout)
@@ -333,6 +339,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_lease = lease
         self._state_operation_id = release_operation_id
         self._state_session_key = session_key
+        self._arm_pending_claim_timeout()
         try:
             model_config = getattr(self.serving, "model_config", None)
             if model_config is not None:
@@ -369,15 +376,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 )
                 self._park_token_id = self._nemotron_session.park_token_id
         except Exception:
-            await service.release(
-                operation_id=release_operation_id,
-                lease=lease,
-                reason="configuration_error",
-            )
-            self._state_release_done = True
-            self._state_lease = None
-            self._state_operation_id = None
-            self._state_session_key = None
+            await self._release_state_lease("configuration_error")
             raise
         self._is_model_validated = True
         if self._configuration_timeout_task is not None:
@@ -752,12 +751,13 @@ class RealtimeConnection(VllmRealtimeConnection):
                         remaining,
                     )
                     reason = "error"
-                observe_safely(
-                    observer.session_finished,
-                    session_key=request_id,
-                    reason=reason,
-                )
-                self._streaming_session_finished = True
+                if not self._streaming_session_finished:
+                    observe_safely(
+                        observer.session_finished,
+                        session_key=request_id,
+                        reason=reason,
+                    )
+                    self._streaming_session_finished = True
             if cancelled is not None:
                 raise cancelled
 
@@ -794,35 +794,116 @@ class RealtimeConnection(VllmRealtimeConnection):
             streaming_input.prompt = prompt
             yield streaming_input
 
-    async def cleanup(self):
-        """Release resident state exactly once after transport cleanup begins."""
-        await super().cleanup()
-        if self._configuration_timeout_task is not None:
-            self._configuration_timeout_task.cancel()
-        if (
-            self._persistent_state_service is not None
-            and self._state_lease is not None
-            and self._state_operation_id is not None
-            and not self._state_release_done
-        ):
-            self._state_release_done = True
-            await self._persistent_state_service.release(
-                operation_id=self._state_operation_id,
-                lease=self._state_lease,
-                reason="connection_cleanup",
-            )
+    def _arm_pending_claim_timeout(self) -> None:
+        service = self._persistent_state_service
+        if service is None or self._state_lease is None:
+            return
+        timeout_s = float(service.pending_claim_timeout_s)
+        self._pending_claim_task = asyncio.create_task(
+            self._expire_pending_claim(timeout_s),
+            name=f"persistent-state-claim-{self.connection_id}",
+        )
+
+    def _finish_streaming_session_once(self, reason: str) -> None:
         session = self._nemotron_session
         if (
             session is not None
             and self._observer is not None
             and not self._streaming_session_finished
         ):
+            outcome = "aborted" if reason == "aborted" else "error"
+            observe_safely(
+                self._observer.clear_all_outstanding,
+                session.session_key,
+                outcome=outcome,
+            )
             self._streaming_session_finished = True
             observe_safely(
                 self._observer.session_finished,
                 session_key=session.session_key,
-                reason=self._streaming_finish_reason,
+                reason=reason,
             )
+
+    async def _release_state_lease(
+        self,
+        reason: str,
+    ) -> bool:
+        service = self._persistent_state_service
+        lease = self._state_lease
+        operation_id = self._state_operation_id
+        if (
+            service is None
+            or lease is None
+            or operation_id is None
+            or self._state_release_done
+        ):
+            return False
+        async with self._state_cleanup_lock:
+            if self._state_release_done:
+                return False
+            task = self._pending_claim_task
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._finish_streaming_session_once(
+                "error"
+                if reason in {
+                    "configuration_error",
+                    "pending_claim_timeout",
+                }
+                else self._streaming_finish_reason
+            )
+            await service.release(
+                operation_id=operation_id,
+                lease=lease,
+                reason=reason,
+            )
+            self._state_release_done = True
+            return True
+
+    async def _expire_pending_claim(self, timeout_s: float) -> None:
+        await asyncio.sleep(timeout_s)
+        service = self._persistent_state_service
+        lease = self._state_lease
+        if service is None or lease is None or self._state_release_done:
+            return
+        async with self._state_cleanup_lock:
+            if self._state_release_done:
+                return
+            won = await service.claim_pending_cleanup(lease)
+            if not won:
+                return
+            generation_task = self.generation_task
+            await super().cleanup()
+            if generation_task is not None:
+                await asyncio.gather(
+                    generation_task,
+                    return_exceptions=True,
+                )
+            self._finish_streaming_session_once("error")
+            assert self._state_operation_id is not None
+            await service.release(
+                operation_id=self._state_operation_id,
+                lease=lease,
+                reason="pending_claim_timeout",
+            )
+            self._state_release_done = True
+
+    async def cleanup(self):
+        """Release resident state exactly once after transport cleanup begins."""
+        generation_task = self.generation_task
+        await super().cleanup()
+        if generation_task is not None:
+            await asyncio.gather(generation_task, return_exceptions=True)
+        if self._configuration_timeout_task is not None:
+            configuration_task = self._configuration_timeout_task
+            if configuration_task is not asyncio.current_task():
+                configuration_task.cancel()
+                await asyncio.gather(
+                    configuration_task,
+                    return_exceptions=True,
+                )
+        await self._release_state_lease("connection_cleanup")
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))

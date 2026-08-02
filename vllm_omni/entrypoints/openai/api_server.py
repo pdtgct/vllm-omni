@@ -743,6 +743,7 @@ async def _install_persistent_state_service(
         reconciliation_timeout_s=runtime.reconciliation_timeout_s,
         tombstone_ttl_s=runtime.tombstone_ttl_s,
         max_tombstones=runtime.max_tombstones,
+        pending_claim_timeout_s=runtime.pending_claim_timeout_s,
     )
     try:
         await service.check_health()
