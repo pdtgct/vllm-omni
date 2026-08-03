@@ -251,6 +251,112 @@ def test_dummy_profile_projection_is_marked_but_not_reconciled(
     ]
 
 
+def test_profile_flag_without_dummy_is_rejected_before_core_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005
+    state = _ProjectionState()
+    runner = _runner(state)
+    core_calls: list[str] = []
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "execute_model",
+        lambda self, value, **kwargs: core_calls.append("execute"),
+    )
+
+    with pytest.raises(ValueError, match="profile.*dummy|dummy.*profile"):
+        type(runner).execute_model(
+            runner,
+            _scheduler_output(),
+            dummy_run=False,
+            is_profile=True,
+        )
+
+    assert core_calls == []
+    assert state.events == []
+
+
+def test_failed_dummy_is_fully_closed_before_the_next_real_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005
+    state = _ProjectionState()
+    runner = _runner(state)
+    output = _scheduler_output()
+    attempts = 0
+
+    def execute(self: Any, value: object, **kwargs: object) -> object:
+        nonlocal attempts
+        del self, value, kwargs
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("profile failed")
+        state.events.append(("real-execute", None))
+        return "real-result"
+
+    monkeypatch.setattr(GPUModelRunner, "execute_model", execute)
+
+    with pytest.raises(RuntimeError, match="profile failed"):
+        type(runner).execute_model(
+            runner,
+            output,
+            dummy_run=True,
+            is_profile=True,
+        )
+    actual = type(runner).execute_model(
+        runner,
+        output,
+        dummy_run=False,
+        is_profile=False,
+    )
+
+    assert actual == "real-result"
+    assert state.events == [
+        ("begin", (output, True, True)),
+        ("end", None),
+        ("begin", (output, False, False)),
+        ("real-execute", None),
+        ("end", None),
+    ]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_v2_prefix_cache_guard_runs_before_initial_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    # @spec PORT-INT-007 / PORT-STATE-002
+    runner_cls = _runner_cls()
+    if "profile_run" not in runner_cls.__dict__:
+        pytest.fail(
+            "PORT-INT-007 missing V2 pre-profile persistent-state guard",
+            pytrace=False,
+        )
+    runner = object.__new__(runner_cls)
+    runner.vllm_config = object()
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=enabled)
+    profile_calls: list[str] = []
+    module = importlib.import_module("vllm_omni.worker.gpu_ar_model_runner_v2")
+    monkeypatch.setattr(
+        module,
+        "discover_persistent_state_specs",
+        lambda config: {"persistent": object()},
+    )
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "profile_run",
+        lambda self: profile_calls.append("profile"),
+    )
+
+    if enabled:
+        with pytest.raises(ValueError, match="prefix caching"):
+            runner_cls.profile_run(runner)
+        assert profile_calls == []
+    else:
+        runner_cls.profile_run(runner)
+        assert profile_calls == ["profile"]
+
+
 def test_v2_cache_discovery_and_initialization_are_thin_pin_guarded_overrides() -> None:
     # @spec PORT-STATE-002 / PORT-MIG-006
     runner_cls = _runner_cls()

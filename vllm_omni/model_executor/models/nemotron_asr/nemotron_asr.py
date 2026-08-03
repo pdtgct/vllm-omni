@@ -676,6 +676,20 @@ class NemotronASRForRNNT(nn.Module):
 
         if input_ids is None or inputs_embeds is None:
             raise RuntimeError("Nemotron forward requires raw ids and embeddings")
+        if persistent_state_projection is not None and persistent_state_projection.no_page_io:
+            if not persistent_state_projection.dummy_run:
+                raise RuntimeError("no-page-I/O projection must be a dummy invocation")
+            if persistent_state_projection.is_profile:
+                from vllm_omni.model_executor.models.nemotron_asr.profile_execution import (
+                    run_persistent_state_profile,
+                )
+
+                run_persistent_state_profile(
+                    self,
+                    num_rows=len(persistent_state_projection.req_ids),
+                    device=inputs_embeds.device,
+                )
+            return torch.zeros_like(inputs_embeds)
         if persistent_state_projection is not None:
             context = self._stage_v2_projection(persistent_state_projection)
             num_decodes = 0

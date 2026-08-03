@@ -18,9 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _module() -> Any:
     try:
-        return importlib.import_module(
-            "vllm_omni.model_executor.models.nemotron_asr.model_state_v2"
-        )
+        return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.model_state_v2")
     except ModuleNotFoundError:
         pytest.fail(
             "PORT-MIG-004 missing direct NemotronASRModelState module",
@@ -30,9 +28,7 @@ def _module() -> Any:
 
 def _model_class() -> type[Any]:
     try:
-        module = importlib.import_module(
-            "vllm_omni.model_executor.models.nemotron_asr.nemotron_asr"
-        )
+        module = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.nemotron_asr")
     except ModuleNotFoundError:
         pytest.fail(
             "PORT-MIG-004 missing Nemotron ASR model module",
@@ -250,6 +246,139 @@ def test_projection_join_dummy_marker_is_distinct_nonresumable_and_no_io() -> No
             req_states=object(),
             model_kwargs={},
         )
+
+
+def _projection_state() -> Any:
+    state_cls = _module().NemotronASRModelState
+    state = object.__new__(state_cls)
+    state._projection = _module().ProjectionJoin()
+    state._projection_epoch = None
+    state._scheduler_output = None
+    state._projected_binding_keys = set()
+    state._initialized_binding_keys = set()
+    state._request_metadata = SimpleNamespace(
+        snapshot=lambda req_ids: pytest.fail(
+            f"PORT-MIG-005 dummy read request metadata for {req_ids!r}",
+            pytrace=False,
+        )
+    )
+    return state
+
+
+def test_prepare_inputs_completes_the_marked_dummy_without_real_views() -> None:
+    # @spec PORT-MIG-005 / PORT-STATE-003 / PORT-STATE-007
+    state = _projection_state()
+    scheduler_output = SimpleNamespace(persistent_state_bindings={})
+    input_batch = SimpleNamespace(req_ids=["arbitrary-client-visible-id"])
+    req_states = object()
+    state.begin_omni_projection(
+        scheduler_output,
+        dummy_run=True,
+        is_profile=True,
+    )
+
+    prepared = state.prepare_inputs(input_batch, req_states)
+    snapshot = prepared["persistent_state_projection"]
+
+    assert snapshot.req_ids == ("arbitrary-client-visible-id",)
+    assert snapshot.input_batch is input_batch
+    assert snapshot.req_states is req_states
+    assert snapshot.dummy_run is True
+    assert snapshot.is_profile is True
+    assert snapshot.no_page_io is True
+    assert snapshot.bindings == ()
+    assert snapshot.request_metadata is None
+    state.end_omni_projection()
+
+
+def test_profile_marker_without_dummy_fails_before_projection_state_exists() -> None:
+    # @spec PORT-MIG-005
+    state = _projection_state()
+
+    with pytest.raises(ValueError, match="profile.*dummy|dummy.*profile"):
+        state.begin_omni_projection(
+            object(),
+            dummy_run=False,
+            is_profile=True,
+        )
+
+    assert state._projection_epoch is None
+    assert state._scheduler_output is None
+
+
+def test_dummy_selection_never_depends_on_the_request_id_spelling() -> None:
+    # @spec PORT-MIG-005
+    state = _projection_state()
+    state.begin_omni_projection(
+        SimpleNamespace(persistent_state_bindings={}),
+        dummy_run=False,
+        is_profile=False,
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        state.prepare_inputs(
+            SimpleNamespace(req_ids=["_dummy_req_0"]),
+            object(),
+        )
+
+    state.end_omni_projection()
+
+
+def test_failed_dummy_cleanup_allows_an_immediate_real_projection() -> None:
+    # @spec PORT-MIG-005
+    state = _projection_state()
+    state.begin_omni_projection(
+        SimpleNamespace(persistent_state_bindings={}),
+        dummy_run=True,
+        is_profile=True,
+    )
+
+    def fail_profile(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("profile failed")
+
+    state._projection.complete_dummy = fail_profile
+
+    with pytest.raises(RuntimeError, match="profile failed"):
+        state.prepare_inputs(SimpleNamespace(req_ids=["dummy"]), object())
+    state.end_omni_projection()
+
+    state.begin_omni_projection(
+        SimpleNamespace(persistent_state_bindings={}),
+        dummy_run=False,
+        is_profile=False,
+    )
+    epoch = state._projection_epoch
+    assert epoch is not None
+    features = object()
+    binding = object()
+    metadata = object()
+    input_batch = SimpleNamespace(req_ids=["real"])
+    req_states = object()
+    state._projection.record_mm(
+        epoch,
+        req_ids=("real",),
+        scheduled_encoder_inputs={"real": [0]},
+        encoder_features=features,
+    )
+    state._projection.record_bindings(
+        epoch,
+        req_ids=("real",),
+        bindings=(binding,),
+        block_ids=((1,),),
+    )
+    state._request_metadata = SimpleNamespace(snapshot=lambda req_ids: {req_ids[0]: metadata})
+
+    prepared = state.prepare_inputs(input_batch, req_states)
+    snapshot = prepared["persistent_state_projection"]
+
+    assert snapshot.dummy_run is False
+    assert snapshot.is_profile is False
+    assert snapshot.no_page_io is False
+    assert snapshot.encoder_features is features
+    assert snapshot.bindings == (binding,)
+    assert snapshot.request_metadata == {"real": metadata}
+    state.end_omni_projection()
 
 
 def test_terminal_reconciliation_prunes_only_finished_absent_metadata() -> None:

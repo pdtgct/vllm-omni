@@ -382,6 +382,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             partition,
         )
 
+    # @spec PORT-INT-007, PORT-STATE-002
+    def profile_run(self) -> None:
+        """Reject prefix caching before persistent-state profiling."""
+
+        persistent_specs = discover_persistent_state_specs(self.vllm_config)
+        if persistent_specs and self.cache_config.enable_prefix_caching:
+            raise ValueError("prefix caching is incompatible with persistent state")
+        super().profile_run()
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],

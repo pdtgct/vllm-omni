@@ -62,6 +62,8 @@ class ProjectionJoin:
         return self._records[epoch]
 
     def begin(self, *, dummy_run: bool, is_profile: bool) -> int:
+        if is_profile and not dummy_run:
+            raise ValueError("persistent-state profile execution requires a dummy run")
         if self._active_epoch is not None:
             raise RuntimeError("projection epoch is already active")
         epoch = self._next_epoch
@@ -69,6 +71,11 @@ class ProjectionJoin:
         self._active_epoch = epoch
         self._records[epoch] = _ProjectionRecord(dummy_run, is_profile)
         return epoch
+
+    def is_dummy(self, epoch: int) -> bool:
+        """Return the active record's invocation kind."""
+
+        return self._record(epoch).dummy_run
 
     def record_mm(
         self,
@@ -220,11 +227,12 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         dummy_run: bool,
         is_profile: bool,
     ) -> None:
-        self._scheduler_output = scheduler_output
-        self._projection_epoch = self._projection.begin(
+        epoch = self._projection.begin(
             dummy_run=dummy_run,
             is_profile=is_profile,
         )
+        self._scheduler_output = scheduler_output
+        self._projection_epoch = epoch
 
     def end_omni_projection(self) -> None:
         if self._projection_epoch is not None:
@@ -299,18 +307,24 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
     ) -> dict[str, Any]:
         if self._projection_epoch is None:
             raise RuntimeError("model input projection has no active epoch")
-        snapshot = self._projection.complete(
-            self._projection_epoch,
-            input_batch=input_batch,
-            req_states=req_states,
-            model_kwargs={},
-        )
-        snapshot = replace(
-            snapshot,
-            request_metadata=self._request_metadata.snapshot(
-                snapshot.req_ids
-            ),
-        )
+        if self._projection.is_dummy(self._projection_epoch):
+            snapshot = self._projection.complete_dummy(
+                self._projection_epoch,
+                input_batch=input_batch,
+                req_states=req_states,
+                model_kwargs={},
+            )
+        else:
+            snapshot = self._projection.complete(
+                self._projection_epoch,
+                input_batch=input_batch,
+                req_states=req_states,
+                model_kwargs={},
+            )
+            snapshot = replace(
+                snapshot,
+                request_metadata=self._request_metadata.snapshot(snapshot.req_ids),
+            )
         return {"persistent_state_projection": snapshot}
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
