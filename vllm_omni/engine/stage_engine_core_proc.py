@@ -23,7 +23,7 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,
@@ -35,6 +35,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.persistent_state_config import (
     PersistentStateRuntimeConfig,
 )
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_init_utils import set_death_signal
 
 logger = init_logger(__name__)
@@ -67,6 +68,22 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def preprocess_add_request(
+        self,
+        request: EngineCoreRequest,
+    ) -> tuple[Any, int]:
+        """Restore Omni metadata after core constructs its base request."""
+
+        scheduled, request_wave = super().preprocess_add_request(request)
+        payload = getattr(request, "additional_information", None)
+        if payload is not None:
+            setattr(
+                scheduled,
+                "additional_information",
+                deserialize_additional_information(payload),
+            )
+        return scheduled, request_wave
 
     def _persistent_state_manager(self) -> Any:
         from vllm_omni.model_executor.persistent_state.manager import (
