@@ -447,6 +447,34 @@ def test_tensor_endpoint_transition_matches_strict_reference_boundary() -> None:
     assert transition.book[0, 2:5].tolist() == [0, 1, 0]
 
 
+def test_tensor_endpoint_eou_has_headroom_after_a_full_label_burst() -> None:
+    # @spec PORT-DEC-001 / PORT-DEC-005 / PORT-SEG-003
+    module = _module()
+    tokens = torch.tensor([[7, 8]], dtype=torch.int32)
+
+    transition = module.observe_chunk_tensors(
+        history=torch.zeros(1, 8, dtype=torch.int32),
+        book=torch.zeros(1, 6, dtype=torch.int32),
+        frame_emission_counts=torch.tensor(
+            [[1, 0, 0, 0, 0, 0]], dtype=torch.int32
+        ),
+        valid_frame_lengths=torch.tensor([6]),
+        token_ids=tokens,
+        token_lengths=torch.tensor([2], dtype=torch.int32),
+        final_tail=torch.tensor([False]),
+        mode=torch.tensor([1]),
+        threshold_frames=torch.tensor([3]),
+        residue_frames=torch.tensor([2]),
+        eou_token_id=19,
+        row_clean=torch.tensor([True]),
+    )
+
+    assert transition.is_eou.tolist() == [True]
+    assert transition.overflow.tolist() == [False]
+    assert transition.token_ids.tolist() == [[7, 8, 19]]
+    assert transition.token_lengths.tolist() == [3]
+
+
 def test_tensor_endpoint_equality_does_not_fire_and_final_tail_is_inert() -> None:
     # @spec PORT-SEG-002 / PORT-SEG-003
     module = _module()

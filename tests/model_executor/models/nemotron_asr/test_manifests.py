@@ -299,7 +299,11 @@ def test_session_limits_are_fp32_representable() -> None:
     limits = manifests.SESSION_LIMITS
     assert limits["carrier_sequence_modulus"] == 2**24
     assert "max_session_chunks" not in limits
-    assert limits["queue_capacity"] == (limits["max_symbols_per_step"] * limits["max_frames_per_chunk"])
+    assert limits["queue_capacity"] == (
+        limits["max_symbols_per_step"]
+        * limits["max_frames_per_chunk"]
+        + 1
+    )
 
 
 def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
@@ -311,17 +315,17 @@ def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
     assert per_layer * 24 == 6_291_552
     # Frontend: 1953*4 + 128*9*4 + 8 counters * 8 bytes = 12,484.
     assert 1953 * 4 + 128 * 9 * 4 + 8 * 8 == 12_484
-    # Predictor h/c: 2 * (2*640*4) = 10,240; queue 140*4 = 560;
+    # Predictor h/c: 2 * (2*640*4) = 10,240; queue 141*4 = 564;
     # 7-slot int32 book = 28.
-    total = 6_291_552 + 12_484 + 10_240 + 560 + 28
+    total = 6_291_552 + 12_484 + 10_240 + 564 + 28
     # Installed endpoint capacity 12: 12 int32 ring slots + six int32
     # book fields. The pre-endpoint A8 subtotal remains independently
     # auditable and no endpoint state can hide in a side store.
     endpoint = 12 * 4 + 6 * 4
-    assert total == 6_314_864
+    assert total == 6_314_868
     assert endpoint == 72
     entries = _expected_entries(_checkpoint_config())
-    assert sum(_entry_bytes(e) for e in entries) == 6_314_936
+    assert sum(_entry_bytes(e) for e in entries) == 6_314_940
 
 
 def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
@@ -380,7 +384,7 @@ def test_author_state_manifest_produces_the_exact_canonical_layout() -> None:
     authored = manifests.author_state_manifest(_checkpoint_config())
     expected = _expected_state_manifest(_checkpoint_config())
     assert authored == expected
-    assert authored["total_page_bytes"] == 6_314_936
+    assert authored["total_page_bytes"] == 6_314_940
 
 
 def test_author_state_manifest_derives_from_config_not_the_checkpoint() -> None:

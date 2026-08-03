@@ -160,5 +160,5 @@ def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
     assert sum(entry["name"].startswith("endpoint.") for entry in entries) == 7
 
     total_bytes = sum(_entry_bytes(entry) for entry in expected)
-    assert total_bytes == 6_314_936
+    assert total_bytes == 6_314_940
     assert manifest["total_page_bytes"] == total_bytes
