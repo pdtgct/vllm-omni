@@ -216,7 +216,15 @@ class FakeAsyncOmni:
         del lease
         return True
 
-    async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
+    async def generate(
+        self,
+        *,
+        prompt: Any,
+        request_id: str,
+        sampling_params_list: Any,
+        request_id_already_unique: bool = False,
+    ) -> Any:
+        del request_id, request_id_already_unique
         index = 0
         async for item in prompt:
             self.prompts.append(item)
