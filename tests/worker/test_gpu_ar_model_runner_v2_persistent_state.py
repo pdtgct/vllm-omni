@@ -301,6 +301,74 @@ def test_execute_model_ends_projection_and_clears_authority_on_failure(
     assert runner._omni_preempted_req_ids == frozenset()
 
 
+@pytest.mark.parametrize("async_wrapped", [False, True])
+def test_sample_boundary_consumes_and_forwards_model_transaction_status(
+    monkeypatch: pytest.MonkeyPatch,
+    async_wrapped: bool,
+) -> None:
+    # @spec PORT-ADV-004 / PORT-HOOK-001 / PORT-MIG-005
+    events: list[str] = []
+
+    class StatusModel:
+        def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+            events.append("collect")
+            return {"healthy": 0, "failed": 512}, {"failed"}
+
+    runner = _runner()
+    runner.model = StatusModel()
+    model_runner_output = SimpleNamespace()
+    core_output = (
+        SimpleNamespace(model_runner_output=model_runner_output)
+        if async_wrapped
+        else model_runner_output
+    )
+
+    def sample(self: Any, grammar_output: object) -> object:
+        del self, grammar_output
+        events.append("sample")
+        return core_output
+
+    monkeypatch.setattr(GPUModelRunner, "sample_tokens", sample)
+
+    actual = type(runner).sample_tokens(runner, grammar_output=None)
+
+    assert actual is core_output
+    assert events == ["sample", "collect"]
+    connector = model_runner_output.omni_connector_output
+    assert connector.model_status == {"healthy": 0, "failed": 512}
+    assert connector.model_failed_req_ids == {"failed"}
+
+
+def test_sample_boundary_consumes_clean_status_before_the_next_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-004 / PORT-HOOK-001 / PORT-MIG-005
+    staged = True
+
+    class StatusModel:
+        def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+            nonlocal staged
+            assert staged
+            staged = False
+            return {"request": 0}, set()
+
+    runner = _runner()
+    runner.model = StatusModel()
+    model_runner_output = SimpleNamespace()
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "sample_tokens",
+        lambda self, grammar_output: model_runner_output,
+    )
+
+    type(runner).sample_tokens(runner, grammar_output=None)
+
+    assert not staged
+    assert model_runner_output.omni_connector_output.model_status == {
+        "request": 0
+    }
+
+
 def test_dummy_profile_projection_is_marked_but_not_reconciled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

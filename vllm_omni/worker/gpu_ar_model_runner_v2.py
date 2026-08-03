@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.persistent_state import (
     allocate_runner_persistent_state,
     build_persistent_state_batch,
@@ -231,6 +232,41 @@ class GPUARModelRunnerV2(GPUModelRunner):
             self.model_state.end_omni_projection()
             self._omni_finished_req_ids = frozenset()
             self._omni_preempted_req_ids = frozenset()
+
+    def sample_tokens(self, grammar_output: Any) -> Any:
+        """Forward committed model status at the scheduler boundary."""
+
+        output = super().sample_tokens(grammar_output)
+        collect = getattr(self.model, "collect_commit_status", None)
+        if not callable(collect):
+            return output
+        model_status, failed_req_ids = collect()
+        if not model_status and not failed_req_ids:
+            return output
+
+        model_runner_output = getattr(output, "model_runner_output", output)
+        if model_runner_output is None:
+            raise RuntimeError(
+                "model transaction status has no model-runner output carrier"
+            )
+        connector_output = getattr(
+            model_runner_output,
+            "omni_connector_output",
+            None,
+        )
+        if connector_output is None:
+            connector_output = OmniConnectorOutput()
+        elif not isinstance(connector_output, OmniConnectorOutput):
+            raise TypeError("model-runner output carries an invalid Omni result")
+        if (
+            connector_output.model_status
+            or connector_output.model_failed_req_ids
+        ):
+            raise RuntimeError("model transaction status was attached twice")
+        connector_output.model_status = model_status
+        connector_output.model_failed_req_ids = failed_req_ids
+        model_runner_output.omni_connector_output = connector_output
+        return output
 
     # @spec PORT-INT-007, PORT-STATE-002
     def profile_run(self) -> None:
