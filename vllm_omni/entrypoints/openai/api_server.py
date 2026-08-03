@@ -781,7 +781,8 @@ async def _wait_for_http_listener_bound(
     timeout: float,
 ) -> None:
     """Wait for Uvicorn startup without awaiting its serving lifetime."""
-    async with asyncio.timeout(timeout):
+
+    async def poll() -> None:
         while True:
             if serve_task.done():
                 shutdown_task = await serve_task
@@ -794,6 +795,10 @@ async def _wait_for_http_listener_bound(
                     continue
                 return
             await asyncio.sleep(0.01)
+
+    # asyncio.timeout is 3.11+; wait_for carries the same cancel-and-raise
+    # semantics for this single awaited poll loop on Python 3.10.
+    await asyncio.wait_for(poll(), timeout)
 
 
 @asynccontextmanager

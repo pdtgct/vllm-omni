@@ -13,15 +13,20 @@ import argparse
 import asyncio
 import json
 import math
+import sys
 import threading
-from builtins import BaseExceptionGroup
+
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup
+else:  # ING-VEH-018: explicit, tested compatibility package
+    from exceptiongroup import BaseExceptionGroup
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass
 from enum import Enum
 from importlib import metadata
 from types import TracebackType
-from typing import Any, Protocol, Self
+from typing import Any, Protocol
 
 APPLICATION_PLUGIN_ENTRY_POINT_GROUP = "vllm_omni.application_plugins"
 APPLICATION_PLUGIN_OPERATIONAL_PATHS = frozenset({"/health", "/metrics"})
@@ -141,7 +146,7 @@ class SelectedApplicationPlugin:
 class ApplicationPluginLifetime(AbstractAsyncContextManager["ApplicationPluginLifetime"], Protocol):
     """Selected-plugin lifetime controlled by the generic API-server host."""
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> ApplicationPluginLifetime:
         """Enter selected plugins in explicit CLI order."""
 
     async def __aexit__(
@@ -547,7 +552,7 @@ class _ManagedApplicationPluginLifetime:
         self._exit_stack = AsyncExitStack()
 
     # @spec ING-VEH-003, ING-VEH-010
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> _ManagedApplicationPluginLifetime:
         try:
             for selected in self._plugins:
                 scoped_installer = _EntryScopedApplicationASGIInstaller(self._host_context.install_asgi_wrapper)
@@ -586,8 +591,11 @@ class _ManagedApplicationPluginLifetime:
             list(zip(self._participants, self._shutdown_graces, strict=True))
         ):
             try:
-                async with asyncio.timeout(shutdown_grace):
-                    await participant.quiesce_and_drain()
+                # asyncio.timeout is 3.11+; wait_for is the 3.10 spelling
+                # with identical cancel-and-raise semantics for one awaitable.
+                await asyncio.wait_for(
+                    participant.quiesce_and_drain(), shutdown_grace
+                )
             except BaseException as error:
                 errors.append(error)
         if errors:

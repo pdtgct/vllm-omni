@@ -9,7 +9,11 @@ import ast
 import asyncio
 import importlib.util
 import sys
-from builtins import BaseExceptionGroup
+
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup
+else:
+    from exceptiongroup import BaseExceptionGroup
 from contextlib import asynccontextmanager
 from dataclasses import fields
 from pathlib import Path
@@ -801,7 +805,7 @@ def test_each_participant_drain_is_timeboxed_and_all_are_attempted() -> None:
                     timeout=0.25,
                 )
             assert any(
-                isinstance(item, TimeoutError)
+                isinstance(item, asyncio.TimeoutError)
                 for item in error.value.exceptions
             )
             assert any(
