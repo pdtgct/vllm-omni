@@ -311,7 +311,9 @@ def _register_omni_exception_handlers(app) -> None:
 
     - Log multi-stage diagnostic info (orchestrator liveness, per-stage health)
       when an ``EngineDeadError`` is caught.
-    - Call ``terminate_if_errored``
+    - Request host shutdown, which closes application admission synchronously
+      when a lifecycle hook is installed and always calls
+      ``terminate_if_errored``.
     - Return an OpenAI-compatible error JSON response.
     """
 
@@ -368,10 +370,7 @@ def _create_engine_error_json_response(
             error_stage_id,
         )
 
-    terminate_if_errored(
-        server=req.app.state.server,
-        engine=engine,
-    )
+    _request_host_shutdown(req.app.state, engine, exc)
 
     payload, status_code = _build_engine_error_payload(exc, request_id=request_id)
     return JSONResponse(content=payload, status_code=status_code)
@@ -908,6 +907,26 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     serving_speech.shutdown()
             finally:
                 sock.close()
+
+
+def _request_host_shutdown(
+    app_state: Any,
+    engine: Any,
+    cause: BaseException | None = None,
+) -> None:
+    """Ask the launcher to shut down, closing admission in the same step.
+
+    ING-VEH-017 puts admission closure at the shutdown linearization point, so
+    a host-initiated stop has to reach the launcher synchronously.  Setting
+    ``should_exit`` alone is only noticed by the launcher's defensive watcher,
+    one poll later, with admission still open.  The entry exists only while a
+    lifecycle hook is installed; without one the upstream launcher is running
+    and ``terminate_if_errored`` is the whole contract.
+    """
+    request_shutdown = getattr(app_state, "request_application_shutdown", None)
+    if request_shutdown is not None:
+        request_shutdown(cause)
+    terminate_if_errored(server=app_state.server, engine=engine)
 
 
 async def _within_startup_deadline(
@@ -3336,10 +3355,7 @@ async def _run_video_generation_job(
         # Background tasks can't propagate exceptions to FastAPI handlers.
         # Actively signal shutdown when the engine is dead.
         if app_state is not None and isinstance(exc, EngineDeadError):
-            terminate_if_errored(
-                server=app_state.server,
-                engine=app_state.engine_client,
-            )
+            _request_host_shutdown(app_state, app_state.engine_client, exc)
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 

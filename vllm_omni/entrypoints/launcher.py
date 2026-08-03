@@ -135,10 +135,6 @@ async def _serve_http_with_lifecycle(
     engine_client = app.state.engine_client
     server, config = _build_server(app, uvicorn_kwargs)
     loop = asyncio.get_running_loop()
-    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
-    watchdog_task = loop.create_task(_watchdog_loop(server, engine_client))
-    programmatic_stop_task = loop.create_task(_wait_for_programmatic_stop(server))
-    failure_task = loop.create_task(lifecycle_hook.wait_failed())
     shutdown_event = asyncio.Event()
     primary_failure: BaseException | None = None
     secondary_failures: list[BaseException] = []
@@ -171,6 +167,18 @@ async def _serve_http_with_lifecycle(
             logger.exception("Application lifecycle shutdown notification failed")
         shutdown_event.set()
 
+    # The linearization point itself, published for the host.  A conforming
+    # programmatic stop calls this and admission is shut in the same
+    # synchronous step; setting server.should_exit directly is only detected by
+    # the watcher below, one poll interval later, with admission open in
+    # between.
+    app.state.request_application_shutdown = request_shutdown
+
+    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
+    watchdog_task = loop.create_task(_watchdog_loop(server, engine_client))
+    programmatic_stop_task = loop.create_task(_wait_for_programmatic_stop(server))
+    failure_task = loop.create_task(lifecycle_hook.wait_failed())
+
     def signal_handler() -> None:
         logger.info_once("[shutdown] API server: shutdown triggered")
         request_shutdown()
@@ -184,6 +192,17 @@ async def _serve_http_with_lifecycle(
     try:
         try:
             await _wait_for_server_bound(server, server_task)
+            # A supervisor can latch a failure while the listener is binding.
+            # Opening admission on top of it would publish a serving window
+            # that is already over (ING-VEH-016).
+            latched = _completed_causes(
+                server,
+                failure_task=failure_task,
+                watchdog_task=watchdog_task,
+                server_task=server_task,
+            )
+            if latched:
+                raise latched[0]
             await lifecycle_hook.on_bound()
         except BaseException as error:
             request_shutdown(error)
@@ -200,21 +219,20 @@ async def _serve_http_with_lifecycle(
                 },
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if failure_task in done:
-                request_shutdown(_participant_supervision_failure(failure_task))
-            elif watchdog_task in done:
-                try:
-                    await watchdog_task
-                except BaseException as error:
-                    request_shutdown(error)
-            elif shutdown_wait in done:
-                request_shutdown()
-            elif programmatic_stop_task in done:
-                request_shutdown()
-            elif server_task in done:
-                server_error = _task_failure(server_task)
-                request_shutdown(server_error or RuntimeError("HTTP server stopped unexpectedly"))
-            else:
+            del done
+            # Every supervisor that finished is reported, not just the one a
+            # branch happened to test first: the earliest in this fixed order
+            # becomes the primary cause and the rest are retained as
+            # secondary evidence.
+            causes = _completed_causes(
+                server,
+                failure_task=failure_task,
+                watchdog_task=watchdog_task,
+                server_task=server_task,
+            )
+            for cause in causes:
+                request_shutdown(cause)
+            if not causes:
                 request_shutdown()
             if not shutdown_wait.done():
                 shutdown_wait.cancel()
@@ -234,6 +252,14 @@ async def _serve_http_with_lifecycle(
             uvicorn_kwargs,
             secondary_failures,
             progress,
+        )
+        # Supervisors can fail while the barriers run; retire them before the
+        # result is decided so a late cause is evidence rather than a warning
+        # asyncio prints after the fact.
+        await _retire_supervisors(
+            (failure_task, watchdog_task, programmatic_stop_task),
+            secondary_failures,
+            primary_failure,
         )
         if primary_failure is not None:
             if secondary_failures:
@@ -265,19 +291,38 @@ async def _serve_http_with_lifecycle(
     finally:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(sig)
-        for task in (
-            failure_task,
-            watchdog_task,
-            programmatic_stop_task,
-        ):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(
-            failure_task,
-            watchdog_task,
-            programmatic_stop_task,
-            return_exceptions=True,
+        await _retire_supervisors(
+            (failure_task, watchdog_task, programmatic_stop_task),
+            secondary_failures,
+            primary_failure,
         )
+
+
+async def _retire_supervisors(
+    tasks: tuple[asyncio.Task[Any], ...],
+    errors: list[BaseException],
+    primary: BaseException | None,
+) -> None:
+    """Stop the supervisors, keeping any failure they finished with.
+
+    Cancelling a supervisor is how this loop retires it, so its own
+    cancellation is not a failure.  Anything else it raised is one, including a
+    failure that arrived while the barriers were already running.  The cause
+    already chosen as primary is not recorded a second time.
+    """
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if not isinstance(result, BaseException):
+            continue
+        if isinstance(result, asyncio.CancelledError) or result is primary:
+            continue
+        if any(result is known for known in errors):
+            continue
+        errors.append(result)
+        logger.error("Application supervisor failed during shutdown: %r", result)
 
 
 class _ShutdownProgress:
@@ -286,21 +331,45 @@ class _ShutdownProgress:
     The chain can be re-entered — a cancellation arriving mid-shutdown runs it
     again under a shield — and no barrier may fire twice.  A phase is marked on
     entry, not on completion: an interrupted drain is not retried, while the
-    phases after it still run, so the engine stop stays both exactly-once and
-    unavoidable.
+    phases after it still run.
+
+    The engine stop is the exception, because it is the one barrier whose work
+    outlives its await: it runs on an executor thread that no cancellation can
+    reach.  Marking it entered would let a cancelled await report a stop that
+    is still running.  The future is kept instead, so re-entry awaits the same
+    stop rather than starting or skipping one.
     """
 
     def __init__(self) -> None:
         self.drained = False
         self.http_stopped = False
         self.exited = False
-        self.engine_stopped = False
+        self.engine_shutdown: asyncio.Future[None] | None = None
 
     def claim(self, phase: str) -> bool:
         if getattr(self, phase):
             return False
         setattr(self, phase, True)
         return True
+
+    def engine_shutdown_future(
+        self,
+        engine_client: EngineClient,
+        timeout: float,
+    ) -> asyncio.Future[None]:
+        """Start the engine stop once and hand back the same future after."""
+        if self.engine_shutdown is None:
+            mode = "abort" if timeout == 0 else "drain"
+            logger.info(
+                "[shutdown] API server: stopping engine client mode=%s timeout=%ss",
+                mode,
+                timeout,
+            )
+            self.engine_shutdown = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(engine_client.shutdown, timeout=timeout),
+            )
+        return self.engine_shutdown
 
 
 async def _coordinated_shutdown(
@@ -361,21 +430,21 @@ async def _coordinated_shutdown(
         errors.append(error)
         logger.exception("Application participant exit failed")
     finally:
-        if progress.claim("engine_stopped"):
-            timeout = engine_client.vllm_config.shutdown_timeout
-            mode = "abort" if timeout == 0 else "drain"
-            logger.info(
-                "[shutdown] API server: stopping engine client mode=%s timeout=%ss",
-                mode,
-                timeout,
-            )
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    partial(engine_client.shutdown, timeout=timeout),
-                )
-            except BaseException as error:
-                errors.append(error)
+        engine_shutdown = progress.engine_shutdown_future(
+            engine_client,
+            engine_client.vllm_config.shutdown_timeout,
+        )
+        try:
+            # Shielded: a cancellation here cancels this await, never the
+            # executor thread doing the stop.  Re-entry awaits this same
+            # future, so the completion log follows the real stop.
+            await asyncio.shield(engine_shutdown)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            errors.append(error)
+            logger.info_once("[shutdown] API server: engine client stop failed")
+        else:
             logger.info_once("[shutdown] API server: engine client stopped")
 
 
@@ -442,6 +511,31 @@ def _task_failure(task: asyncio.Task[Any]) -> BaseException | None:
     if task.cancelled():
         return asyncio.CancelledError()
     return task.exception()
+
+
+def _completed_causes(
+    server: uvicorn.Server,
+    *,
+    failure_task: asyncio.Task[None],
+    watchdog_task: asyncio.Task[Any],
+    server_task: asyncio.Task[Any],
+) -> list[BaseException]:
+    """Name every supervisor that has already finished, most severe first.
+
+    The order is fixed rather than whichever branch was tested first, so the
+    primary cause of a shutdown is the same whether one supervisor finished or
+    three did in the same tick.  A finished serve task is only a cause while
+    ``should_exit`` is unset: after that its completion is the shutdown
+    working, not an unexpected exit.
+    """
+    causes: list[BaseException] = []
+    if failure_task.done():
+        causes.append(_participant_supervision_failure(failure_task))
+    if watchdog_task.done():
+        causes.append(_task_failure(watchdog_task) or RuntimeError("engine watchdog stopped unexpectedly"))
+    if server_task.done() and not server.should_exit:
+        causes.append(_task_failure(server_task) or RuntimeError("HTTP server stopped unexpectedly"))
+    return causes
 
 
 def _participant_supervision_failure(

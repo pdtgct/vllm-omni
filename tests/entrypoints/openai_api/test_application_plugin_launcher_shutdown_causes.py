@@ -30,6 +30,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -463,3 +464,267 @@ async def test_first_cause_stays_primary_across_a_two_cause_race(
     events, hook, outcome = await _run_cause(monkeypatch, trigger)
     assert outcome is boom, events
     assert hook.causes == [boom]
+
+
+@pytest.mark.asyncio
+async def test_host_request_closes_admission_before_publishing_the_flag(
+    monkeypatch,
+) -> None:
+    """The conforming programmatic stop is synchronous, not a polled flag."""
+
+    # @spec ING-VEH-017
+    async def trigger(app, hook) -> None:
+        request_shutdown = app.state.request_application_shutdown
+        assert hook.causes == [], "admission closed before the host asked"
+
+        request_shutdown(None)
+
+        # Both assertions are about the same instant: the notification has
+        # already happened and the flag the watcher polls has not been set,
+        # so admission closure cannot trail the stop by a poll interval.
+        assert hook.causes == [None]
+        assert app.state.server.should_exit is False
+
+    events, hook, outcome = await _run_cause(monkeypatch, trigger)
+    assert not isinstance(outcome, BaseException), events
+    assert events.count("shutdown-requested") == 1, events
+
+
+@pytest.mark.asyncio
+async def test_failure_latched_while_binding_never_opens_admission(
+    monkeypatch,
+) -> None:
+    """A failure that beats the listener must not be followed by serving."""
+    # @spec ING-VEH-016, ING-VEH-017
+    launcher = _load_launcher()
+    events: list[str] = []
+
+    original_http_shutdown = uvicorn.Server.shutdown
+
+    async def recording_http_shutdown(self, sockets=None):
+        events.append("http-shutdown")
+        return await original_http_shutdown(self, sockets=sockets)
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", recording_http_shutdown)
+
+    app = FastAPI()
+    app.state.engine_client = _RecordingEngine(events)
+    hook = _RecordingHook(events, asyncio.Event())
+    latched = ValueError("failed while binding")
+    hook.failure.set_exception(latched)
+    listen_socket, host, port = _listening_socket()
+
+    outcome: object = None
+    try:
+        try:
+            shutdown = await asyncio.wait_for(
+                launcher.serve_http(
+                    app,
+                    listen_socket,
+                    lifecycle_hook=hook,
+                    host=host,
+                    port=port,
+                    log_level="error",
+                    lifespan="off",
+                ),
+                timeout=5,
+            )
+            outcome = await shutdown
+        except asyncio.TimeoutError:
+            raise
+        except BaseException as error:  # noqa: BLE001 - the contract result
+            outcome = error
+    finally:
+        listen_socket.close()
+
+    assert outcome is latched, events
+    assert "bound" not in events, events
+    assert hook.causes == [latched]
+    _assert_journal(events)
+
+
+@pytest.mark.asyncio
+async def test_engine_shutdown_is_awaited_to_completion_across_cancellation(
+    monkeypatch,
+) -> None:
+    """Cancelling the await cannot orphan the executor thread's stop."""
+    # @spec ING-VEH-017, ING-VEH-022
+    launcher = _load_launcher()
+    events: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine(_RecordingEngine):
+        def shutdown(self, timeout=None) -> None:
+            self._events.append("engine-shutdown")
+            started.set()
+            assert release.wait(timeout=10), "engine stop was never released"
+            self._events.append("engine-shutdown-returned")
+
+    app = FastAPI()
+    app.state.engine_client = BlockingEngine(events)
+    bound = asyncio.Event()
+    hook = _RecordingHook(events, bound)
+    listen_socket, host, port = _listening_socket()
+
+    serve_task = asyncio.create_task(
+        launcher.serve_http(
+            app,
+            listen_socket,
+            lifecycle_hook=hook,
+            host=host,
+            port=port,
+            log_level="error",
+            lifespan="off",
+        )
+    )
+    try:
+        await asyncio.wait_for(bound.wait(), timeout=2)
+        app.state.request_application_shutdown(None)
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), events
+
+        # Cancel while the stop is in flight on the executor thread.
+        serve_task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        # The decisive assertion: serve has not finished, because the engine
+        # stop it started has not finished.  A launcher that treated the
+        # cancelled await as the phase being over would already be done here,
+        # leaving the executor thread running behind it.
+        assert not serve_task.done(), events
+
+        release.set()
+        await asyncio.gather(serve_task, return_exceptions=True)
+    finally:
+        release.set()
+        listen_socket.close()
+
+    assert events.count("engine-shutdown") == 1, events
+    assert "engine-shutdown-returned" in events, events
+
+
+@pytest.mark.asyncio
+async def test_a_late_supervisor_failure_is_retained_as_the_result(
+    monkeypatch,
+) -> None:
+    """A watchdog that fires mid-drain is evidence, not a discarded task."""
+    # @spec ING-VEH-017, ING-VEH-022
+    launcher = _load_launcher()
+    monkeypatch.setattr(launcher, "_WATCHDOG_INTERVAL_S", 0.02)
+    monkeypatch.setattr(sys.modules["vllm.envs"], "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", False)
+
+    class DyingDuringDrain(_RecordingHook):
+        def __init__(self, events, bound, engine) -> None:
+            super().__init__(events, bound)
+            self._engine = engine
+
+        async def before_http_shutdown(self) -> None:
+            self._record("participant-drain")
+            self._engine.errored = True
+            self._engine.is_running = False
+            await asyncio.sleep(0.2)
+
+    events: list[str] = []
+    engine = _RecordingEngine(events)
+
+    async def trigger(app, hook) -> None:
+        del hook
+        app.state.request_application_shutdown(None)
+
+    original_http_shutdown = uvicorn.Server.shutdown
+
+    async def recording_http_shutdown(self, sockets=None):
+        events.append("http-shutdown")
+        return await original_http_shutdown(self, sockets=sockets)
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", recording_http_shutdown)
+
+    app = FastAPI()
+    app.state.engine_client = engine
+    bound = asyncio.Event()
+    hook = DyingDuringDrain(events, bound, engine)
+    listen_socket, host, port = _listening_socket()
+
+    serve_task = asyncio.create_task(
+        launcher.serve_http(
+            app,
+            listen_socket,
+            lifecycle_hook=hook,
+            host=host,
+            port=port,
+            log_level="error",
+            lifespan="off",
+        )
+    )
+    outcome: object = None
+    try:
+        await asyncio.wait_for(bound.wait(), timeout=2)
+        await trigger(app, hook)
+        try:
+            shutdown = await asyncio.wait_for(serve_task, timeout=5)
+            outcome = await shutdown
+        except asyncio.TimeoutError:
+            raise
+        except BaseException as error:  # noqa: BLE001 - the contract result
+            outcome = error
+    finally:
+        if not serve_task.done():
+            serve_task.cancel()
+            await asyncio.gather(serve_task, return_exceptions=True)
+        listen_socket.close()
+
+    # No cause was named at the linearization point, so the only failure the
+    # run produced is the one that arrived after it — and it survived.
+    assert hook.causes == [None], events
+    assert isinstance(outcome, RuntimeError), outcome
+    assert "watchdog" in str(outcome), outcome
+    _assert_journal(events)
+
+
+def test_completed_causes_orders_every_finished_supervisor() -> None:
+    """Concurrent causes are all named, with a fixed primary."""
+    # @spec ING-VEH-017
+    launcher = _load_launcher()
+
+    async def exercise() -> None:
+        participant = ValueError("participant")
+        watchdog = RuntimeError("engine client failed its HTTP watchdog")
+        http = RuntimeError("serve raised")
+
+        async def raise_it(error):
+            raise error
+
+        failure_task = asyncio.ensure_future(raise_it(participant))
+        watchdog_task = asyncio.ensure_future(raise_it(watchdog))
+        server_task = asyncio.ensure_future(raise_it(http))
+        await asyncio.gather(
+            failure_task,
+            watchdog_task,
+            server_task,
+            return_exceptions=True,
+        )
+        server = SimpleNamespace(should_exit=False)
+
+        causes = launcher._completed_causes(
+            server,
+            failure_task=failure_task,
+            watchdog_task=watchdog_task,
+            server_task=server_task,
+        )
+        assert causes == [participant, watchdog, http]
+
+        # Once the stop is under way, a finished serve task is the shutdown
+        # working rather than an unexpected exit.
+        server.should_exit = True
+        assert launcher._completed_causes(
+            server,
+            failure_task=failure_task,
+            watchdog_task=watchdog_task,
+            server_task=server_task,
+        ) == [participant, watchdog]
+
+    asyncio.run(exercise())
