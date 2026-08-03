@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_omni.worker.persistent_state import (
@@ -15,6 +16,56 @@ from vllm_omni.worker.persistent_state import (
     discover_persistent_state_specs,
     partition_persistent_state_config,
 )
+
+
+class _EmptyOrdinaryBlockTables:
+    """Adapt core block-table operations to a truthful zero-group topology."""
+
+    def __init__(self, block_tables: BlockTables) -> None:
+        if block_tables.num_kv_cache_groups != 0:
+            raise ValueError("empty block-table adapter requires zero cache groups")
+        self._block_tables = block_tables
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._block_tables, name)
+
+    def append_block_ids(
+        self,
+        req_index: int,
+        new_block_ids: tuple[list[int], ...],
+        overwrite: bool,
+    ) -> None:
+        del req_index, overwrite
+        if new_block_ids:
+            raise RuntimeError("ordinary block ids supplied without a cache group")
+
+    def apply_staged_writes(self) -> None:
+        """There are no ordinary block-table writes to apply."""
+
+    def gather_block_tables(
+        self,
+        idx_mapping: Any,
+        num_reqs_padded: int,
+    ) -> tuple[Any, ...]:
+        del idx_mapping, num_reqs_padded
+        return ()
+
+    def compute_slot_mappings(
+        self,
+        idx_mapping: Any,
+        query_start_loc: Any,
+        positions: Any,
+        num_tokens_padded: int,
+    ) -> Any:
+        del idx_mapping, query_start_loc, positions
+        return self._block_tables.slot_mappings[:, :num_tokens_padded]
+
+    def get_dummy_block_tables(self, num_reqs: int) -> tuple[Any, ...]:
+        del num_reqs
+        return ()
+
+    def get_dummy_slot_mappings(self, num_tokens: int) -> Any:
+        return self._block_tables.slot_mappings[:, :num_tokens]
 
 
 class GPUARModelRunnerV2(GPUModelRunner):
@@ -55,9 +106,25 @@ class GPUARModelRunnerV2(GPUModelRunner):
             else None
         )
         super().initialize_kv_cache(partition.ordinary_config)
+        persistent_only = (
+            partition.state_group is not None
+            and not partition.ordinary_config.kv_cache_groups
+        )
+        if persistent_only:
+            self._install_persistent_only_block_tables()
         self._persistent_state_storage = allocate_runner_persistent_state(
             self,
             partition,
+        )
+
+    def _install_persistent_only_block_tables(self) -> None:
+        """Make core's generic execution path valid with no ordinary cache."""
+
+        if isinstance(self.block_tables, _EmptyOrdinaryBlockTables):
+            return
+        self.block_tables = cast(
+            BlockTables,
+            _EmptyOrdinaryBlockTables(self.block_tables),
         )
 
     def _ordinary_block_ids(

@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import torch
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker as CoreGPUWorker
 
@@ -102,6 +104,68 @@ def test_core_call_order_guard_matches_the_selected_v025_pin() -> None:
     )
     offsets = [source.index(fragment) for fragment in ordered]
     assert offsets == sorted(offsets)
+
+
+def test_persistent_only_block_tables_cross_the_real_core_staged_write_step() -> None:
+    # @spec PORT-MIG-005 / PORT-STATE-002
+    runner_cls = _runner_cls()
+    if "_install_persistent_only_block_tables" not in runner_cls.__dict__:
+        pytest.fail(
+            "PORT-MIG-005 missing persistent-only block-table adapter",
+            pytrace=False,
+        )
+
+    class RawEmptyBlockTables:
+        num_kv_cache_groups = 0
+        fused_writer = None
+
+        def apply_staged_writes(self) -> None:
+            BlockTables.apply_staged_writes(self)  # type: ignore[arg-type]
+
+    state = _ProjectionState()
+    runner = _runner(state)
+    runner.block_tables = RawEmptyBlockTables()
+    runner.update_pp_decode_requests = lambda: None
+    runner.finish_requests = lambda output: None
+    runner.free_states = lambda output: None
+    runner.add_requests = lambda output: None
+    runner.update_requests = lambda output: None
+    no_forward = object()
+    runner.kv_connector = SimpleNamespace(
+        no_forward=lambda output: no_forward,
+    )
+    output = _scheduler_output(total_tokens=0)
+
+    runner_cls._install_persistent_only_block_tables(runner)
+    actual = runner_cls.execute_model(runner, output)
+
+    assert actual is no_forward
+    assert runner.block_tables.num_kv_cache_groups == 0
+
+
+def test_persistent_only_block_tables_expose_empty_attention_views() -> None:
+    # @spec PORT-MIG-005 / PORT-STATE-002
+    runner_cls = _runner_cls()
+
+    class RawEmptyBlockTables:
+        num_kv_cache_groups = 0
+        slot_mappings = torch.empty((0, 16), dtype=torch.int64)
+
+    runner = _runner()
+    runner.block_tables = RawEmptyBlockTables()
+    runner_cls._install_persistent_only_block_tables(runner)
+
+    runner.block_tables.apply_staged_writes()
+    runner.block_tables.append_block_ids(0, (), overwrite=True)
+    assert runner.block_tables.gather_block_tables(object(), 4) == ()
+    assert runner.block_tables.get_dummy_block_tables(4) == ()
+    slot_mappings = runner.block_tables.compute_slot_mappings(
+        object(), object(), object(), 7
+    )
+    assert slot_mappings.shape == (0, 7)
+    assert runner.block_tables.get_dummy_slot_mappings(5).shape == (0, 5)
+    with pytest.raises(RuntimeError, match="ordinary block ids"):
+        runner.block_tables.append_block_ids(0, ([1],), overwrite=True)
 
 
 def test_bridge_is_a_direct_thin_core_runner_subclass() -> None:
