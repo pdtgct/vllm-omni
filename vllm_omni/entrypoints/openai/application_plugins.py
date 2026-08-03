@@ -13,7 +13,6 @@ import argparse
 import asyncio
 import json
 import math
-import sys
 import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager

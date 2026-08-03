@@ -27,6 +27,7 @@ _MIRRORED_SURFACE = {
     "h11_limits",
     "port_conflict_diagnostics",
     "route_logging",
+    "shutdown_ordering",
     "signal_cleanup",
     "ssl_refresh",
     "uvicorn_configuration",

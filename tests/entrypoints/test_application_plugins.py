@@ -1176,8 +1176,8 @@ def test_each_participant_drain_is_timeboxed_and_all_are_attempted() -> None:
                     timeout=0.25,
                 )
             errors = getattr(error.value, "exceptions", ())
-            # asyncio.TimeoutError is not the builtin below 3.11.
-            assert any(isinstance(item, asyncio.TimeoutError) for item in errors)
+            # The lifetime normalizes 3.10's asyncio timeout to the builtin.
+            assert any(isinstance(item, TimeoutError) for item in errors)
             assert any(isinstance(item, RuntimeError) for item in errors)
 
         assert events[2:4] == ["drain:hanging", "drain:failing"]

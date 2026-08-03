@@ -64,14 +64,8 @@ def _load_launcher():
     return module
 
 
-def _assert_journal(
-    events: list[str], *, expect_http_shutdown: bool = True
-) -> None:
-    expected = [
-        name
-        for name in _ORDERED_JOURNAL
-        if expect_http_shutdown or name != "http-shutdown"
-    ]
+def _assert_journal(events: list[str], *, expect_http_shutdown: bool = True) -> None:
+    expected = [name for name in _ORDERED_JOURNAL if expect_http_shutdown or name != "http-shutdown"]
     positions = [events.index(name) for name in expected]
     assert positions == sorted(positions), events
     assert events.count("shutdown-requested") == 1, events
@@ -101,9 +95,7 @@ class _RecordingHook:
         self._bound = bound
         self._fault_site = fault_site
         self.causes: list[BaseException | None] = []
-        self.failure: asyncio.Future[None] = (
-            asyncio.get_running_loop().create_future()
-        )
+        self.failure: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def _record(self, site: str) -> None:
         self._events.append(site)
@@ -206,7 +198,7 @@ async def _run_cause(
     return events, hook, outcome
 
 
-_SIGNAL_CHILD = '''
+_SIGNAL_CHILD = """
 import asyncio
 import importlib.util
 import json
@@ -291,7 +283,7 @@ async def main():
 
 asyncio.run(main())
 print(json.dumps(events))
-'''
+"""
 
 
 def test_process_signal_orders_the_full_shutdown_barrier_chain(
@@ -323,22 +315,17 @@ async def test_watchdog_engine_failure_orders_the_full_barrier_chain(
     # @spec ING-VEH-017, ING-VEH-022
     launcher = _load_launcher()
     assert hasattr(launcher, "_WATCHDOG_INTERVAL_S"), (
-        "the watchdog poll interval must be a module seam so the "
-        "failure path is testable in bounded time"
+        "the watchdog poll interval must be a module seam so the failure path is testable in bounded time"
     )
     monkeypatch.setattr(launcher, "_WATCHDOG_INTERVAL_S", 0.05)
-    monkeypatch.setattr(
-        sys.modules["vllm.envs"], "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", False
-    )
+    monkeypatch.setattr(sys.modules["vllm.envs"], "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", False)
 
     async def trigger(app, hook) -> None:
         del hook
         app.state.engine_client.errored = True
         app.state.engine_client.is_running = False
 
-    events, _, outcome = await _run_cause(
-        monkeypatch, trigger, launcher=launcher
-    )
+    events, _, outcome = await _run_cause(monkeypatch, trigger, launcher=launcher)
     assert isinstance(outcome, RuntimeError), events
     assert "watchdog" in str(outcome)
 
@@ -397,9 +384,7 @@ async def test_unexpected_http_exit_still_drains_before_engine_shutdown(
     async def dying_serve(self, sockets=None):
         inner = asyncio.create_task(original_serve(self, sockets=sockets))
         die_wait = asyncio.create_task(die.wait())
-        done, _ = await asyncio.wait(
-            {inner, die_wait}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _ = await asyncio.wait({inner, die_wait}, return_when=asyncio.FIRST_COMPLETED)
         if die_wait in done:
             inner.cancel()
             await asyncio.gather(inner, return_exceptions=True)
@@ -413,9 +398,7 @@ async def test_unexpected_http_exit_still_drains_before_engine_shutdown(
         del app, hook
         die.set()
 
-    events, _, outcome = await _run_cause(
-        monkeypatch, trigger, expect_http_shutdown=False
-    )
+    events, _, outcome = await _run_cause(monkeypatch, trigger, expect_http_shutdown=False)
     assert isinstance(outcome, RuntimeError), events
     assert "unexpectedly" in str(outcome)
 
@@ -445,9 +428,7 @@ async def test_programmatic_stop_orders_the_full_barrier_chain(
         "participant-exit",
     ],
 )
-async def test_fault_inside_the_chain_cannot_skip_later_phases(
-    monkeypatch, fault_site
-) -> None:
+async def test_fault_inside_the_chain_cannot_skip_later_phases(monkeypatch, fault_site) -> None:
     """A raising phase surfaces as the result; the engine still stops once."""
 
     # @spec ING-VEH-017, ING-VEH-022

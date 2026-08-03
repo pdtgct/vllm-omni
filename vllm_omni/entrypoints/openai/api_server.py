@@ -15,7 +15,7 @@ import os
 import random
 import time
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
@@ -861,12 +861,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                         )
                     )
                     startup_deadline = asyncio.get_running_loop().time() + startup_timeout
-                    await asyncio.wait_for(
+                    await _within_startup_deadline(
                         plugin_lifetime.__aenter__(),
-                        timeout=max(
-                            0.0,
-                            startup_deadline - asyncio.get_running_loop().time(),
-                        ),
+                        startup_deadline,
                     )
                     entered = True
                     lifecycle_hook = _ApplicationServerLifecycleHook(
@@ -874,12 +871,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                         plugin_lifetime,
                     )
                     app.state._application_lifecycle_ready = lifecycle_hook.is_ready
-                    await asyncio.wait_for(
+                    await _within_startup_deadline(
                         plugin_lifetime.wait_ready(),
-                        timeout=max(
-                            0.0,
-                            startup_deadline - asyncio.get_running_loop().time(),
-                        ),
+                        startup_deadline,
                     )
                     assert asgi_composition is not None
                     asgi_composition.seal()
@@ -914,6 +908,23 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     serving_speech.shutdown()
             finally:
                 sock.close()
+
+
+async def _within_startup_deadline(
+    awaitable: Awaitable[Any],
+    deadline: float,
+) -> None:
+    """Await one startup step against the shared budget, timing out portably.
+
+    Python 3.10's ``asyncio.TimeoutError`` is not the built-in, so the raw
+    ``wait_for`` failure would name a different exception per interpreter.
+    Callers and tests see the built-in on every supported version.
+    """
+    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    try:
+        await asyncio.wait_for(awaitable, timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError("application plugin startup budget expired") from exc
 
 
 @asynccontextmanager

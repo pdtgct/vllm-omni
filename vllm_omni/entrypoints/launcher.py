@@ -1,6 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Omni-owned HTTP launcher with optional application lifecycle barriers."""
+"""Omni-owned HTTP launcher with optional application lifecycle barriers.
+
+Without a lifecycle hook this module is a pass-through to the paired vLLM
+launcher, so zero-plugin behavior is upstream's by construction rather than by
+imitation.  A hook installs the ING-VEH-017 barrier chain: admission closes
+synchronously at the shutdown linearization point, participants drain, HTTP
+settles, participant contexts unwind, and only then does the engine stop.
+
+Two upstream behaviors are deliberately different on the hook path, and only
+there:
+
+* ``shutdown_ordering`` — upstream stops the engine before HTTP.  In-flight
+  participant work needs a live engine while it drains, so the hook path
+  inverts the pair.
+* ``watchdog`` — upstream's watchdog only sets ``should_exit``, which never
+  reaches the engine seam.  Here it raises, so an engine death enters the same
+  coordinated chain as every other cause.
+
+Every other behavior in ``MIRRORED_UPSTREAM_BEHAVIORS`` is mirrored, and
+``UPSTREAM_LAUNCHER_SHA256`` pins the upstream source those judgments were made
+against: a vLLM pin bump fails the parity suite until the re-diff is redone and
+the digest re-stamped.
+"""
 
 import asyncio
 import signal
@@ -32,12 +54,22 @@ MIRRORED_UPSTREAM_BEHAVIORS = frozenset(
         "h11_limits",
         "port_conflict_diagnostics",
         "route_logging",
+        "shutdown_ordering",
         "signal_cleanup",
         "ssl_refresh",
         "uvicorn_configuration",
         "watchdog",
     }
 )
+
+# SHA-256 of the vllm.entrypoints.launcher source every behavior above was last
+# dispositioned against.  The parity suite compares this to the installed
+# source, so the re-diff is executable rather than remembered.
+UPSTREAM_LAUNCHER_SHA256 = "f2340520aa886ff8d2e4b53d6cd06614deaeb0afb91e0b258e3eb0fa0cb0a1a7"
+
+# Upstream keeps this local to the watchdog loop body, which leaves the engine
+# failure path untestable in bounded time.
+_WATCHDOG_INTERVAL_S = 5.0
 
 
 class ApplicationLifecycleHook(Protocol):
@@ -110,6 +142,7 @@ async def _serve_http_with_lifecycle(
     shutdown_event = asyncio.Event()
     primary_failure: BaseException | None = None
     secondary_failures: list[BaseException] = []
+    progress = _ShutdownProgress()
 
     ssl_cert_refresher = (
         None
@@ -168,10 +201,7 @@ async def _serve_http_with_lifecycle(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if failure_task in done:
-                try:
-                    await failure_task
-                except BaseException as error:
-                    request_shutdown(error)
+                request_shutdown(_participant_supervision_failure(failure_task))
             elif watchdog_task in done:
                 try:
                     await watchdog_task
@@ -203,6 +233,7 @@ async def _serve_http_with_lifecycle(
             lifecycle_hook,
             uvicorn_kwargs,
             secondary_failures,
+            progress,
         )
         if primary_failure is not None:
             if secondary_failures:
@@ -227,6 +258,7 @@ async def _serve_http_with_lifecycle(
                 lifecycle_hook,
                 uvicorn_kwargs,
                 secondary_failures,
+                progress,
             )
         )
         raise
@@ -248,6 +280,29 @@ async def _serve_http_with_lifecycle(
         )
 
 
+class _ShutdownProgress:
+    """Which barriers have already been entered.
+
+    The chain can be re-entered — a cancellation arriving mid-shutdown runs it
+    again under a shield — and no barrier may fire twice.  A phase is marked on
+    entry, not on completion: an interrupted drain is not retried, while the
+    phases after it still run, so the engine stop stays both exactly-once and
+    unavoidable.
+    """
+
+    def __init__(self) -> None:
+        self.drained = False
+        self.http_stopped = False
+        self.exited = False
+        self.engine_stopped = False
+
+    def claim(self, phase: str) -> bool:
+        if getattr(self, phase):
+            return False
+        setattr(self, phase, True)
+        return True
+
+
 async def _coordinated_shutdown(
     engine_client: EngineClient,
     server: uvicorn.Server,
@@ -258,64 +313,70 @@ async def _coordinated_shutdown(
     lifecycle_hook: ApplicationLifecycleHook,
     uvicorn_kwargs: dict[str, Any],
     errors: list[BaseException],
+    progress: _ShutdownProgress,
 ) -> None:
     """Run every barrier even when an earlier drain operation fails."""
     try:
-        await lifecycle_hook.before_http_shutdown()
+        if progress.claim("drained"):
+            await lifecycle_hook.before_http_shutdown()
     except BaseException as error:
         errors.append(error)
         logger.exception("Application participant drain failed")
     finally:
-        server.should_exit = True
-        watchdog_task.cancel()
-        programmatic_stop_task.cancel()
-        if ssl_cert_refresher:
-            ssl_cert_refresher.stop()
-        try:
-            if not server_task.done():
-                await server_task
-            else:
-                server_error = _task_failure(server_task)
-                if server_error is not None:
-                    errors.append(server_error)
-        except asyncio.CancelledError:
+        if progress.claim("http_stopped"):
+            server.should_exit = True
+            logger.info_once("[shutdown] API server: signalling HTTP server shutdown")
+            watchdog_task.cancel()
+            programmatic_stop_task.cancel()
+            if ssl_cert_refresher:
+                ssl_cert_refresher.stop()
             try:
-                await server.shutdown()
+                if not server_task.done():
+                    await server_task
+                else:
+                    server_error = _task_failure(server_task)
+                    if server_error is not None:
+                        errors.append(server_error)
+            except asyncio.CancelledError:
+                try:
+                    await server.shutdown()
+                except BaseException as error:
+                    errors.append(error)
             except BaseException as error:
                 errors.append(error)
-        except BaseException as error:
-            errors.append(error)
-            port = uvicorn_kwargs["port"]
-            process = find_process_using_port(port)
-            if process is not None:
-                logger.warning(
-                    "port %s is used by process %s launched with command:\n%s",
-                    port,
-                    process,
-                    " ".join(process.cmdline()),
-                )
+                port = uvicorn_kwargs["port"]
+                process = find_process_using_port(port)
+                if process is not None:
+                    logger.warning(
+                        "port %s is used by process %s launched with command:\n%s",
+                        port,
+                        process,
+                        " ".join(process.cmdline()),
+                    )
 
     try:
-        await lifecycle_hook.before_engine_shutdown()
+        if progress.claim("exited"):
+            await lifecycle_hook.before_engine_shutdown()
     except BaseException as error:
         errors.append(error)
         logger.exception("Application participant exit failed")
     finally:
-        timeout = engine_client.vllm_config.shutdown_timeout
-        mode = "abort" if timeout == 0 else "drain"
-        logger.info(
-            "[shutdown] API server: stopping engine client mode=%s timeout=%ss",
-            mode,
-            timeout,
-        )
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                partial(engine_client.shutdown, timeout=timeout),
+        if progress.claim("engine_stopped"):
+            timeout = engine_client.vllm_config.shutdown_timeout
+            mode = "abort" if timeout == 0 else "drain"
+            logger.info(
+                "[shutdown] API server: stopping engine client mode=%s timeout=%ss",
+                mode,
+                timeout,
             )
-        except BaseException as error:
-            errors.append(error)
-        logger.info_once("[shutdown] API server: engine client stopped")
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    partial(engine_client.shutdown, timeout=timeout),
+                )
+            except BaseException as error:
+                errors.append(error)
+            logger.info_once("[shutdown] API server: engine client stopped")
 
 
 def _log_routes(app: FastAPI) -> None:
@@ -352,7 +413,7 @@ def _build_server(
 
     config = uvicorn.Config(app, **uvicorn_kwargs)
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
-    config.h11_max_header_count = h11_max_header_count  # type: ignore[attr-defined]
+    config.h11_max_header_count = h11_max_header_count
     config.load()
     server = uvicorn.Server(config)
     app.state.server = server
@@ -383,12 +444,32 @@ def _task_failure(task: asyncio.Task[Any]) -> BaseException | None:
     return task.exception()
 
 
+def _participant_supervision_failure(
+    failure_task: asyncio.Task[None],
+) -> BaseException:
+    """Reduce a completed ``wait_failed()`` to the failure it always is.
+
+    ``wait_failed()`` exists to block until a participant fails, so any way it
+    can finish is a failure: it raised, it returned without naming a cause, or
+    something cancelled it out from under the coordinator.  The latter two are
+    reported as ordinary exceptions rather than ``CancelledError`` so they
+    travel the same coordinated path as the first and never read as this
+    launcher itself being cancelled.
+    """
+    if failure_task.cancelled():
+        return RuntimeError("application participant supervision was cancelled")
+    error = failure_task.exception()
+    if error is not None:
+        return error
+    return RuntimeError("application participant supervision ended without a cause")
+
+
 async def _watchdog_loop(
     server: uvicorn.Server,
     engine: EngineClient,
 ) -> None:
     while True:
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(_WATCHDOG_INTERVAL_S)
         engine_errored = engine.errored and not engine.is_running
         if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
             raise RuntimeError("engine client failed its HTTP watchdog")
