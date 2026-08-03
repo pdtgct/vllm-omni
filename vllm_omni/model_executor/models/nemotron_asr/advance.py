@@ -855,6 +855,7 @@ def _mrv1_projection_invariant_rows(
     *,
     park_id: int,
     blank_id: int,
+    eou_token_id: int | None = None,
 ) -> torch.Tensor:
     """Validate MRV1 output and queue/book transitions exactly on device.
 
@@ -877,6 +878,8 @@ def _mrv1_projection_invariant_rows(
     finite = torch.isfinite(decision)
     integral = finite & (decision == decision.trunc())
     legal = (decision == park_id) | ((decision >= 0) & (decision < blank_id))
+    if eou_token_id is not None:
+        legal |= decision == eou_token_id
     bad = (~integral) | (~legal)
     if rows.shape[1] > 1:
         bad |= (rows[:, 1:] != 0).any(dim=1)
@@ -3044,6 +3047,7 @@ def advance_model_rows(
         status,
         park_id=park_id,
         blank_id=blank,
+        eou_token_id=eou_token_id if endpoint_enabled else None,
     )
     status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     failed = status != 0
