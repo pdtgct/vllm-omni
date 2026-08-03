@@ -338,10 +338,22 @@ def observe_chunk_tensors(
         & (last_symbol == int(FrameSymbol.BLANK))
         & (silent > threshold_frames)
     )
-    width = int(token_ids.shape[1])
+    label_width = int(token_ids.shape[1])
+    # PORT-DEC-005 reserves one control column beyond the checkpoint's
+    # complete nonblank-label capacity.  Endpointing must never steal the
+    # last legal RNN-T label slot merely because the same CHUNK closes a
+    # semantic segment.
+    width = label_width + 1
+    next_tokens = torch.zeros(
+        rows,
+        width,
+        dtype=token_ids.dtype,
+        device=token_ids.device,
+    )
+    if label_width:
+        next_tokens[:, :label_width] = token_ids
     overflow = is_eou & (token_lengths.long() >= width)
-    safe_index = token_lengths.long().clamp(min=0, max=max(width - 1, 0))
-    next_tokens = token_ids.clone()
+    safe_index = token_lengths.long().clamp(min=0, max=width - 1)
     if width:
         previous = next_tokens.gather(1, safe_index.unsqueeze(1)).squeeze(1)
         next_tokens.scatter_(

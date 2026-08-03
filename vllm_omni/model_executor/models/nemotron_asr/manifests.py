@@ -149,7 +149,9 @@ PRECISION_POLICY_ID = "fp32-bringup-v1"
 SESSION_LIMITS: dict[str, int] = {
     "max_symbols_per_step": 10,
     "max_frames_per_chunk": 14,
-    "queue_capacity": 140,
+    # Full checkpoint label capacity plus one optional semantic EOU control.
+    # Park is emitted directly and never enters the replay queue.
+    "queue_capacity": 141,
     "carrier_sequence_modulus": 2**24,
 }
 
@@ -213,7 +215,7 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
     ``init`` vocabulary: ``"zeros"`` | ``"blank_label"`` |
     ``"admitted_prompt"`` | ``"admitted_geometry"``.
     ``total_page_bytes`` is the exact sum over entries (the A8 pin:
-    6,314,864 for the published checkpoint's geometry).
+    6,314,944 for the published checkpoint's geometry).
 
     Args:
         config: the checkpoint's ``NemotronASRConfig`` (or equivalent),
@@ -267,9 +269,9 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
         }
     )
     # The replay group precedes the int64 frontend counters deliberately.
-    # Its 28-byte scalar book closes the 4-byte alignment remainder left by
-    # the frontend float buffers, so the one aggregate page needs no hidden
-    # padding and retains the manifest's exact 6,314,936-byte footprint.
+    # The 141-slot queue plus 28-byte scalar book leave the page four bytes
+    # short of the counters' 8-byte alignment, so that padding is published
+    # and initialized explicitly rather than hidden in allocator arithmetic.
     entries.append(
         {
             "name": "decode.layers.0.replay.queue",
@@ -287,6 +289,14 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
                 "init": init,
             }
         )
+    entries.append(
+        {
+            "name": "padding.frontend_counters_alignment",
+            "shape": [1],
+            "dtype": "int32",
+            "init": "zeros",
+        }
+    )
     for counter in FRONTEND_COUNTER_FIELDS:
         entries.append(
             {

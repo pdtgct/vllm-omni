@@ -87,7 +87,7 @@ def _expected_inventory() -> list[dict[str, Any]]:
             _entry("frontend.mel_tail", [128, 9], "float32"),
         )
     )
-    entries.append(_entry("decode.layers.0.replay.queue", [140], "int32"))
+    entries.append(_entry("decode.layers.0.replay.queue", [141], "int32"))
     for name, init in (
         ("queue_head", "zeros"),
         ("queue_length", "zeros"),
@@ -98,6 +98,7 @@ def _expected_inventory() -> list[dict[str, Any]]:
         ("expected_label", "zeros"),
     ):
         entries.append(_entry(f"decode.layers.0.replay.book.{name}", [1], "int32", init))
+    entries.append(_entry("padding.frontend_counters_alignment", [1], "int32"))
     for counter in (
         "total_valid_samples",
         "committed_mel_frames",
@@ -149,7 +150,7 @@ def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
     assert manifest["schema"] == "state-manifest-v1"
     assert manifest["precision_policy"] == "fp32-bringup-v1"
     assert entries == expected
-    assert len(entries) == len({entry["name"] for entry in entries}) == 99
+    assert len(entries) == len({entry["name"] for entry in entries}) == 100
 
     assert sum(entry["name"].endswith(".window.channel") for entry in entries) == 24
     assert sum(entry["name"].endswith(".window.valid") for entry in entries) == 24
@@ -158,7 +159,8 @@ def test_checkpoint_profile_declares_one_complete_resumable_bundle() -> None:
     assert sum(entry["name"].startswith("predictor.") for entry in entries) == 2
     assert sum(entry["name"].startswith("decode.") for entry in entries) == 8
     assert sum(entry["name"].startswith("endpoint.") for entry in entries) == 7
+    assert sum(entry["name"].startswith("padding.") for entry in entries) == 1
 
     total_bytes = sum(_entry_bytes(entry) for entry in expected)
-    assert total_bytes == 6_314_940
+    assert total_bytes == 6_314_944
     assert manifest["total_page_bytes"] == total_bytes

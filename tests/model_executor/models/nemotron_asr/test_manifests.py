@@ -19,9 +19,8 @@ being rewritten (the LID tests-first rule).
 
 The canonical layout pins the DECIDED design inventory
 (PORT-STATE-001/009, ``port-design.md``'s state-page table): total
-6,314,864 bytes (~6.0223 MiB) FP32 bring-up =
-6,291,552 (24-layer window/conv/valid) + 12,484 (frontend page)
-+ 10,240 (predictor h/c) + 560 (queue) + 28 (7-slot book).
+6,314,944 bytes (~6.0223 MiB) FP32 bring-up, including the explicit
+4-byte alignment descriptor required after the 141-slot replay queue.
 """
 
 from __future__ import annotations
@@ -130,7 +129,7 @@ def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
     entries.append(
         {
             "name": "decode.layers.0.replay.queue",
-            "shape": [140],
+            "shape": [141],
             "dtype": "int32",
             "init": "zeros",
         }
@@ -152,6 +151,14 @@ def _expected_entries(cfg: Any) -> list[dict[str, Any]]:
                 "init": init,
             }
         )
+    entries.append(
+        {
+            "name": "padding.frontend_counters_alignment",
+            "shape": [1],
+            "dtype": "int32",
+            "init": "zeros",
+        }
+    )
     for counter in (
         "total_valid_samples",
         "committed_mel_frames",
@@ -316,16 +323,16 @@ def test_canonical_fp32_layout_arithmetic_is_auditable() -> None:
     # Frontend: 1953*4 + 128*9*4 + 8 counters * 8 bytes = 12,484.
     assert 1953 * 4 + 128 * 9 * 4 + 8 * 8 == 12_484
     # Predictor h/c: 2 * (2*640*4) = 10,240; queue 141*4 = 564;
-    # 7-slot int32 book = 28.
-    total = 6_291_552 + 12_484 + 10_240 + 564 + 28
+    # 7-slot int32 book = 28; explicit int64-alignment padding = 4.
+    total = 6_291_552 + 12_484 + 10_240 + 564 + 28 + 4
     # Installed endpoint capacity 12: 12 int32 ring slots + six int32
     # book fields. The pre-endpoint A8 subtotal remains independently
     # auditable and no endpoint state can hide in a side store.
     endpoint = 12 * 4 + 6 * 4
-    assert total == 6_314_868
+    assert total == 6_314_872
     assert endpoint == 72
     entries = _expected_entries(_checkpoint_config())
-    assert sum(_entry_bytes(e) for e in entries) == 6_314_940
+    assert sum(_entry_bytes(e) for e in entries) == 6_314_944
 
 
 def test_carrier_width_covers_header_plus_largest_raw_cadence() -> None:
@@ -384,7 +391,7 @@ def test_author_state_manifest_produces_the_exact_canonical_layout() -> None:
     authored = manifests.author_state_manifest(_checkpoint_config())
     expected = _expected_state_manifest(_checkpoint_config())
     assert authored == expected
-    assert authored["total_page_bytes"] == 6_314_940
+    assert authored["total_page_bytes"] == 6_314_944
 
 
 def test_author_state_manifest_derives_from_config_not_the_checkpoint() -> None:

@@ -38,12 +38,13 @@ def test_manifest_builds_one_exact_aggregate_and_zero_copy_pool_views() -> None:
     storage.initialize_fresh_state_slot(1, generation=4)
     pools = project_nemotron_state_pools(storage, n_layers=24)
 
-    assert len(spec.descriptors) == 99
+    assert len(spec.descriptors) == 100
     assert len(pools.channel) == len(pools.convolution) == 24
     assert pools.replay_book.shape == (2, 7)
     assert pools.frontend_counters.shape == (2, 8)
     assert pools.endpoint_book.shape == (2, 6)
     assert pools.replay_book[1, 2].item() == 13_087
+    assert storage.views["padding.frontend_counters_alignment"][1].item() == 0
 
     pools.replay_book[1, 4] = 9
     pools.frontend_counters[1, 7] = 1
