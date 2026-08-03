@@ -2965,6 +2965,49 @@ def test_adapter_drained_replay_parks_and_clears_echo() -> None:
     assert int(proj.book[0, _BOOK["queue_head"]]) == 2
 
 
+def test_endpoint_control_is_a_legal_replay_decision_only_when_installed() -> None:
+    # @spec PORT-DEC-005 / PORT-SEG-003 / PORT-ADV-004
+    eou_token_id = VOCAB + 3
+    queue = torch.zeros(1, CAP, dtype=torch.int32)
+    queue[0, 0] = eou_token_id
+    book = torch.zeros(1, BOOK_WIDTH, dtype=torch.int32)
+    book[0, _BOOK["queue_length"]] = 1
+    ctx = _context(
+        roles=[advance.ROLE_REPLAY],
+        input_ids=[4],
+        chunk_rows=[],
+        queue=queue,
+        book=book,
+    )
+    result = advance.AdvanceResult(
+        token_ids=torch.zeros(0, 0, dtype=torch.int32),
+        token_lengths=torch.zeros(0, dtype=torch.int32),
+    )
+    projection = _adapter()(result, ctx)
+    assert int(projection.rows[0, 0]) == eou_token_id
+
+    installed_bad = advance._mrv1_projection_invariant_rows(
+        result,
+        ctx,
+        projection,
+        torch.zeros(1, dtype=torch.int32),
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+        eou_token_id=eou_token_id,
+    )
+    disabled_bad = advance._mrv1_projection_invariant_rows(
+        result,
+        ctx,
+        projection,
+        torch.zeros(1, dtype=torch.int32),
+        park_id=PARK_ID,
+        blank_id=VOCAB,
+        eou_token_id=None,
+    )
+    assert installed_bad.tolist() == [False]
+    assert disabled_bad.tolist() == [True]
+
+
 def test_adapter_queue_saturation_full_capacity_burst() -> None:
     adapter = _adapter()
     burst = torch.arange(1, CAP + 1, dtype=torch.int32).unsqueeze(0)
