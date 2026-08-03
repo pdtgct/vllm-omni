@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from vllm_omni.metrics import streaming_transport
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.persistent_state import (
     allocate_runner_persistent_state,
@@ -233,10 +234,22 @@ class GPUARModelRunnerV2(GPUModelRunner):
             self._omni_finished_req_ids = frozenset()
             self._omni_preempted_req_ids = frozenset()
 
+    # @spec PORT-OBS-008, PORT-OBS-009
     def sample_tokens(self, grammar_output: Any) -> Any:
-        """Forward committed model status at the scheduler boundary."""
+        """Forward committed model status and batch stats at the boundary."""
 
         output = super().sample_tokens(grammar_output)
+        model_runner_output = getattr(output, "model_runner_output", output)
+        consume_batch_stats = getattr(
+            self.model,
+            "consume_batch_stats",
+            None,
+        )
+        if model_runner_output is not None and callable(consume_batch_stats):
+            streaming_transport.drain_batch_stats_into_runner_output(
+                self.model,
+                model_runner_output,
+            )
         collect = getattr(self.model, "collect_commit_status", None)
         if not callable(collect):
             return output
@@ -244,7 +257,6 @@ class GPUARModelRunnerV2(GPUModelRunner):
         if not model_status and not failed_req_ids:
             return output
 
-        model_runner_output = getattr(output, "model_runner_output", output)
         if model_runner_output is None:
             raise RuntimeError(
                 "model transaction status has no model-runner output carrier"

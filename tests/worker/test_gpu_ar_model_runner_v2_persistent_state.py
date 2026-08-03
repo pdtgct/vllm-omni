@@ -369,6 +369,45 @@ def test_sample_boundary_consumes_clean_status_before_the_next_transaction(
     }
 
 
+@pytest.mark.parametrize("async_wrapped", [False, True])
+def test_sample_boundary_drains_streaming_batch_stats_under_mrv2(
+    monkeypatch: pytest.MonkeyPatch,
+    async_wrapped: bool,
+) -> None:
+    # @spec PORT-OBS-008, PORT-OBS-009
+    class BatchStatsModel:
+        def __init__(self) -> None:
+            self.consume_calls = 0
+
+        def consume_batch_stats(self) -> list[tuple[str, int]]:
+            self.consume_calls += 1
+            return [("1120", 4)]
+
+        def collect_commit_status(self) -> tuple[dict[str, int], set[str]]:
+            return {}, set()
+
+    runner = _runner()
+    model = BatchStatsModel()
+    runner.model = model
+    model_runner_output = SimpleNamespace()
+    core_output = (
+        SimpleNamespace(model_runner_output=model_runner_output)
+        if async_wrapped
+        else model_runner_output
+    )
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "sample_tokens",
+        lambda self, grammar_output: core_output,
+    )
+
+    actual = type(runner).sample_tokens(runner, grammar_output=None)
+
+    assert actual is core_output
+    assert model.consume_calls == 1
+    assert model_runner_output.streaming_chunk_batch_stats == [("1120", 4)]
+
+
 def test_dummy_profile_projection_is_marked_but_not_reconciled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
