@@ -500,6 +500,10 @@ class NemotronSessionLease:
                 prompt=self._rendered(render),
                 request_id=self._request_id,
                 sampling_params_list=_streaming_sampling_params(self._engine),
+                # The persistent-state binding is keyed by this exact id
+                # (lease session_key); a default AsyncOmni uuid suffix would
+                # break the scheduler's binding-identity invariant.
+                request_id_already_unique=True,
             )
             async for output in outputs:
                 if getattr(output, "stage_id", 0) not in (None, 0):

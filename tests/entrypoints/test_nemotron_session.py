@@ -45,6 +45,7 @@ from collections.abc import Awaitable, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -211,8 +212,14 @@ class FakeAsyncOmni:
     """AsyncOmni stand-in: scripted generate outputs, recorded abort.
 
     ``generate`` mirrors the real keyword surface (``prompt`` async
-    generator, ``request_id``, ``sampling_params_list``); the script
-    maps each consumed rendered prompt to output batches.
+    generator, ``request_id``, ``sampling_params_list``,
+    ``request_id_already_unique``); the script maps each consumed
+    rendered prompt to output batches. Like the real ``AsyncOmni``,
+    a call WITHOUT ``request_id_already_unique=True`` suffixes the
+    request id — the recorded ``request_ids`` therefore reflect the
+    identity the engine actually tracks, which the scheduler's
+    persistent-state claim requires to equal the lease's
+    request/session key (PORT-STATE-019).
     """
 
     def __init__(self, *, script: Any = None, stop_after: int | None = None) -> None:
@@ -267,8 +274,25 @@ class FakeAsyncOmni:
         self.pending_cleanup_calls.append(lease)
         return self.pending_cleanup_wins
 
-    async def generate(self, *, prompt: Any, request_id: str, sampling_params_list: Any) -> Any:
+    def _track_generate(
+        self,
+        request_id: str,
+        request_id_already_unique: bool,
+    ) -> None:
+        """Mirror ``AsyncOmni.generate``'s id handling exactly."""
+        if not request_id_already_unique:
+            request_id = f"{request_id}-{uuid4().hex[:8]}"
         self.request_ids.append(request_id)
+
+    async def generate(
+        self,
+        *,
+        prompt: Any,
+        request_id: str,
+        sampling_params_list: Any,
+        request_id_already_unique: bool = False,
+    ) -> Any:
+        self._track_generate(request_id, request_id_already_unique)
         self.sampling = sampling_params_list
         index = 0
         async for item in prompt:
@@ -438,8 +462,9 @@ def test_feed_notifies_piece_acceptance_before_carrier_completion() -> None:
                 prompt: Any,
                 request_id: str,
                 sampling_params_list: Any,
+                request_id_already_unique: bool = False,
             ) -> Any:
-                self.request_ids.append(request_id)
+                self._track_generate(request_id, request_id_already_unique)
                 self.sampling = sampling_params_list
                 async for item in prompt:
                     self.prompts.append(item)
@@ -493,6 +518,42 @@ def test_factory_opens_selected_cadence_without_a_parallel_limiter() -> None:
         assert lease.session.geometry.cadence == _CADENCE
         assert lease.session.prompt_index == PROMPTS["en-US"]
         await lease.release()
+        await lease.release()
+
+    _run(scenario())
+
+
+# @spec PORT-STATE-019, PORT-RTC-003
+def test_factory_lease_submits_engine_request_under_the_lease_session_key() -> None:
+    """The engine-tracked request id must equal the reserved session_key.
+
+    ``AsyncOmni.generate`` suffixes the request id unless the caller
+    declares it already unique. The persistent-state binding travels
+    under the lease's session_key, and the scheduler keys the claimed
+    binding by the ENGINE request id — a suffixed submission therefore
+    fails ``prepare_attn``'s identity check ("persistent-state binding
+    request mismatch") on the bounded-stream lane. The fake engine
+    mirrors the real suffixing contract, so this test fails if the
+    lease ever lets the default rewrite happen.
+    """
+
+    async def scenario() -> None:
+        engine = FakeAsyncOmni(
+            script=lambda item, index: [_out([7, PARK_ID], text=" ok")]
+        )
+        factory = NemotronSessionFactory(engine=engine)
+        lease = await factory.open(cadence=_CADENCE, locale="en-US")
+
+        async def render(prompt: Any) -> Any:
+            return SimpleNamespace(prompt=prompt)
+
+        lease._render = render
+        assert lease._state_lease.session_key == lease.request_id
+
+        await lease.feed(_audio(_CHUNK))
+
+        assert engine.request_ids == [lease.request_id]
+        await lease.abort()
         await lease.release()
 
     _run(scenario())
@@ -617,8 +678,9 @@ def test_factory_finalization_timeout_aborts_without_terminal_result() -> None:
                 prompt: Any,
                 request_id: str,
                 sampling_params_list: Any,
+                request_id_already_unique: bool = False,
             ) -> Any:
-                self.request_ids.append(request_id)
+                self._track_generate(request_id, request_id_already_unique)
                 self.sampling = sampling_params_list
                 async for item in prompt:
                     self.prompts.append(item)
