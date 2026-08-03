@@ -2,13 +2,18 @@ import gc
 import os
 
 import torch
+from vllm.config.compilation import CompilationMode
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+from vllm.utils.gpu_sync_debug import enable_gpu_sync_check
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
@@ -28,6 +33,99 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     Extends the base GPUWorker to initialize and manage autoregressive
     model runners for text generation stages (e.g., thinker stages).
     """
+
+    def _has_persistent_only_cache(self) -> bool:
+        """Return whether this runner has state but no token-cache group."""
+
+        storage = getattr(
+            self.model_runner,
+            "_persistent_state_storage",
+            None,
+        )
+        config = getattr(self.model_runner, "kv_cache_config", None)
+        groups = None if config is None else config.kv_cache_groups
+        return storage is not None and groups == []
+
+    def _has_persistent_cache(self) -> bool:
+        """Return whether the runner owns an allocated state group."""
+
+        return (
+            getattr(
+                self.model_runner,
+                "_persistent_state_storage",
+                None,
+            )
+            is not None
+        )
+
+    @instrument(span_name="Warmup persistent-only model (GPU)")
+    def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
+        """Finish eager worker warmup without inventing token-cache requests.
+
+        Core MRv2's final ``warmup_kernels`` pass constructs synthetic text
+        requests and divides capacity by their attention/Mamba block demand.
+        A persistent-state-only model deliberately has no such cache group;
+        its canonical maximum-shape profile has already executed the model and
+        sampler. Preserve core's model-neutral kernel warmup and operational
+        postamble while omitting only that incompatible synthetic-request pass.
+
+        This specialization is intentionally limited to the already-enforced
+        eager, non-compiled lane. A future execution-mode expansion must first
+        qualify the corresponding core warmup/capture behavior.
+        """
+
+        if not self.model_config.enforce_eager:
+            raise RuntimeError(
+                "persistent-only warmup requires eager execution"
+            )
+        if self.compilation_config.mode != CompilationMode.NONE:
+            raise RuntimeError(
+                "persistent-only warmup does not support model compilation"
+            )
+
+        self.model_runner.maybe_remove_all_loras(
+            self.model_runner.lora_config
+        )
+        kernel_warmup(self)
+
+        warmup_resident_state = getattr(
+            self.model_runner.model,
+            "warmup_resident_state",
+            None,
+        )
+        if not callable(warmup_resident_state):
+            raise RuntimeError(
+                "persistent-only model does not expose resident-state warmup"
+            )
+        warmup_resident_state()
+
+        # Profiling and warmup must not perturb request-time randomness.
+        set_random_seed(self.model_config.seed)
+
+        from vllm.utils.jit_monitor import activate as activate_jit_monitor
+
+        activate_jit_monitor(
+            mode=self.observability_config.jit_monitor_mode,
+            verbose=self.observability_config.jit_monitor_verbose,
+        )
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
+        enable_gpu_sync_check()
+        return CompilationTimes(
+            language_model=self.compilation_config.compilation_time,
+            encoder=self.compilation_config.encoder_compilation_time,
+        )
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Warm ordinary runners normally and persistent-only runners natively."""
+
+        if self._has_persistent_only_cache():
+            return self._compile_or_warm_up_persistent_only_model()
+        if self._has_persistent_cache():
+            raise RuntimeError(
+                "mixed persistent and token-cache warmup is not qualified"
+            )
+        return super().compile_or_warm_up_model()
 
     @instrument(span_name="Init device")
     def init_device(self):

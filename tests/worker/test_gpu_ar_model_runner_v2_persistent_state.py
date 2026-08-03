@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_worker import Worker as CoreGPUWorker
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,6 +25,17 @@ def _runner_cls() -> type[Any]:
             pytrace=False,
         )
     return cast(type[Any], module.GPUARModelRunnerV2)
+
+
+def _worker_cls() -> type[Any]:
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+    if "compile_or_warm_up_model" not in GPUARWorker.__dict__:
+        pytest.fail(
+            "PORT-ADV-003 missing persistent-only worker warmup",
+            pytrace=False,
+        )
+    return GPUARWorker
 
 
 class _ProjectionState:
@@ -377,3 +389,184 @@ def test_worker_selects_v2_without_mutating_the_requested_runner() -> None:
     source = inspect.getsource(GPUARWorker.init_device)
     assert "self.use_v2_model_runner = False" not in source
     assert "GPUARModelRunnerV2" in source
+
+
+def _worker(*, persistent: bool, ordinary_groups: int) -> Any:
+    worker = object.__new__(_worker_cls())
+    worker.model_runner = SimpleNamespace(
+        _persistent_state_storage=object() if persistent else None,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[object()] * ordinary_groups,
+        ),
+        model=SimpleNamespace(),
+    )
+    return worker
+
+
+def test_persistent_only_worker_skips_core_text_cache_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-003 / PORT-MIG-005
+    worker_cls = _worker_cls()
+    worker = _worker(persistent=True, ordinary_groups=0)
+    events: list[str] = []
+    marker = object()
+    monkeypatch.setattr(
+        CoreGPUWorker,
+        "compile_or_warm_up_model",
+        lambda self: pytest.fail(
+            "PORT-ADV-003 persistent-only warmup entered core text warmup",
+            pytrace=False,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_cls,
+        "_compile_or_warm_up_persistent_only_model",
+        lambda self: events.append("persistent-only") or marker,
+    )
+    actual = worker_cls.compile_or_warm_up_model(worker)
+
+    assert actual is marker
+    assert events == ["persistent-only"]
+
+
+def test_nonpersistent_worker_preserves_core_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-003 / PORT-MIG-006
+    worker_cls = _worker_cls()
+    worker = _worker(persistent=False, ordinary_groups=1)
+    events: list[str] = []
+    marker = object()
+    monkeypatch.setattr(
+        CoreGPUWorker,
+        "compile_or_warm_up_model",
+        lambda self: events.append("core") or marker,
+    )
+
+    actual = worker_cls.compile_or_warm_up_model(worker)
+
+    assert actual is marker
+    assert events == ["core"]
+
+
+def test_mixed_persistent_and_token_cache_warmup_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-003 / PORT-MIG-006
+    worker_cls = _worker_cls()
+    worker = _worker(persistent=True, ordinary_groups=1)
+    monkeypatch.setattr(
+        CoreGPUWorker,
+        "compile_or_warm_up_model",
+        lambda self: pytest.fail(
+            "PORT-ADV-003 mixed persistent cache silently entered core warmup",
+            pytrace=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="mixed.*not qualified"):
+        worker_cls.compile_or_warm_up_model(worker)
+
+
+def test_persistent_only_warmup_preserves_the_core_operational_postamble(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-003 / PORT-MIG-005 / PORT-MIG-006
+    from vllm.config.compilation import CompilationMode
+
+    module = importlib.import_module("vllm_omni.worker.gpu_ar_worker")
+    worker_cls = _worker_cls()
+    if "_compile_or_warm_up_persistent_only_model" not in worker_cls.__dict__:
+        pytest.fail(
+            "PORT-ADV-003 missing persistent-only worker warmup lifecycle",
+            pytrace=False,
+        )
+    worker = _worker(persistent=True, ordinary_groups=0)
+    events: list[str] = []
+    worker.model_runner.maybe_remove_all_loras = (
+        lambda config: events.append("remove-loras")
+    )
+    worker.model_runner.lora_config = None
+    worker.model_runner.model.warmup_resident_state = lambda: events.append(
+        "resident-state"
+    )
+    worker.model_config = SimpleNamespace(enforce_eager=True, seed=17)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.NONE,
+            backend="",
+            compilation_time=1.5,
+            encoder_compilation_time=2.5,
+        ),
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off",
+            jit_monitor_verbose=False,
+        ),
+    )
+    worker.compilation_config = worker.vllm_config.compilation_config
+    worker.observability_config = worker.vllm_config.observability_config
+    monkeypatch.setattr(
+        module,
+        "kernel_warmup",
+        lambda value: events.append("kernel-warmup"),
+    )
+    monkeypatch.setattr(
+        module,
+        "set_random_seed",
+        lambda seed: events.append(f"seed:{seed}"),
+    )
+    monkeypatch.setattr(
+        module,
+        "freeze_gc_heap",
+        lambda: events.append("freeze-gc"),
+    )
+    monkeypatch.setattr(
+        module,
+        "maybe_attach_gc_debug_callback",
+        lambda: events.append("gc-debug"),
+    )
+    monkeypatch.setattr(
+        module,
+        "enable_gpu_sync_check",
+        lambda: events.append("gpu-sync-check"),
+    )
+    jit_monitor = importlib.import_module("vllm.utils.jit_monitor")
+    monkeypatch.setattr(
+        jit_monitor,
+        "activate",
+        lambda **kwargs: events.append("jit-monitor"),
+    )
+
+    result = worker_cls._compile_or_warm_up_persistent_only_model(worker)
+
+    assert result.language_model == 1.5
+    assert result.encoder == 2.5
+    assert events == [
+        "remove-loras",
+        "kernel-warmup",
+        "resident-state",
+        "seed:17",
+        "jit-monitor",
+        "freeze-gc",
+        "gc-debug",
+        "gpu-sync-check",
+    ]
+
+
+def test_core_warmup_pin_guard_keeps_the_persistent_only_divergence_narrow() -> None:
+    # @spec PORT-MIG-006
+    source = inspect.getsource(CoreGPUWorker.compile_or_warm_up_model)
+    ordered = (
+        "self.model_runner.maybe_remove_all_loras",
+        "kernel_warmup(self)",
+        "self.model_runner.capture_model()",
+        "warmup_kernels(self.model_runner",
+        "set_random_seed(self.model_config.seed)",
+        "activate_jit_monitor(",
+        "freeze_gc_heap()",
+        "enable_gpu_sync_check()",
+        "return CompilationTimes(",
+    )
+    offsets = [source.index(fragment) for fragment in ordered]
+    assert offsets == sorted(offsets)
