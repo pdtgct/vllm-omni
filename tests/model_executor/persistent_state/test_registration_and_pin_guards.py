@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -65,9 +66,25 @@ def test_platform_registration_runs_after_core_builtins_and_is_idempotent(
     monkeypatch.setattr(KVCacheSpecRegistry, "register", record_registration)
     from vllm import platforms as vllm_platforms
 
-    from vllm_omni.platforms import current_omni_platform
+    import vllm_omni.platforms as omni_platforms
+    from vllm_omni.engine.stage_engine_core_proc import (
+        _install_omni_platform_for_stage_core,
+    )
 
-    monkeypatch.setattr(vllm_platforms, "current_platform", current_omni_platform)
+    resolved_omni_platform = SimpleNamespace(
+        is_unspecified=lambda: False,
+        register_custom_kv_cache_specs=(
+            omni_platforms.OmniPlatform.register_custom_kv_cache_specs
+        ),
+    )
+    monkeypatch.setattr(
+        omni_platforms,
+        "_current_omni_platform",
+        resolved_omni_platform,
+    )
+    monkeypatch.setattr(vllm_platforms, "current_platform", object())
+    _install_omni_platform_for_stage_core()
+    assert vllm_platforms.current_platform is resolved_omni_platform
     before_models = dict(MODELS_CONFIG_MAP)
 
     register_all_kvcache_specs(None)
@@ -84,8 +101,8 @@ def test_platform_registration_runs_after_core_builtins_and_is_idempotent(
     assert min(custom_positions) > max(builtin_positions)
 
     metadata_before_repeat = registry[spec_cls]
-    current_omni_platform.register_custom_kv_cache_specs(None)
-    current_omni_platform.register_custom_kv_cache_specs(None)
+    resolved_omni_platform.register_custom_kv_cache_specs(None)
+    resolved_omni_platform.register_custom_kv_cache_specs(None)
     assert registry[spec_cls] == metadata_before_repeat
     assert dict(MODELS_CONFIG_MAP) == before_models
 

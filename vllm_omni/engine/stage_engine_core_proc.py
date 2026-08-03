@@ -48,6 +48,18 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _install_omni_platform_for_stage_core() -> None:
+    """Install Omni's platform before core cache-spec registration."""
+
+    from vllm import platforms as vllm_platforms
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_unspecified():
+        raise RuntimeError("stage core requires a resolved Omni platform")
+    vllm_platforms.current_platform = current_omni_platform
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -445,6 +457,7 @@ class StageEngineCoreProc(EngineCoreProc):
         """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
+        _install_omni_platform_for_stage_core()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves
