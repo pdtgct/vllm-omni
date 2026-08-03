@@ -220,6 +220,11 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         # only post-update residency reconciliation can distinguish terminality.
         del req_id
 
+    def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor:
+        """Return MRv2's ephemeral embedding buffer for profile execution."""
+
+        return self.encoder_runner.inputs_embeds[:num_tokens]
+
     def begin_omni_projection(
         self,
         scheduler_output: object,

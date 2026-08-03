@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import torch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
@@ -52,6 +53,7 @@ def test_model_state_accounts_for_the_complete_v025_hook_surface() -> None:
     projected_hooks = {
         "add_request",
         "remove_request",
+        "dummy_inputs_embeds",
         "get_mm_embeddings",
         "prepare_inputs",
         "prepare_dummy_inputs",
@@ -63,7 +65,6 @@ def test_model_state_accounts_for_the_complete_v025_hook_surface() -> None:
     inherited_hooks = {
         "get_supported_generation_tasks",
         "apply_staged_writes",
-        "dummy_inputs_embeds",
         "gather_mm_embeddings",
         "preprocess_state",
         "postprocess_state",
@@ -73,6 +74,20 @@ def test_model_state_accounts_for_the_complete_v025_hook_surface() -> None:
     assert projected_hooks <= state_cls.__dict__.keys()
     assert inherited_hooks.isdisjoint(state_cls.__dict__)
     assert state_cls.num_new_sampled_tokens_per_step == 1
+
+
+def test_mrv2_profile_uses_the_encoder_runners_ephemeral_embedding_buffer() -> None:
+    # @spec PORT-MIG-005 / PORT-STATE-007
+    state_cls = _module().NemotronASRModelState
+    state = object.__new__(state_cls)
+    backing = torch.arange(40, dtype=torch.float32).reshape(10, 4)
+    state.encoder_runner = SimpleNamespace(inputs_embeds=backing)
+
+    dummy = state.dummy_inputs_embeds(7)
+
+    assert dummy.shape == (7, 4)
+    assert dummy.data_ptr() == backing.data_ptr()
+    assert torch.equal(dummy, backing[:7])
 
 
 def test_core_task_policy_is_generate_plus_realtime_only() -> None:
