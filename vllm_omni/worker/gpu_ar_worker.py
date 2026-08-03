@@ -120,6 +120,23 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         """Warm ordinary runners normally and persistent-only runners natively."""
 
         if self._has_persistent_only_cache():
+            runner = self.model_runner
+            model = runner.model
+            model_state = getattr(runner, "model_state", None)
+            storage = runner._persistent_state_storage
+            state_spec = getattr(storage, "spec", None)
+            logger.info(
+                "Persistent-state execution fingerprint: worker=%s "
+                "runner=%s model=%s model_state=%s state_spec=%s "
+                "is_hybrid=%s eager=%s",
+                type(self).__name__,
+                type(runner).__name__,
+                type(model).__name__,
+                type(model_state).__name__,
+                type(state_spec).__name__,
+                bool(getattr(type(model), "is_hybrid", False)),
+                bool(self.model_config.enforce_eager),
+            )
             return self._compile_or_warm_up_persistent_only_model()
         if self._has_persistent_cache():
             raise RuntimeError(

@@ -393,6 +393,7 @@ def test_worker_selects_v2_without_mutating_the_requested_runner() -> None:
 
 def _worker(*, persistent: bool, ordinary_groups: int) -> Any:
     worker = object.__new__(_worker_cls())
+    worker.model_config = SimpleNamespace(enforce_eager=True)
     worker.model_runner = SimpleNamespace(
         _persistent_state_storage=object() if persistent else None,
         kv_cache_config=SimpleNamespace(
@@ -428,6 +429,62 @@ def test_persistent_only_worker_skips_core_text_cache_warmup(
 
     assert actual is marker
     assert events == ["persistent-only"]
+
+
+def test_persistent_only_worker_logs_actual_execution_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005 / PORT-MIG-006 / PORT-STATE-002
+    module = importlib.import_module("vllm_omni.worker.gpu_ar_worker")
+    worker_cls = _worker_cls()
+    worker = _worker(persistent=True, ordinary_groups=0)
+
+    class LoadedModel:
+        is_hybrid = False
+
+    class LoadedModelState:
+        pass
+
+    class LoadedPersistentStateSpec:
+        pass
+
+    class LoadedPersistentStateStorage:
+        spec = LoadedPersistentStateSpec()
+
+    worker.model_runner.model = LoadedModel()
+    worker.model_runner.model_state = LoadedModelState()
+    worker.model_runner._persistent_state_storage = (
+        LoadedPersistentStateStorage()
+    )
+    worker.model_config = SimpleNamespace(enforce_eager=True)
+    marker = object()
+    monkeypatch.setattr(
+        worker_cls,
+        "_compile_or_warm_up_persistent_only_model",
+        lambda self: marker,
+    )
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        module.logger,
+        "info",
+        lambda message, *args: logged.append((message, *args)),
+    )
+
+    assert worker_cls.compile_or_warm_up_model(worker) is marker
+    assert logged == [
+        (
+            "Persistent-state execution fingerprint: worker=%s "
+            "runner=%s model=%s model_state=%s state_spec=%s "
+            "is_hybrid=%s eager=%s",
+            "GPUARWorker",
+            "SimpleNamespace",
+            "LoadedModel",
+            "LoadedModelState",
+            "LoadedPersistentStateSpec",
+            False,
+            True,
+        )
+    ]
 
 
 def test_nonpersistent_worker_preserves_core_warmup(

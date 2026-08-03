@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import socket
@@ -147,6 +148,12 @@ class StageEngineCoreClientBase(StageClientBase):
             self.custom_process_input_func = metadata.custom_process_input_func
 
         self.engine_outputs: Any = None
+        # Stage clients and their ZMQ output handlers are created on the
+        # orchestrator thread's event loop.  API-process services may invoke
+        # utility methods from the HTTP loop, so retain the owning loop and
+        # marshal those calls back to it rather than resolving an asyncio
+        # Future from a foreign thread.
+        self._owner_loop = asyncio.get_running_loop()
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
@@ -238,6 +245,26 @@ class StageEngineCoreClientBase(StageClientBase):
             request.request_id,
         )
         await super().add_request_async(request)
+
+    async def call_utility_async(self, method: str, *args: Any) -> Any:
+        """Execute stage utilities on the stage client's owning event loop."""
+
+        owner_loop = self._owner_loop
+        if asyncio.get_running_loop() is owner_loop:
+            return await super().call_utility_async(method, *args)
+        if not owner_loop.is_running():
+            raise EngineDeadError(
+                f"Stage-{self.stage_id} owner event loop is not running"
+            )
+        concurrent_result = asyncio.run_coroutine_threadsafe(
+            super().call_utility_async(method, *args),
+            owner_loop,
+        )
+        try:
+            return await asyncio.wrap_future(concurrent_result)
+        except BaseException:
+            concurrent_result.cancel()
+            raise
 
     # ==================== Stage Methods ====================
 
