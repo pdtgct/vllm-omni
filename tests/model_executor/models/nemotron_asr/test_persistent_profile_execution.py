@@ -291,6 +291,43 @@ def test_forward_consumes_no_state_projection_before_resident_authorities(
     assert calls == ([(2, torch.device("cpu"))] if is_profile else [])
 
 
+def test_profile_forward_accepts_mrv2_embedding_only_dummy_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005 / PORT-STATE-007
+    profile = _profile_module()
+    model_cls = _model_class()
+    model = _no_state_model()
+    calls: list[tuple[int, torch.device]] = []
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        pytest.fail(
+            "PORT-MIG-005 MRv2 profile touched resident authority",
+            pytrace=False,
+        )
+
+    monkeypatch.setattr(model_cls, "_stage_v2_projection", forbidden)
+    monkeypatch.setattr(model_cls, "_state_pools", forbidden)
+    monkeypatch.setattr(
+        profile,
+        "run_persistent_state_profile",
+        lambda value, *, num_rows, device: calls.append((num_rows, device)),
+    )
+    inputs_embeds = torch.zeros(7, 11, dtype=torch.float32)
+
+    output = model.forward(
+        input_ids=None,
+        inputs_embeds=inputs_embeds,
+        persistent_state_projection=_projection(is_profile=True),
+    )
+
+    assert output.shape == inputs_embeds.shape
+    assert output.dtype == inputs_embeds.dtype
+    assert output.device == inputs_embeds.device
+    assert calls == [(2, torch.device("cpu"))]
+
+
 def test_prepare_inputs_snapshot_flows_directly_into_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
