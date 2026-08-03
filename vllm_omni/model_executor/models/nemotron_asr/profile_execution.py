@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     RowPlan,
     advance_model_rows,
     consume_batch_stats,
+    warmup_advance_model_rows_scatter,
 )
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
@@ -196,6 +197,21 @@ def run_persistent_state_profile(
             device=device,
         )
         pools = invocation.pools
+        if device.type == "cuda":
+            warmup_advance_model_rows_scatter(
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+            )
         return advance_model_rows(
             model.core,
             invocation.input_ids,

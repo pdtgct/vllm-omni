@@ -154,6 +154,11 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     )
     monkeypatch.setattr(
         profile,
+        "warmup_advance_model_rows_scatter",
+        lambda **kwargs: events.append(("warmup", kwargs)),
+    )
+    monkeypatch.setattr(
+        profile,
         "consume_batch_stats",
         lambda: events.append(("drain", None)),
     )
@@ -162,12 +167,16 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     profile.run_persistent_state_profile(
         model,
         num_rows=2,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
     )
 
-    assert [name for name, _ in events] == ["log", "build", "advance", "drain"]
+    assert [name for name, _ in events] == ["log", "build", "warmup", "advance", "drain"]
     assert "persistent-state profile execution" in events[0][1][0]
-    advance_args, advance_kwargs = events[2][1]
+    warmup_kwargs = events[2][1]
+    assert warmup_kwargs["channel_pools"] == []
+    assert warmup_kwargs["h_pool"] is invocation.pools.predictor_h
+    assert warmup_kwargs["endpoint_book_pool"] is invocation.pools.endpoint_book
+    advance_args, advance_kwargs = events[3][1]
     assert advance_args[:4] == (
         model.core,
         invocation.input_ids,
