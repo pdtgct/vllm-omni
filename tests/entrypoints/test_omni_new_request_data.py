@@ -52,3 +52,32 @@ def test_omni_new_request_data_allows_missing_payloads():
 
     assert data.prompt_embeds is None
     assert data.additional_information is None
+
+
+def test_omni_new_request_data_rewrap_preserves_v2_prefill_tokens():
+    # @spec PORT-MIG-005 / PORT-MIG-006
+    prefill_token_ids = [301, 302, 303]
+    base = SimpleNamespace(
+        req_id="req-v2",
+        prompt_token_ids=[301],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([7],),
+        num_computed_tokens=0,
+        lora_request=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=[True],
+        prefill_token_ids=prefill_token_ids,
+    )
+    request = SimpleNamespace(
+        external_req_id="external-v2",
+        prompt_embeds=None,
+        additional_information={"source": "test"},
+    )
+
+    data = OmniNewRequestData.from_new_request_data(base, request)
+
+    assert data.prefill_token_ids is prefill_token_ids
+    assert data.external_req_id == "external-v2"
+    assert data.additional_information == {"source": "test"}

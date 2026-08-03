@@ -10,8 +10,10 @@ import pytest
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
+import vllm_omni.core.sched.omni_ar_scheduler as scheduler_mod
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 # isort: on
@@ -90,3 +92,54 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_scheduler_rewrap_preserves_v2_prefill_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005 / PORT-MIG-006
+    scheduler = _make_scheduler()
+    scheduler.waiting = []
+    scheduler.running = []
+    scheduler.input_coordinator = None
+    scheduler._consume_pending_connector_output = lambda model_mode: None
+    scheduler._process_pending_input_timeouts = lambda: None
+    scheduler._should_defer_waiting_admission = lambda: False
+    scheduler.get_finished_requests_needing_kv_transfer = lambda: {}
+    scheduler._wrap_omni_scheduler_output = (
+        lambda output, **kwargs: output
+    )
+    request = SimpleNamespace(
+        external_req_id="external-v2",
+        prompt_embeds=None,
+        additional_information=None,
+    )
+    scheduler.requests = {"req-v2": request}
+    prefill_token_ids = [401, 402, 403]
+    base_new_request = SimpleNamespace(
+        req_id="req-v2",
+        prompt_token_ids=[401],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([9],),
+        num_computed_tokens=0,
+        lora_request=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=[True],
+        prefill_token_ids=prefill_token_ids,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[base_new_request]
+    )
+    monkeypatch.setattr(
+        scheduler_mod.VLLMScheduler,
+        "schedule",
+        lambda self, throttle_prefills=False: scheduler_output,
+    )
+
+    output = scheduler.schedule()
+
+    wrapped = output.scheduled_new_reqs[0]
+    assert isinstance(wrapped, OmniNewRequestData)
+    assert wrapped.prefill_token_ids is prefill_token_ids

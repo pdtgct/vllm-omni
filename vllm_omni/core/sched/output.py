@@ -59,6 +59,38 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
         )
 
+    @classmethod
+    def from_new_request_data(
+        cls,
+        data: NewRequestData,
+        request: Request | None,
+    ) -> "OmniNewRequestData":
+        """Enrich scheduler output without dropping core runner fields."""
+
+        return cls(
+            req_id=data.req_id,
+            external_req_id=(
+                getattr(request, "external_req_id", None)
+                if request is not None
+                else None
+            ),
+            prompt_token_ids=data.prompt_token_ids,
+            mm_features=data.mm_features,
+            sampling_params=data.sampling_params,
+            pooling_params=data.pooling_params,
+            block_ids=data.block_ids,
+            num_computed_tokens=data.num_computed_tokens,
+            lora_request=data.lora_request,
+            prompt_embeds=data.prompt_embeds,
+            prompt_is_token_ids=data.prompt_is_token_ids,
+            prefill_token_ids=data.prefill_token_ids,
+            additional_information=(
+                getattr(request, "additional_information", None)
+                if request is not None
+                else None
+            ),
+        )
+
 
 @dataclass
 class OmniCachedRequestData(CachedRequestData):
