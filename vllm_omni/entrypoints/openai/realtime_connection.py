@@ -165,9 +165,11 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         Audio pieces are copied into ``AcceptedAudioAuthority`` at append
         time and every append wakes its cadence-ready FIFO with a zero-sample
-        control.  A nonfinal commit first appends its ordered forced-EOU
-        barrier; a final commit ends this generator so ``buffer_stream``
-        drains the already-minted final tail and FLUSHes the request.
+        control.  The first nonfinal commit starts generation without
+        inventing a segment boundary; a later nonfinal commit appends its
+        ordered forced-EOU barrier.  A final commit ends this generator so
+        ``buffer_stream`` drains the already-minted final tail and FLUSHes
+        the request.
         """
 
         while True:
@@ -315,6 +317,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "model_not_validated",
                 )
                 return
+            generation_live = (
+                self.generation_task is not None
+                and not self.generation_task.done()
+            )
             if bool(event.get("final", False)):
                 if self._session_lifecycle.expired:
                     await self.send_error(
@@ -325,10 +331,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                 session.begin_finalize()
                 self._native_finalized = True
                 self._arm_session_lifecycle_timeout("finalization")
-            else:
+            elif generation_live:
                 session.force_segment()
             self._native_fifo_event.set()
-            if self.generation_task is None or self.generation_task.done():
+            if not generation_live:
                 await self.start_generation()
             return
         return await super().handle_event(event)

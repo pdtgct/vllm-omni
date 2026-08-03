@@ -403,6 +403,28 @@ async def test_later_nonfinal_native_commit_queues_forced_segment() -> None:
     assert session.finalizations == 0
 
 
+# @spec PORT-SEG-004 / PORT-SESS-014
+@pytest.mark.asyncio
+async def test_first_nonfinal_native_commit_starts_without_forced_segment() -> None:
+    connection, session = _native_event_connection()
+    connection.generation_task = None
+    starts = 0
+
+    async def _start_generation() -> None:
+        nonlocal starts
+        starts += 1
+
+    connection.start_generation = _start_generation  # type: ignore[method-assign]
+
+    await connection.handle_event(
+        {"type": "input_audio_buffer.commit", "final": False}
+    )
+
+    assert starts == 1
+    assert session.forces == 0
+    assert session.finalizations == 0
+
+
 # @spec PORT-SESS-003 / PORT-SESS-014
 @pytest.mark.asyncio
 async def test_final_native_commit_uses_session_finalization_not_queue_sentinel() -> None:
