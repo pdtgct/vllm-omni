@@ -160,7 +160,9 @@ def patch_generation_config_if_needed(model_config: Any) -> None:
         model_config.try_get_generation_config = lambda: {}
         return
     if fields.get("eos_token_id") is None:
-        hf_eos = getattr(model_config.hf_config, "eos_token_id", None)
+        hf_eos = getattr(
+            getattr(model_config, "hf_config", None), "eos_token_id", None
+        )
         if not isinstance(hf_eos, bool) and isinstance(hf_eos, int):
             completed = dict(fields)
             completed["eos_token_id"] = hf_eos
