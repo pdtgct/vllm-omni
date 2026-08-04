@@ -357,6 +357,49 @@ def test_card_translation_retains_the_decode_cap_declaration() -> None:
     assert config.max_symbols_per_step == 10
 
 
+# @spec PORT-DEC-005
+def test_partial_generation_config_inherits_the_declared_park_stop() -> None:
+    """A shipped generation config without eos must not lose the park.
+
+    The card ships generation_config.json without eos_token_id, which
+    blocks vLLM's from-model-config inheritance the authored artifact
+    relied on; the stage-0 seam completes a partial file from the model
+    config's declaration so every request stops on the park token.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.stage_init_utils import (
+        patch_generation_config_if_needed,
+    )
+
+    served = NemotronCardServingConfig(**_card_config_dict())
+
+    # Card shape: file present, eos absent -> inherit 13088.
+    partial = SimpleNamespace(
+        hf_config=served,
+        try_get_generation_config=lambda: {"pad_token_id": 0},
+    )
+    patch_generation_config_if_needed(partial)
+    assert partial.try_get_generation_config()["eos_token_id"] == 13088
+    assert partial.try_get_generation_config()["pad_token_id"] == 0
+
+    # A file that declares eos is authoritative and untouched.
+    explicit = SimpleNamespace(
+        hf_config=served,
+        try_get_generation_config=lambda: {"eos_token_id": 7},
+    )
+    patch_generation_config_if_needed(explicit)
+    assert explicit.try_get_generation_config() == {"eos_token_id": 7}
+
+    # The existing raise guard still degrades to an empty dict.
+    def _boom() -> dict:
+        raise ValueError("no model_type")
+
+    broken = SimpleNamespace(hf_config=served, try_get_generation_config=_boom)
+    patch_generation_config_if_needed(broken)
+    assert broken.try_get_generation_config() == {}
+
+
 # @spec PORT-WGT-004
 def test_card_translation_never_presents_an_encoder_decoder_model() -> None:
     """The card's architectural flag must not select vLLM's enc-dec path.
