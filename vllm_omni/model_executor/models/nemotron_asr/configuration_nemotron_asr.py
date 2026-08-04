@@ -278,6 +278,14 @@ def translate_card_config(card: dict) -> dict:
     # Retained card facts ride through as plain attributes; keys this
     # port reinterprets were popped above so they cannot collide.
     card.pop("model_type", None)
+    # The card describes the architecture as encoder-decoder; this
+    # port's serving schema deliberately does not. The model runs its
+    # encoder inside its own forward with model-local attention, so
+    # vLLM's encoder-decoder input path (which requires a decoder start
+    # token the tokenizer does not define) must stay off — GPU launch
+    # 2026-08-04 failed on exactly this rider ("Cannot find decoder
+    # start token id or <BOS>").
+    card.pop("is_encoder_decoder", None)
     translated.update(card)
     return translated
 
