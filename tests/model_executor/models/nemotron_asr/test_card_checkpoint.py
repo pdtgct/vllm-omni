@@ -91,6 +91,10 @@ def test_card_translation_mints_the_publisher_identity() -> None:
     assert translated["n_mels"] == 128
     assert translated["pred_hidden"] == 640
     assert translated["pred_rnn_layers"] == 2
+    # PORT-DEC-008: the card publisher declares the qualified eager arm;
+    # the runtime never falls back to a hardcoded dispatch default.
+    assert translated["decode_dispatch_arm"] == "dense-eager"
+    assert "decode_dispatch_table" not in translated
 
 
 # @spec PORT-WGT-004
