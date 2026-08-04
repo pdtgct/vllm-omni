@@ -23,33 +23,68 @@ _UNPREFIXED_STREAMING_KEYS = frozenset(
     }
 )
 
+# PORT-owned envelope defaults (ENV-MIG-009): omission resolves through
+# these — the exact values every qualified GPU round served — while an
+# explicit null or invalid value still fails closed. Derived defaults
+# (reconciliation >= operation, queue = sessions, tombstones and the
+# finalization floor scaled from their inputs) are computed in
+# ``from_vllm_config`` so a partial override stays self-consistent.
+_DEFAULT_SAFETY_RESERVE_SLOTS = 1
+_DEFAULT_MAX_RESIDENT_SESSIONS = 8
+_DEFAULT_OPERATION_TIMEOUT_S = 10.0
+_DEFAULT_RECONCILIATION_FLOOR_S = 30.0
+_DEFAULT_TOMBSTONE_TTL_S = 600.0
+_DEFAULT_TOMBSTONE_FLOOR = 32
+_DEFAULT_PENDING_CLAIM_TIMEOUT_S = 15.0
+_DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S = 10.0
+_DEFAULT_SESSION_IDLE_TIMEOUT_S = 60.0
+_DEFAULT_FINALIZATION_FLOOR_S = 40.0
+_DEFAULT_ACCEPTED_AUDIO_CAPACITY_SAMPLES = 30 * _RFC1_SAMPLE_RATE_HZ
+_DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES = 1 << 20
 
-def _required_int(
-    values: Mapping[str, Any],
-    name: str,
-    *,
-    minimum: int,
-) -> int:
-    value = values.get(name)
+
+def _validated_int(name: str, value: object, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(
-            f"{name} must be an explicit integer >= {minimum}, got {value!r}"
+            f"{name} must be an integer >= {minimum}, got {value!r}"
         )
     return value
 
 
-def _required_duration(values: Mapping[str, Any], name: str) -> float:
-    value = values.get(name)
+def _validated_duration(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(
-            f"{name} must be an explicit positive finite duration, got {value!r}"
+            f"{name} must be a positive finite duration, got {value!r}"
         )
     resolved = float(value)
     if not math.isfinite(resolved) or resolved <= 0:
         raise ValueError(
-            f"{name} must be an explicit positive finite duration, got {value!r}"
+            f"{name} must be a positive finite duration, got {value!r}"
         )
     return resolved
+
+
+def _resolved_int(
+    values: Mapping[str, Any],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+) -> int:
+    if name not in values:
+        return default
+    return _validated_int(name, values[name], minimum=minimum)
+
+
+def _resolved_duration(
+    values: Mapping[str, Any],
+    name: str,
+    *,
+    default: float,
+) -> float:
+    if name not in values:
+        return default
+    return _validated_duration(name, values[name])
 
 
 def _optional_duration(
@@ -61,7 +96,7 @@ def _optional_duration(
     value = values.get(name, default)
     if value is None:
         return None
-    return _required_duration({name: value}, name)
+    return _validated_duration(name, value)
 
 
 @dataclass(frozen=True)
@@ -126,9 +161,11 @@ class PersistentStateRuntimeConfig:
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> PersistentStateRuntimeConfig:
         raw = getattr(vllm_config, "additional_config", None)
+        if raw is None:
+            raw = {}
         if not isinstance(raw, Mapping):
             raise ValueError(
-                "persistent-state runtime limits require additional_config"
+                "additional_config must be a mapping when provided"
             )
         unprefixed = sorted(_UNPREFIXED_STREAMING_KEYS.intersection(raw))
         if unprefixed:
@@ -136,62 +173,93 @@ class PersistentStateRuntimeConfig:
                 "streaming serving keys in additional_config require the "
                 f"streaming_ prefix: {unprefixed}"
             )
-        operation_timeout_s = _required_duration(
-            raw, "persistent_state_operation_timeout_s"
+        operation_timeout_s = _resolved_duration(
+            raw,
+            "persistent_state_operation_timeout_s",
+            default=_DEFAULT_OPERATION_TIMEOUT_S,
         )
-        reconciliation_timeout_s = _required_duration(
-            raw, "persistent_state_reconciliation_timeout_s"
+        reconciliation_timeout_s = _resolved_duration(
+            raw,
+            "persistent_state_reconciliation_timeout_s",
+            default=max(_DEFAULT_RECONCILIATION_FLOOR_S, operation_timeout_s),
         )
         if reconciliation_timeout_s < operation_timeout_s:
             raise ValueError(
                 "persistent_state_reconciliation_timeout_s must be no shorter "
                 "than persistent_state_operation_timeout_s"
             )
-        session_idle_timeout_s = (
-            _required_duration(raw, "streaming_session_idle_timeout_s")
-            if "streaming_session_idle_timeout_s" in raw
-            else 60.0
+        max_resident_sessions = _resolved_int(
+            raw,
+            "max_resident_sessions",
+            default=_DEFAULT_MAX_RESIDENT_SESSIONS,
+            minimum=1,
+        )
+        accepted_audio_capacity_samples = _resolved_int(
+            raw,
+            "streaming_accepted_audio_capacity_samples",
+            default=_DEFAULT_ACCEPTED_AUDIO_CAPACITY_SAMPLES,
+            minimum=1,
+        )
+        safe_finalization_floor_s = (
+            accepted_audio_capacity_samples / _RFC1_SAMPLE_RATE_HZ
+            + _RFC1_FINALIZATION_SERVICE_INTERVALS * _RFC1_MAX_CADENCE_S
         )
         resolved = cls(
-            safety_reserve_slots=_required_int(
+            safety_reserve_slots=_resolved_int(
                 raw,
                 "persistent_state_safety_reserve_slots",
+                default=_DEFAULT_SAFETY_RESERVE_SLOTS,
                 minimum=0,
             ),
-            max_resident_sessions=_required_int(
-                raw, "max_resident_sessions", minimum=1
-            ),
-            reserve_queue_capacity=_required_int(
+            max_resident_sessions=max_resident_sessions,
+            reserve_queue_capacity=_resolved_int(
                 raw,
                 "persistent_state_reserve_queue_capacity",
+                default=max_resident_sessions,
                 minimum=1,
             ),
             operation_timeout_s=operation_timeout_s,
             reconciliation_timeout_s=reconciliation_timeout_s,
-            tombstone_ttl_s=_required_duration(
-                raw, "persistent_state_tombstone_ttl_s"
-            ),
-            max_tombstones=_required_int(
-                raw, "persistent_state_max_tombstones", minimum=1
-            ),
-            pending_claim_timeout_s=_required_duration(
-                raw, "persistent_state_pending_claim_timeout_s"
-            ),
-            session_configuration_timeout_s=_required_duration(
-                raw, "streaming_session_configuration_timeout_s"
-            ),
-            session_idle_timeout_s=session_idle_timeout_s,
-            session_finalization_timeout_s=_required_duration(
-                raw, "streaming_session_finalization_timeout_s"
-            ),
-            accepted_audio_capacity_samples=_required_int(
+            tombstone_ttl_s=_resolved_duration(
                 raw,
-                "streaming_accepted_audio_capacity_samples",
+                "persistent_state_tombstone_ttl_s",
+                default=_DEFAULT_TOMBSTONE_TTL_S,
+            ),
+            max_tombstones=_resolved_int(
+                raw,
+                "persistent_state_max_tombstones",
+                default=max(
+                    _DEFAULT_TOMBSTONE_FLOOR, 4 * max_resident_sessions
+                ),
                 minimum=1,
             ),
-            max_retained_transcript_bytes=_required_int(
+            pending_claim_timeout_s=_resolved_duration(
+                raw,
+                "persistent_state_pending_claim_timeout_s",
+                default=_DEFAULT_PENDING_CLAIM_TIMEOUT_S,
+            ),
+            session_configuration_timeout_s=_resolved_duration(
+                raw,
+                "streaming_session_configuration_timeout_s",
+                default=_DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S,
+            ),
+            session_idle_timeout_s=_resolved_duration(
+                raw,
+                "streaming_session_idle_timeout_s",
+                default=_DEFAULT_SESSION_IDLE_TIMEOUT_S,
+            ),
+            session_finalization_timeout_s=_resolved_duration(
+                raw,
+                "streaming_session_finalization_timeout_s",
+                default=max(
+                    _DEFAULT_FINALIZATION_FLOOR_S, safe_finalization_floor_s
+                ),
+            ),
+            accepted_audio_capacity_samples=accepted_audio_capacity_samples,
+            max_retained_transcript_bytes=_resolved_int(
                 raw,
                 "streaming_max_retained_transcript_bytes",
+                default=_DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES,
                 minimum=1,
             ),
             max_session_duration_s=_optional_duration(

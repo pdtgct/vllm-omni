@@ -377,64 +377,138 @@ async def test_completed_operations_are_bounded_tombstones_and_retry_exactly() -
     service.shutdown()
 
 
-def test_runtime_config_requires_explicit_bounded_tombstone_values() -> None:
+_QUALIFIED_ENVELOPE = {
+    "persistent_state_safety_reserve_slots": 1,
+    "max_resident_sessions": 8,
+    "persistent_state_reserve_queue_capacity": 8,
+    "persistent_state_operation_timeout_s": 10.0,
+    "persistent_state_reconciliation_timeout_s": 30.0,
+    "persistent_state_tombstone_ttl_s": 600.0,
+    "persistent_state_max_tombstones": 32,
+    "persistent_state_pending_claim_timeout_s": 15.0,
+    "streaming_session_configuration_timeout_s": 10.0,
+    "streaming_session_finalization_timeout_s": 40.0,
+    "streaming_accepted_audio_capacity_samples": 480_000,
+    "streaming_max_retained_transcript_bytes": 1 << 20,
+}
+
+
+def test_runtime_config_resolves_the_qualified_envelope_by_default() -> None:
+    """Omission resolves through PORT-owned defaults (ENV-MIG-009).
+
+    The default envelope IS the qualified one: an explicit full envelope
+    and a defaults-only boot resolve to the same values, so the
+    fingerprint records identical resolved fields either way.
+    """
     # @spec PORT-STATE-012 / PORT-STATE-013 / ENV-MIG-009
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
 
-    values = {
-        "persistent_state_safety_reserve_slots": 1,
-        "max_resident_sessions": 8,
-        "persistent_state_reserve_queue_capacity": 8,
-        "persistent_state_operation_timeout_s": 10.0,
-        "persistent_state_reconciliation_timeout_s": 30.0,
-        "persistent_state_tombstone_ttl_s": 600.0,
-        "persistent_state_max_tombstones": 32,
-        "persistent_state_pending_claim_timeout_s": 15.0,
-        "streaming_session_configuration_timeout_s": 10.0,
-        "streaming_session_finalization_timeout_s": 40.0,
-        "streaming_accepted_audio_capacity_samples": 480_000,
-        "streaming_max_retained_transcript_bytes": 1 << 20,
-    }
-    resolved = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config=values)
+    explicit = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config=dict(_QUALIFIED_ENVELOPE))
+    )
+    for defaults_source in (None, {}):
+        defaulted = PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=defaults_source)
+        )
+        assert defaulted == explicit
+
+    assert explicit.tombstone_ttl_s == 600.0
+    assert explicit.max_tombstones == 32
+    assert explicit.cleanup_queue_capacity == 8
+    assert explicit.session_idle_timeout_s == 60.0
+    assert explicit.accepted_audio_budget_s == 30.0
+    assert explicit.safe_finalization_timeout_s == pytest.approx(32.24)
+    assert explicit.session_finalization_timeout_s == 40.0
+    assert explicit.max_session_duration_s is None
+
+
+def test_runtime_config_partial_override_stays_self_consistent() -> None:
+    """Derived defaults follow an overridden input (ENV-MIG-009)."""
+    # @spec ENV-MIG-009
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
     )
 
-    assert resolved.tombstone_ttl_s == 600.0
-    assert resolved.max_tombstones == 32
-    assert resolved.cleanup_queue_capacity == 8
-    assert resolved.session_idle_timeout_s == 60.0
-    assert resolved.accepted_audio_budget_s == 30.0
-    assert resolved.safe_finalization_timeout_s == pytest.approx(32.24)
+    resolved = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config={"max_resident_sessions": 16})
+    )
+    assert resolved.max_resident_sessions == 16
+    assert resolved.reserve_queue_capacity == 16
+    assert resolved.cleanup_queue_capacity == 16
+    assert resolved.max_tombstones == 64
 
-    for key in values:
-        incomplete = dict(values)
-        incomplete.pop(key)
-        with pytest.raises(ValueError, match=key):
-            PersistentStateRuntimeConfig.from_vllm_config(
-                SimpleNamespace(additional_config=incomplete)
-            )
-
-    too_short = dict(values)
-    explicit_null = dict(values)
-    explicit_null["streaming_session_idle_timeout_s"] = None
-    with pytest.raises(ValueError, match="streaming_session_idle_timeout_s"):
+    # Raising the operation timeout raises the derived reconciliation
+    # default with it, instead of failing the cross-field check.
+    slow = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            additional_config={"persistent_state_operation_timeout_s": 45.0}
+        )
+    )
+    assert slow.reconciliation_timeout_s == 45.0
+    with pytest.raises(ValueError, match="no shorter"):
         PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=explicit_null)
+            SimpleNamespace(
+                additional_config={
+                    "persistent_state_operation_timeout_s": 45.0,
+                    "persistent_state_reconciliation_timeout_s": 30.0,
+                }
+            )
         )
 
-    unprefixed = dict(values)
+    # A larger audio budget lifts the derived finalization default to
+    # the published safe drain floor.
+    wide = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            additional_config={
+                "streaming_accepted_audio_capacity_samples": 960_000
+            }
+        )
+    )
+    assert wide.accepted_audio_budget_s == 60.0
+    assert wide.session_finalization_timeout_s == pytest.approx(
+        wide.safe_finalization_timeout_s
+    )
+
+
+def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
+    """Defaults never launder a bad explicit value (ENV-MIG-009)."""
+    # @spec ENV-MIG-009
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    for key in _QUALIFIED_ENVELOPE:
+        with pytest.raises(ValueError, match=key):
+            PersistentStateRuntimeConfig.from_vllm_config(
+                SimpleNamespace(additional_config={key: None})
+            )
+
+    with pytest.raises(ValueError, match="streaming_session_idle_timeout_s"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(
+                additional_config={"streaming_session_idle_timeout_s": None}
+            )
+        )
+
+    unprefixed = dict(_QUALIFIED_ENVELOPE)
     unprefixed["session_idle_timeout_s"] = 60.0
     with pytest.raises(ValueError, match="streaming_ prefix"):
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(additional_config=unprefixed)
         )
 
+    too_short = dict(_QUALIFIED_ENVELOPE)
     too_short["streaming_session_finalization_timeout_s"] = 32.0
     with pytest.raises(ValueError, match="safe drain bound"):
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(additional_config=too_short)
+        )
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config="not-a-mapping")
         )
 
 
