@@ -1014,11 +1014,17 @@ def test_vllm_metrics_route_pair_preserves_plugin_collision_detection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_observer_and_orchestrator_sink_exist_before_participant_entry(
+async def test_ordinary_app_state_precedes_participant_entry(
     monkeypatch,
 ) -> None:
-    """Ordinary state installation remains before downstream inheritance."""
-    # @spec ING-VEH-018, PORT-OBS-003, PORT-OBS-009
+    """Whatever ordinary app-state init installs is visible at entry.
+
+    The generic host promises only the ordering; which attributes a
+    capability installs during ordinary state initialization is that
+    capability's business. The sentinel attributes stand for any of
+    them.
+    """
+    # @spec ING-VEH-018
     events: list[str] = []
     app = FastAPI()
 
@@ -1053,15 +1059,13 @@ async def test_observer_and_orchestrator_sink_exist_before_participant_entry(
     async def init_ordinary_state(engine_client, state, args) -> None:
         del args
         assert engine_client is engine
-        state.streaming_observer = object()
-        state.streaming_batch_sink = object()
+        state.ordinary_state_sentinel = object()
         events.append("ordinary-state")
 
     monkeypatch.setattr(api_server, "omni_init_app_state", init_ordinary_state)
 
     def optional_entry_point(context):
-        assert context.app.state.streaming_observer is not None
-        assert context.app.state.streaming_batch_sink is not None
+        assert context.app.state.ordinary_state_sentinel is not None
         return FakePluginLifetime(events)
 
     optional_entry_point.config_optional = True
