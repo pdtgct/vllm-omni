@@ -309,23 +309,12 @@ class StageConfigFactory:
             deploy_config_path=deploy_config_path,
         )
         if pipeline_cfg is not None:
-            derived_engine_defaults: dict[str, Any] = {}
-            if pipeline_cfg.derive_engine_args is not None:
-                derived_engine_defaults = dict(
-                    pipeline_cfg.derive_engine_args(
-                        cls.get_hf_config(
-                            model=model, trust_remote_code=trust_remote_code
-                        )
-                    )
-                    or {}
-                )
             return cls._create_from_registry(
                 pipeline_cfg.model_type,
                 pipeline_cfg,
                 cli_overrides,
                 deploy_config_path,
                 strategy_specs=strategy_specs,
-                derived_engine_defaults=derived_engine_defaults,
             )
         return None, None
 
@@ -337,7 +326,6 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
-        derived_engine_defaults: dict[str, Any] | None = None,
         **deprecated_kwargs: Any,
     ) -> tuple[list[StageConfig], str | None]:
         """Create StageConfigs from pipeline registry + deploy YAML.
@@ -379,12 +367,6 @@ class StageConfigFactory:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
-        # Model-owned derived defaults sit BELOW every explicit source:
-        # only keys nothing else set are filled.
-        if derived_engine_defaults:
-            for stage in stages:
-                for key, value in derived_engine_defaults.items():
-                    stage.yaml_engine_args.setdefault(key, value)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)

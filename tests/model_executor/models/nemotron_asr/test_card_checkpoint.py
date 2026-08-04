@@ -357,25 +357,6 @@ def test_card_translation_retains_the_decode_cap_declaration() -> None:
     assert config.max_symbols_per_step == 10
 
 
-# @spec PORT-DEC-005
-def test_pipeline_derives_the_park_stop_from_the_served_config() -> None:
-    """The park stop id is derived, never dependent on file shape.
-
-    The public card ships a generation_config.json without eos, which
-    blocks vLLM's from-model-config inheritance the authored artifact
-    accidentally relied on; the pipeline's derived engine defaults make
-    the stop id an explicit property of the served configuration.
-    """
-    from vllm_omni.model_executor.models.nemotron_asr.pipeline import (
-        NEMOTRON_ASR_PIPELINE,
-    )
-
-    config = NemotronCardServingConfig(**_card_config_dict())
-    derived = NEMOTRON_ASR_PIPELINE.derive_engine_args(config)
-    assert derived == {"override_generation_config": {"eos_token_id": 13088}}
-    assert NEMOTRON_ASR_PIPELINE.derive_engine_args(object()) == {}
-
-
 # @spec PORT-WGT-004
 def test_card_translation_never_presents_an_encoder_decoder_model() -> None:
     """The card's architectural flag must not select vLLM's enc-dec path.
