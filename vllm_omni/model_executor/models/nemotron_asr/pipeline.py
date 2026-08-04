@@ -53,6 +53,11 @@ NEMOTRON_ASR_PIPELINE = PipelineConfig(
                 # docstring for why this must be explicit.
                 "max_tokens": _MAX_BURST_TOKENS,
                 "detokenize": True,
+                # The language-ID tags are meaningful transcript output
+                # (PORT-LID-001); the public card's tokenizer marks them
+                # special, and default detokenization would silently
+                # drop them from every final.
+                "skip_special_tokens": False,
             },
         ),
     ),
