@@ -213,7 +213,9 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
             raise RuntimeError(
                 "streaming session must be at a legal park (parked "
                 "waiting, or at its park-stop boundary) before "
-                "replacement"
+                f"replacement; got status={session.status!r} "
+                f"stop_reason={getattr(session, 'stop_reason', None)!r} "
+                f"outputs={len(session.output_token_ids)}"
             )
 
         prompt_token_ids = list(update.prompt_token_ids or ())
