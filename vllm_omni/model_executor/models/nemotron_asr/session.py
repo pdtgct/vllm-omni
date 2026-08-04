@@ -686,6 +686,20 @@ class NemotronRealtimeSession:
             request_id = session_key
         hf = getattr(model_config, "hf_config", model_config)
         geometry = AdmittedGeometry.from_cadence(cadence)
+        # PORT-SESS-015: the publisher's declared lookahead arms gate
+        # cadence admission. A cadence's implied lookahead is its
+        # right attention context (frames_per_chunk - 1); a served
+        # configuration declaring no set admits every manifest cadence.
+        declared_arms = getattr(hf, "supported_num_lookahead_tokens", None)
+        if declared_arms is not None:
+            implied = CADENCES[cadence][1]
+            if implied not in declared_arms:
+                raise ValueError(
+                    f"cadence {cadence!r} implies lookahead {implied}, "
+                    "which is not in the served configuration's declared "
+                    f"supported set {sorted(int(v) for v in declared_arms)} "
+                    "(PORT-SESS-015)"
+                )
         model_path = getattr(model_config, "model", None)
         if model_path and not getattr(hf, "prompt_dictionary", None):
             from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (

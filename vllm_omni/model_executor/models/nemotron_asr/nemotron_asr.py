@@ -294,6 +294,32 @@ class NemotronASRForRNNT(nn.Module):
             getattr(hf_config, "prompt_dictionary", None),
             getattr(hf_config, "num_prompts", None),
         )
+        from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+            MAX_SYMBOLS_PER_STEP,
+        )
+
+        # PORT-DEC-005: the served declaration is the authority; the
+        # manifest-derived emission budgets were computed from the
+        # module value, so a disagreeing declaration fails closed
+        # instead of being silently overridden.
+        declared_symbols = getattr(hf_config, "max_symbols_per_step", None)
+        if declared_symbols is not None and int(declared_symbols) != MAX_SYMBOLS_PER_STEP:
+            raise ValueError(
+                "served config declares max_symbols_per_step="
+                f"{declared_symbols}, but the manifest-derived emission "
+                f"budgets were computed from {MAX_SYMBOLS_PER_STEP}; "
+                "requalify the budgets before serving this declaration "
+                "(PORT-DEC-005)"
+            )
+        # PORT-STATE-009: precision is part of the qualified profile.
+        # An unqualified --dtype fails loudly, never warn-and-ignore.
+        engine_dtype = getattr(vllm_config.model_config, "dtype", None)
+        if engine_dtype is not None and engine_dtype != torch.float32:
+            raise ValueError(
+                f"--dtype {engine_dtype} is not the qualified profile "
+                "for this model (float32); a precision change requires "
+                "requalification (PORT-STATE-009)"
+            )
         reject_unsupported_outer_graph_mode(
             getattr(vllm_config, "compilation_config", None)
         )
