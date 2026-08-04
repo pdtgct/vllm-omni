@@ -194,11 +194,26 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
         session: Request,
         update: StreamingUpdate,
     ) -> None:
-        """Replace one legally parked transaction envelope in place."""
+        """Replace one legally parked transaction envelope in place.
 
-        if session.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+        Core replaces on two legal paths: an update arriving for a
+        session already parked (``WAITING_FOR_STREAMING_REQ``), or an
+        update already queued when the park stop is processed — core's
+        ``_handle_stopped_request`` then replaces atomically at the stop
+        boundary, before any parked status is set, with the session
+        still in its stop status (``FINISHED_STOPPED``). Both are legal
+        parks; anything else (a running session, a length-capped or
+        aborted stop) is the invariant violation this guard exists for.
+        """
+
+        if session.status not in (
+            RequestStatus.WAITING_FOR_STREAMING_REQ,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             raise RuntimeError(
-                "streaming session must be parked in the waiting state before replacement"
+                "streaming session must be at a legal park (parked "
+                "waiting, or at its park-stop boundary) before "
+                "replacement"
             )
 
         prompt_token_ids = list(update.prompt_token_ids or ())
@@ -247,7 +262,12 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         session.max_tokens = update.max_tokens
-        self.num_waiting_for_streaming_input -= 1
+        # Mirror the base scheduler: only a session counted into the
+        # waiting-for-input population leaves it. On the stop-boundary
+        # path the session was never parked, so there is nothing to
+        # decrement.
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
 
         if self.log_stats:
