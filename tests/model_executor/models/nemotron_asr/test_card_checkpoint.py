@@ -357,6 +357,20 @@ def test_card_translation_retains_the_decode_cap_declaration() -> None:
     assert config.max_symbols_per_step == 10
 
 
+# @spec PORT-WGT-004
+def test_card_translation_never_presents_an_encoder_decoder_model() -> None:
+    """The card's architectural flag must not select vLLM's enc-dec path.
+
+    vLLM's encoder-decoder renderer requires a decoder start token this
+    tokenizer does not define; the port serves the model single-stage
+    with the encoder inside its own forward.
+    """
+    translated = translate_card_config(_card_config_dict())
+    assert "is_encoder_decoder" not in translated
+    config = NemotronCardServingConfig(**_card_config_dict())
+    assert not getattr(config, "is_encoder_decoder", False)
+
+
 def test_served_schema_still_constructs_directly() -> None:
     """The authored artifact's schema is untouched by the card path."""
     config = NemotronASRConfig(
