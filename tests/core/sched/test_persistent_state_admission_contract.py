@@ -283,6 +283,28 @@ def test_replacement_requires_the_parked_streaming_update_state() -> None:
     assert list(session.all_token_ids) == before
 
 
+def test_replacement_at_the_park_stop_boundary_is_a_legal_park() -> None:
+    """Core replaces on two legal paths; the stop boundary is one.
+
+    When the next update is already queued at the park stop, core's
+    ``_handle_stopped_request`` applies the replacement before any
+    parked status is set — the session is still ``FINISHED_STOPPED``.
+    The guard must accept it, and the waiting-population counter must
+    not decrement for a session that never joined it (first observed
+    live: GPU launch 2026-08-04, first burst slowed by JIT warm-up).
+    """
+    # @spec PORT-STATE-020
+    scheduler = _streaming_scheduler()
+    session = _streaming_session()
+    session.status = RequestStatus.FINISHED_STOPPED
+    scheduler.num_waiting_for_streaming_input = 5
+
+    scheduler._update_request_as_session(session, _streaming_update(44))
+
+    assert session.status == RequestStatus.WAITING
+    assert scheduler.num_waiting_for_streaming_input == 5
+
+
 def test_generic_omni_stage_zero_history_policy_is_not_changed_globally() -> None:
     # @spec PORT-STATE-020
     generic_source = inspect.getsource(OmniARScheduler._update_request_as_session)
