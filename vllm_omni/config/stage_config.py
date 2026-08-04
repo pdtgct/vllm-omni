@@ -264,11 +264,6 @@ class PipelineConfig:
     # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
     # to avoid misrouting 2.6 checkpoints.
     hf_config_predicate: Callable[[Any], bool] | None = None
-    # Optional model-owned engine-arg DEFAULTS derived from the loaded
-    # ``hf_config`` (e.g. a stop id the served configuration declares).
-    # Lowest precedence: applied with ``setdefault`` after the full
-    # pipeline/deploy/CLI merge, so an explicit value anywhere wins.
-    derive_engine_args: Callable[[Any], dict[str, Any]] | None = None
     # Diffusers pipeline class name: for models that ship a ``model_index.json``
     # (no root ``config.json``), the ``_class_name`` field is matched against
     # this value to auto-detect the pipeline.  Only needed for diffusers-style

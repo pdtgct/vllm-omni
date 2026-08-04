@@ -28,31 +28,12 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
 #: (PORT-INT-002; realtime_token_budget(frames_per_chunk=14)).
 _MAX_BURST_TOKENS = 14 * MAX_SYMBOLS_PER_STEP + 1
 
-def _derive_engine_args(hf_config: object) -> dict:
-    """Derive the engine stop id from the served configuration.
-
-    The park token — the served config's ``eos_token_id`` — must stop
-    every burst. vLLM only inherits eos into request stop ids from the
-    generation config, and whether that inheritance happens depends on
-    which files the checkpoint ships (the public card ships a
-    ``generation_config.json`` without eos, which blocks the
-    from-model-config fallback the authored artifact relied on).
-    Declaring the override here derives the value from the config and
-    removes the file-shape dependency on every path.
-    """
-    eos = getattr(hf_config, "eos_token_id", None)
-    if isinstance(eos, bool) or not isinstance(eos, int):
-        return {}
-    return {"override_generation_config": {"eos_token_id": eos}}
-
-
 NEMOTRON_ASR_PIPELINE = PipelineConfig(
     model_type="nemotron_asr",
     model_arch=ARCHITECTURE,
     # The public HF card resolves here too: by its architectures entry
     # (this fallback) and by its model_type (the registry alias).
     hf_architectures=(ARCHITECTURE,),
-    derive_engine_args=_derive_engine_args,
     stages=(
         StagePipelineConfig(
             stage_id=0,
