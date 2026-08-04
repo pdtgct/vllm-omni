@@ -140,11 +140,31 @@ def set_death_signal(sig: int) -> None:
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:
-    """Guard InputProcessor init for models whose config lacks model_type."""
+    """Guard InputProcessor init and complete a partial generation config.
+
+    Two normalizations, both at the seam the input processor reads:
+
+    - models whose config lacks ``model_type`` make
+      ``try_get_generation_config`` raise; degrade to an empty dict.
+    - vLLM inherits ``eos_token_id`` from the model config only when NO
+      generation-config file exists (``GenerationConfig.from_model_config``).
+      A checkpoint that ships a generation-config file which merely
+      omits eos blocks that inheritance, silently leaving requests with
+      no stop token even though the model config declares one. Extend
+      the same inheritance to partial files: a loaded generation config
+      without eos inherits the model config's declared value.
+    """
     try:
-        model_config.try_get_generation_config()
+        fields = model_config.try_get_generation_config()
     except Exception:
         model_config.try_get_generation_config = lambda: {}
+        return
+    if fields.get("eos_token_id") is None:
+        hf_eos = getattr(model_config.hf_config, "eos_token_id", None)
+        if not isinstance(hf_eos, bool) and isinstance(hf_eos, int):
+            completed = dict(fields)
+            completed["eos_token_id"] = hf_eos
+            model_config.try_get_generation_config = lambda: dict(completed)
 
 
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
