@@ -99,6 +99,10 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "nemotron_asr": NEMOTRON_ASR_PIPELINE,
+    # The public HF card's model type (transformers' nemotron3_5_asr);
+    # same pipeline, so deploy-profile resolution keyed on the
+    # pipeline's own model_type is identical on both paths.
+    "nemotron3_5_asr": NEMOTRON_ASR_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,

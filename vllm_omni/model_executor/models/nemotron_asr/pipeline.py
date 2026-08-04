@@ -31,6 +31,9 @@ _MAX_BURST_TOKENS = 14 * MAX_SYMBOLS_PER_STEP + 1
 NEMOTRON_ASR_PIPELINE = PipelineConfig(
     model_type="nemotron_asr",
     model_arch=ARCHITECTURE,
+    # The public HF card resolves here too: by its architectures entry
+    # (this fallback) and by its model_type (the registry alias).
+    hf_architectures=(ARCHITECTURE,),
     stages=(
         StagePipelineConfig(
             stage_id=0,
