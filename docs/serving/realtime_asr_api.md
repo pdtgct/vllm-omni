@@ -97,7 +97,7 @@ transcript.
 
 | Field | Values | Default | Meaning |
 |---|---|---|---|
-| `cadence` | `80ms`, `160ms`, `320ms`, `560ms`, `1120ms` | `560ms` | Streaming chunk size: smaller is lower latency, larger is higher throughput. |
+| `cadence` | `80ms`, `320ms`, `560ms`, `1120ms` | `560ms` | Streaming chunk size: smaller is lower latency, larger is higher throughput. Admission validates the cadence against the checkpoint's declared supported lookahead arms; `160ms` is rejected for this checkpoint because its implied lookahead is not in the card's declared set. |
 | `locale` | a locale from the checkpoint's `processor_config.json` (e.g. `en-US`), or `auto` | `auto` | Language conditioning. `auto` lets the model detect the language and emit a language tag. |
 | `endpointing` | `{"mode": "greedy_blank" \| "disabled", "stop_history_ms": int, "residue_frames": int}` | `greedy_blank`, 800 ms, 2 | Server-side end-of-segment detection over the decode stream. |
 
