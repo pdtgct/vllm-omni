@@ -283,9 +283,13 @@ class NemotronASRForRNNT(nn.Module):
             raise ValueError("NemotronASRForRNNT requires vllm_config")
         hf_config = vllm_config.model_config.hf_config
         from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+            ensure_prompt_dictionary,
             validate_prompt_dictionary,
         )
 
+        model_path = getattr(vllm_config.model_config, "model", None)
+        if model_path:
+            ensure_prompt_dictionary(hf_config, model_path)
         validate_prompt_dictionary(
             getattr(hf_config, "prompt_dictionary", None),
             getattr(hf_config, "num_prompts", None),
@@ -341,13 +345,29 @@ class NemotronASRForRNNT(nn.Module):
         return self._state_pools_cache
 
     def load_weights(self, weights: Any) -> set[str]:
-        """Strictly load the converted checkpoint tree."""
+        """Strictly load the served tree or the public HF card.
+
+        The served artifact's names load as-is. The public card's
+        renamed modules map through ``remap_card_name``; shared leaves
+        already match. A card checkpoint persists no featurizer
+        buffers, so those two are synthesized after the stream — only
+        when card naming was actually seen, never for a served artifact
+        (persisted buffers are inputs, not recomputed).
+        """
+        from vllm_omni.model_executor.models.nemotron_asr.rules import (
+            remap_card_name,
+        )
 
         expected: dict[str, torch.Tensor] = dict(self.core.named_parameters())
         expected.update(self.core.named_buffers())
         required = set(self.core.state_dict())
         consumed: set[str] = set()
+        card_names_seen = False
         for name, tensor in weights:
+            mapped = remap_card_name(name)
+            if mapped is not None:
+                card_names_seen = True
+                name = mapped
             if name not in expected:
                 raise ValueError(f"unexpected weight {name!r}")
             target = expected[name]
@@ -361,6 +381,28 @@ class NemotronASRForRNNT(nn.Module):
                 target.copy_(tensor)
             consumed.add(name)
         missing = required - consumed
+        featurizer_buffers = {"featurizer.fb", "featurizer.window"}
+        if card_names_seen and featurizer_buffers & missing:
+            from vllm_omni.model_executor.models.nemotron_asr.featurizer import (
+                synthesize_card_featurizer_buffers,
+            )
+
+            fb, window = synthesize_card_featurizer_buffers(
+                n_mels=int(self.config.n_mels),
+            )
+            for name, tensor in (("featurizer.fb", fb), ("featurizer.window", window)):
+                if name not in missing:
+                    continue
+                target = expected[name]
+                if tuple(target.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"synthesized {name!r} shape {tuple(tensor.shape)} "
+                        f"does not match the module ({tuple(target.shape)})"
+                    )
+                with torch.no_grad():
+                    target.copy_(tensor)
+                consumed.add(name)
+            missing = required - consumed
         lid_missing = sorted(
             name for name in missing if LID_REQUIRED_PATTERN.search(name)
         )

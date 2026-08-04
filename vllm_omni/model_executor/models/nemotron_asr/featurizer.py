@@ -13,8 +13,76 @@ reimplementation risk — parity is asserted against a NeMo-produced
 fixture).
 """
 
+import math
+
 import torch
 from torch import nn
+
+
+def synthesize_card_featurizer_buffers(
+    *,
+    n_mels: int,
+    n_fft: int = 512,
+    win_length: int = 400,
+    sample_rate: int = 16000,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the featurizer buffers the public HF card does not persist.
+
+    The published checkpoint carries no ``featurizer.fb``/``window``
+    tensors; its authoritative computation is the transformers feature
+    extractor: ``librosa.filters.mel(sr, n_fft, n_mels, fmin=0,
+    fmax=sr/2, norm="slaney")`` (slaney scale, slaney norm) and
+    ``torch.hann_window(win_length, periodic=False)``. The filterbank
+    below is that same slaney construction in float64, cast to float32
+    at the end like the extractor; the cross-check test asserts
+    equality against librosa wherever it is installed. The parity note
+    on :class:`MelFeaturizer` about persisted-buffer ulps applies: a
+    served artifact that ships buffers still wins over synthesis.
+    """
+    f_sp = 200.0 / 3.0
+    min_log_hz = 1000.0
+    min_log_mel = min_log_hz / f_sp
+    logstep = math.log(6.4) / 27.0
+
+    def hz_to_mel(hz: torch.Tensor) -> torch.Tensor:
+        mel = hz / f_sp
+        log_region = hz >= min_log_hz
+        return torch.where(
+            log_region,
+            min_log_mel + torch.log(hz.clamp_min(min_log_hz) / min_log_hz) / logstep,
+            mel,
+        )
+
+    def mel_to_hz(mel: torch.Tensor) -> torch.Tensor:
+        hz = mel * f_sp
+        log_region = mel >= min_log_mel
+        return torch.where(
+            log_region,
+            min_log_hz * torch.exp(logstep * (mel - min_log_mel)),
+            hz,
+        )
+
+    n_freqs = n_fft // 2 + 1
+    fft_hz = torch.linspace(0.0, sample_rate / 2.0, n_freqs, dtype=torch.float64)
+    mel_edges = torch.linspace(
+        hz_to_mel(torch.tensor(0.0, dtype=torch.float64)),
+        hz_to_mel(torch.tensor(sample_rate / 2.0, dtype=torch.float64)),
+        n_mels + 2,
+        dtype=torch.float64,
+    )
+    hz_edges = mel_to_hz(mel_edges)
+    fdiff = hz_edges[1:] - hz_edges[:-1]
+    ramps = hz_edges.unsqueeze(1) - fft_hz.unsqueeze(0)
+    lower = -ramps[:-2] / fdiff[:-1].unsqueeze(1)
+    upper = ramps[2:] / fdiff[1:].unsqueeze(1)
+    weights = torch.maximum(
+        torch.zeros(1, dtype=torch.float64),
+        torch.minimum(lower, upper),
+    )
+    enorm = 2.0 / (hz_edges[2 : n_mels + 2] - hz_edges[:n_mels])
+    fb = (weights * enorm.unsqueeze(1)).to(torch.float32)
+    window = torch.hann_window(win_length, periodic=False).to(torch.float32)
+    return fb, window
 
 
 class MelFeaturizer(nn.Module):

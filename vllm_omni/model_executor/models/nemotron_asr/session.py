@@ -686,6 +686,13 @@ class NemotronRealtimeSession:
             request_id = session_key
         hf = getattr(model_config, "hf_config", model_config)
         geometry = AdmittedGeometry.from_cadence(cadence)
+        model_path = getattr(model_config, "model", None)
+        if model_path and not getattr(hf, "prompt_dictionary", None):
+            from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
+                ensure_prompt_dictionary,
+            )
+
+            ensure_prompt_dictionary(hf, model_path)
         prompts = validate_prompt_dictionary(
             getattr(hf, "prompt_dictionary", None),
             getattr(hf, "num_prompts", None),

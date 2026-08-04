@@ -11,6 +11,9 @@ values are produced by the conversion publisher
 (``convert.author_config``), never hand-authored.
 """
 
+import json
+from pathlib import Path
+
 from transformers import PretrainedConfig
 
 from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
@@ -20,6 +23,17 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 )
 
 MODEL_TYPE = "nemotron_asr"
+
+#: The public HuggingFace card's model type (owned by transformers'
+#: ``nemotron3_5_asr`` implementation; this port serves that checkpoint
+#: directly through the translating config below).
+CARD_MODEL_TYPE = "nemotron3_5_asr"
+
+#: The port's pinned right attention context (lookahead, in subsampled
+#: encoder frames) — the 1120 ms arm. The card's
+#: ``default_num_lookahead_tokens`` is the *default* arm, not a bound;
+#: translation validates this pin against the card's supported set.
+_PINNED_LOOKAHEAD = 13
 
 #: The raw chunk-envelope carrier width: header slots plus the largest
 #: admitted raw cadence (1120 ms at 16 kHz) — DERIVED from the
@@ -173,4 +187,149 @@ class NemotronASRConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             torch_dtype=torch_dtype,
             **kwargs,
+        )
+
+
+def _require_int(mapping: dict, key: str, source: str) -> int:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{source} requires an integer {key!r}")
+    return value
+
+
+def translate_card_config(card: dict) -> dict:
+    """Translate the public HF card schema into this port's schema.
+
+    The card (transformers' ``nemotron3_5_asr``) declares the joint
+    width as ``vocab_size`` with blank last; this port's ``vocab_size``
+    is the engine logit width, which additionally covers four minted
+    control ids. The controls are minted deterministically as the four
+    ids immediately past blank, matching the offline publisher's
+    arithmetic (``convert.author_config``): a control must be a genuinely
+    new id (> V) and the logit width must cover every id.
+
+    Raises:
+        ValueError: If the card's identity arithmetic is inconsistent,
+            a required encoder field is absent, or the port's pinned
+            lookahead arm is outside the card's supported set.
+    """
+    card = dict(card)
+    encoder = card.pop("encoder_config", None)
+    if not isinstance(encoder, dict):
+        encoder = dict(getattr(encoder, "__dict__", None) or {}) if encoder is not None else None
+    if not encoder:
+        raise ValueError("public card requires encoder_config")
+    blank = _require_int(card, "blank_token_id", "public card")
+    joint_width = _require_int(card, "vocab_size", "public card")
+    if joint_width != blank + 1:
+        raise ValueError(
+            "public card identity mismatch: vocab_size must be "
+            f"blank_token_id + 1 (blank last), got vocab_size={joint_width} "
+            f"blank_token_id={blank}"
+        )
+    card.pop("vocab_size")
+    supported = encoder.get("supported_num_lookahead_tokens")
+    if supported is not None and _PINNED_LOOKAHEAD not in supported:
+        raise ValueError(
+            f"the pinned lookahead arm ({_PINNED_LOOKAHEAD}) is not in the "
+            f"card's supported set {supported}"
+        )
+    for key in ("hidden_size", "num_hidden_layers", "conv_kernel_size", "sliding_window", "num_mel_bins"):
+        _require_int(encoder, key, "public card encoder_config")
+    d_model = int(encoder["hidden_size"])
+    prompt_intermediate = card.get("prompt_intermediate_size")
+    if prompt_intermediate is not None and int(prompt_intermediate) != 2 * d_model:
+        raise ValueError(
+            "prompt fusion width mismatch: the port's prompt kernel is "
+            f"Linear(hidden+prompts -> 2*hidden); card declares "
+            f"{prompt_intermediate} for hidden {d_model}"
+        )
+    translated = {
+        "num_asr_labels": blank,
+        "eos_token_id": blank + 1,
+        "audio_chunk_token_id": blank + 2,
+        "eou_token_id": blank + 3,
+        "flush_token_id": blank + 4,
+        "vocab_size": blank + 5,
+        "d_model": d_model,
+        "n_layers": int(encoder["num_hidden_layers"]),
+        "conv_kernel": int(encoder["conv_kernel_size"]),
+        "att_context_left": int(encoder["sliding_window"]) - 1,
+        "att_context_right": _PINNED_LOOKAHEAD,
+        "n_mels": int(encoder["num_mel_bins"]),
+        "torch_dtype": str(card.pop("dtype", card.pop("torch_dtype", "float32"))),
+    }
+    if "decoder_hidden_size" in card:
+        translated["pred_hidden"] = int(card.pop("decoder_hidden_size"))
+    if "num_decoder_layers" in card:
+        translated["pred_rnn_layers"] = int(card.pop("num_decoder_layers"))
+    # Retained card facts ride through as plain attributes; keys this
+    # port reinterprets were popped above so they cannot collide.
+    card.pop("model_type", None)
+    translated.update(card)
+    return translated
+
+
+class NemotronCardServingConfig(NemotronASRConfig):
+    """Serve the public HF card directly (PORT-WGT-004, card path).
+
+    Registered with vLLM's config registry for ``nemotron3_5_asr`` so
+    every process that builds a ``ModelConfig`` from the public
+    checkpoint sees this port's canonical fields. A dict carrying
+    ``encoder_config`` is the card shape and is translated; a dict
+    already in the served schema (a round-trip of this class's own
+    ``to_dict``) passes through unchanged.
+    """
+
+    model_type = CARD_MODEL_TYPE
+
+    def __init__(self, **kwargs: object) -> None:
+        if "encoder_config" in kwargs:
+            kwargs = translate_card_config(kwargs)
+        super().__init__(**kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):  # type: ignore[override]
+        loaded = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        config = loaded[0] if isinstance(loaded, tuple) else loaded
+        ensure_prompt_dictionary(config, pretrained_model_name_or_path)
+        return loaded
+
+
+def ensure_prompt_dictionary(config: PretrainedConfig, model_path: object) -> None:
+    """Fill ``prompt_dictionary`` from the card's processor sidecar.
+
+    The public card ships the complete locale-to-row authority in
+    ``processor_config.json``, not ``config.json``. Idempotent: a config
+    that already carries a non-empty mapping (the served artifact) is
+    left untouched, and an absent sidecar leaves the config unchanged —
+    the model's existing ``validate_prompt_dictionary`` gate then fails
+    admission with its own error.
+    """
+    if getattr(config, "prompt_dictionary", None):
+        return
+    sidecar = None
+    local = Path(str(model_path)) / "processor_config.json"
+    if local.is_file():
+        sidecar = json.loads(local.read_text())
+    else:
+        try:
+            from transformers.utils import cached_file
+
+            resolved = cached_file(
+                str(model_path),
+                "processor_config.json",
+                _raise_exceptions_for_missing_entries=False,
+            )
+            if resolved:
+                sidecar = json.loads(Path(resolved).read_text())
+        except Exception:
+            sidecar = None
+    if not sidecar:
+        return
+    mapping = sidecar.get("prompt_dictionary")
+    if mapping:
+        config.prompt_dictionary = validate_prompt_dictionary(
+            mapping,
+            getattr(config, "num_prompts", None),
         )
