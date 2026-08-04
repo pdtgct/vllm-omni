@@ -239,6 +239,7 @@ def author_config(
     flush_token_id: int,
     hidden_size: int,
     reference_vocab_size: int | None = None,
+    max_symbols_per_step: int = 10,
 ) -> dict:
     """Assemble the served ``config.json`` dict (PORT-WGT-004).
 
@@ -295,4 +296,8 @@ def author_config(
         "flush_token_id": flush_token_id,
         "torch_dtype": "float32",
         "n_layers": n_layers,
+        # The publisher's decode-cap declaration (PORT-DEC-005): serving
+        # validates its budgets against this value and fails closed on
+        # disagreement rather than silently preferring either source.
+        "max_symbols_per_step": max_symbols_per_step,
     }

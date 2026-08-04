@@ -307,6 +307,56 @@ def test_card_model_type_is_registered_with_vllm() -> None:
     assert _CONFIG_REGISTRY["nemotron3_5_asr"] is NemotronCardServingConfig
 
 
+# ---- cadence admission against the declared arms (D1) ------------------------
+
+
+def _admissible_config() -> NemotronCardServingConfig:
+    config = NemotronCardServingConfig(**_card_config_dict())
+    config.prompt_dictionary = {"en-US": 0, "auto": 101}
+    return config
+
+
+# @spec PORT-SESS-015
+def test_cadence_admission_rejects_an_arm_the_card_does_not_declare() -> None:
+    """160 ms implies lookahead 1, outside the card's [3, 0, 6, 13]."""
+    from vllm_omni.model_executor.models.nemotron_asr.session import (
+        NemotronRealtimeSession,
+    )
+
+    config = _admissible_config()
+    assert config.supported_num_lookahead_tokens == [3, 0, 6, 13]
+    with pytest.raises(ValueError, match="PORT-SESS-015"):
+        NemotronRealtimeSession.from_model_config(config, cadence="160ms")
+
+
+# @spec PORT-SESS-015
+def test_cadence_admission_follows_the_declared_set_not_the_code() -> None:
+    """Declared arms admit their cadences; no declaration admits all."""
+    from vllm_omni.model_executor.models.nemotron_asr.session import (
+        NemotronRealtimeSession,
+    )
+
+    config = _admissible_config()
+    for cadence in ("80ms", "320ms", "560ms", "1120ms"):
+        session = NemotronRealtimeSession.from_model_config(
+            config, cadence=cadence
+        )
+        assert session.geometry.cadence == cadence
+
+    undeclared = _admissible_config()
+    del undeclared.supported_num_lookahead_tokens
+    session = NemotronRealtimeSession.from_model_config(
+        undeclared, cadence="160ms"
+    )
+    assert session.geometry.cadence == "160ms"
+
+
+# @spec PORT-DEC-005
+def test_card_translation_retains_the_decode_cap_declaration() -> None:
+    config = NemotronCardServingConfig(**_card_config_dict())
+    assert config.max_symbols_per_step == 10
+
+
 def test_served_schema_still_constructs_directly() -> None:
     """The authored artifact's schema is untouched by the card path."""
     config = NemotronASRConfig(

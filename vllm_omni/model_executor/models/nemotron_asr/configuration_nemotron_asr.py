@@ -234,6 +234,12 @@ def translate_card_config(card: dict) -> dict:
             f"the pinned lookahead arm ({_PINNED_LOOKAHEAD}) is not in the "
             f"card's supported set {supported}"
         )
+    if supported is not None:
+        # Retained verbatim: session admission validates each requested
+        # cadence's implied lookahead against this declared set
+        # (PORT-SESS-015) — the card, not the code, decides which arms
+        # the publisher stands behind.
+        card["supported_num_lookahead_tokens"] = [int(v) for v in supported]
     for key in ("hidden_size", "num_hidden_layers", "conv_kernel_size", "sliding_window", "num_mel_bins"):
         _require_int(encoder, key, "public card encoder_config")
     d_model = int(encoder["hidden_size"])
