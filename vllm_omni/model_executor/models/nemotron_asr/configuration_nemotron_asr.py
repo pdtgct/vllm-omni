@@ -251,6 +251,12 @@ def translate_card_config(card: dict) -> dict:
         "eou_token_id": blank + 3,
         "flush_token_id": blank + 4,
         "vocab_size": blank + 5,
+        # Decode dispatch is a publisher declaration, never a runtime
+        # default (PORT-DEC-008). On the card path this translation IS
+        # the publisher, and it declares the qualified eager arm — the
+        # same value the offline publisher stamps into the served
+        # artifact.
+        "decode_dispatch_arm": "dense-eager",
         "d_model": d_model,
         "n_layers": int(encoder["num_hidden_layers"]),
         "conv_kernel": int(encoder["conv_kernel_size"]),
