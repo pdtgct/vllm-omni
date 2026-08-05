@@ -315,6 +315,19 @@ class NemotronCardServingConfig(NemotronASRConfig):
         ensure_prompt_dictionary(config, pretrained_model_name_or_path)
         return loaded
 
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        # vLLM registers this class with AutoConfig and loads checkpoints
+        # through ``AutoConfig.from_pretrained``, which dispatches here —
+        # never through ``from_pretrained`` above. AutoConfig forwards the
+        # checkpoint path as ``name_or_path``, so the sidecar hydration
+        # must also fire on this path.
+        loaded = super().from_dict(config_dict, **kwargs)
+        config = loaded[0] if isinstance(loaded, tuple) else loaded
+        if config.name_or_path:
+            ensure_prompt_dictionary(config, config.name_or_path)
+        return loaded
+
 
 def ensure_prompt_dictionary(config: PretrainedConfig, model_path: object) -> None:
     """Fill ``prompt_dictionary`` from the card's processor sidecar.

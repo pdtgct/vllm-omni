@@ -160,6 +160,29 @@ def test_prompt_dictionary_sidecar_absent_leaves_config_unchanged(tmp_path) -> N
     assert not config.prompt_dictionary
 
 
+# @spec PORT-WGT-003, PORT-LID-001
+def test_prompt_dictionary_hydrates_on_the_autoconfig_dispatch_path(tmp_path) -> None:
+    """vLLM loads registry classes through ``AutoConfig.from_pretrained``,
+    which dispatches to ``from_dict`` with the checkpoint path forwarded as
+    ``name_or_path`` — never through ``from_pretrained``. The sidecar
+    hydration must fire there too; the 2026-08-04 A40 co-hosted bring-up
+    failed on exactly this (frontend saw an empty ``prompt_dictionary``
+    while the engine-side copy was hydrated at model construction).
+    """
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"prompt_dictionary": {"en-US": 0, "auto": 101}})
+    )
+    config = NemotronCardServingConfig.from_dict(
+        _card_config_dict(), name_or_path=str(tmp_path)
+    )
+    assert config.prompt_dictionary == {"en-US": 0, "auto": 101}
+    # Without a path the config stays permissive for registry and
+    # introspection construction — the model's own admission gate is
+    # the backstop, unchanged.
+    bare = NemotronCardServingConfig.from_dict(_card_config_dict())
+    assert not bare.prompt_dictionary
+
+
 # ---- tensor-name remapping ---------------------------------------------------
 
 #: (card name, port name) pairs covering every rename class, from the
