@@ -29,6 +29,14 @@ else:
 
 _MAX_BLOCK_SIZE: Final = 1024
 _CUDA_DTYPES: Final = frozenset((torch.float32, torch.int32, torch.int64))
+#: Compute capabilities the CUDA masked scatter is qualified on — the
+#: complete SM8x (Ampere/Ada) set, each validated by a live serving
+#: round. Admission is keyed off this declared set, never a code
+#: default: a capability joins only with a green qualification round on
+#: real hardware (Turing SM75 and Hopper SM90 are pending lanes), so an
+#: unqualified device fails closed at warmup with a named error instead
+#: of surfacing a raw kernel fault mid-stream.
+_QUALIFIED_CAPABILITIES: Final = frozenset(((8, 0), (8, 6), (8, 7), (8, 9)))
 _OP_NAME: Final = "nemotron_asr_masked_page_scatter_"
 _OP_REGISTERED = False
 _REGISTRATION_LOCK = threading.Lock()
@@ -172,9 +180,16 @@ def _validate_masked_page_scatter(
     if pool.device.type == "cuda":
         if pool.dtype not in _CUDA_DTYPES:
             raise ValueError(f"CUDA masked scatter dtype {pool.dtype} is not qualified")
-        major, _ = torch.cuda.get_device_capability(pool.device)
-        if major != 8:
-            raise ValueError("CUDA masked scatter is qualified only for SM8x; Hopper qualification is a later lane")
+        capability = torch.cuda.get_device_capability(pool.device)
+        if capability not in _QUALIFIED_CAPABILITIES:
+            qualified = ", ".join(
+                f"SM{major}{minor}" for major, minor in sorted(_QUALIFIED_CAPABILITIES)
+            )
+            raise ValueError(
+                f"CUDA masked scatter is not qualified on SM{capability[0]}{capability[1]}; "
+                f"qualified capabilities: {qualified}. A capability joins the declared "
+                "set only with a green qualification round on real hardware."
+            )
         if _TRITON_LOAD_ERROR is not None:
             raise ValueError("CUDA masked scatter requires Triton") from _TRITON_LOAD_ERROR
         _ensure_cuda_op_registered()
