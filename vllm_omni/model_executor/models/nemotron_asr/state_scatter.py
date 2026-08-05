@@ -36,7 +36,9 @@ _CUDA_DTYPES: Final = frozenset((torch.float32, torch.int32, torch.int64))
 #: real hardware (Turing SM75 and Hopper SM90 are pending lanes), so an
 #: unqualified device fails closed at warmup with a named error instead
 #: of surfacing a raw kernel fault mid-stream.
-_QUALIFIED_CAPABILITIES: Final = frozenset(((8, 0), (8, 6), (8, 7), (8, 9)))
+_QUALIFIED_CAPABILITIES: Final = frozenset(((7, 5), (8, 0), (8, 6), (8, 7), (8, 9)))
+# SM75 (Turing/T4) is admitted ON THIS QUALIFICATION BRANCH ONLY; it
+# joins the mainline set with the green round's evidence attached.
 _OP_NAME: Final = "nemotron_asr_masked_page_scatter_"
 _OP_REGISTERED = False
 _REGISTRATION_LOCK = threading.Lock()
