@@ -1,4 +1,6 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.24.0
+# The RFC-1 lane pairs with vLLM v0.25.0 (unmodified core); the fork
+# installs on top of the upstream serving image unchanged otherwise.
+ARG BASE_IMAGE=vllm/vllm-openai:v0.25.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
