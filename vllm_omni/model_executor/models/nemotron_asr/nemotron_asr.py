@@ -266,6 +266,24 @@ __all__ = [
     info=NemotronASRProcessingInfo,
     dummy_inputs=NemotronASRDummyInputsBuilder,
 )
+def derive_state_pool_blocks(vllm_config: Any) -> int:
+    """The exact page-pool size the resolved envelope needs.
+
+    One aggregate page holds one session's complete state, so the pool
+    needs the resolved resident-session cap, plus the safety reserve,
+    plus the manager's null block — nothing else. Derived from the same
+    envelope resolution serving uses (defaults equal the qualified
+    profile), so a defaults-only boot and an explicit envelope size the
+    pool identically.
+    """
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
+    return runtime.max_resident_sessions + runtime.safety_reserve_slots + 1
+
+
 class NemotronASRForRNNT(nn.Module):
     """Engine-facing cache-aware RNN-T over one aggregate state page."""
 
@@ -319,6 +337,22 @@ class NemotronASRForRNNT(nn.Module):
                 f"--dtype {engine_dtype} is not the qualified profile "
                 "for this model (float32); a precision change requires "
                 "requalification (PORT-STATE-009)"
+            )
+        # The state pool's size is DERIVED, never swept: one aggregate
+        # page per session (~6 MiB at the shipped profile), so the pool
+        # needs exactly the resolved session cap plus the safety
+        # reserve plus the null block — tens of MiB. Left to vLLM's LLM
+        # utilization sweep, the pool instead grabs
+        # gpu_memory_utilization of the card and OOMs any GPU smaller
+        # than the profiling machine (observed on A10G: a 20.5 GiB
+        # request for a 60 MiB need). An operator-set override wins.
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if (
+            cache_config is not None
+            and getattr(cache_config, "num_gpu_blocks_override", None) is None
+        ):
+            cache_config.num_gpu_blocks_override = derive_state_pool_blocks(
+                vllm_config
             )
         reject_unsupported_outer_graph_mode(
             getattr(vllm_config, "compilation_config", None)

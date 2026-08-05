@@ -400,6 +400,32 @@ def test_partial_generation_config_inherits_the_declared_park_stop() -> None:
     assert broken.try_get_generation_config() == {}
 
 
+# @spec PORT-STATE-004
+def test_state_pool_blocks_derive_from_the_resolved_envelope() -> None:
+    """Pool size is sessions + reserve + null block, never a sweep.
+
+    The utilization sweep requested 20.5 GiB for a ~60 MiB need and
+    OOMed an A10G; the derived count follows the envelope on both the
+    defaults-only and explicit paths.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        derive_state_pool_blocks,
+    )
+
+    defaults_only = SimpleNamespace(additional_config=None)
+    assert derive_state_pool_blocks(defaults_only) == 8 + 1 + 1
+
+    explicit = SimpleNamespace(
+        additional_config={
+            "max_resident_sessions": 16,
+            "persistent_state_safety_reserve_slots": 2,
+        }
+    )
+    assert derive_state_pool_blocks(explicit) == 16 + 2 + 1
+
+
 # @spec PORT-WGT-004
 def test_card_translation_never_presents_an_encoder_decoder_model() -> None:
     """The card's architectural flag must not select vLLM's enc-dec path.
