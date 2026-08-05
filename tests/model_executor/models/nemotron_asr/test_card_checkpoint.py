@@ -426,6 +426,25 @@ def test_state_pool_blocks_derive_from_the_resolved_envelope() -> None:
     assert derive_state_pool_blocks(explicit) == 16 + 2 + 1
 
 
+def test_model_class_owns_the_multimodal_registration() -> None:
+    """The registry decorator must bind the model class, nothing else.
+
+    A helper inserted between the decorator and the class silently
+    stole the registration (found live 2026-08-05: the model lost its
+    processor and dummy-inputs builder, and engine bring-up died on the
+    profiling run with "forward requires embeddings").
+    """
+    import inspect
+
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr
+
+    src = inspect.getsource(nemotron_asr)
+    decorator = src.index("@MULTIMODAL_REGISTRY.register_processor(")
+    model_class = src.index("class NemotronASRForRNNT")
+    assert decorator < model_class
+    assert "def " not in src[decorator:model_class]
+
+
 # @spec PORT-WGT-004
 def test_card_translation_never_presents_an_encoder_decoder_model() -> None:
     """The card's architectural flag must not select vLLM's enc-dec path.

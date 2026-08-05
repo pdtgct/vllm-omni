@@ -261,11 +261,6 @@ __all__ = [
 ]
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    NemotronASRMultiModalProcessor,
-    info=NemotronASRProcessingInfo,
-    dummy_inputs=NemotronASRDummyInputsBuilder,
-)
 def derive_state_pool_blocks(vllm_config: Any) -> int:
     """The exact page-pool size the resolved envelope needs.
 
@@ -284,6 +279,11 @@ def derive_state_pool_blocks(vllm_config: Any) -> int:
     return runtime.max_resident_sessions + runtime.safety_reserve_slots + 1
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    NemotronASRMultiModalProcessor,
+    info=NemotronASRProcessingInfo,
+    dummy_inputs=NemotronASRDummyInputsBuilder,
+)
 class NemotronASRForRNNT(nn.Module):
     """Engine-facing cache-aware RNN-T over one aggregate state page."""
 
