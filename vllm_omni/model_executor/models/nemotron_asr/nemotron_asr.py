@@ -336,7 +336,14 @@ class NemotronASRForRNNT(nn.Module):
             raise ValueError(
                 f"--dtype {engine_dtype} is not the qualified profile "
                 "for this model (float32); a precision change requires "
-                "requalification (PORT-STATE-009)"
+                "requalification (PORT-STATE-009). If no --dtype was "
+                "given, vLLM's auto policy downcasts float32 checkpoints "
+                "on SM80+ GPUs and the pipeline's deploy profile "
+                "(vllm_omni/deploy/nemotron_asr.yaml) normally pins "
+                "float32 - a 'Deploy config not found' warning earlier "
+                "in this log means the installation is missing its "
+                "deploy data. Pass --dtype float32 or repair the "
+                "installation."
             )
         # The state pool's size is DERIVED, never swept: one aggregate
         # page per session (~6 MiB at the shipped profile), so the pool

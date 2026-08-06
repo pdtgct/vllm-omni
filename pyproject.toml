@@ -150,7 +150,10 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+# deploy/*.yaml are the qualified per-model deploy profiles; a wheel built
+# without them silently loses pipeline-pinned settings (dtype, prefix
+# caching, eager) and falls through to platform defaults.
+"vllm_omni" = ["_version.py", "py.typed", "deploy/*.yaml"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.setuptools_scm]
