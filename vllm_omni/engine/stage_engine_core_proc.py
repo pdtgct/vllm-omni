@@ -129,8 +129,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 "pending": {},
                 "claimed": {},
                 "cleanup": {},
+                "binding_created": {},
                 "tombstone_ttl_s": runtime.tombstone_ttl_s,
                 "max_tombstones": runtime.max_tombstones,
+                "pending_claim_timeout_s": runtime.pending_claim_timeout_s,
             }
             self._persistent_state_control_state = control
             self.scheduler.persistent_state_registry = self
@@ -196,7 +198,36 @@ class StageEngineCoreProc(EngineCoreProc):
                 "tombstone_ttl_s"
             ],
             "persistent_state_max_tombstones": control["max_tombstones"],
+            # PORT-STATE-023: binding inventory for handshake-time orphan
+            # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
+            # across processes on one host, which is the deployment shape
+            # (the service and this proc are co-hosted).
+            "bindings": self._persistent_state_binding_inventory(control),
         }
+
+    @staticmethod
+    def _persistent_state_binding_inventory(
+        control: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        horizon = float(control["pending_claim_timeout_s"])
+        inventory: list[dict[str, Any]] = []
+        for owner in ("pending", "claimed", "cleanup"):
+            for token, binding in control[owner].items():
+                created = control["binding_created"].get(token)
+                inventory.append(
+                    {
+                        "binding_token": token,
+                        "session_key": binding.request_id,
+                        "generation": binding.generation,
+                        "schema_id": binding.schema_id,
+                        "profile_id": binding.profile_id,
+                        "engine_epoch": binding.engine_epoch,
+                        "claim_expires_at": (
+                            None if created is None else created + horizon
+                        ),
+                    }
+                )
+        return inventory
 
     def persistent_state_reserve(
         self,
@@ -217,8 +248,12 @@ class StageEngineCoreProc(EngineCoreProc):
             len(control["operations"]) + len(manager._bindings) + 2
             > int(control["max_tombstones"])
         ):
+            # PORT-STATE-024: typed, retryable backpressure - the horizon
+            # frees by tombstone expiry (pruned on every attempt and probe)
+            # and by release; this is never an invariant failure.
             raise RuntimeError(
-                "persistent-state operation tombstone horizon is full"
+                "persistent_state_horizon_exhausted: operation tombstone "
+                "horizon is full; retry after tombstone expiry"
             )
         if schema_id != manager.persistent_state_spec.schema_id:
             raise ValueError("persistent_state schema mismatch")
@@ -239,6 +274,7 @@ class StageEngineCoreProc(EngineCoreProc):
             "binding_token": binding_token,
         }
         control["pending"][binding_token] = binding
+        control["binding_created"][binding_token] = time.monotonic()
         control["revision"] += 1
         result = {
             "operation_id": operation_id,
@@ -426,6 +462,7 @@ class StageEngineCoreProc(EngineCoreProc):
         if actual != expected:
             raise ValueError("persistent-state release lease mismatch")
         control[owner].pop(binding_token)
+        control["binding_created"].pop(binding_token, None)
         manager.drop_lease(binding.request_id)
         generation = binding.generation
         session_key = binding.request_id

@@ -39,6 +39,12 @@ class PersistentStateIndeterminate(PersistentStateServiceError):  # noqa: N818
     """A submitted operation could not be reconciled authoritatively."""
 
 
+class PersistentStateBackpressure(PersistentStateServiceError):  # noqa: N818
+    """Retryable per-operation shed; admission remains open (PORT-STATE-024)."""
+
+    retryable = True
+
+
 @dataclass(frozen=True)
 class StateLocationEvent:
     """Content-free projection of one committed location transition."""
@@ -169,6 +175,10 @@ class PersistentStateService:
         self._ready = False
         self._admission_open = False
         self._tombstone_admission_blocked = False
+        # Live leases this mint issued and has not seen released - the
+        # authority the handshake's orphan reconciliation compares engine
+        # bindings against (PORT-STATE-023).
+        self._live_leases: dict[str, StateLease] = {}
         self._engine_epoch: str | None = None
         self._inventory: dict[str, Any] | None = None
         self._metrics_sink: Any | None = None
@@ -204,6 +214,18 @@ class PersistentStateService:
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""
         self._admission_open = False
+
+    def _demote(self) -> None:
+        """Close admission AND require a fresh handshake to reopen.
+
+        Recovery reuses the startup path (PORT-STATE-022): the next health
+        probe re-runs the capability/inventory handshake and reopens
+        admission only against a consistent engine snapshot. Retained
+        tombstones survive, so exact-retry semantics hold across recovery.
+        Only ``engine_epoch_changed`` latches terminally.
+        """
+        self.close_admission()
+        self._ready = False
 
     def _prune_operation_tombstones(self) -> None:
         """Forget only completed operations whose retry horizon expired."""
@@ -324,10 +346,62 @@ class PersistentStateService:
         """Fail closed when a new engine epoch invalidates every live lease."""
         self.close_admission()
         self._ready = False
+        self._live_leases.clear()
         self._fatal_error = PersistentStateServiceUnavailable(
             "persistent-state engine epoch changed; live leases are invalid"
         )
         self._engine_epoch = engine_epoch
+
+    async def _reconcile_orphan_bindings(
+        self, snapshot: dict[str, Any]
+    ) -> None:
+        """Release engine bindings no live lease owns (PORT-STATE-023).
+
+        Runs inside the handshake, before admission opens. An orphan is a
+        binding whose token this mint never issued or has already seen
+        released, and whose claim horizon has expired - a live lease or
+        an unexpired pending claim is never reclaimed. A claimed binding
+        the engine still runs is skipped (its abort path owns it); any
+        other release failure fails the handshake, so admission stays
+        closed until the engine answers consistently.
+        """
+        for binding in snapshot.get("bindings", ()):
+            token = str(binding["binding_token"])
+            if token in self._live_leases:
+                continue
+            expires = binding.get("claim_expires_at")
+            if expires is None or float(expires) > self._monotonic():
+                continue
+            payload = {
+                "engine_epoch": str(binding["engine_epoch"]),
+                "session_key": str(binding["session_key"]),
+                "generation": int(binding["generation"]),
+                "schema_id": str(binding["schema_id"]),
+                "profile_id": str(binding["profile_id"]),
+                "location": "resident",
+                "binding_token": token,
+            }
+            try:
+                raw = await self._stage_client.call_utility_async(
+                    "persistent_state_release",
+                    f"orphan-{token}",
+                    payload,
+                    "orphan_reconciliation",
+                )
+            except Exception as error:
+                if "still running" in str(error):
+                    continue
+                raise PersistentStateServiceUnavailable(
+                    f"orphan reconciliation failed for one binding: {error}"
+                ) from error
+            self._inventory["manager_revision"] = raw.get(
+                "manager_revision",
+                self._inventory.get("manager_revision"),
+            )
+            self._inventory["resident_count"] = raw.get(
+                "resident_count",
+                self._inventory.get("resident_count"),
+            )
 
     async def _ensure_started(self) -> None:
         if self._startup_lock is None:
@@ -389,6 +463,7 @@ class PersistentStateService:
                     raise PersistentStateServiceUnavailable(
                         "persistent-state tombstone count disagrees across processes"
                     )
+                await self._reconcile_orphan_bindings(snapshot)
                 self._ready = True
                 self._admission_open = True
                 self._refresh_tombstone_admission()
@@ -487,6 +562,7 @@ class PersistentStateService:
                     timeout=self._reconciliation_timeout_s,
                 )
             except asyncio.TimeoutError as error:
+                self._demote()
                 raise PersistentStateIndeterminate(
                     "persistent-state reserve reconciliation remained indeterminate"
                 ) from error
@@ -527,7 +603,7 @@ class PersistentStateService:
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
                 self._operation_expires_at.pop(operation_id, None)
-                self.close_admission()
+                self._demote()
                 raise PersistentStateServiceUnavailable(
                     "persistent-state cleanup queue is full"
                 ) from error
@@ -538,7 +614,7 @@ class PersistentStateService:
                 asyncio.shield(shared), timeout=self._reconciliation_timeout_s
             )
         except asyncio.TimeoutError as error:
-            self.close_admission()
+            self._demote()
             raise PersistentStateIndeterminate(
                 "persistent-state release reconciliation remained indeterminate"
             ) from error
@@ -575,7 +651,7 @@ class PersistentStateService:
                 )
             except asyncio.QueueFull as error:
                 self._pending_cleanup_claims.pop(binding_token, None)
-                self.close_admission()
+                self._demote()
                 raise PersistentStateServiceUnavailable(
                     "persistent-state cleanup queue is full"
                 ) from error
@@ -587,7 +663,7 @@ class PersistentStateService:
                 timeout=self._reconciliation_timeout_s,
             )
         except asyncio.TimeoutError as error:
-            self.close_admission()
+            self._demote()
             raise PersistentStateIndeterminate(
                 "persistent-state pending cleanup claim remained indeterminate"
             ) from error
@@ -640,14 +716,17 @@ class PersistentStateService:
                 )
         except Exception as error:
             mapped = self._map_error(error)
-            self._observe_admission_rejection(
-                "capacity"
-                if isinstance(mapped, PersistentStateCapacityExhausted)
-                else "unavailable"
-            )
+            if isinstance(mapped, PersistentStateBackpressure):
+                rejection = "backpressure"
+            elif isinstance(mapped, PersistentStateCapacityExhausted):
+                rejection = "capacity"
+            else:
+                rejection = "unavailable"
+            self._observe_admission_rejection(rejection)
             if not command.future.done():
                 command.future.set_exception(mapped)
         else:
+            self._live_leases[result.lease.binding_token] = result.lease
             if not command.future.done():
                 command.future.set_result(result)
 
@@ -670,6 +749,7 @@ class PersistentStateService:
             if not command.future.done():
                 command.future.set_exception(mapped)
         else:
+            self._live_leases.pop(command.lease.binding_token, None)
             if not command.future.done():
                 command.future.set_result(result)
 
@@ -699,6 +779,8 @@ class PersistentStateService:
         if isinstance(error, PersistentStateServiceError):
             return error
         message = str(error)
+        if "persistent_state_horizon_exhausted" in message:
+            return PersistentStateBackpressure(message)
         if "capacity" in message.lower():
             return PersistentStateCapacityExhausted(message)
         return PersistentStateServiceUnavailable(message)
