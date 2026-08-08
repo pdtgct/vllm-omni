@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
     _execute_masked_page_scatter_,
     validate_masked_page_scatter,
@@ -1127,19 +1128,20 @@ def advance_session(
     # rows take no prefix and drop nothing.
     prefix = state.mel_tail.clone()
 
-    new_frames, counts, row_status = advance_frontend(
-        core.featurizer,
-        batch.samples,
-        batch.valid_samples,
-        batch.final_tail,
-        targets,
-        raw_tail=state.raw_tail,
-        mel_tail=state.mel_tail,
-        counters=state.frontend_counters,
-        cadence_frames=cadence,
-        pad_frames=pad_frames,
-        row_status=incoming,
-    )
+    with phase("port.featurize"):
+        new_frames, counts, row_status = advance_frontend(
+            core.featurizer,
+            batch.samples,
+            batch.valid_samples,
+            batch.final_tail,
+            targets,
+            raw_tail=state.raw_tail,
+            mel_tail=state.mel_tail,
+            counters=state.frontend_counters,
+            cadence_frames=cadence,
+            pad_frames=pad_frames,
+            row_status=incoming,
+        )
     row_ok = row_status == 0
     counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] += row_ok.to(torch.int64)
 
@@ -3186,8 +3188,11 @@ def advance_model_rows(
     # pass); the commit window calls the private prevalidated
     # executor directly so no descriptor is re-validated here.
     try:
-        for op in scatter_ops:
-            _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+        with phase("port.scatter"):
+            for op in scatter_ops:
+                _execute_masked_page_scatter_(
+                    op.pool, op.scratch, op.blocks, op.row_status
+                )
     except BaseException:
         if cancel_reservation is not None:
             cancel_reservation()
