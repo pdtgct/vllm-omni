@@ -774,14 +774,27 @@ class PersistentStateService:
             if not command.future.done():
                 command.future.set_result(won)
 
-    @staticmethod
-    def _map_error(error: BaseException) -> PersistentStateServiceError:
+    def _map_error(self, error: BaseException) -> PersistentStateServiceError:
         if isinstance(error, PersistentStateServiceError):
             return error
         message = str(error)
         if "persistent_state_horizon_exhausted" in message:
             return PersistentStateBackpressure(message)
         if "capacity" in message.lower():
+            # A fail-closed error that does not name its remedy costs an
+            # operator a source dive. The resident limit is a deployment
+            # choice whose default suits functional qualification, not
+            # load, so say what it is and what raises it.
+            inventory = self._inventory or {}
+            effective = inventory.get("effective_capacity")
+            configured = inventory.get("configured_limit")
+            if effective is not None:
+                message = (
+                    f"{message} (effective capacity {effective} resident "
+                    f"sessions, configured limit {configured}; raise "
+                    "max_resident_sessions in --additional-config to admit "
+                    "more concurrent sessions)"
+                )
             return PersistentStateCapacityExhausted(message)
         return PersistentStateServiceUnavailable(message)
 
