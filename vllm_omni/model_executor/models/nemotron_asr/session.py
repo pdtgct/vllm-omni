@@ -51,6 +51,7 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     RAW_SAMPLES_PER_CHUNK,
     SESSION_LIMITS,
 )
+from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 from vllm_omni.model_executor.models.nemotron_asr.transcript import (
     BoundedTranscript,
 )
@@ -922,7 +923,11 @@ class NemotronRealtimeSession:
             unit.logical_sequence for unit in self._accepted_audio.ready_units
         }
         try:
-            accepted = self._accepted_audio.accept(samples)
+            # Measured at the call site rather than inside the authority:
+            # the span then includes any wait for the authority's lock,
+            # which is the contention this phase exists to expose.
+            with phase("port.ingest"):
+                accepted = self._accepted_audio.accept(samples)
         except ValueError as error:
             if (
                 self._observer is not None

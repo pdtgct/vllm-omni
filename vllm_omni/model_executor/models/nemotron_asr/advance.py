@@ -1179,7 +1179,7 @@ def advance_session(
     out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
 
     caches = _GatheredCaches(state)
-    with torch.no_grad():
+    with torch.no_grad(), phase("port.encode"):
         enc = stream_step(
             # _GatheredCaches is StreamingCaches' structural twin over
             # the gathered batch; stream_step reads only the shared
@@ -1218,13 +1218,14 @@ def advance_session(
             c=decode_in.c.clone(),
             last_label=decode_in.last_label.clone(),
         )
-        decoded = decode_fn(
-            conditioned,
-            enc_lengths,
-            core.predictor,
-            core.joint,
-            decode_in,
-        )
+        with phase("port.decode"):
+            decoded = decode_fn(
+                conditioned,
+                enc_lengths,
+                core.predictor,
+                core.joint,
+                decode_in,
+            )
         from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
             FrameAlignedDecode,
         )
