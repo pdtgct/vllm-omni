@@ -14,16 +14,20 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _MODULE = "vllm_omni.engine.persistent_state_capacity"
+_SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1_120)
 
 _SYMBOL_SPECS = {
     "OnePointServiceDemand": "PORT-STATE-025",
     "PersistentStateAdmissionController": "PORT-STATE-025",
+    "ServiceExecutionTier": "PORT-PERF-006",
     "ServiceProfileContext": "PORT-PERF-006",
-    "ServiceRateExecution": "PORT-PERF-006",
+    "ServiceRoundExecution": "PORT-PERF-006",
     "TwoTermServiceDemand": "PORT-STATE-025",
     "admission_headroom": "PORT-OBS-012",
+    "compile_provisional_service_profile": "PORT-PERF-006",
+    "compile_service_demand_profile": "PORT-STATE-025",
     "derive_provisional_profile": "PORT-STATE-025",
-    "reduce_startup_service_rate": "PORT-PERF-006",
+    "fallback_transaction_duration_ns": "PORT-STATE-026",
     "resolve_pool_capacity": "PORT-STATE-004",
     "evaluate_admission": "PORT-STATE-026",
 }
@@ -202,22 +206,43 @@ def test_measured_fallback_is_derated_and_never_zero(
     assert profile.qualified is False
 
 
-def _profile_execution(
+def _service_tier(tier_id: str, maximum: int) -> Any:
+    return _symbol("ServiceExecutionTier")(
+        tier_id=tier_id,
+        max_active_population=maximum,
+    )
+
+
+def _service_round(
     *,
-    row_count: int,
+    tier_id: str,
+    active_population: int,
     elapsed_ns: int,
-    completed_rows: int | None = None,
+    service_interval_ms: int = 1_120,
+    geometry_id: int = 4,
+    completed_legal_parks: int | None = None,
+    completed_model_rows: int | None = None,
     post_jit: bool = True,
     continuously_loaded: bool = True,
+    dummy_run: bool = False,
+    is_profile: bool = False,
 ) -> Any:
-    return _symbol("ServiceRateExecution")(
-        row_count=row_count,
+    return _symbol("ServiceRoundExecution")(
+        tier_id=tier_id,
+        active_population=active_population,
         elapsed_ns=elapsed_ns,
-        completed_rows=(
-            row_count if completed_rows is None else completed_rows
+        service_interval_ms=service_interval_ms,
+        geometry_id=geometry_id,
+        completed_legal_parks=(
+            active_population
+            if completed_legal_parks is None
+            else completed_legal_parks
         ),
+        completed_model_rows=completed_model_rows,
         post_jit=post_jit,
         continuously_loaded=continuously_loaded,
+        dummy_run=dummy_run,
+        is_profile=is_profile,
     )
 
 
@@ -234,122 +259,343 @@ def _profile_context(**overrides: Any) -> Any:
         "execution_environment_key": "a100-40gb-cuda13-torch2.9",
         "precision_policy": "fp32",
         "state_profile": "nemotron-asr-fp32-v1",
+        "compiler_version": "persistent-state-capacity-v2",
+        "mixed_composition_policy": "homogeneous_upper_sum",
     }
     values.update(overrides)
     return _symbol("ServiceProfileContext")(**values)
 
 
-def test_profile_reduction_uses_only_trailing_post_jit_executions() -> None:
-    """@spec PORT-PERF-006: warmup cannot inflate measured service rate."""
+def _geometry_rounds(
+    *,
+    single_elapsed_ns: int,
+    small_elapsed_ns: int,
+    single_model_rows: int | None = None,
+    small_model_rows: int | None = None,
+    post_jit: bool = True,
+) -> tuple[Any, ...]:
+    return tuple(
+        execution
+        for geometry_id, service_interval_ms in enumerate(
+            _SERVICE_INTERVALS_MS
+        )
+        for execution in (
+            _service_round(
+                tier_id="single",
+                active_population=1,
+                elapsed_ns=single_elapsed_ns,
+                service_interval_ms=service_interval_ms,
+                geometry_id=geometry_id,
+                completed_model_rows=single_model_rows,
+                post_jit=post_jit,
+            ),
+            _service_round(
+                tier_id="small",
+                active_population=4,
+                elapsed_ns=small_elapsed_ns,
+                service_interval_ms=service_interval_ms,
+                geometry_id=geometry_id,
+                completed_model_rows=small_model_rows,
+                post_jit=post_jit,
+            ),
+        )
+    )
 
-    result = _symbol("reduce_startup_service_rate")(
+
+def _compile_profile(
+    executions: tuple[Any, ...],
+    *,
+    tiers: tuple[Any, ...] | None = None,
+    max_population: int = 4,
+    trailing_rounds: int = 1,
+    derating_factor: Fraction = Fraction(1, 2),
+) -> Any:
+    return _symbol("compile_provisional_service_profile")(
+        executions,
+        execution_tiers=(
+            (_service_tier("single", 1), _service_tier("small", 4))
+            if tiers is None
+            else tiers
+        ),
+        max_population=max_population,
+        reference_interval_ms=1_120,
+        reference_geometry_id=4,
+        admitted_geometry_ids=(0, 1, 2, 3, 4),
+        trailing_rounds=trailing_rounds,
+        derating_factor=derating_factor,
+        context=_profile_context(
+            allocated_pool=max_population,
+            count_cap=max_population,
+        ),
+    )
+
+
+def test_profile_expands_runner_tier_upper_bounds_without_interpolation() -> None:
+    """@spec PORT-PERF-006: finite tier coverage expands exactly to 1..P."""
+
+    result = _compile_profile(
+        _geometry_rounds(
+            single_elapsed_ns=100_000_000,
+            small_elapsed_ns=80_000_000,
+        )
+    )
+
+    assert result.upper_duration_ns_by_geometry_and_population[4] == (
+        100_000_000,
+        100_000_000,
+        100_000_000,
+        100_000_000,
+    )
+    assert result.measured_capacity == 4
+    assert result.provisional_capacity == 2
+    assert result.reference_demand == Fraction(1, 2)
+
+
+def test_profile_uses_worst_trailing_complete_round_and_legal_park() -> None:
+    """@spec PORT-PERF-006: no favorable sample or partial row is capacity."""
+
+    result = _compile_profile(
         (
-            _profile_execution(
-                row_count=1,
-                elapsed_ns=1,
+            *_geometry_rounds(
+                single_elapsed_ns=1,
+                small_elapsed_ns=1,
                 post_jit=False,
             ),
-            _profile_execution(row_count=1, elapsed_ns=100_000_000),
-            _profile_execution(row_count=1, elapsed_ns=200_000_000),
-            _profile_execution(row_count=1, elapsed_ns=250_000_000),
-        ),
-        operating_row_counts=(1,),
-        trailing_executions=2,
-        context=_profile_context(allocated_pool=1, count_cap=1),
-    )
-
-    assert result.measured_rate_rows_per_s == Fraction(40, 9)
-    assert result.trailing_executions == 2
-
-
-def test_profile_reduction_uses_least_rate_across_executed_range() -> None:
-    """@spec PORT-PERF-006: the weakest executed operating point gates."""
-
-    result = _symbol("reduce_startup_service_rate")(
-        (
-            _profile_execution(row_count=1, elapsed_ns=100_000_000),
-            _profile_execution(row_count=1, elapsed_ns=100_000_000),
-            _profile_execution(row_count=4, elapsed_ns=500_000_000),
-            _profile_execution(row_count=4, elapsed_ns=500_000_000),
-        ),
-        operating_row_counts=(1, 4),
-        trailing_executions=2,
-        context=_profile_context(allocated_pool=4, count_cap=4),
-    )
-
-    assert result.rate_by_row_count == {
-        1: Fraction(10),
-        4: Fraction(8),
-    }
-    assert result.operating_row_count == 4
-    assert result.measured_rate_rows_per_s == Fraction(8)
-
-
-def test_profile_reduction_refuses_extrapolation_or_noncontinuous_data() -> None:
-    """@spec PORT-PERF-006: fallback evidence covers its operating range."""
-
-    reduce_profile = _symbol("reduce_startup_service_rate")
-    with pytest.raises(ValueError, match=r"operating.*4|missing.*4"):
-        reduce_profile(
-            (_profile_execution(row_count=1, elapsed_ns=100_000_000),),
-            operating_row_counts=(1, 4),
-            trailing_executions=1,
-            context=_profile_context(allocated_pool=4, count_cap=4),
-        )
-    with pytest.raises(ValueError, match=r"continuous|load"):
-        reduce_profile(
-            (
-                _profile_execution(
-                    row_count=1,
-                    elapsed_ns=100_000_000,
-                    continuously_loaded=False,
-                ),
+            *_geometry_rounds(
+                single_elapsed_ns=90_000_000,
+                small_elapsed_ns=900_000_000,
             ),
-            operating_row_counts=(1,),
-            trailing_executions=1,
-            context=_profile_context(allocated_pool=1, count_cap=1),
-        )
-    with pytest.raises(ValueError, match=r"allocated.*4|operating.*4"):
-        reduce_profile(
-            (_profile_execution(row_count=1, elapsed_ns=100_000_000),),
-            operating_row_counts=(1,),
-            trailing_executions=1,
-            context=_profile_context(allocated_pool=4, count_cap=4),
-        )
-
-
-def test_profile_candidate_and_receipt_stamp_all_authorities() -> None:
-    """@spec PORT-PERF-006: candidates are complete and never self-promote."""
-
-    result = _symbol("reduce_startup_service_rate")(
-        (_profile_execution(row_count=4, elapsed_ns=500_000_000),),
-        operating_row_counts=(4,),
-        trailing_executions=1,
-        context=_profile_context(allocated_pool=4, count_cap=4),
+            *_geometry_rounds(
+                single_elapsed_ns=120_000_000,
+                small_elapsed_ns=1_000_000_000,
+            ),
+        ),
+        trailing_rounds=2,
     )
 
-    assert result.profile_candidate.execution_environment_key == (
-        "a100-40gb-cuda13-torch2.9"
+    assert result.upper_duration_ns_by_geometry_and_tier[4] == {
+        "single": 120_000_000,
+        "small": 1_000_000_000,
+    }
+    assert result.measured_capacity == 4
+
+    with pytest.raises(ValueError, match=r"legal park|complete.*round"):
+        _compile_profile(
+            (
+                *_geometry_rounds(
+                    single_elapsed_ns=100_000_000,
+                    small_elapsed_ns=800_000_000,
+                )[:-1],
+                _service_round(
+                    tier_id="small",
+                    active_population=4,
+                    completed_legal_parks=3,
+                    elapsed_ns=800_000_000,
+                    geometry_id=4,
+                    service_interval_ms=1_120,
+                ),
+            )
+        )
+
+
+def test_profile_refuses_missing_underfilled_or_extrapolated_tiers() -> None:
+    """@spec PORT-PERF-006: a sparse numerical curve earns no authority."""
+
+    compile_profile = _symbol("compile_provisional_service_profile")
+    complete = _geometry_rounds(
+        single_elapsed_ns=100_000_000,
+        small_elapsed_ns=700_000_000,
     )
-    assert result.profile_candidate.precision_policy == "fp32"
-    assert result.profile_candidate.state_profile == "nemotron-asr-fp32-v1"
+    with pytest.raises(
+        ValueError,
+        match=r"missing.*geometry.*4.*small|geometry.*4.*tier.*small",
+    ):
+        _compile_profile(complete[:-1])
+    with pytest.raises(ValueError, match=r"maximum.*4|underfilled|active.*4"):
+        _compile_profile(
+            (
+                *complete[:-1],
+                _service_round(
+                    tier_id="small",
+                    active_population=3,
+                    elapsed_ns=700_000_000,
+                    geometry_id=4,
+                    service_interval_ms=1_120,
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match=r"population.*8|extrapolat|tier"):
+        compile_profile(
+            complete,
+            execution_tiers=(
+                _service_tier("single", 1),
+                _service_tier("small", 4),
+            ),
+            max_population=8,
+            reference_interval_ms=1_120,
+            reference_geometry_id=4,
+            admitted_geometry_ids=(0, 1, 2, 3, 4),
+            trailing_rounds=1,
+            derating_factor=Fraction(1, 2),
+            context=_profile_context(allocated_pool=8, count_cap=8),
+        )
+
+
+def test_equal_row_rates_do_not_create_equal_session_capacity() -> None:
+    """@spec PORT-PERF-006 / PORT-PERF-008: legal parks, not rows/s, gate."""
+
+    fast = _compile_profile(
+        _geometry_rounds(
+            single_elapsed_ns=100_000_000,
+            small_elapsed_ns=800_000_000,
+            single_model_rows=1,
+            small_model_rows=8,
+        ),
+        derating_factor=Fraction(1),
+    )
+    slow = _compile_profile(
+        _geometry_rounds(
+            single_elapsed_ns=100_000_000,
+            small_elapsed_ns=1_200_000_000,
+            single_model_rows=1,
+            small_model_rows=12,
+        ),
+        derating_factor=Fraction(1),
+    )
+
+    assert fast.diagnostic_rows_per_second_by_geometry_and_tier[4][
+        "small"
+    ] == Fraction(10)
+    assert slow.diagnostic_rows_per_second_by_geometry_and_tier[4][
+        "small"
+    ] == Fraction(10)
+    assert fast.measured_capacity == 4
+    assert slow.measured_capacity == 1
+
+
+@pytest.mark.parametrize("marker", ["dummy_run", "is_profile"])
+def test_service_capacity_never_uses_memory_profile_dummy(
+    marker: str,
+) -> None:
+    """@spec PORT-MIG-005 / PORT-PERF-005: the two profile paths differ."""
+
+    marked = {marker: True}
+    rounds = list(
+        _geometry_rounds(
+            single_elapsed_ns=100_000_000,
+            small_elapsed_ns=800_000_000,
+        )
+    )
+    rounds[0] = _service_round(
+        tier_id="single",
+        active_population=1,
+        elapsed_ns=100_000_000,
+        service_interval_ms=80,
+        geometry_id=0,
+        **marked,
+    )
+    with pytest.raises(ValueError, match=r"service prim|dummy|profile"):
+        _compile_profile(tuple(rounds))
+
+
+def test_fixed_point_compiler_bounds_rounding_and_signed64() -> None:
+    """@spec PORT-STATE-025 / PORT-PERF-008: precision is capacity-safe."""
+
+    source = (
+        (80, Fraction(1)),
+        (160, Fraction(1, 2)),
+        (320, Fraction(1, 4)),
+        (560, Fraction(1, 4)),
+        (1_120, Fraction(1, 4)),
+    )
+    compiled = _symbol("compile_service_demand_profile")(
+        source,
+        max_charged_population=1_000,
+    )
+
+    assert compiled.scale > 0
+    assert compiled.scale & (compiled.scale - 1) == 0
+    assert compiled.budget == compiled.scale
+    assert compiled.intervals_ms == tuple(interval for interval, _ in source)
+    assert all(isinstance(units, int) for units in compiled.demand_units)
+    for (_, demand), units in zip(source, compiled.demand_units):
+        assert Fraction(units, compiled.scale) >= demand
+        assert Fraction(units, compiled.scale) - demand < Fraction(
+            1,
+            compiled.scale,
+        )
+    assert Fraction(1_000, compiled.scale) < Fraction(1, 4)
+    assert 1_000 * max(compiled.demand_units) <= 2**63 - 1
+
+
+def test_fixed_point_compiler_rejects_when_precision_and_range_conflict() -> None:
+    """@spec PORT-STATE-025 / PORT-PERF-008: coarse safety is no fallback."""
+
+    with pytest.raises(ValueError, match=r"scale|precision|signed-64"):
+        _symbol("compile_service_demand_profile")(
+            ((1_120, Fraction(1)),),
+            max_charged_population=2**62,
+        )
+
+
+def test_provisional_mixed_transaction_repeats_homogeneous_setup() -> None:
+    """@spec PORT-STATE-026 / PORT-PERF-008: no unproved separability."""
+
+    tables = (
+        (0, 100, 180),
+        (0, 200, 350),
+        (0, 300, 520),
+        (0, 400, 700),
+        (0, 500, 880),
+    )
+    duration = _symbol("fallback_transaction_duration_ns")(
+        resident_counts_by_geometry=(1, 1, 0, 0, 0),
+        homogeneous_upper_duration_ns_by_geometry=tables,
+        mixed_composition_policy="homogeneous_upper_sum",
+    )
+    assert duration == 300
+
+    with pytest.raises(ValueError, match=r"homogeneous|mixed"):
+        _symbol("fallback_transaction_duration_ns")(
+            resident_counts_by_geometry=(1, 1, 0, 0, 0),
+            homogeneous_upper_duration_ns_by_geometry=tables,
+            mixed_composition_policy="homogeneous_only",
+        )
+
+
+def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
+    """@spec PORT-PERF-006 / PORT-INT-005: receipt identity is complete."""
+
+    result = _compile_profile(
+        _geometry_rounds(
+            single_elapsed_ns=100_000_000,
+            small_elapsed_ns=800_000_000,
+        )
+    )
+    receipt = result.receipt
+
+    assert receipt.compiler_version == "persistent-state-capacity-v2"
+    assert receipt.reference_interval_ms == 1_120
+    assert receipt.reference_geometry_id == 4
+    assert receipt.execution_tier_maxima == {"single": 1, "small": 4}
+    assert receipt.measured_upper_duration_ns_by_geometry_and_tier[4] == {
+        "single": 100_000_000,
+        "small": 800_000_000,
+    }
+    assert len(receipt.expanded_duration_table_sha256) == 64
+    assert receipt.mixed_composition_policy == "homogeneous_upper_sum"
+    assert receipt.service_demand_scale > 0
+    assert len(receipt.service_demand_units) == 5
+    assert receipt.aggregate_rounding_bound == Fraction(
+        receipt.maximum_charged_population,
+        receipt.service_demand_scale,
+    )
+    assert receipt.least_rational_demand > receipt.aggregate_rounding_bound
+    assert receipt.provisional_capacity == 2
+    assert receipt.derating_factor == Fraction(1, 2)
+    assert len(receipt.receipt_sha256) == 64
     assert result.profile_candidate.qualified is False
     assert result.profile_candidate.installable is False
-    assert result.receipt.pre_override_physical_bound == 20
-    assert result.receipt.allocated_pool == 4
-    assert result.receipt.count_cap == 4
-    assert result.receipt.execution_claim_ceiling == 16
-    assert result.receipt.service_budget_source == "measured_fallback"
-    assert result.receipt.service_budget_coefficients == (Fraction(1, 4),)
-    assert result.receipt.derating_factor == Fraction(1, 2)
-    assert result.receipt.measured_rate_rows_per_s == Fraction(8)
-    assert result.receipt.slot_bytes == 6_314_936
-    assert result.receipt.execution_environment_key == (
-        "a100-40gb-cuda13-torch2.9"
-    )
-    assert result.receipt.idle_device is True
-    assert result.receipt.no_competing_tenant is True
-    assert result.receipt.synthetic_silence is True
 
 
 def test_mixed_pool_pressure_waits_instead_of_becoming_a_refusal() -> None:
