@@ -54,6 +54,7 @@ class _Service:
         self.pending_cleanup_calls: list[object] = []
         self.pending_cleanup_wins = True
         self.pending_claim_timeout_s = 30.0
+        self.reserve_error: Exception | None = None
         self.lease = object()
         self.runtime_config = SimpleNamespace(
             accepted_audio_budget_s=30.0,
@@ -67,6 +68,8 @@ class _Service:
 
     async def reserve(self, **kwargs: Any) -> object:
         self.reserve_calls.append(kwargs)
+        if self.reserve_error is not None:
+            raise self.reserve_error
         return self.lease
 
     async def release(self, **kwargs: Any) -> None:
@@ -134,7 +137,113 @@ async def test_first_valid_update_reserves_before_marking_model_valid() -> None:
     assert call["session_key"]
     assert call["schema_id"]
     assert call["profile_id"]
+    assert call.get("service_interval_ms") == 560, (
+        "PORT-STATE-025 requires the admitted cadence at reserve"
+    )
     assert connection._state_lease is service.lease
+    assert connection._is_model_validated is True
+
+
+def _service_error(name: str, *args: Any, **kwargs: Any) -> Exception:
+    from vllm_omni.engine import persistent_state_service as service_module
+
+    try:
+        error_cls = getattr(service_module, name)
+    except AttributeError:
+        pytest.fail(f"PORT-STATE-024 missing typed {name}", pytrace=False)
+    try:
+        return error_cls(*args, **kwargs)
+    except TypeError:
+        pytest.fail(
+            f"PORT-STATE-024 {name} lacks the approved typed metadata",
+            pytrace=False,
+        )
+
+
+def test_pin_inherited_error_event_accepts_omni_retry_metadata() -> None:
+    """Green upstream-assumption pin; Phase 5 behavior tests remain red.
+
+    @spec PORT-SESS-011 / PORT-MIG-006
+    """
+    from vllm.entrypoints.speech_to_text.realtime.protocol import ErrorEvent
+
+    event = ErrorEvent(
+        type="error",
+        error="retry later",
+        code="capacity_exhausted",
+        retry_after_ms=125,
+    )
+
+    assert event.model_dump(exclude_none=True)["retry_after_ms"] == 125
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_retryable_shed_carries_backoff_and_keeps_socket_open() -> None:
+    # @spec PORT-STATE-024 / PORT-SESS-011
+    connection, websocket, service = _connection()
+    service.reserve_error = _service_error(
+        "PersistentStateBackpressure",
+        "service budget exhausted",
+        retry_after_ms=125,
+    )
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr", "cadence": "320ms"}
+    )
+
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert websocket.sent[-1]["retry_after_ms"] == 125
+    assert websocket.closed == []
+    assert connection._is_connected is True
+    assert connection._is_model_validated is False
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_unsupported_interval_is_nonretryable_and_keeps_socket_open() -> None:
+    # @spec PORT-STATE-024 / PORT-STATE-026 / PORT-SESS-011
+    connection, websocket, service = _connection()
+    service.reserve_error = _service_error(
+        "PersistentStateUnsupportedServiceInterval",
+        requested_interval_ms=80,
+        resolved_envelope="profile-a",
+    )
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr", "cadence": "80ms"}
+    )
+
+    error = websocket.sent[-1]
+    assert error["code"] == "unsupported_service_interval"
+    assert "80" in error["error"]
+    assert "retry_after_ms" not in error
+    assert websocket.closed == []
+    assert connection._is_model_validated is False
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_definitive_denial_retry_mints_fresh_identity() -> None:
+    # @spec PORT-SESS-011
+    connection, websocket, service = _connection()
+    service.reserve_error = _service_error(
+        "PersistentStateBackpressure",
+        "execution claims exhausted",
+        retry_after_ms=50,
+    )
+    update = {
+        "type": "session.update",
+        "model": "nemotron-asr",
+        "cadence": "560ms",
+    }
+
+    await connection.handle_event(update)
+    service.reserve_error = None
+    await connection.handle_event(update)
+
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert len(service.reserve_calls) == 2
+    first, second = service.reserve_calls
+    assert first["operation_id"] != second["operation_id"]
+    assert first["session_key"] != second["session_key"]
     assert connection._is_model_validated is True
 
 

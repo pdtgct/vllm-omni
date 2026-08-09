@@ -29,11 +29,29 @@ def _value(prefix: str) -> float | None:
     return None
 
 
+async def _reserve_with_interval(
+    service: PersistentStateService,
+    *,
+    service_interval_ms: int = 560,
+    **kwargs: Any,
+) -> Any:
+    if "service_interval_ms" not in inspect.signature(service.reserve).parameters:
+        pytest.fail(
+            "PORT-STATE-025 missing reserve-to-release service interval",
+            pytrace=False,
+        )
+    return await service.reserve(
+        service_interval_ms=service_interval_ms,
+        **kwargs,
+    )
+
+
 class _StageClient:
     def __init__(self) -> None:
         self.resident = 0
         self.revision = 0
         self.capacity_error = False
+        self.reserve_error: Exception | None = None
 
     async def call_utility_async(self, method: str, *args: Any) -> dict[str, Any]:
         if method == "persistent_state_snapshot":
@@ -52,6 +70,8 @@ class _StageClient:
                 "profile_id": "profile-1",
             }
         if method == "persistent_state_reserve":
+            if self.reserve_error is not None:
+                raise self.reserve_error
             if self.capacity_error:
                 raise ValueError("persistent-state capacity exhausted")
             operation_id, session_key, schema_id, profile_id = args
@@ -159,6 +179,89 @@ def test_definitive_capacity_failure_is_counted_once() -> None:
                 profile_id="profile-1",
             )
 
+        assert _value(prefix) == before + 1.0
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_unsupported_interval_failure_is_counted_once() -> None:
+    # @spec PORT-OBS-001 / PORT-OBS-007 / PORT-STATE-024
+    async def scenario() -> None:
+        from vllm_omni.engine import persistent_state_service as service_module
+
+        unsupported_cls = getattr(
+            service_module,
+            "PersistentStateUnsupportedServiceInterval",
+            None,
+        )
+        if unsupported_cls is None:
+            pytest.fail(
+                "PORT-STATE-024 missing unsupported-service-interval type",
+                pytrace=False,
+            )
+        stage = _StageClient()
+        service = PersistentStateService(stage)
+        metrics = OmniStreamingMetrics(
+            model_name="state-service-unsupported", log_stats=True
+        )
+        await service.check_health()
+        service.install_metrics(metrics)
+        stage.reserve_error = RuntimeError(
+            "persistent_state_unsupported_service_interval: 80ms exceeds "
+            "the empty-pool transaction envelope"
+        )
+        prefix = (
+            f'{defs.STREAMING_ADMISSION_REJECTIONS}_total{{'
+            'model_name="state-service-unsupported",reason="unsupported"}'
+        )
+        before = _value(prefix) or 0.0
+
+        with pytest.raises(unsupported_cls):
+            await _reserve_with_interval(
+                service,
+                service_interval_ms=80,
+                operation_id="reserve-unsupported",
+                session_key="session-unsupported",
+                schema_id="schema-1",
+                profile_id="profile-1",
+            )
+
+        assert _value(prefix) == before + 1.0
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_retryable_shed_uses_capacity_metric_reason() -> None:
+    # @spec PORT-OBS-007 / PORT-STATE-024
+    async def scenario() -> None:
+        stage = _StageClient()
+        service = PersistentStateService(stage)
+        metrics = OmniStreamingMetrics(
+            model_name="state-service-shed", log_stats=True
+        )
+        await service.check_health()
+        service.install_metrics(metrics)
+        stage.reserve_error = RuntimeError(
+            "persistent_state_horizon_exhausted: retry after tombstone expiry"
+        )
+        prefix = (
+            f'{defs.STREAMING_ADMISSION_REJECTIONS}_total{{'
+            'model_name="state-service-shed",reason="capacity"}'
+        )
+        before = _value(prefix) or 0.0
+
+        with pytest.raises(Exception) as info:
+            await _reserve_with_interval(
+                service,
+                operation_id="reserve-shed",
+                session_key="session-shed",
+                schema_id="schema-1",
+                profile_id="profile-1",
+            )
+
+        assert getattr(info.value, "retryable", False)
         assert _value(prefix) == before + 1.0
         service.shutdown()
 
