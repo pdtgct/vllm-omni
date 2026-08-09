@@ -163,7 +163,12 @@ def test_full_waiter_slab_is_typed_shed_and_never_dispatches_directly() -> None:
     """@spec PORT-STATE-024 / PORT-STATE-027: bounded burst waiting."""
 
     clock = _Clock()
-    controller = _controller(clock, waiter_capacity=1)
+    controller = _controller(
+        clock,
+        waiter_capacity=1,
+        max_inflight_reserves=1,
+        dispatch_budget=1,
+    )
     controller.enqueue(_attempt(1))
     queue_full = _symbol("AdmissionQueueFull", "PORT-STATE-024")
 
@@ -186,7 +191,12 @@ def test_reused_slab_slot_fences_stale_handle_and_deadline() -> None:
     """@spec PORT-STATE-027 / PORT-STATE-028: indexed timers never ghost."""
 
     clock = _Clock()
-    controller = _controller(clock, waiter_capacity=1)
+    controller = _controller(
+        clock,
+        waiter_capacity=1,
+        max_inflight_reserves=1,
+        dispatch_budget=1,
+    )
     stale = controller.enqueue(
         _attempt(1, admission_deadline_ns=5, unadmitted_deadline_ns=50)
     )
@@ -370,7 +380,12 @@ def test_admission_or_cleanup_handoff_precedes_waiter_slot_reuse(
     """@spec PORT-STATE-013 / PORT-STATE-028: no forgotten lease window."""
 
     clock = _Clock()
-    controller = _controller(clock, waiter_capacity=1, dispatch_budget=1)
+    controller = _controller(
+        clock,
+        waiter_capacity=1,
+        max_inflight_reserves=1,
+        dispatch_budget=1,
+    )
     handle = controller.enqueue(_attempt(1))
     controller.drain(_capacity())[0]
     lease = object()
