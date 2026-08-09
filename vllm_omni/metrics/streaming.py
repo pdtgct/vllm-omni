@@ -57,6 +57,21 @@ _overflow_labels = list(defs.STREAMING_OVERFLOW_LABELS)
 _open_rejection_labels = list(defs.STREAMING_OPEN_REJECTION_LABELS)
 _admission_rejection_labels = list(defs.STREAMING_ADMISSION_REJECTION_LABELS)
 _persistent_state_slot_labels = list(defs.PERSISTENT_STATE_SLOT_LABELS)
+_persistent_state_service_demand_labels = list(
+    defs.PERSISTENT_STATE_SERVICE_DEMAND_LABELS
+)
+_persistent_state_execution_claims_labels = list(
+    defs.PERSISTENT_STATE_EXECUTION_CLAIMS_LABELS
+)
+_persistent_state_admission_headroom_labels = list(
+    defs.PERSISTENT_STATE_ADMISSION_HEADROOM_LABELS
+)
+_persistent_state_admission_pending_labels = list(
+    defs.PERSISTENT_STATE_ADMISSION_PENDING_LABELS
+)
+_persistent_state_admission_wait_labels = list(
+    defs.PERSISTENT_STATE_ADMISSION_WAIT_LABELS
+)
 _input_audio_labels = list(defs.STREAMING_INPUT_AUDIO_LABELS)
 _batch_size_labels = list(defs.STREAMING_BATCH_SIZE_LABELS)
 
@@ -118,6 +133,31 @@ _persistent_state_slots_family = Gauge(
     defs.PERSISTENT_STATE_SLOTS,
     "Manager-sourced persistent-state resident inventory and capacity limits.",
     labelnames=_persistent_state_slot_labels,
+)
+_persistent_state_service_demand_family = Gauge(
+    defs.PERSISTENT_STATE_SERVICE_DEMAND_RATIO,
+    "Normalized persistent-state service budget and charged demand.",
+    labelnames=_persistent_state_service_demand_labels,
+)
+_persistent_state_execution_claims_family = Gauge(
+    defs.PERSISTENT_STATE_EXECUTION_CLAIMS,
+    "Persistent-state execution claims and resolved scheduler ceiling.",
+    labelnames=_persistent_state_execution_claims_labels,
+)
+_persistent_state_admission_headroom_family = Gauge(
+    defs.PERSISTENT_STATE_ADMISSION_HEADROOM,
+    "Additional hard and nominally dispatchable sessions by cadence.",
+    labelnames=_persistent_state_admission_headroom_labels,
+)
+_persistent_state_admission_pending_family = Gauge(
+    defs.PERSISTENT_STATE_ADMISSION_PENDING,
+    "Bounded pre-audio and committed-cleanup admission state.",
+    labelnames=_persistent_state_admission_pending_labels,
+)
+_persistent_state_admission_wait_family = Histogram(
+    defs.PERSISTENT_STATE_ADMISSION_WAIT_S,
+    "Pre-audio controller wait to admission or terminal disposition.",
+    labelnames=_persistent_state_admission_wait_labels,
 )
 _input_audio_seconds_family = Counter(
     defs.STREAMING_INPUT_AUDIO_SECONDS,
@@ -220,6 +260,100 @@ class OmniStreamingMetrics:
                 replica=replica,
                 kind=kind,
             ).set(inventory[kind])
+
+    # @spec PORT-OBS-012
+    def observe_persistent_state_capacity(
+        self,
+        stage: str,
+        replica: str,
+        *,
+        service_source: str,
+        service_budget: float,
+        charged_demand: float,
+        execution_claims: int,
+        max_num_seqs: int,
+        headroom_by_cadence: dict[str, dict[str, int]],
+        pending_by_cadence: dict[str, dict[str, int]],
+    ) -> None:
+        """Replace one consistent fixed-cardinality capacity projection."""
+        if not self._log_stats:
+            return
+        if not stage or not replica:
+            return
+        if service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES:
+            return
+        for kind, value in (
+            ("budget", service_budget),
+            ("charged_demand", charged_demand),
+        ):
+            _persistent_state_service_demand_family.labels(
+                model_name=self._model_name,
+                stage=stage,
+                replica=replica,
+                kind=kind,
+                source=service_source,
+            ).set(value)
+        for kind, value in (
+            ("claims", execution_claims),
+            ("max_num_seqs", max_num_seqs),
+        ):
+            _persistent_state_execution_claims_family.labels(
+                model_name=self._model_name,
+                stage=stage,
+                replica=replica,
+                kind=kind,
+            ).set(value)
+        for cadence_ms, headroom in headroom_by_cadence.items():
+            if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES:
+                continue
+            if set(headroom) != set(
+                defs.PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS
+            ):
+                continue
+            for kind, value in headroom.items():
+                _persistent_state_admission_headroom_family.labels(
+                    model_name=self._model_name,
+                    stage=stage,
+                    replica=replica,
+                    cadence_ms=cadence_ms,
+                    kind=kind,
+                ).set(value)
+        for cadence_ms, pending in pending_by_cadence.items():
+            if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES:
+                continue
+            for state in defs.PERSISTENT_STATE_ADMISSION_PENDING_STATES:
+                _persistent_state_admission_pending_family.labels(
+                    model_name=self._model_name,
+                    stage=stage,
+                    replica=replica,
+                    cadence_ms=cadence_ms,
+                    state=state,
+                ).set(pending.get(state, 0))
+
+    # @spec PORT-OBS-012
+    def observe_persistent_state_admission_wait(
+        self,
+        stage: str,
+        replica: str,
+        *,
+        cadence_ms: str,
+        outcome: str,
+        wait_s: float,
+    ) -> None:
+        """Observe one bounded pre-audio attempt's residence time."""
+        if not self._log_stats:
+            return
+        if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES:
+            return
+        if outcome not in defs.PERSISTENT_STATE_ADMISSION_WAIT_OUTCOMES:
+            return
+        _persistent_state_admission_wait_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+            cadence_ms=cadence_ms,
+            outcome=outcome,
+        ).observe(max(wait_s, 0.0))
 
     def inc_input_audio_seconds(self, cadence_ms: str, seconds: float) -> None:
         """Accepted-audio seconds at the common PORT acceptance event."""

@@ -330,6 +330,21 @@ STREAMING_BACKLOG_OVERFLOWS = METRIC_PREFIX + "streaming_backlog_overflows"
 STREAMING_SESSION_OPEN_REJECTIONS = METRIC_PREFIX + "streaming_session_open_rejections"
 STREAMING_ADMISSION_REJECTIONS = METRIC_PREFIX + "streaming_admission_rejections"
 PERSISTENT_STATE_SLOTS = METRIC_PREFIX + "persistent_state_slots"
+PERSISTENT_STATE_SERVICE_DEMAND_RATIO = (
+    METRIC_PREFIX + "persistent_state_service_demand_ratio"
+)
+PERSISTENT_STATE_EXECUTION_CLAIMS = (
+    METRIC_PREFIX + "persistent_state_execution_claims"
+)
+PERSISTENT_STATE_ADMISSION_HEADROOM = (
+    METRIC_PREFIX + "persistent_state_admission_headroom"
+)
+PERSISTENT_STATE_ADMISSION_PENDING = (
+    METRIC_PREFIX + "persistent_state_admission_pending"
+)
+PERSISTENT_STATE_ADMISSION_WAIT_S = (
+    METRIC_PREFIX + "persistent_state_admission_wait_s"
+)
 STREAMING_INPUT_AUDIO_SECONDS = METRIC_PREFIX + "streaming_input_audio_seconds"
 STREAMING_CHUNK_BATCH_SIZE = METRIC_PREFIX + "streaming_chunk_batch_size"
 
@@ -348,6 +363,40 @@ STREAMING_OVERFLOW_LABELS = ("model_name", "kind")
 STREAMING_OPEN_REJECTION_LABELS = ("model_name", "reason")
 STREAMING_ADMISSION_REJECTION_LABELS = ("model_name", "reason")
 PERSISTENT_STATE_SLOT_LABELS = ("model_name", "stage", "replica", "kind")
+PERSISTENT_STATE_SERVICE_DEMAND_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "kind",
+    "source",
+)
+PERSISTENT_STATE_EXECUTION_CLAIMS_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "kind",
+)
+PERSISTENT_STATE_ADMISSION_HEADROOM_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "kind",
+)
+PERSISTENT_STATE_ADMISSION_PENDING_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "state",
+)
+PERSISTENT_STATE_ADMISSION_WAIT_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "outcome",
+)
 STREAMING_INPUT_AUDIO_LABELS = ("model_name", "cadence_ms")
 STREAMING_BATCH_SIZE_LABELS = ("model_name", "stage", "replica", "cadence_ms")
 
@@ -358,13 +407,36 @@ STREAMING_CHUNK_OUTCOMES = ("parked", "aborted", "error")
 STREAMING_FINISHED_REASONS = ("completed", "aborted", "error")
 STREAMING_OVERFLOW_KINDS = ("input_queue", "carrier", "receipt")
 STREAMING_OPEN_REJECTION_REASONS = ("model", "cadence", "locale", "config")
-STREAMING_ADMISSION_REJECTION_REASONS = ("capacity", "unavailable")
+STREAMING_ADMISSION_REJECTION_REASONS = (
+    "capacity",
+    "unavailable",
+    "unsupported",
+)
 PERSISTENT_STATE_SLOT_KINDS = (
     "resident",
     "safety_reserve",
     "physical_capacity",
     "configured_limit",
     "effective_capacity",
+)
+PERSISTENT_STATE_SERVICE_DEMAND_KINDS = ("budget", "charged_demand")
+PERSISTENT_STATE_SERVICE_DEMAND_SOURCES = (
+    "qualified_profile",
+    "measured_fallback",
+)
+PERSISTENT_STATE_EXECUTION_CLAIMS_KINDS = ("claims", "max_num_seqs")
+PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS = ("hard", "nominal")
+PERSISTENT_STATE_ADMISSION_PENDING_STATES = (
+    "waiting",
+    "submitted",
+    "reconciling",
+    "committed_cleanup",
+)
+PERSISTENT_STATE_ADMISSION_WAIT_OUTCOMES = (
+    "admitted",
+    "shed",
+    "unavailable",
+    "cancelled",
 )
 
 # Latency ladder: every admitted cadence period (in seconds) is an explicit

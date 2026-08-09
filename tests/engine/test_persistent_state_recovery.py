@@ -75,7 +75,6 @@ class _RecoveryStage:
         self.snapshot_gate: asyncio.Event | None = None
 
     def _snapshot(self) -> dict[str, Any]:
-        self.snapshot_calls += 1
         snapshot = dict(_SNAPSHOT_BASE)
         snapshot["engine_epoch"] = self.engine_epoch
         snapshot["manager_revision"] = self.revision
@@ -87,6 +86,7 @@ class _RecoveryStage:
         self, name: str, *args: Any
     ) -> dict[str, Any]:
         if name == "persistent_state_snapshot":
+            self.snapshot_calls += 1
             if self.snapshot_gate is not None:
                 await self.snapshot_gate.wait()
             if self.snapshot_error is not None:
