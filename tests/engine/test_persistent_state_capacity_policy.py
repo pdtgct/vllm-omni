@@ -64,17 +64,20 @@ def _resolution(**overrides: Any) -> Any:
 
 def _evaluate(**overrides: Any) -> Any:
     values: dict[str, Any] = {
-        "current_intervals_ms": (),
+        "resident_counts_by_interval": (0, 0, 0, 0, 0),
+        "reserved_counts_by_interval": (0, 0, 0, 0, 0),
         "candidate_interval_ms": 320,
         "allocated_slots": 8,
         "count_limit": 8,
+        "resident_count": 0,
+        "reserved_count": 0,
         "execution_claims": 0,
         "max_num_seqs": 8,
-        "committed_demand": Fraction(0),
+        "charged_demand": Fraction(0),
         "service_budget": Fraction(1),
         "candidate_demand": Fraction(1, 8),
-        "transaction_duration_ms": lambda intervals: Fraction(
-            40 * len(intervals)
+        "transaction_duration_ms": lambda counts: Fraction(
+            40 * sum(counts)
         ),
     }
     values.update(overrides)
@@ -349,18 +352,24 @@ def test_profile_candidate_and_receipt_stamp_all_authorities() -> None:
     assert result.receipt.synthetic_silence is True
 
 
-def test_candidate_is_included_in_the_transaction_predicate() -> None:
-    """@spec PORT-STATE-026: validate C+candidate, not the old pool alone."""
+def test_mixed_pool_pressure_waits_instead_of_becoming_a_refusal() -> None:
+    """@spec PORT-STATE-025 / PORT-STATE-026: nominal is dispatch guidance."""
 
     decision = _evaluate(
-        current_intervals_ms=(1120,),
+        resident_counts_by_interval=(0, 0, 0, 0, 1),
+        resident_count=1,
         candidate_interval_ms=80,
-        transaction_duration_ms=lambda intervals: Fraction(80 * len(intervals)),
+        transaction_duration_ms=lambda counts: Fraction(80 * sum(counts)),
     )
 
-    assert decision.accepted is False
-    assert decision.refusal == "capacity"
-    assert decision.retryable is True
+    assert decision.candidate_supported is True
+    assert decision.hard_feasible is True
+    assert decision.nominal_dispatchable is False
+    assert decision.nominal_reason == "transaction_time"
+    assert not hasattr(decision, "refusal"), (
+        "the capacity projection must not turn nominal pressure into a "
+        "client-visible refusal"
+    )
 
 
 def test_empty_pool_latency_failure_is_nonretryable_unsupported() -> None:
@@ -371,52 +380,105 @@ def test_empty_pool_latency_failure_is_nonretryable_unsupported() -> None:
         transaction_duration_ms=lambda intervals: Fraction(81),
     )
 
-    assert decision.accepted is False
-    assert decision.refusal == "unsupported_service_interval"
-    assert decision.retryable is False
+    assert decision.candidate_supported is False
+    assert decision.hard_feasible is False
+    assert decision.nominal_dispatchable is False
+    assert decision.binding_authority == "candidate_alone"
 
 
 @pytest.mark.parametrize(
-    "override",
+    ("override", "authority"),
     [
-        {"allocated_slots": 0},
-        {"count_limit": 0},
-        {"execution_claims": 8},
-        {
-            "committed_demand": Fraction(7, 8),
-            "candidate_demand": Fraction(1, 4),
-        },
+        ({"allocated_slots": 0}, "physical_slots"),
+        ({"count_limit": 0}, "logical_count"),
+        ({"execution_claims": 8}, "execution_claims"),
     ],
 )
-def test_each_exhausted_runtime_authority_is_retryable_shed(
+def test_each_hard_authority_blocks_dispatch_without_reclassifying_the_client(
     override: dict[str, Any],
+    authority: str,
 ) -> None:
-    """@spec PORT-STATE-024 / PORT-STATE-025: authorities compose by AND."""
+    """@spec PORT-STATE-004 / PORT-STATE-024: hard pressure waits first."""
 
     decision = _evaluate(**override)
 
-    assert decision.accepted is False
-    assert decision.refusal == "capacity"
-    assert decision.retryable is True
+    assert decision.candidate_supported is True
+    assert decision.hard_feasible is False
+    assert decision.binding_authority == authority
+    assert not hasattr(decision, "retryable")
 
 
-def test_headroom_uses_the_complete_evaluator() -> None:
-    """@spec PORT-OBS-012: headroom and admission cannot disagree."""
+def test_service_budget_is_nominal_and_never_creates_physical_capacity() -> None:
+    """@spec PORT-STATE-004 / PORT-STATE-025 / PORT-STATE-026."""
+
+    decision = _evaluate(
+        charged_demand=Fraction(7, 8),
+        candidate_demand=Fraction(1, 4),
+    )
+
+    assert decision.candidate_supported is True
+    assert decision.hard_feasible is True
+    assert decision.nominal_dispatchable is False
+    assert decision.nominal_reason == "service_budget"
+    assert decision.hard_headroom == 8
+
+
+def test_headroom_uses_fixed_cardinality_aggregates() -> None:
+    """@spec PORT-OBS-012: no resident-population input or scan."""
 
     headroom = _symbol("admission_headroom")(
-        current_intervals_ms=(),
+        resident_counts_by_interval=(0, 0, 0, 0, 0),
+        reserved_counts_by_interval=(0, 0, 0, 0, 0),
         candidate_interval_ms=160,
         allocated_slots=8,
         count_limit=8,
+        resident_count=0,
+        reserved_count=0,
         execution_claims=0,
         max_num_seqs=8,
-        committed_demand=Fraction(0),
+        charged_demand=Fraction(0),
         service_budget=Fraction(1),
         candidate_demand=Fraction(1, 4),
-        transaction_duration_ms=lambda intervals: Fraction(40 * len(intervals)),
+        transaction_duration_ms=lambda counts: Fraction(40 * sum(counts)),
     )
 
-    assert headroom == 4
+    assert headroom.hard == 8
+    assert headroom.nominal == 4
+
+
+def test_headroom_work_is_sublinear_in_capacity() -> None:
+    """@spec PORT-PERF-008 / PORT-OBS-012: never loop once per slot."""
+
+    calls = 0
+
+    def transaction_duration(counts: tuple[int, ...]) -> Fraction:
+        nonlocal calls
+        calls += 1
+        assert len(counts) == 5
+        return Fraction(sum(counts))
+
+    headroom = _symbol("admission_headroom")(
+        resident_counts_by_interval=(0, 0, 0, 0, 0),
+        reserved_counts_by_interval=(0, 0, 0, 0, 0),
+        candidate_interval_ms=1120,
+        allocated_slots=1_000_000,
+        count_limit=1_000_000,
+        resident_count=0,
+        reserved_count=0,
+        execution_claims=0,
+        max_num_seqs=1_000_000,
+        charged_demand=Fraction(0),
+        service_budget=Fraction(1_000_000),
+        candidate_demand=Fraction(1),
+        transaction_duration_ms=transaction_duration,
+    )
+
+    assert headroom.hard == 1_000_000
+    assert headroom.nominal == 1_000_000
+    assert calls <= 32, (
+        "headroom may use fixed-cardinality arithmetic or logarithmic "
+        "monotone search, never one evaluation/allocation per slot"
+    )
 
 
 def test_execution_claim_and_demand_span_reserve_to_release() -> None:
@@ -426,14 +488,14 @@ def test_execution_claim_and_demand_span_reserve_to_release() -> None:
     claim = controller.reserve("lease-a", service_interval_ms=320)
 
     assert controller.snapshot.execution_claims == 1
-    assert controller.snapshot.committed_demand == Fraction(1, 4)
+    assert controller.snapshot.charged_demand == Fraction(1, 4)
     assert controller.snapshot.intervals_ms == (320,)
     controller.park(claim)
     assert controller.snapshot.execution_claims == 1
-    assert controller.snapshot.committed_demand == Fraction(1, 4)
+    assert controller.snapshot.charged_demand == Fraction(1, 4)
     controller.release(claim)
     assert controller.snapshot.execution_claims == 0
-    assert controller.snapshot.committed_demand == Fraction(0)
+    assert controller.snapshot.charged_demand == Fraction(0)
     assert controller.snapshot.intervals_ms == ()
 
 
@@ -446,17 +508,26 @@ def test_duplicate_release_cannot_return_capacity_twice() -> None:
     controller.release(claim)
 
     assert controller.snapshot.execution_claims == 0
-    assert controller.snapshot.committed_demand == Fraction(0)
+    assert controller.snapshot.charged_demand == Fraction(0)
 
 
-def test_operator_count_cannot_raise_service_or_execution_capacity() -> None:
+def test_operator_count_never_enlarges_hard_headroom() -> None:
     """@spec PORT-STATE-004 / PORT-STATE-025."""
 
-    controller = _controller(count_limit=100, allocated_slots=2, max_num_seqs=1)
-    controller.reserve("lease-a", service_interval_ms=1120)
+    headroom = _symbol("admission_headroom")(
+        resident_counts_by_interval=(0, 0, 0, 0, 1),
+        reserved_counts_by_interval=(0, 0, 0, 0, 0),
+        candidate_interval_ms=1120,
+        allocated_slots=2,
+        count_limit=100,
+        resident_count=1,
+        reserved_count=0,
+        execution_claims=1,
+        max_num_seqs=1,
+        charged_demand=Fraction(1, 4),
+        service_budget=Fraction(1),
+        candidate_demand=Fraction(1, 4),
+        transaction_duration_ms=lambda counts: Fraction(40 * sum(counts)),
+    )
 
-    with pytest.raises(Exception) as info:
-        controller.reserve("lease-b", service_interval_ms=1120)
-
-    assert getattr(info.value, "retryable", False)
-    assert controller.snapshot.execution_claims == 1
+    assert headroom.hard == 0

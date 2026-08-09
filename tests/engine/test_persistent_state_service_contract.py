@@ -56,10 +56,19 @@ def test_service_api_is_async_and_operation_id_explicit() -> None:
     assert "session_key" in reserve.parameters
     assert "schema_id" in reserve.parameters
     assert "profile_id" in reserve.parameters
-    assert "service_interval_ms" in reserve.parameters
+    assert "service_interval_ms" in reserve.parameters, (
+        "PORT-STATE-025 missing reserve-to-release cadence authority"
+    )
     assert "operation_id" in release.parameters
     assert "lease" in release.parameters
     assert "reason" in release.parameters
+    constructor = inspect.signature(service_cls)
+    assert "admission_config" in constructor.parameters, (
+        "PORT-STATE-027 missing resolved controller configuration"
+    )
+    assert "host_fatal_callback" in constructor.parameters, (
+        "PORT-STATE-014 missing host-fatal recovery escalation"
+    )
 
 
 def test_refusal_types_encode_retryability_without_message_matching() -> None:
@@ -69,10 +78,13 @@ def test_refusal_types_encode_retryability_without_message_matching() -> None:
         shed = module.PersistentStateBackpressure(
             "pool full",
             retry_after_ms=75,
+            cause="controller_full",
         )
         capacity = module.PersistentStateCapacityExhausted(
             "physical pool exhausted",
             retry_after_ms=75,
+            cause="hard_pressure",
+            binding_authority="physical_slots",
         )
         unavailable = module.PersistentStateServiceUnavailable(
             "control path closed"
@@ -100,7 +112,26 @@ def test_refusal_types_encode_retryability_without_message_matching() -> None:
     assert isinstance(capacity, module.PersistentStateBackpressure)
     assert shed.retryable is True
     assert shed.retry_after_ms == 75
+    assert shed.cause == "controller_full"
     assert capacity.retryable is True
+    assert capacity.cause == "hard_pressure"
+    assert capacity.binding_authority == "physical_slots"
+    assert shed.telemetry_fields == {
+        "cause": "controller_full",
+        "retry_after_ms": 75,
+    }
+    assert capacity.telemetry_fields == {
+        "binding_authority": "physical_slots",
+        "cause": "hard_pressure",
+        "retry_after_ms": 75,
+    }
+    assert not {
+        "attempt_id",
+        "connection_id",
+        "operation_id",
+        "request_id",
+        "session_id",
+    }.intersection(capacity.telemetry_fields)
     assert unavailable.retryable is False
     assert unsupported.retryable is False
     assert unsupported.requested_interval_ms == 80
