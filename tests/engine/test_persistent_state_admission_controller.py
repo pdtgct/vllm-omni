@@ -218,6 +218,30 @@ def test_reused_slab_slot_fences_stale_handle_and_deadline() -> None:
     ]
 
 
+def test_reuse_allocates_no_waiter_node_or_lazy_deadline_record() -> None:
+    """@spec PORT-STATE-027 / PORT-PERF-008: storage is fixed at startup."""
+
+    clock = _Clock()
+    controller = _controller(
+        clock,
+        waiter_capacity=1,
+        max_inflight_reserves=1,
+        dispatch_budget=1,
+    )
+    slab_entry_ids = tuple(id(entry) for entry in controller._entries)
+
+    for n in range(100):
+        handle = controller.enqueue(_attempt(n))
+        controller.cancel(handle)
+
+    assert tuple(id(entry) for entry in controller._entries) == slab_entry_ids
+    assert controller._deadline_size == 0
+    assert controller._deadline_heap == [-1]
+    assert controller._deadline_positions == [-1]
+    assert set(controller._queue_heads.values()) == {-1}
+    assert set(controller._queue_tails.values()) == {-1}
+
+
 def test_one_drain_turn_is_bounded_by_five_heads_and_dispatch_budget() -> None:
     """@spec PORT-STATE-027 / PORT-PERF-008: fixed work per reactor turn."""
 

@@ -153,7 +153,15 @@ def test_service_uses_the_existing_utility_boundary_only() -> None:
 
 def test_post_submit_timeout_reconciles_the_same_operation_under_shield() -> None:
     # @spec PORT-STATE-012 / PORT-STATE-013 / PORT-SESS-011
-    source = inspect.getsource(_service_module().PersistentStateService.reserve)
+    service_cls = _service_module().PersistentStateService
+    source = "\n".join(
+        inspect.getsource(method)
+        for method in (
+            service_cls.reserve,
+            service_cls._reserve_direct,
+            service_cls._submit_admission,
+        )
+    )
 
     assert "shield" in source
     assert "operation_id" in source

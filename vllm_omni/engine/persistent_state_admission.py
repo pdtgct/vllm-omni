@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import heapq
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -71,12 +70,14 @@ class AdmissionControllerConfig:
         ):
             raise ValueError("recovery bounds must be positive")
         if (
-            not self.supported_intervals_ms
+            len(self.supported_intervals_ms) != 5
             or len(set(self.supported_intervals_ms))
             != len(self.supported_intervals_ms)
             or any(value <= 0 for value in self.supported_intervals_ms)
         ):
-            raise ValueError("supported intervals must be unique and positive")
+            raise ValueError(
+                "exactly five supported intervals must be unique and positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,9 @@ class AdmissionAttempt:
     service_interval_ms: int
     admission_deadline_ns: int
     unadmitted_deadline_ns: int
+    resource_key: str = ""
+    schema_id: str = ""
+    profile_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,8 @@ class AdmissionDispatch:
 class AdmissionDisposition:
     attempt_id: str
     outcome: AdmissionOutcome
+    handle: AdmissionHandle | None = None
+    service_interval_ms: int | None = None
     terminal_connection: bool = False
     close_code: int | None = None
 
@@ -130,11 +136,17 @@ class AdmissionControllerSnapshot:
 
 @dataclass
 class _Entry:
-    attempt: AdmissionAttempt
-    handle: AdmissionHandle
-    enqueued_at_ns: int
-    sequence: int
-    state: Literal["waiting", "submitted"] = "waiting"
+    """One mutable, startup-preallocated waiter slab entry."""
+
+    attempt: AdmissionAttempt | None = None
+    handle: AdmissionHandle | None = None
+    enqueued_at_ns: int = 0
+    sequence: int = 0
+    state: Literal["free", "waiting", "submitted"] = "free"
+    queue_previous: int = -1
+    queue_next: int = -1
+    deadline_ns: int = 0
+    deadline_closes_connection: bool = False
 
 
 class BoundedAdmissionController:
@@ -155,15 +167,21 @@ class BoundedAdmissionController:
         self._engine_epoch = engine_epoch
         self._monotonic_ns = monotonic_ns
         self._jitter_secret = jitter_secret
-        self._entries: list[_Entry | None] = [None] * config.waiter_capacity
+        # The waiter nodes, intrusive queue links, and deadline heap storage
+        # are all allocated once. Enqueue mutates one free slab entry; it does
+        # not allocate a deque node or retain a lazy deadline tombstone.
+        self._entries = [_Entry() for _ in range(config.waiter_capacity)]
         self._generations = [0] * config.waiter_capacity
         self._free = list(range(config.waiter_capacity))
         heapq.heapify(self._free)
-        self._queues = {
-            interval: deque[int]() for interval in config.supported_intervals_ms
-        }
+        self._queue_heads = dict.fromkeys(config.supported_intervals_ms, -1)
+        self._queue_tails = dict.fromkeys(config.supported_intervals_ms, -1)
+        self._waiting_counts = dict.fromkeys(config.supported_intervals_ms, 0)
+        self._submitted_counts = dict.fromkeys(config.supported_intervals_ms, 0)
         self._connections: dict[str, AdmissionHandle] = {}
-        self._deadlines: list[tuple[int, int, int, int]] = []
+        self._deadline_heap = [-1] * config.waiter_capacity
+        self._deadline_positions = [-1] * config.waiter_capacity
+        self._deadline_size = 0
         self._sequence = 0
         self._submitted = 0
         self._protected: AdmissionHandle | None = None
@@ -179,7 +197,9 @@ class BoundedAdmissionController:
             submitted_count=self._submitted,
             free_entries=len(self._free),
             protected_attempt_id=(
-                None if protected is None else protected.attempt.attempt_id
+                None
+                if protected is None or protected.attempt is None
+                else protected.attempt.attempt_id
             ),
             authority=self._authority,
             last_drain_examined_heads=self._last_examined,
@@ -190,7 +210,7 @@ class BoundedAdmissionController:
         if handle is None or not 0 <= handle.slot < len(self._entries):
             return None
         entry = self._entries[handle.slot]
-        if entry is None or entry.handle != handle:
+        if entry.state == "free" or entry.handle != handle:
             return None
         return entry
 
@@ -213,8 +233,138 @@ class BoundedAdmissionController:
         )
         return self._config.retry_floor_ms + jitter
 
+    @property
+    def next_deadline_ns(self) -> int | None:
+        """Return the earliest live waiter deadline without allocating."""
+
+        if self._deadline_size == 0:
+            return None
+        slot = self._deadline_heap[0]
+        return self._entries[slot].deadline_ns
+
+    @property
+    def pending_counts(self) -> Mapping[int, Mapping[str, int]]:
+        """Project five fixed counters without scanning waiter entries."""
+
+        return {
+            interval: {
+                "waiting": self._waiting_counts[interval],
+                "submitted": self._submitted_counts[interval],
+                "reconciling": 0,
+            }
+            for interval in self._config.supported_intervals_ms
+        }
+
+    def _deadline_less(self, left_slot: int, right_slot: int) -> bool:
+        left = self._entries[left_slot]
+        right = self._entries[right_slot]
+        return (left.deadline_ns, left.sequence) < (
+            right.deadline_ns,
+            right.sequence,
+        )
+
+    def _deadline_swap(self, left: int, right: int) -> None:
+        left_slot = self._deadline_heap[left]
+        right_slot = self._deadline_heap[right]
+        self._deadline_heap[left], self._deadline_heap[right] = (
+            right_slot,
+            left_slot,
+        )
+        self._deadline_positions[left_slot] = right
+        self._deadline_positions[right_slot] = left
+
+    def _deadline_sift_up(self, position: int) -> int:
+        while position > 0:
+            parent = (position - 1) // 2
+            if not self._deadline_less(
+                self._deadline_heap[position],
+                self._deadline_heap[parent],
+            ):
+                break
+            self._deadline_swap(position, parent)
+            position = parent
+        return position
+
+    def _deadline_sift_down(self, position: int) -> None:
+        while True:
+            left = 2 * position + 1
+            if left >= self._deadline_size:
+                return
+            right = left + 1
+            child = left
+            if right < self._deadline_size and self._deadline_less(
+                self._deadline_heap[right],
+                self._deadline_heap[left],
+            ):
+                child = right
+            if not self._deadline_less(
+                self._deadline_heap[child],
+                self._deadline_heap[position],
+            ):
+                return
+            self._deadline_swap(position, child)
+            position = child
+
+    def _deadline_insert(self, slot: int) -> None:
+        if self._deadline_positions[slot] != -1:
+            raise RuntimeError("admission deadline already indexed")
+        position = self._deadline_size
+        self._deadline_size += 1
+        self._deadline_heap[position] = slot
+        self._deadline_positions[slot] = position
+        self._deadline_sift_up(position)
+
+    def _deadline_remove(self, slot: int) -> None:
+        position = self._deadline_positions[slot]
+        if position == -1:
+            return
+        self._deadline_size -= 1
+        last_slot = self._deadline_heap[self._deadline_size]
+        self._deadline_heap[self._deadline_size] = -1
+        self._deadline_positions[slot] = -1
+        if position == self._deadline_size:
+            return
+        self._deadline_heap[position] = last_slot
+        self._deadline_positions[last_slot] = position
+        position = self._deadline_sift_up(position)
+        self._deadline_sift_down(position)
+
+    def _queue_append(self, entry: _Entry) -> None:
+        attempt = entry.attempt
+        handle = entry.handle
+        if attempt is None or handle is None:
+            raise RuntimeError("cannot queue an empty admission entry")
+        interval = attempt.service_interval_ms
+        tail = self._queue_tails[interval]
+        entry.queue_previous = tail
+        entry.queue_next = -1
+        if tail == -1:
+            self._queue_heads[interval] = handle.slot
+        else:
+            self._entries[tail].queue_next = handle.slot
+        self._queue_tails[interval] = handle.slot
+
+    def _queue_remove(self, entry: _Entry) -> None:
+        attempt = entry.attempt
+        handle = entry.handle
+        if attempt is None or handle is None:
+            raise RuntimeError("cannot unlink an empty admission entry")
+        interval = attempt.service_interval_ms
+        previous = entry.queue_previous
+        following = entry.queue_next
+        if previous == -1:
+            self._queue_heads[interval] = following
+        else:
+            self._entries[previous].queue_next = following
+        if following == -1:
+            self._queue_tails[interval] = previous
+        else:
+            self._entries[following].queue_previous = previous
+        entry.queue_previous = -1
+        entry.queue_next = -1
+
     def enqueue(self, attempt: AdmissionAttempt) -> AdmissionHandle:
-        if attempt.service_interval_ms not in self._queues:
+        if attempt.service_interval_ms not in self._queue_heads:
             raise ValueError(
                 f"unsupported service interval {attempt.service_interval_ms}"
             )
@@ -229,33 +379,51 @@ class BoundedAdmissionController:
         self._generations[slot] += 1
         handle = AdmissionHandle(slot, self._generations[slot])
         self._sequence += 1
-        entry = _Entry(
-            attempt=attempt,
-            handle=handle,
-            enqueued_at_ns=self._monotonic_ns(),
-            sequence=self._sequence,
+        entry = self._entries[slot]
+        entry.attempt = attempt
+        entry.handle = handle
+        entry.enqueued_at_ns = self._monotonic_ns()
+        entry.sequence = self._sequence
+        entry.state = "waiting"
+        entry.deadline_ns = min(
+            attempt.admission_deadline_ns,
+            attempt.unadmitted_deadline_ns,
         )
-        self._entries[slot] = entry
+        entry.deadline_closes_connection = (
+            attempt.unadmitted_deadline_ns <= attempt.admission_deadline_ns
+        )
         self._connections[attempt.connection_id] = handle
-        self._queues[attempt.service_interval_ms].append(slot)
-        heapq.heappush(
-            self._deadlines,
-            (attempt.admission_deadline_ns, 0, slot, handle.generation),
-        )
-        heapq.heappush(
-            self._deadlines,
-            (attempt.unadmitted_deadline_ns, 1, slot, handle.generation),
-        )
+        self._queue_append(entry)
+        self._waiting_counts[attempt.service_interval_ms] += 1
+        self._deadline_insert(slot)
         return handle
 
     def _release_slot(self, entry: _Entry) -> None:
+        attempt = entry.attempt
+        handle = entry.handle
+        if attempt is None or handle is None:
+            raise RuntimeError("cannot release an empty admission entry")
+        if entry.state == "waiting":
+            self._queue_remove(entry)
+            self._waiting_counts[attempt.service_interval_ms] -= 1
         if entry.state == "submitted":
             self._submitted -= 1
-        self._entries[entry.handle.slot] = None
-        self._connections.pop(entry.attempt.connection_id, None)
-        if self._protected == entry.handle:
+            self._submitted_counts[attempt.service_interval_ms] -= 1
+        self._deadline_remove(handle.slot)
+        self._connections.pop(attempt.connection_id, None)
+        if self._protected == handle:
             self._protected = None
-        heapq.heappush(self._free, entry.handle.slot)
+        slot = handle.slot
+        entry.attempt = None
+        entry.handle = None
+        entry.enqueued_at_ns = 0
+        entry.sequence = 0
+        entry.state = "free"
+        entry.queue_previous = -1
+        entry.queue_next = -1
+        entry.deadline_ns = 0
+        entry.deadline_closes_connection = False
+        heapq.heappush(self._free, slot)
 
     def _disposition(
         self,
@@ -264,9 +432,13 @@ class BoundedAdmissionController:
         *,
         terminal_connection: bool = False,
     ) -> AdmissionDisposition:
+        if entry.attempt is None:
+            raise RuntimeError("cannot disposition an empty admission entry")
         disposition = AdmissionDisposition(
             attempt_id=entry.attempt.attempt_id,
             outcome=outcome,
+            handle=entry.handle,
+            service_interval_ms=entry.attempt.service_interval_ms,
             terminal_connection=terminal_connection,
             close_code=1013 if terminal_connection else None,
         )
@@ -276,19 +448,23 @@ class BoundedAdmissionController:
     def cancel(self, handle: AdmissionHandle) -> AdmissionDisposition:
         return self._disposition(self._require(handle), "cancelled")
 
+    def detach(self, handle: AdmissionHandle) -> AdmissionDisposition | None:
+        """Cancel waiting work, but retain submitted resource authority."""
+
+        entry = self._require(handle)
+        if entry.state == "submitted":
+            return None
+        return self._disposition(entry, "cancelled")
+
     def expire_due(self) -> tuple[AdmissionDisposition, ...]:
         now = self._monotonic_ns()
-        due: dict[AdmissionHandle, bool] = {}
-        while self._deadlines and self._deadlines[0][0] <= now:
-            _, kind, slot, generation = heapq.heappop(self._deadlines)
-            handle = AdmissionHandle(slot, generation)
-            if self._entry_or_none(handle) is not None:
-                due[handle] = due.get(handle, False) or kind == 1
         dispositions: list[AdmissionDisposition] = []
-        for handle, terminal_connection in due.items():
-            entry = self._entry_or_none(handle)
-            if entry is None:
-                continue
+        while self._deadline_size:
+            slot = self._deadline_heap[0]
+            entry = self._entries[slot]
+            if entry.deadline_ns > now:
+                break
+            terminal_connection = entry.deadline_closes_connection
             outcome: AdmissionOutcome = (
                 "shed" if self._authority == "OPEN" else "unavailable"
             )
@@ -302,15 +478,12 @@ class BoundedAdmissionController:
         return tuple(dispositions)
 
     def _head(self, interval: int) -> _Entry | None:
-        queue = self._queues[interval]
-        while queue:
-            entry = self._entries[queue[0]]
-            if entry is not None and entry.state == "waiting":
-                return entry
-            queue.popleft()
-        return None
+        slot = self._queue_heads[interval]
+        return None if slot == -1 else self._entries[slot]
 
     def _fits(self, entry: _Entry, capacity: AdmissionCapacity) -> bool:
+        if entry.attempt is None:
+            return False
         return (
             capacity.authority == "OPEN"
             and capacity.hard_headroom > 0
@@ -322,17 +495,23 @@ class BoundedAdmissionController:
         )
 
     def _launch(self, entry: _Entry) -> AdmissionDispatch:
-        queue = self._queues[entry.attempt.service_interval_ms]
-        while queue and queue[0] != entry.handle.slot:
-            queue.popleft()
-        if not queue:
+        attempt = entry.attempt
+        handle = entry.handle
+        if attempt is None or handle is None:
+            raise RuntimeError("cannot launch an empty admission entry")
+        if self._queue_heads[attempt.service_interval_ms] != handle.slot:
             raise RuntimeError("admission FIFO lost its selected head")
-        queue.popleft()
+        self._queue_remove(entry)
+        self._waiting_counts[attempt.service_interval_ms] -= 1
+        # The admission-wait deadline ends at submission. Resource
+        # terminality, not a stale timer, owns this slab entry thereafter.
+        self._deadline_remove(handle.slot)
         entry.state = "submitted"
         self._submitted += 1
-        if self._protected == entry.handle:
+        self._submitted_counts[attempt.service_interval_ms] += 1
+        if self._protected == handle:
             self._protected = None
-        return AdmissionDispatch(entry.handle, entry.attempt)
+        return AdmissionDispatch(handle, attempt)
 
     def drain(
         self,
@@ -350,21 +529,24 @@ class BoundedAdmissionController:
         if available <= 0:
             return ()
         now = self._monotonic_ns()
-        heads = tuple(
-            head
-            for interval in self._config.supported_intervals_ms
-            if (head := self._head(interval)) is not None
-        )
-        self._last_examined = len(heads)
         protected = self._entry_or_none(self._protected)
         if protected is None:
-            aged = tuple(
-                entry
-                for entry in heads
-                if now - entry.enqueued_at_ns >= self._config.aging_threshold_ns
-            )
-            if aged:
-                protected = min(aged, key=lambda entry: entry.sequence)
+            for interval in self._config.supported_intervals_ms:
+                entry = self._head(interval)
+                if entry is None:
+                    continue
+                self._last_examined += 1
+                if (
+                    now - entry.enqueued_at_ns
+                    >= self._config.aging_threshold_ns
+                    and (
+                        protected is None
+                        or entry.sequence < protected.sequence
+                    )
+                ):
+                    protected = entry
+            if protected is not None:
+                assert protected.handle is not None
                 self._protected = protected.handle
         if protected is not None:
             if not self._fits(protected, capacity):
@@ -373,26 +555,29 @@ class BoundedAdmissionController:
             self._last_launched = 1
             return launched
 
-        remaining_nominal = dict(capacity.nominal_headroom_by_interval)
+        remaining_nominal = [
+            capacity.nominal_headroom_by_interval.get(interval, 0)
+            for interval in self._config.supported_intervals_ms
+        ]
         launched_items: list[AdmissionDispatch] = []
         while len(launched_items) < available:
-            heads = tuple(
-                head
-                for interval in self._config.supported_intervals_ms
-                if (head := self._head(interval)) is not None
-            )
-            feasible = tuple(
-                entry
-                for entry in heads
-                if remaining_nominal.get(entry.attempt.service_interval_ms, 0)
-                > 0
-            )
-            if not feasible:
+            selected: _Entry | None = None
+            selected_index = -1
+            for index, interval in enumerate(
+                self._config.supported_intervals_ms
+            ):
+                if remaining_nominal[index] <= 0:
+                    continue
+                entry = self._head(interval)
+                if entry is not None and (
+                    selected is None or entry.sequence < selected.sequence
+                ):
+                    selected = entry
+                    selected_index = index
+            if selected is None:
                 break
-            selected = min(feasible, key=lambda entry: entry.sequence)
             launched_items.append(self._launch(selected))
-            interval = selected.attempt.service_interval_ms
-            remaining_nominal[interval] -= 1
+            remaining_nominal[selected_index] -= 1
         self._last_launched = len(launched_items)
         return tuple(launched_items)
 
@@ -409,6 +594,8 @@ class BoundedAdmissionController:
     ) -> None:
         del attached
         entry = self._require(handle)
+        if entry.attempt is None:
+            raise RuntimeError("cannot hand off an empty admission entry")
         handoff(entry.attempt, lease)
         self._release_slot(entry)
 
@@ -428,7 +615,9 @@ class BoundedAdmissionController:
     ) -> tuple[AdmissionDisposition, ...]:
         if not engine_epoch or engine_epoch == self._engine_epoch:
             raise ValueError("engine epoch change requires a fresh epoch")
-        entries = tuple(entry for entry in self._entries if entry is not None)
+        entries = tuple(
+            entry for entry in self._entries if entry.state != "free"
+        )
         dispositions = tuple(
             self._disposition(entry, "unavailable") for entry in entries
         )

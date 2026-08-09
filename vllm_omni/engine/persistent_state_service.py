@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -186,6 +187,7 @@ class PersistentStateService:
         admission_config: Any | None = None,
         host_fatal_callback: Callable[[BaseException], None] | None = None,
         compiled_service_profile: Any | None = None,
+        admission_jitter_secret: bytes | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
@@ -218,6 +220,9 @@ class PersistentStateService:
         self._admission_config = admission_config
         self._host_fatal_callback = host_fatal_callback
         self._compiled_service_profile = compiled_service_profile
+        self._admission_jitter_secret = (
+            admission_jitter_secret or secrets.token_bytes(16)
+        )
         self._monotonic = monotonic
         self._operations: dict[str, asyncio.Future[Any]] = {}
         self._operation_expires_at: dict[str, float] = {}
@@ -242,6 +247,32 @@ class PersistentStateService:
         self._fatal_error: BaseException | None = None
         self._host_fatal_reported = False
         self._recovery_task: asyncio.Task[None] | None = None
+        self._admission_controller: Any | None = None
+        waiter_capacity = (
+            0
+            if admission_config is None
+            else int(admission_config.waiter_capacity)
+        )
+        self._admission_futures: list[
+            asyncio.Future[StateLease] | None
+        ] = [None] * waiter_capacity
+        self._admission_generations = [0] * waiter_capacity
+        self._admission_enqueued_at = [0.0] * waiter_capacity
+        self._admission_attached = [False] * waiter_capacity
+        self._admission_resource_tasks: list[
+            asyncio.Task[None] | None
+        ] = [None] * waiter_capacity
+        self._admission_drain_task: asyncio.Task[None] | None = None
+        self._admission_timer: asyncio.TimerHandle | None = None
+        self._resident_interval_counts = dict.fromkeys(
+            (80, 160, 320, 560, 1120), 0
+        )
+        self._submitted_interval_counts = dict.fromkeys(
+            (80, 160, 320, 560, 1120), 0
+        )
+        self._failed_release_interval_counts = dict.fromkeys(
+            (80, 160, 320, 560, 1120), 0
+        )
 
     @property
     def ready(self) -> bool:
@@ -275,6 +306,311 @@ class PersistentStateService:
 
         return self._compiled_service_profile
 
+    @property
+    def admission_snapshot(self) -> Any | None:
+        """Return the content-free bounded-controller projection."""
+
+        controller = self._admission_controller
+        return None if controller is None else controller.snapshot
+
+    def _install_admission_controller(self) -> None:
+        """Install the bounded controller once compiled authority exists."""
+
+        if self._admission_controller is not None:
+            return
+        config = self._admission_config
+        profile = self._compiled_service_profile
+        epoch = self._engine_epoch
+        if config is None or profile is None or epoch is None:
+            return
+        from vllm_omni.engine.persistent_state_capacity import (
+            StartupServiceProfile,
+        )
+
+        if not isinstance(profile, StartupServiceProfile):
+            return
+        from vllm_omni.engine.persistent_state_admission import (
+            BoundedAdmissionController,
+        )
+
+        self._admission_controller = BoundedAdmissionController(
+            config=config,
+            engine_epoch=epoch,
+            monotonic_ns=lambda: int(self._monotonic() * 1_000_000_000),
+            jitter_secret=self._admission_jitter_secret,
+        )
+
+    def _project_dispatch_capacity(self) -> Any:
+        controller = self._admission_controller
+        inventory = self._inventory
+        profile = self._compiled_service_profile
+        if controller is None or inventory is None or profile is None:
+            raise PersistentStateServiceUnavailable(
+                "persistent-state admission capacity is not installed"
+            )
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionCapacity,
+        )
+        from vllm_omni.engine.persistent_state_capacity import (
+            project_fixed_dispatch_capacity,
+        )
+
+        projection = project_fixed_dispatch_capacity(
+            profile=profile,
+            inventory=inventory,
+            resident_counts_by_interval=self._resident_interval_counts,
+            submitted_counts_by_interval=self._submitted_interval_counts,
+            authority_open=self.ready,
+        )
+        return AdmissionCapacity(
+            # One candidate per reactor turn makes every subsequent turn
+            # re-read the just-installed provisional charge. J still bounds
+            # concurrently submitted reserves; no stale multi-cadence
+            # projection can over-launch a nominal authority.
+            hard_headroom=min(projection.hard_headroom, 1),
+            nominal_headroom_by_interval=(
+                projection.nominal_dispatchable_by_interval
+            ),
+            authority="OPEN" if self.ready else "UNHANDSHAKED",
+        )
+
+    def _candidate_supported(self, service_interval_ms: int) -> bool:
+        from vllm_omni.engine.persistent_state_capacity import (
+            project_fixed_dispatch_capacity,
+        )
+
+        inventory = self._inventory
+        profile = self._compiled_service_profile
+        if inventory is None or profile is None:
+            return False
+        projection = project_fixed_dispatch_capacity(
+            profile=profile,
+            inventory=inventory,
+            resident_counts_by_interval=self._resident_interval_counts,
+            submitted_counts_by_interval=self._submitted_interval_counts,
+            authority_open=self.ready,
+        )
+        return bool(
+            projection.candidate_supported_by_interval.get(
+                service_interval_ms,
+                False,
+            )
+        )
+
+    def _arm_admission_timer(self) -> None:
+        controller = self._admission_controller
+        timer = self._admission_timer
+        if timer is not None:
+            timer.cancel()
+            self._admission_timer = None
+        if controller is None:
+            return
+        deadline_ns = controller.next_deadline_ns
+        if deadline_ns is None:
+            return
+        delay = max(
+            0.0,
+            (deadline_ns - int(self._monotonic() * 1_000_000_000))
+            / 1_000_000_000,
+        )
+        self._admission_timer = asyncio.get_running_loop().call_later(
+            delay,
+            self._schedule_admission_drain,
+        )
+
+    def _schedule_admission_drain(self) -> None:
+        task = self._admission_drain_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._admission_drain_task = loop.create_task(
+            self._drain_admission(),
+            name="persistent-state-admission-drain",
+        )
+
+    def _admission_future_for(
+        self,
+        handle: Any,
+    ) -> asyncio.Future[StateLease] | None:
+        if handle is None or not 0 <= handle.slot < len(self._admission_futures):
+            return None
+        slot = int(handle.slot)
+        if self._admission_generations[slot] != handle.generation:
+            return None
+        return self._admission_futures[slot]
+
+    def _clear_admission_slot(self, handle: Any) -> None:
+        if not 0 <= handle.slot < len(self._admission_futures):
+            return
+        if self._admission_generations[handle.slot] != handle.generation:
+            return
+        self._admission_futures[handle.slot] = None
+        self._admission_enqueued_at[handle.slot] = 0.0
+        self._admission_attached[handle.slot] = False
+        self._admission_resource_tasks[handle.slot] = None
+        self._sync_service_projection()
+
+    def _complete_admission_disposition(self, disposition: Any) -> None:
+        handle = disposition.handle
+        future = self._admission_future_for(handle)
+        if future is None:
+            return
+        wait_s = max(
+            0.0,
+            self._monotonic() - self._admission_enqueued_at[handle.slot],
+        )
+        self._clear_admission_slot(handle)
+        self._observe_metrics(
+            "observe_persistent_state_admission_wait",
+            str((self._inventory or {}).get("stage", "0")),
+            str((self._inventory or {}).get("replica", "0")),
+            cadence_ms=str(disposition.service_interval_ms),
+            outcome=disposition.outcome,
+            wait_s=wait_s,
+        )
+        if future.done():
+            return
+        if disposition.outcome == "shed":
+            config = self._admission_config
+            assert config is not None
+            future.set_exception(
+                PersistentStateBackpressure(
+                    "persistent-state admission wait expired",
+                    retry_after_ms=config.retry_floor_ms,
+                    cause="wait_deadline",
+                )
+            )
+        elif disposition.outcome == "unavailable":
+            future.set_exception(
+                PersistentStateServiceUnavailable(
+                    "persistent-state admission authority is unavailable"
+                )
+            )
+        else:
+            future.cancel()
+
+    async def _drain_admission(self) -> None:
+        controller = self._admission_controller
+        launched = False
+        try:
+            if controller is None:
+                return
+            for disposition in controller.expire_due():
+                self._complete_admission_disposition(disposition)
+            capacity = self._project_dispatch_capacity()
+            for dispatch in controller.drain(capacity):
+                future = self._admission_future_for(dispatch.handle)
+                if future is None:
+                    controller.complete_no_lease(dispatch.handle)
+                    continue
+                operation_id = dispatch.attempt.operation_id
+                interval = dispatch.attempt.service_interval_ms
+                self._charge_pending_interval(operation_id, interval)
+                task = asyncio.create_task(
+                    self._submit_admission(dispatch),
+                    name=f"persistent-state-admit-{operation_id}",
+                )
+                self._admission_resource_tasks[dispatch.handle.slot] = task
+                launched = True
+        except PersistentStateServiceUnavailable:
+            if controller is not None and self._engine_epoch is not None:
+                controller.authority_lost(engine_epoch=self._engine_epoch)
+        finally:
+            self._admission_drain_task = None
+            self._arm_admission_timer()
+            if launched:
+                asyncio.get_running_loop().call_soon(
+                    self._schedule_admission_drain
+                )
+
+    async def _submit_admission(self, dispatch: Any) -> None:
+        controller = self._admission_controller
+        future = self._admission_future_for(dispatch.handle)
+        if controller is None or future is None:
+            return
+        attempt = dispatch.attempt
+        try:
+            lease = await self._reserve_direct(
+                operation_id=attempt.operation_id,
+                session_key=attempt.resource_key,
+                schema_id=attempt.schema_id,
+                profile_id=attempt.profile_id,
+                service_interval_ms=attempt.service_interval_ms,
+            )
+        except PersistentStateIndeterminate:
+            shared = self._operations.get(attempt.operation_id)
+            if shared is None:
+                error: BaseException = PersistentStateServiceUnavailable(
+                    "indeterminate admission lost its exact operation"
+                )
+                controller.complete_no_lease(dispatch.handle)
+                if not future.done():
+                    future.set_exception(error)
+                self._clear_admission_slot(dispatch.handle)
+                self._schedule_admission_drain()
+                return
+            try:
+                result = await asyncio.shield(shared)
+                if not isinstance(result, StateReserveResult):
+                    raise PersistentStateServiceUnavailable(
+                        "reconciled admission returned an invalid result"
+                    )
+                lease = result.lease
+            except Exception as error:
+                controller.complete_no_lease(dispatch.handle)
+                if not future.done():
+                    future.set_exception(error)
+                self._clear_admission_slot(dispatch.handle)
+                self._schedule_admission_drain()
+                return
+        except Exception as error:
+            controller.complete_no_lease(dispatch.handle)
+            if not future.done():
+                future.set_exception(error)
+            self._clear_admission_slot(dispatch.handle)
+            self._schedule_admission_drain()
+            return
+
+        attached = (
+            self._admission_attached[dispatch.handle.slot]
+            and not future.cancelled()
+        )
+
+        def handoff(_attempt: Any, committed: object) -> None:
+            if attached and not future.done():
+                future.set_result(committed)  # type: ignore[arg-type]
+
+        controller.complete_admitted(
+            dispatch.handle,
+            lease=lease,
+            attached=attached,
+            handoff=handoff,
+        )
+        wait_s = max(
+            0.0,
+            self._monotonic()
+            - self._admission_enqueued_at[dispatch.handle.slot],
+        )
+        self._clear_admission_slot(dispatch.handle)
+        self._observe_metrics(
+            "observe_persistent_state_admission_wait",
+            str((self._inventory or {}).get("stage", "0")),
+            str((self._inventory or {}).get("replica", "0")),
+            cadence_ms=str(attempt.service_interval_ms),
+            outcome="admitted",
+            wait_s=wait_s,
+        )
+        if not attached:
+            await self.release(
+                operation_id=f"detached-{attempt.operation_id}",
+                lease=lease,
+                reason="admission_client_detached",
+            )
+        self._schedule_admission_drain()
+
     def close_admission(self) -> None:
         """Close new admission without discarding cleanup authority."""
         self._admission_open = False
@@ -290,6 +626,9 @@ class PersistentStateService:
         """
         self.close_admission()
         self._ready = False
+        controller = self._admission_controller
+        if controller is not None and self._engine_epoch is not None:
+            controller.authority_lost(engine_epoch=self._engine_epoch)
         self._arm_recovery()
 
     def _arm_recovery(self) -> None:
@@ -417,14 +756,19 @@ class PersistentStateService:
         if self._metrics_sink is not None:
             raise RuntimeError("persistent-state metrics already installed")
         self._metrics_sink = metrics_sink
-        self._project_inventory()
+        self._sync_service_projection()
 
-    def _observe_metrics(self, method_name: str, *args: Any) -> None:
+    def _observe_metrics(
+        self,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         sink = self._metrics_sink
         if sink is None:
             return
         try:
-            getattr(sink, method_name)(*args)
+            getattr(sink, method_name)(*args, **kwargs)
         except Exception:
             logger.exception(
                 "persistent-state metric observation failed; serving is unaffected"
@@ -459,10 +803,136 @@ class PersistentStateService:
         inventory["charged_demand"] = float(Fraction(charged_count, capacity))
         profile = self._compiled_service_profile
         if profile is not None:
-            receipt_hash = getattr(profile, "receipt_sha256", None)
+            receipt = getattr(profile, "receipt", profile)
+            receipt_hash = getattr(receipt, "receipt_sha256", None)
             if receipt_hash is not None:
                 inventory["service_profile_receipt_sha256"] = str(receipt_hash)
+        controller = self._admission_controller
+        if controller is not None and profile is not None:
+            from vllm_omni.engine.persistent_state_capacity import (
+                project_fixed_dispatch_capacity,
+            )
+
+            projection = project_fixed_dispatch_capacity(
+                profile=profile,
+                inventory=inventory,
+                resident_counts_by_interval=self._resident_interval_counts,
+                submitted_counts_by_interval=self._submitted_interval_counts,
+                authority_open=self.ready,
+            )
+            inventory["execution_claims"] = projection.execution_claims
+            inventory["charged_demand"] = (
+                projection.charged_units / projection.service_budget_units
+            )
+            pending = controller.pending_counts
+            pending_by_cadence = {
+                str(interval): {
+                    **pending[interval],
+                    "committed_cleanup": self._failed_release_interval_counts[
+                        interval
+                    ],
+                }
+                for interval in self._resident_interval_counts
+            }
+            self._observe_metrics(
+                "observe_persistent_state_capacity",
+                str(inventory["stage"]),
+                str(inventory["replica"]),
+                service_source=str(
+                    getattr(receipt, "service_budget_source", "measured_fallback")
+                ),
+                service_budget=1.0,
+                charged_demand=float(inventory["charged_demand"]),
+                execution_claims=projection.execution_claims,
+                max_num_seqs=projection.max_num_seqs,
+                headroom_by_cadence={
+                    str(interval): {
+                        "hard": projection.hard_headroom,
+                        "nominal": projection.nominal_dispatchable_by_interval[
+                            interval
+                        ],
+                    }
+                    for interval in self._resident_interval_counts
+                },
+                pending_by_cadence=pending_by_cadence,
+            )
         self._project_inventory()
+
+    def _charge_pending_interval(
+        self,
+        operation_id: str,
+        service_interval_ms: int,
+    ) -> None:
+        existing = self._pending_service_intervals.get(operation_id)
+        if existing is not None:
+            if existing != service_interval_ms:
+                raise PersistentStateServiceUnavailable(
+                    "one reserve operation changed service interval"
+                )
+            return
+        if service_interval_ms not in self._submitted_interval_counts:
+            raise PersistentStateUnsupportedServiceInterval(
+                requested_interval_ms=service_interval_ms,
+                resolved_envelope=str(
+                    (self._inventory or {}).get("profile_id", "installed profile")
+                ),
+            )
+        self._pending_service_intervals[operation_id] = service_interval_ms
+        self._submitted_interval_counts[service_interval_ms] += 1
+        self._sync_service_projection()
+
+    def _pop_pending_interval(
+        self,
+        operation_id: str,
+        fallback: int | None = None,
+    ) -> int | None:
+        interval = self._pending_service_intervals.pop(operation_id, fallback)
+        if interval is not None:
+            self._submitted_interval_counts[interval] -= 1
+            if self._submitted_interval_counts[interval] < 0:
+                raise RuntimeError("persistent-state submitted cadence underflow")
+        return interval
+
+    def _commit_resident_interval(
+        self,
+        binding_token: str,
+        service_interval_ms: int,
+    ) -> None:
+        existing = self._service_intervals.get(binding_token)
+        if existing is not None:
+            if existing != service_interval_ms:
+                raise RuntimeError("persistent-state lease changed cadence")
+            return
+        self._service_intervals[binding_token] = service_interval_ms
+        self._resident_interval_counts[service_interval_ms] += 1
+        self._sync_service_projection()
+
+    def _release_resident_interval(self, binding_token: str) -> None:
+        interval = self._service_intervals.pop(binding_token, None)
+        if interval is None:
+            return
+        self._resident_interval_counts[interval] -= 1
+        if self._resident_interval_counts[interval] < 0:
+            raise RuntimeError("persistent-state resident cadence underflow")
+        self._sync_service_projection()
+
+    def _mark_failed_release_interval(self, binding_token: str) -> None:
+        if binding_token in self._failed_releases:
+            return
+        interval = self._service_intervals.get(binding_token)
+        if interval is not None:
+            self._failed_release_interval_counts[interval] += 1
+
+    def _clear_failed_release_interval(self, binding_token: str) -> None:
+        if binding_token not in self._failed_releases:
+            return
+        interval = self._service_intervals.get(binding_token)
+        if interval is not None:
+            self._failed_release_interval_counts[interval] -= 1
+            if self._failed_release_interval_counts[interval] < 0:
+                raise RuntimeError(
+                    "persistent-state failed-release cadence underflow"
+                )
 
     def _observe_admission_rejection(self, reason: str) -> None:
         self._observe_metrics("inc_admission_rejection", reason)
@@ -486,6 +956,26 @@ class PersistentStateService:
         self._recovery_task = None
         if recovery is not None and not recovery.done():
             recovery.cancel()
+        timer = self._admission_timer
+        self._admission_timer = None
+        if timer is not None:
+            timer.cancel()
+        drain = self._admission_drain_task
+        self._admission_drain_task = None
+        if drain is not None and not drain.done():
+            drain.cancel()
+        for slot, future in enumerate(self._admission_futures):
+            if future is not None and not future.done():
+                future.set_exception(
+                    PersistentStateServiceUnavailable(
+                        "persistent-state service is stopping"
+                    )
+                )
+            resource_task = self._admission_resource_tasks[slot]
+            if resource_task is not None and not resource_task.done():
+                resource_task.cancel()
+            self._admission_futures[slot] = None
+            self._admission_resource_tasks[slot] = None
 
     def engine_epoch_changed(self, engine_epoch: str) -> None:
         """Fail closed when a new engine epoch invalidates every live lease."""
@@ -495,6 +985,10 @@ class PersistentStateService:
         self._fatal_error = PersistentStateServiceUnavailable(
             "persistent-state engine epoch changed; live leases are invalid"
         )
+        controller = self._admission_controller
+        if controller is not None:
+            for disposition in controller.engine_epoch_changed(engine_epoch):
+                self._complete_admission_disposition(disposition)
         self._engine_epoch = engine_epoch
 
     async def _reconcile_orphan_bindings(
@@ -510,6 +1004,11 @@ class PersistentStateService:
         other release failure fails the handshake, so admission stays
         closed until the engine answers consistently.
         """
+        inventory = self._inventory
+        if inventory is None:
+            raise PersistentStateServiceUnavailable(
+                "persistent-state inventory is unavailable during orphan recovery"
+            )
         for binding in snapshot.get("bindings", ()):
             token = str(binding["binding_token"])
             if token in self._live_leases:
@@ -539,13 +1038,13 @@ class PersistentStateService:
                 raise PersistentStateServiceUnavailable(
                     f"orphan reconciliation failed for one binding: {error}"
                 ) from error
-            self._inventory["manager_revision"] = raw.get(
+            inventory["manager_revision"] = raw.get(
                 "manager_revision",
-                self._inventory.get("manager_revision"),
+                inventory.get("manager_revision"),
             )
-            self._inventory["resident_count"] = raw.get(
+            inventory["resident_count"] = raw.get(
                 "resident_count",
-                self._inventory.get("resident_count"),
+                inventory.get("resident_count"),
             )
 
     # @spec PORT-STATE-014, PORT-STATE-022, PORT-STATE-023
@@ -592,10 +1091,10 @@ class PersistentStateService:
                 retry,
                 retain_error=False,
             )
+            self._clear_failed_release_interval(token)
             self._failed_releases.pop(token, None)
             self._live_leases.pop(token, None)
-            self._service_intervals.pop(token, None)
-            self._sync_service_projection()
+            self._release_resident_interval(token)
             snapshot["bindings"] = [
                 candidate
                 for candidate in snapshot.get("bindings", ())
@@ -669,8 +1168,14 @@ class PersistentStateService:
                 await self._reconcile_orphan_bindings(snapshot)
                 self._ready = True
                 self._admission_open = True
+                self._install_admission_controller()
+                controller = self._admission_controller
+                if controller is not None:
+                    controller.authority_recovered(engine_epoch=engine_epoch)
+                    self._sync_service_projection()
                 self._refresh_tombstone_admission()
                 self._project_inventory()
+                self._schedule_admission_drain()
             if self._dispatcher_task is None or self._dispatcher_task.done():
                 self._dispatcher_task = asyncio.create_task(
                     self._dispatch(), name="persistent-state-dispatch"
@@ -719,6 +1224,92 @@ class PersistentStateService:
         schema_id: str,
         profile_id: str,
         service_interval_ms: int = 560,
+        connection_id: str | None = None,
+        connection_handle: str | None = None,
+        admission_deadline_ns: int | None = None,
+        unadmitted_deadline_ns: int | None = None,
+    ) -> StateLease:
+        """Enter bounded pre-audio admission before manager reservation."""
+
+        try:
+            await self._ensure_started()
+        except PersistentStateServiceUnavailable:
+            self._observe_admission_rejection("unavailable")
+            raise
+        controller = self._admission_controller
+        if controller is None:
+            return await self._reserve_direct(
+                operation_id=operation_id,
+                session_key=session_key,
+                schema_id=schema_id,
+                profile_id=profile_id,
+                service_interval_ms=service_interval_ms,
+            )
+        if not self._candidate_supported(service_interval_ms):
+            self._observe_admission_rejection("unsupported")
+            raise PersistentStateUnsupportedServiceInterval(
+                requested_interval_ms=service_interval_ms,
+                resolved_envelope=str(
+                    (self._inventory or {}).get("profile_id", "installed profile")
+                ),
+            )
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionAttempt,
+        )
+
+        now_ns = int(self._monotonic() * 1_000_000_000)
+        config = self._admission_config
+        assert config is not None
+        wait_deadline = admission_deadline_ns or (
+            now_ns + int(config.admission_wait_timeout_s * 1_000_000_000)
+        )
+        attempt = AdmissionAttempt(
+            attempt_id=operation_id,
+            connection_id=connection_id or session_key,
+            connection_handle=connection_handle or session_key,
+            operation_id=operation_id,
+            service_interval_ms=service_interval_ms,
+            admission_deadline_ns=wait_deadline,
+            unadmitted_deadline_ns=(
+                unadmitted_deadline_ns or wait_deadline
+            ),
+            resource_key=session_key,
+            schema_id=schema_id,
+            profile_id=profile_id,
+        )
+        handle = controller.enqueue(attempt)
+        existing = self._admission_future_for(handle)
+        if existing is not None:
+            return await asyncio.shield(existing)
+        future: asyncio.Future[StateLease] = (
+            asyncio.get_running_loop().create_future()
+        )
+        slot = handle.slot
+        self._admission_generations[slot] = handle.generation
+        self._admission_futures[slot] = future
+        self._admission_enqueued_at[slot] = self._monotonic()
+        self._admission_attached[slot] = True
+        self._sync_service_projection()
+        self._schedule_admission_drain()
+        self._arm_admission_timer()
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self._admission_attached[slot] = False
+            disposition = controller.detach(handle)
+            if disposition is not None:
+                self._complete_admission_disposition(disposition)
+                self._schedule_admission_drain()
+            raise
+
+    async def _reserve_direct(
+        self,
+        *,
+        operation_id: str,
+        session_key: str,
+        schema_id: str,
+        profile_id: str,
+        service_interval_ms: int,
     ) -> StateLease:
         """Reserve once, reconciling the same operation after timeout."""
         try:
@@ -740,8 +1331,7 @@ class PersistentStateService:
                 raise PersistentStateServiceUnavailable(
                     "persistent-state admission is closed"
                 )
-            self._pending_service_intervals[operation_id] = service_interval_ms
-            self._sync_service_projection()
+            self._charge_pending_interval(operation_id, service_interval_ms)
             future: asyncio.Future[StateReserveResult] = (
                 asyncio.get_running_loop().create_future()
             )
@@ -764,7 +1354,7 @@ class PersistentStateService:
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
                 self._operation_expires_at.pop(operation_id, None)
-                self._pending_service_intervals.pop(operation_id, None)
+                self._pop_pending_interval(operation_id)
                 self._sync_service_projection()
                 self._observe_admission_rejection("capacity")
                 raise PersistentStateBackpressure(
@@ -792,6 +1382,9 @@ class PersistentStateService:
                     "persistent-state reserve reconciliation remained indeterminate"
                 ) from error
             self._admission_open = True
+            controller = self._admission_controller
+            if controller is not None and self._engine_epoch is not None:
+                controller.authority_recovered(engine_epoch=self._engine_epoch)
         if not isinstance(result, StateReserveResult):
             raise PersistentStateServiceUnavailable(
                 "persistent-state reserve returned an invalid result"
@@ -940,7 +1533,7 @@ class PersistentStateService:
                     "persistent-state reserve crossed an engine epoch"
                 )
         except Exception as error:
-            self._pending_service_intervals.pop(command.operation_id, None)
+            self._pop_pending_interval(command.operation_id)
             self._sync_service_projection()
             mapped = self._map_error(
                 error,
@@ -957,12 +1550,19 @@ class PersistentStateService:
                 command.future.set_exception(mapped)
         else:
             self._live_leases[result.lease.binding_token] = result.lease
-            interval = self._pending_service_intervals.pop(
+            self._update_projection(
+                manager_revision=result.manager_revision,
+                resident_count=result.resident_count,
+            )
+            interval = self._pop_pending_interval(
                 command.operation_id,
                 command.service_interval_ms,
             )
-            self._service_intervals[result.lease.binding_token] = interval
-            self._sync_service_projection()
+            assert interval is not None
+            self._commit_resident_interval(
+                result.lease.binding_token,
+                interval,
+            )
             if not command.future.done():
                 command.future.set_result(result)
 
@@ -982,6 +1582,7 @@ class PersistentStateService:
                 )
         except Exception as error:
             mapped = self._map_error(error)
+            self._mark_failed_release_interval(command.lease.binding_token)
             self._failed_releases[command.lease.binding_token] = command
             if self._failed_release_started_at is None:
                 self._failed_release_started_at = asyncio.get_running_loop().time()
@@ -989,12 +1590,17 @@ class PersistentStateService:
             if not command.future.done():
                 command.future.set_exception(mapped)
         else:
+            self._update_projection(
+                manager_revision=result.manager_revision,
+                resident_count=result.resident_count,
+            )
             self._live_leases.pop(command.lease.binding_token, None)
+            self._clear_failed_release_interval(command.lease.binding_token)
             self._failed_releases.pop(command.lease.binding_token, None)
-            self._service_intervals.pop(command.lease.binding_token, None)
-            self._sync_service_projection()
+            self._release_resident_interval(command.lease.binding_token)
             if not command.future.done():
                 command.future.set_result(result)
+            self._schedule_admission_drain()
 
     async def _execute_begin_cleanup(
         self,
