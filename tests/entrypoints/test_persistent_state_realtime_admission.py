@@ -55,13 +55,22 @@ class _Service:
         self.pending_cleanup_wins = True
         self.pending_claim_timeout_s = 30.0
         self.reserve_error: Exception | None = None
-        self.lease = object()
+        self.ready = True
+        self.lease = SimpleNamespace(
+            engine_epoch="epoch-a",
+            generation=1,
+            binding_token="binding-a",
+        )
         self.runtime_config = SimpleNamespace(
             accepted_audio_budget_s=30.0,
             accepted_audio_capacity_samples=480_000,
             max_retained_transcript_bytes=1 << 20,
             max_session_samples=None,
-            session_configuration_timeout_s=30.0,
+            session_configuration_timeout_s=0.05,
+            unadmitted_connection_timeout_s=0.20,
+            admission_wait_timeout_s=0.10,
+            admission_retry_floor_ms=10,
+            admission_retry_jitter_ms=0,
             session_idle_timeout_s=60.0,
             session_finalization_timeout_s=40.0,
         )
@@ -106,6 +115,57 @@ def _connection() -> tuple[RealtimeConnection, _WebSocket, _Service]:
     return connection, websocket, service
 
 
+def _start_pre_admission_timeouts(connection: RealtimeConnection) -> None:
+    start = getattr(connection, "_start_pre_admission_timeouts", None)
+    if not callable(start):
+        pytest.fail(
+            "PORT-SESS-012 missing orthogonal pre-admission clock authority",
+            pytrace=False,
+        )
+    start()
+
+
+def _require_standard_update(websocket: _WebSocket) -> dict[str, Any]:
+    updates = [
+        event for event in websocket.sent if event.get("type") == "session.updated"
+    ]
+    if len(updates) != 1:
+        pytest.fail(
+            "PORT-SESS-010 expected exactly one standard session.updated "
+            f"event, observed {len(updates)}",
+            pytrace=False,
+        )
+    return updates[0]
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_connection_entry_arms_the_total_unadmitted_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-SESS-012: the real connection entry owns both clocks."""
+
+    connection, websocket, service = _connection()
+    connection.session_configuration_timeout = 0.20
+    service.runtime_config.unadmitted_connection_timeout_s = 0.01
+
+    async def hold_transport(_connection: object) -> None:
+        await asyncio.sleep(0.03)
+
+    monkeypatch.setattr(
+        RealtimeConnection.__mro__[1],
+        "handle_connection",
+        hold_transport,
+    )
+
+    await connection.handle_connection()
+
+    assert websocket.sent, (
+        "PORT-SESS-012 connection entry did not arm total unadmitted timeout"
+    )
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert websocket.closed == [1013]
+
+
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_audio_before_manager_ack_is_rejected_without_buffering() -> None:
     # @spec PORT-SESS-010
@@ -125,7 +185,7 @@ async def test_audio_before_manager_ack_is_rejected_without_buffering() -> None:
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_first_valid_update_reserves_before_marking_model_valid() -> None:
     # @spec PORT-STATE-004 / PORT-SESS-010
-    connection, _, service = _connection()
+    connection, websocket, service = _connection()
 
     await connection.handle_event(
         {"type": "session.update", "model": "nemotron-asr"}
@@ -142,6 +202,237 @@ async def test_first_valid_update_reserves_before_marking_model_valid() -> None:
     )
     assert connection._state_lease is service.lease
     assert connection._is_model_validated is True
+    updated = _require_standard_update(websocket)
+    assert updated["session"] == {
+        "model": "nemotron-asr",
+        "cadence": "560ms",
+        "locale": "auto",
+        "endpointing": {
+            "mode": "greedy_blank",
+            "stop_history_ms": 800,
+            "residue_frames": 2,
+        },
+    }, "PORT-SESS-010 requires the full resolved configuration"
+    assert not {
+        "binding_token",
+        "engine_epoch",
+        "operation_id",
+        "request_id",
+        "session_key",
+    }.intersection(updated["session"])
+    assert all(event["type"] != "session.admitted" for event in websocket.sent)
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_standard_update_ack_waits_for_manager_admission() -> None:
+    """@spec PORT-STATE-004 / PORT-SESS-010."""
+
+    connection, websocket, service = _connection()
+    allow_reserve = asyncio.Event()
+
+    async def delayed_reserve(**kwargs: Any) -> object:
+        service.reserve_calls.append(kwargs)
+        await allow_reserve.wait()
+        return service.lease
+
+    service.reserve = delayed_reserve  # type: ignore[method-assign]
+    update = asyncio.create_task(
+        connection.handle_event(
+            {
+                "type": "session.update",
+                "model": "nemotron-asr",
+                "cadence": "320ms",
+                "locale": "en-US",
+                "endpointing": {
+                    "mode": "greedy_blank",
+                    "stop_history_ms": 640,
+                    "residue_frames": 1,
+                },
+            }
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert service.reserve_calls
+    assert websocket.sent == []
+    assert connection._is_model_validated is False
+    allow_reserve.set()
+    await update
+
+    assert connection._is_model_validated is True
+    assert len(websocket.sent) == 1
+    updated = _require_standard_update(websocket)
+    assert updated["session"] == {
+        "model": "nemotron-asr",
+        "cadence": "320ms",
+        "locale": "en-US",
+        "endpointing": {
+            "mode": "greedy_blank",
+            "stop_history_ms": 640,
+            "residue_frames": 1,
+        },
+    }, "PORT-SESS-010 requires requested values after resolution"
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_standard_ack_follows_real_session_construction_and_observer_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-STATE-004 / PORT-SESS-010 / PORT-OBS-003."""
+
+    connection, websocket, service = _connection()
+    events: list[str] = []
+    observer = object()
+    connection._observer = observer
+    connection.serving.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(endpoint_history_capacity_frames=12)
+    )
+
+    original_reserve = service.reserve
+
+    async def reserve(**kwargs: Any) -> object:
+        events.append("reserve")
+        return await original_reserve(**kwargs)
+
+    service.reserve = reserve  # type: ignore[method-assign]
+
+    def construct(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        del args
+        assert kwargs["observer"] is observer
+        events.append("session-and-observer-open")
+        return SimpleNamespace(park_token_id=99)
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.realtime_connection."
+        "NemotronRealtimeSession.from_model_config",
+        construct,
+    )
+    original_send = websocket.send_text
+
+    async def send_text(value: str) -> None:
+        payload = json.loads(value)
+        if payload["type"] == "session.updated":
+            events.append("session.updated")
+        await original_send(value)
+
+    websocket.send_text = send_text  # type: ignore[method-assign]
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+
+    assert events == [
+        "reserve",
+        "session-and-observer-open",
+        "session.updated",
+    ], "PORT-SESS-010 missing post-construction standard acknowledgement"
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_construction_failure_releases_without_standard_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-STATE-014 / PORT-SESS-010."""
+
+    connection, websocket, service = _connection()
+    connection.serving.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(endpoint_history_capacity_frames=12)
+    )
+
+    def reject(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.realtime_connection."
+        "NemotronRealtimeSession.from_model_config",
+        reject,
+    )
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        await connection.handle_event(
+            {"type": "session.update", "model": "nemotron-asr"}
+        )
+
+    assert all(event["type"] != "session.updated" for event in websocket.sent)
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "configuration_error"
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_audio_racing_admission_is_rejected_before_standard_ack() -> None:
+    """@spec PORT-SESS-010: socket serialization is not admission."""
+
+    connection, websocket, service = _connection()
+    allow_reserve = asyncio.Event()
+
+    async def delayed_reserve(**kwargs: Any) -> object:
+        service.reserve_calls.append(kwargs)
+        await allow_reserve.wait()
+        return service.lease
+
+    service.reserve = delayed_reserve  # type: ignore[method-assign]
+    update = asyncio.create_task(
+        connection.handle_event(
+            {"type": "session.update", "model": "nemotron-asr"}
+        )
+    )
+    await asyncio.sleep(0)
+    audio = base64.b64encode(b"\x01\x00").decode()
+    await connection.handle_event(
+        {"type": "input_audio_buffer.append", "audio": audio}
+    )
+
+    assert len(websocket.sent) == 1
+    assert websocket.sent[0]["type"] == "error"
+    assert websocket.sent[0]["code"] == "model_not_validated"
+    allow_reserve.set()
+    await update
+    _require_standard_update(websocket)
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_permitted_locale_update_acks_only_after_application() -> None:
+    """@spec PORT-LID-001 / PORT-SESS-010 / PORT-SESS-011."""
+
+    connection, websocket, service = _connection()
+    applied: list[str] = []
+
+    class _Session:
+        async def update_locale(self, locale: str) -> None:
+            assert websocket.sent == []
+            applied.append(locale)
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+    _require_standard_update(websocket)
+    websocket.sent.clear()
+    connection._nemotron_session = _Session()  # type: ignore[assignment]
+
+    await connection.handle_event(
+        {
+            "type": "session.update",
+            "model": "nemotron-asr",
+            "locale": "de-DE",
+        }
+    )
+
+    assert applied == ["de-DE"], (
+        "PORT-LID-001 / PORT-SESS-010 locale update was not applied"
+    )
+    updated = _require_standard_update(websocket)
+    assert updated["session"] == {
+        "model": "nemotron-asr",
+        "cadence": "560ms",
+        "locale": "de-DE",
+        "endpointing": {
+            "mode": "greedy_blank",
+            "stop_history_ms": 800,
+            "residue_frames": 2,
+        },
+    }
+    assert len(service.reserve_calls) == 1
 
 
 def _service_error(name: str, *args: Any, **kwargs: Any) -> Exception:
@@ -196,6 +487,7 @@ async def test_retryable_shed_carries_backoff_and_keeps_socket_open() -> None:
     assert websocket.closed == []
     assert connection._is_connected is True
     assert connection._is_model_validated is False
+    assert all(event["type"] != "session.updated" for event in websocket.sent)
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -218,6 +510,7 @@ async def test_unsupported_interval_is_nonretryable_and_keeps_socket_open() -> N
     assert "retry_after_ms" not in error
     assert websocket.closed == []
     assert connection._is_model_validated is False
+    assert all(event["type"] != "session.updated" for event in websocket.sent)
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -237,9 +530,11 @@ async def test_definitive_denial_retry_mints_fresh_identity() -> None:
 
     await connection.handle_event(update)
     service.reserve_error = None
+    await asyncio.sleep(0.06)
     await connection.handle_event(update)
 
-    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert websocket.sent[0]["code"] == "capacity_exhausted"
+    _require_standard_update(websocket)
     assert len(service.reserve_calls) == 2
     first, second = service.reserve_calls
     assert first["operation_id"] != second["operation_id"]
@@ -355,10 +650,11 @@ async def test_rearming_idle_timeout_fences_the_superseded_timer() -> None:
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
-async def test_configuration_timeout_releases_a_late_reserve_result() -> None:
-    # @spec PORT-SESS-012 / PORT-STATE-014
+async def test_total_unadmitted_timeout_releases_a_late_reserve_result() -> None:
+    # @spec PORT-SESS-012 / PORT-STATE-014 / PORT-STATE-028
     connection, websocket, service = _connection()
-    connection.session_configuration_timeout = 0.01
+    service.runtime_config.session_configuration_timeout_s = 0.10
+    service.runtime_config.unadmitted_connection_timeout_s = 0.01
     allow_reserve = asyncio.Event()
 
     async def delayed_reserve(**kwargs: Any) -> object:
@@ -367,9 +663,7 @@ async def test_configuration_timeout_releases_a_late_reserve_result() -> None:
         return service.lease
 
     service.reserve = delayed_reserve  # type: ignore[method-assign]
-    connection._configuration_timeout_task = asyncio.create_task(
-        connection._configuration_timeout()
-    )
+    _start_pre_admission_timeouts(connection)
     configure = asyncio.create_task(
         connection.handle_event(
             {"type": "session.update", "model": "nemotron-asr"}
@@ -379,11 +673,127 @@ async def test_configuration_timeout_releases_a_late_reserve_result() -> None:
     allow_reserve.set()
     await configure
 
-    assert websocket.sent[-1]["code"] == "model_not_validated"
-    assert websocket.closed == [1008]
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert websocket.closed == [1013]
     assert connection._is_model_validated is False
     assert len(service.release_calls) == 1
-    assert service.release_calls[0]["reason"] == "configuration_timeout"
+    assert service.release_calls[0]["reason"] == (
+        "unadmitted_connection_timeout"
+    )
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_configuration_clock_stops_before_server_admission_wait() -> None:
+    """@spec PORT-SESS-012: client think time cannot charge server wait."""
+
+    connection, websocket, service = _connection()
+    connection.session_configuration_timeout = 0.01
+    service.runtime_config.session_configuration_timeout_s = 0.01
+    service.runtime_config.unadmitted_connection_timeout_s = 0.20
+    allow_reserve = asyncio.Event()
+
+    async def delayed_reserve(**kwargs: Any) -> object:
+        service.reserve_calls.append(kwargs)
+        await allow_reserve.wait()
+        return service.lease
+
+    service.reserve = delayed_reserve  # type: ignore[method-assign]
+    _start_pre_admission_timeouts(connection)
+    configure = asyncio.create_task(
+        connection.handle_event(
+            {"type": "session.update", "model": "nemotron-asr"}
+        )
+    )
+    await asyncio.sleep(0.03)
+
+    assert websocket.sent == []
+    assert websocket.closed == []
+    allow_reserve.set()
+    await configure
+    _require_standard_update(websocket)
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_total_unadmitted_lifetime_never_resets_and_closes_1013() -> None:
+    """@spec PORT-SESS-011 / PORT-SESS-012."""
+
+    connection, websocket, service = _connection()
+    service.runtime_config.session_configuration_timeout_s = 0.02
+    service.runtime_config.unadmitted_connection_timeout_s = 0.05
+    service.runtime_config.admission_wait_timeout_s = 0.20
+    allow_reserve = asyncio.Event()
+
+    async def delayed_reserve(**kwargs: Any) -> object:
+        service.reserve_calls.append(kwargs)
+        await allow_reserve.wait()
+        return service.lease
+
+    service.reserve = delayed_reserve  # type: ignore[method-assign]
+    _start_pre_admission_timeouts(connection)
+    update = {"type": "session.update", "model": "nemotron-asr"}
+    first = asyncio.create_task(connection.handle_event(update))
+    await asyncio.sleep(0.02)
+    duplicate = asyncio.create_task(connection.handle_event(update))
+    await asyncio.sleep(0.04)
+
+    assert len(service.reserve_calls) == 1
+    assert websocket.closed == [1013]
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert all(event["type"] != "session.updated" for event in websocket.sent)
+    allow_reserve.set()
+    await asyncio.gather(first, duplicate)
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["reason"] == "unadmitted_connection_timeout"
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_retry_hint_beyond_remaining_lifetime_closes_fresh_retry() -> None:
+    """@spec PORT-SESS-011 / PORT-SESS-012: impossible same-socket advice."""
+
+    connection, websocket, service = _connection()
+    service.runtime_config.unadmitted_connection_timeout_s = 0.03
+    _start_pre_admission_timeouts(connection)
+    await asyncio.sleep(0.02)
+    service.reserve_error = _service_error(
+        "PersistentStateBackpressure",
+        "controller full",
+        retry_after_ms=25,
+    )
+
+    await connection.handle_event(
+        {"type": "session.update", "model": "nemotron-asr"}
+    )
+
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
+    assert websocket.sent[-1]["retry_after_ms"] == 25
+    assert websocket.closed == [1013]
+    assert connection._is_connected is False
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_definitive_refusal_cycles_cannot_extend_socket_lifetime() -> None:
+    """@spec PORT-SESS-011 / PORT-SESS-012: total lifetime never rearms."""
+
+    connection, websocket, service = _connection()
+    service.runtime_config.session_configuration_timeout_s = 0.02
+    service.runtime_config.unadmitted_connection_timeout_s = 0.07
+    service.reserve_error = _service_error(
+        "PersistentStateBackpressure",
+        "controller full",
+        retry_after_ms=5,
+    )
+    _start_pre_admission_timeouts(connection)
+    update = {"type": "session.update", "model": "nemotron-asr"}
+
+    await connection.handle_event(update)
+    await asyncio.sleep(0.03)
+    await connection.handle_event(update)
+    await asyncio.sleep(0.05)
+
+    assert len(service.reserve_calls) == 2
+    assert websocket.closed == [1013]
+    assert connection._is_connected is False
+    assert websocket.sent[-1]["code"] == "capacity_exhausted"
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -456,25 +866,6 @@ async def test_cleanup_waits_for_abort_and_decrements_active_before_release() ->
     ]
 
 
-def test_connection_arms_a_finite_configuration_timeout_at_creation() -> None:
-    # @spec PORT-SESS-012
-    source = inspect.getsource(RealtimeConnection)
-
-    assert "session_configuration_timeout" in source
-    assert "create_task" in source
-    assert "_is_model_validated" in source
-
-
-def test_connection_uses_service_errors_without_inventing_a_new_wire_shape() -> None:
-    # @spec PORT-SESS-011
-    source = inspect.getsource(RealtimeConnection)
-
-    assert "capacity_exhausted" in source
-    assert "service_unavailable" in source
-    assert "model_not_validated" in source
-    assert "ErrorEvent" not in source or "send_error" in source
-
-
 def test_connection_mints_fresh_session_and_operation_ids_per_attempt() -> None:
     # @spec PORT-STATE-012 / PORT-SESS-011
     source = inspect.getsource(RealtimeConnection)
@@ -509,16 +900,6 @@ def test_connection_keeps_transport_and_model_admission_distinct() -> None:
     assert connection._is_connected is True
     assert connection._is_model_validated is False
     assert getattr(connection, "_state_lease", None) is None
-
-
-def test_definitive_denial_leaves_socket_unadmitted_for_a_fresh_update() -> None:
-    # @spec PORT-SESS-011
-    source = inspect.getsource(RealtimeConnection.handle_event)
-
-    assert "capacity_exhausted" in source
-    assert "service_unavailable" in source
-    assert "_is_connected = False" not in source
-    assert "_is_model_validated = True" in source
 
 
 def test_post_submit_indeterminate_path_never_mints_a_parallel_attempt() -> None:

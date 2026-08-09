@@ -45,15 +45,23 @@ def _observe(metrics: OmniStreamingMetrics) -> None:
         "0",
         service_source="qualified_profile",
         service_budget=1.0,
-        committed_demand=0.25,
+        charged_demand=0.25,
         execution_claims=2,
         max_num_seqs=8,
         headroom_by_cadence={
-            "80": 0,
-            "160": 1,
-            "320": 2,
-            "560": 3,
-            "1120": 4,
+            "80": {"hard": 0, "nominal": 0},
+            "160": {"hard": 1, "nominal": 1},
+            "320": {"hard": 2, "nominal": 2},
+            "560": {"hard": 3, "nominal": 3},
+            "1120": {"hard": 4, "nominal": 4},
+        },
+        pending_by_cadence={
+            "80": {
+                "waiting": 1,
+                "submitted": 2,
+                "reconciling": 3,
+                "committed_cleanup": 4,
+            },
         },
     )
 
@@ -69,6 +77,12 @@ def test_additive_capacity_families_have_operator_vocabulary() -> None:
     )
     assert _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM") == (
         "vllm_omni:persistent_state_admission_headroom"
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING") == (
+        "vllm_omni:persistent_state_admission_pending"
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_S") == (
+        "vllm_omni:persistent_state_admission_wait_s"
     )
 
 
@@ -93,10 +107,25 @@ def test_additive_capacity_labels_are_exact_and_bounded() -> None:
         "stage",
         "replica",
         "cadence_ms",
+        "kind",
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING_LABELS") == (
+        "model_name",
+        "stage",
+        "replica",
+        "cadence_ms",
+        "state",
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_LABELS") == (
+        "model_name",
+        "stage",
+        "replica",
+        "cadence_ms",
+        "outcome",
     )
     assert _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_KINDS") == (
         "budget",
-        "committed_demand",
+        "charged_demand",
     )
     assert _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_SOURCES") == (
         "qualified_profile",
@@ -105,6 +134,22 @@ def test_additive_capacity_labels_are_exact_and_bounded() -> None:
     assert _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS_KINDS") == (
         "claims",
         "max_num_seqs",
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS") == (
+        "hard",
+        "nominal",
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING_STATES") == (
+        "waiting",
+        "submitted",
+        "reconciling",
+        "committed_cleanup",
+    )
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_OUTCOMES") == (
+        "admitted",
+        "shed",
+        "unavailable",
+        "cancelled",
     )
 
 
@@ -117,12 +162,13 @@ def test_capacity_projection_is_one_consistent_snapshot() -> None:
     budget = _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO")
     execution = _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS")
     headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
+    pending = _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING")
     assert _sample(
         f'{budget}{{kind="budget",model_name="{_MODEL}",replica="0",'
         'source="qualified_profile",stage="0"}'
     ) == 1.0
     assert _sample(
-        f'{budget}{{kind="committed_demand",model_name="{_MODEL}",'
+        f'{budget}{{kind="charged_demand",model_name="{_MODEL}",'
         'replica="0",source="qualified_profile",stage="0"}'
     ) == 0.25
     assert _sample(
@@ -134,13 +180,43 @@ def test_capacity_projection_is_one_consistent_snapshot() -> None:
         'replica="0",stage="0"}'
     ) == 8.0
     assert _sample(
-        f'{headroom}{{cadence_ms="80",model_name="{_MODEL}",replica="0",'
+        f'{headroom}{{cadence_ms="80",kind="hard",model_name="{_MODEL}",replica="0",'
         'stage="0"}'
     ) == 0.0
     assert _sample(
-        f'{headroom}{{cadence_ms="1120",model_name="{_MODEL}",replica="0",'
+        f'{headroom}{{cadence_ms="1120",kind="nominal",model_name="{_MODEL}",replica="0",'
         'stage="0"}'
     ) == 4.0
+    assert _sample(
+        f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",'
+        'stage="0",state="waiting"}'
+    ) == 1.0
+    assert _sample(
+        f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",'
+        'stage="0",state="committed_cleanup"}'
+    ) == 4.0
+
+
+def test_admission_wait_observation_uses_bounded_outcome_and_seconds() -> None:
+    """@spec PORT-OBS-012: queue wait is distinct from TTFS."""
+
+    metrics = OmniStreamingMetrics(model_name=_MODEL, log_stats=True)
+    method = getattr(metrics, "observe_persistent_state_admission_wait", None)
+    if not callable(method):
+        _fail("PORT-OBS-012 missing admission-wait observation")
+    method("0", "0", cadence_ms="320", outcome="admitted", wait_s=0.125)
+
+    family = _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_S")
+    count = _sample(
+        f'{family}_count{{cadence_ms="320",model_name="{_MODEL}",'
+        'outcome="admitted",replica="0",stage="0"}'
+    )
+    total = _sample(
+        f'{family}_sum{{cadence_ms="320",model_name="{_MODEL}",'
+        'outcome="admitted",replica="0",stage="0"}'
+    )
+    assert count == 1.0
+    assert total == 0.125
 
 
 def test_disabled_statistics_emit_no_capacity_samples() -> None:
@@ -161,4 +237,4 @@ def test_admission_reason_enum_adds_unsupported_without_renaming() -> None:
         "capacity",
         "unavailable",
         "unsupported",
-    )
+    ), "PORT-OBS-001 missing the approved three-class rejection taxonomy"

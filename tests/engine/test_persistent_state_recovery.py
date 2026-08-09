@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Recovery contract: admission closures reopen; only epoch stays fatal.
+"""Recovery contract: admission closures recover autonomously.
 
 PORT-STATE-022/023/024, from the live incident where a client storm
 latched admission closed until restart. Every fail-closed edge except
-engine-epoch invalidation demotes the service to un-handshaked, and the
-next health probe re-runs the capability/inventory handshake and reopens
-admission against a fresh engine snapshot. The handshake reconciles
+engine-epoch invalidation demotes the service to un-handshaked and arms one
+service-owned recovery authority. Health probes join that authority rather
+than driving a second handshake. The handshake reconciles
 orphaned engine bindings; horizon exhaustion is per-operation retryable
 backpressure, never a service latch.
 """
@@ -70,10 +70,13 @@ class _RecoveryStage:
         self.revision = 0
         self.bindings: list[dict[str, Any]] = []
         self.snapshot_calls = 0
+        self.engine_epoch = "epoch-a"
+        self.snapshot_gate: asyncio.Event | None = None
 
     def _snapshot(self) -> dict[str, Any]:
         self.snapshot_calls += 1
         snapshot = dict(_SNAPSHOT_BASE)
+        snapshot["engine_epoch"] = self.engine_epoch
         snapshot["manager_revision"] = self.revision
         snapshot["resident_count"] = self.resident
         snapshot["bindings"] = [dict(b) for b in self.bindings]
@@ -83,6 +86,8 @@ class _RecoveryStage:
         self, name: str, *args: Any
     ) -> dict[str, Any]:
         if name == "persistent_state_snapshot":
+            if self.snapshot_gate is not None:
+                await self.snapshot_gate.wait()
             if self.snapshot_error is not None:
                 raise self.snapshot_error
             return self._snapshot()
@@ -166,6 +171,66 @@ def _service(
     return PersistentStateService(stage, **kwargs)
 
 
+def _recovering_service(
+    stage: _RecoveryStage,
+    clock: _Clock,
+    *,
+    fatal_errors: list[BaseException] | None = None,
+    **overrides: Any,
+) -> PersistentStateService:
+    """Build the Phase-5 recovery shape with explicit, non-ENV defaults."""
+
+    required = {"admission_config", "host_fatal_callback"}
+    parameters = set(inspect.signature(PersistentStateService).parameters)
+    if missing := required.difference(parameters):
+        pytest.fail(
+            "PORT-STATE-014 / PORT-STATE-022 missing autonomous recovery "
+            f"constructor seams: {sorted(missing)}",
+            pytrace=False,
+        )
+    errors = fatal_errors if fatal_errors is not None else []
+    try:
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionControllerConfig,
+        )
+    except (ImportError, ModuleNotFoundError):
+        pytest.fail(
+            "PORT-STATE-027 missing AdmissionControllerConfig",
+            pytrace=False,
+        )
+    admission_config = AdmissionControllerConfig(
+        waiter_capacity=4,
+        max_inflight_reserves=2,
+        dispatch_budget=1,
+        aging_threshold_ns=10_000_000,
+        admission_wait_timeout_s=0.25,
+        retry_floor_ms=10,
+        retry_jitter_ms=0,
+        recovery_backoff_s=(0.001, 0.002),
+        release_convergence_timeout_s=0.03,
+        supported_intervals_ms=(80, 160, 320, 560, 1120),
+    )
+    return _service(
+        stage,
+        clock,
+        admission_config=admission_config,
+        host_fatal_callback=errors.append,
+        **overrides,
+    )
+
+
+async def _wait_until(
+    predicate: Any,
+    *,
+    timeout_s: float = 0.25,
+) -> None:
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), timeout=timeout_s)
+
+
 def _lease_kwargs(n: int) -> dict[str, str]:
     return {
         "operation_id": f"op-{n}",
@@ -201,10 +266,8 @@ async def _reserve_with_interval(
 
 
 # @spec PORT-STATE-022
-def test_indeterminate_reserve_demotes_then_next_probe_recovers() -> None:
-    """Both reserve timeouts expire -> Indeterminate closes admission AND
-    demotes; a later probe re-handshakes against the healthy engine and
-    reopens. The incident's latch: closure without demotion was forever."""
+def test_probe_joins_recovery_after_an_initial_handshake_failure() -> None:
+    """A probe observes, but never becomes, the recovery authority."""
 
     async def scenario() -> None:
         stage = _RecoveryStage()
@@ -212,10 +275,10 @@ def test_indeterminate_reserve_demotes_then_next_probe_recovers() -> None:
         service = _service(stage, clock)
         await _open_service(service)
         stage.hang_reserve = True
+        stage.snapshot_error = RuntimeError("engine not answering")
         with pytest.raises(PersistentStateIndeterminate):
             await service.reserve(**_lease_kwargs(1))
         assert not service.ready
-        stage.snapshot_error = RuntimeError("engine not answering")
         with pytest.raises(Exception):
             await service.check_health()  # engine unhealthy: stays closed
         assert not service.ready
@@ -226,6 +289,72 @@ def test_indeterminate_reserve_demotes_then_next_probe_recovers() -> None:
         assert service.ready
         result = await service.reserve(**_lease_kwargs(2))
         assert result.session_key == "session-2"
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-022 / PORT-STATE-028
+def test_indeterminate_reserve_recovers_without_an_external_health_probe() -> None:
+    """Entering UNHANDSHAKED arms the one service-owned recovery driver."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        service = _recovering_service(
+            stage,
+            clock,
+            operation_timeout_s=0.005,
+            reconciliation_timeout_s=0.005,
+        )
+        await _open_service(service)
+        initial_snapshots = stage.snapshot_calls
+        stage.hang_reserve = True
+        with pytest.raises(PersistentStateIndeterminate):
+            await service.reserve(**_lease_kwargs(1))
+        assert not service.ready
+
+        stage.hang_reserve = False
+        stage._hang_release.set()
+        await _wait_until(lambda: service.ready)
+
+        assert stage.snapshot_calls > initial_snapshots
+        result = await service.reserve(**_lease_kwargs(2))
+        assert result.session_key == "session-2"
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-022
+def test_health_probes_join_one_inflight_recovery_authority() -> None:
+    """Concurrent health traffic must not start parallel handshakes."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        service = _recovering_service(
+            stage,
+            clock,
+            operation_timeout_s=0.005,
+            reconciliation_timeout_s=0.005,
+        )
+        await _open_service(service)
+        stage.hang_reserve = True
+        with pytest.raises(PersistentStateIndeterminate):
+            await service.reserve(**_lease_kwargs(1))
+        stage.hang_reserve = False
+        stage._hang_release.set()
+        stage.snapshot_gate = asyncio.Event()
+        snapshots_before = stage.snapshot_calls
+        await _wait_until(lambda: stage.snapshot_calls > snapshots_before)
+
+        probes = [asyncio.create_task(service.check_health()) for _ in range(8)]
+        await asyncio.sleep(0)
+        assert stage.snapshot_calls == snapshots_before + 1
+        stage.snapshot_gate.set()
+        await asyncio.gather(*probes)
+        assert stage.snapshot_calls == snapshots_before + 1
         service.shutdown()
 
     asyncio.run(scenario())
@@ -395,8 +524,8 @@ def test_horizon_exhaustion_is_retryable_and_never_closes_admission() -> None:
 
 
 # @spec PORT-STATE-013 / PORT-STATE-024
-def test_full_presubmit_reserve_queue_is_retryable_shed() -> None:
-    """A local full queue is load protection, not unavailable authority."""
+def test_full_reserve_bridge_is_retryable_shed() -> None:
+    """@spec PORT-STATE-024: the J-bounded bridge is not a fault."""
 
     async def scenario() -> None:
         stage = _RecoveryStage()
@@ -423,6 +552,7 @@ def test_full_presubmit_reserve_queue_is_retryable_shed() -> None:
         assert getattr(info.value, "retryable", False), (
             "PORT-STATE-024 requires queue-full to be typed shed"
         )
+        assert getattr(info.value, "cause", None) == "bridge_full"
         assert service.ready
         assert stage.reserve_calls == 1
 
@@ -469,7 +599,7 @@ def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> N
         assert service.inventory is not None
         assert service.inventory["resident_count"] == 1
         assert service.inventory["execution_claims"] == 1
-        assert service.inventory["committed_demand"] > 0
+        assert service.inventory["charged_demand"] > 0
         assert stage.release_operation_ids == ["release-1"]
 
         stage.bindings[0]["terminal"] = True
@@ -480,7 +610,58 @@ def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> N
         assert service.inventory is not None
         assert service.inventory["resident_count"] == 0
         assert service.inventory["execution_claims"] == 0
-        assert service.inventory["committed_demand"] == 0
+        assert service.inventory["charged_demand"] == 0
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-014 / PORT-STATE-022
+def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
+    """A release-pending record cannot keep admission closed forever."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        fatal_errors: list[BaseException] = []
+        service = _recovering_service(
+            stage,
+            clock,
+            fatal_errors=fatal_errors,
+            operation_timeout_s=0.005,
+            reconciliation_timeout_s=0.005,
+        )
+        await _open_service(service)
+        lease = await _reserve_with_interval(service, 1)
+        stage.bindings = [
+            {
+                "binding_token": lease.binding_token,
+                "session_key": lease.session_key,
+                "generation": lease.generation,
+                "schema_id": lease.schema_id,
+                "profile_id": lease.profile_id,
+                "engine_epoch": lease.engine_epoch,
+                "claim_expires_at": clock.now - 1.0,
+                "terminal": False,
+            }
+        ]
+        stage.release_failures_remaining = 1_000
+
+        with pytest.raises(PersistentStateServiceUnavailable):
+            await service.release(
+                operation_id="release-never-converges",
+                lease=lease,
+                reason="client_disconnect",
+            )
+
+        await _wait_until(lambda: len(fatal_errors) == 1)
+        await asyncio.sleep(0.05)
+        assert len(fatal_errors) == 1
+        assert "release" in str(fatal_errors[0]).lower()
+        assert not service.ready
+        with pytest.raises(PersistentStateServiceUnavailable):
+            await service.check_health()
+        assert len(fatal_errors) == 1
         service.shutdown()
 
     asyncio.run(scenario())
