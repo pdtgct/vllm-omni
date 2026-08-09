@@ -186,6 +186,7 @@ class TestEnumCompleteness:
         assert defs.STREAMING_ADMISSION_REJECTION_REASONS == (
             "capacity",
             "unavailable",
+            "unsupported",
         )
 
     # @spec PORT-OBS-001, PORT-OBS-010

@@ -14,6 +14,7 @@ backpressure, never a service latch.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +64,8 @@ class _RecoveryStage:
         self.snapshot_error: Exception | None = None
         self.reserve_calls = 0
         self.release_calls: list[tuple[str, dict[str, Any]]] = []
+        self.release_operation_ids: list[str] = []
+        self.release_failures_remaining = 0
         self.resident = 0
         self.revision = 0
         self.bindings: list[dict[str, Any]] = []
@@ -118,6 +121,10 @@ class _RecoveryStage:
         if name == "persistent_state_release":
             operation_id, lease, reason = args
             self.release_calls.append((reason, dict(lease)))
+            self.release_operation_ids.append(operation_id)
+            if self.release_failures_remaining:
+                self.release_failures_remaining -= 1
+                raise RuntimeError("claimed lease is still running")
             self.resident = max(0, self.resident - 1)
             self.revision += 1
             self.bindings = [
@@ -173,6 +180,21 @@ async def _open_service(
 ) -> None:
     await service.check_health()
     assert service.ready
+
+
+async def _reserve_with_interval(
+    service: PersistentStateService,
+    n: int,
+) -> Any:
+    if "service_interval_ms" not in inspect.signature(service.reserve).parameters:
+        pytest.fail(
+            "PORT-STATE-025 missing reserve-to-release service interval",
+            pytrace=False,
+        )
+    return await service.reserve(
+        **_lease_kwargs(n),
+        service_interval_ms=560,
+    )
 
 
 # ---- PORT-STATE-022: demote and re-verify ----------------------------------
@@ -367,6 +389,98 @@ def test_horizon_exhaustion_is_retryable_and_never_closes_admission() -> None:
         stage.reserve_error = None
         result = await service.reserve(**_lease_kwargs(2))
         assert result.session_key == "session-2"
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-013 / PORT-STATE-024
+def test_full_presubmit_reserve_queue_is_retryable_shed() -> None:
+    """A local full queue is load protection, not unavailable authority."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        service = _service(
+            stage,
+            clock,
+            reserve_queue_capacity=1,
+            operation_timeout_s=5.0,
+            reconciliation_timeout_s=5.0,
+        )
+        await _open_service(service)
+        stage.hang_reserve = True
+        first = asyncio.create_task(service.reserve(**_lease_kwargs(1)))
+        while stage.reserve_calls < 1:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(service.reserve(**_lease_kwargs(2)))
+        while service.reserve_queue.qsize() < 1:
+            await asyncio.sleep(0)
+
+        with pytest.raises(Exception) as info:
+            await service.reserve(**_lease_kwargs(3))
+
+        assert getattr(info.value, "retryable", False), (
+            "PORT-STATE-024 requires queue-full to be typed shed"
+        )
+        assert service.ready
+        assert stage.reserve_calls == 1
+
+        stage.hang_reserve = False
+        stage._hang_release.set()
+        await asyncio.gather(first, second)
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-014 / PORT-STATE-022 / PORT-STATE-023
+def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> None:
+    """A failed release cannot become an orphan or lose its operation id."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        service = _service(stage, clock)
+        await _open_service(service)
+        lease = await _reserve_with_interval(service, 1)
+        stage.bindings = [
+            {
+                "binding_token": lease.binding_token,
+                "session_key": lease.session_key,
+                "generation": lease.generation,
+                "schema_id": lease.schema_id,
+                "profile_id": lease.profile_id,
+                "engine_epoch": lease.engine_epoch,
+                "claim_expires_at": clock.now - 1.0,
+                "terminal": False,
+            }
+        ]
+        stage.release_failures_remaining = 1
+
+        with pytest.raises(PersistentStateServiceUnavailable):
+            await service.release(
+                operation_id="release-1",
+                lease=lease,
+                reason="client_disconnect",
+            )
+
+        assert not service.ready
+        assert service.inventory is not None
+        assert service.inventory["resident_count"] == 1
+        assert service.inventory["execution_claims"] == 1
+        assert service.inventory["committed_demand"] > 0
+        assert stage.release_operation_ids == ["release-1"]
+
+        stage.bindings[0]["terminal"] = True
+        await service.check_health()
+
+        assert service.ready
+        assert stage.release_operation_ids == ["release-1", "release-1"]
+        assert service.inventory is not None
+        assert service.inventory["resident_count"] == 0
+        assert service.inventory["execution_claims"] == 0
+        assert service.inventory["committed_demand"] == 0
         service.shutdown()
 
     asyncio.run(scenario())

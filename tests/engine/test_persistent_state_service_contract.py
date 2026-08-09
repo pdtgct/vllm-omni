@@ -56,9 +56,55 @@ def test_service_api_is_async_and_operation_id_explicit() -> None:
     assert "session_key" in reserve.parameters
     assert "schema_id" in reserve.parameters
     assert "profile_id" in reserve.parameters
+    assert "service_interval_ms" in reserve.parameters
     assert "operation_id" in release.parameters
     assert "lease" in release.parameters
     assert "reason" in release.parameters
+
+
+def test_refusal_types_encode_retryability_without_message_matching() -> None:
+    # @spec PORT-STATE-024
+    module = _service_module()
+    try:
+        shed = module.PersistentStateBackpressure(
+            "pool full",
+            retry_after_ms=75,
+        )
+        capacity = module.PersistentStateCapacityExhausted(
+            "physical pool exhausted",
+            retry_after_ms=75,
+        )
+        unavailable = module.PersistentStateServiceUnavailable(
+            "control path closed"
+        )
+    except TypeError:
+        pytest.fail(
+            "PORT-STATE-024 missing typed retry metadata on refusal errors",
+            pytrace=False,
+        )
+    unsupported_cls = getattr(
+        module,
+        "PersistentStateUnsupportedServiceInterval",
+        None,
+    )
+    if unsupported_cls is None:
+        pytest.fail(
+            "PORT-STATE-024 missing unsupported-service-interval type",
+            pytrace=False,
+        )
+    unsupported = unsupported_cls(
+        requested_interval_ms=80,
+        resolved_envelope="profile-a",
+    )
+
+    assert isinstance(capacity, module.PersistentStateBackpressure)
+    assert shed.retryable is True
+    assert shed.retry_after_ms == 75
+    assert capacity.retryable is True
+    assert unavailable.retryable is False
+    assert unsupported.retryable is False
+    assert unsupported.requested_interval_ms == 80
+    assert unsupported.retry_after_ms is None
 
 
 def test_service_uses_the_existing_utility_boundary_only() -> None:
