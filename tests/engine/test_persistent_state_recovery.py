@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -355,6 +356,51 @@ def test_health_probes_join_one_inflight_recovery_authority() -> None:
         stage.snapshot_gate.set()
         await asyncio.gather(*probes)
         assert stage.snapshot_calls == snapshots_before + 1
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-022 / PORT-PERF-006
+def test_recovery_reinstalls_the_cold_start_profile_without_remeasuring() -> None:
+    """Recovery reuses the exact immutable compiled authority.
+
+    The service receives a compiled profile, not a profiler callback. That
+    type-level boundary prevents a recovering or partially loaded engine from
+    silently replacing the startup capacity receipt.
+    """
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        profile = SimpleNamespace(receipt_sha256="a" * 64)
+        parameters = set(inspect.signature(PersistentStateService).parameters)
+        if "compiled_service_profile" not in parameters:
+            pytest.fail(
+                "PORT-STATE-022 missing immutable compiled service profile "
+                "on recovery",
+                pytrace=False,
+            )
+        service = _recovering_service(
+            stage,
+            clock,
+            compiled_service_profile=profile,
+            operation_timeout_s=0.005,
+            reconciliation_timeout_s=0.005,
+        )
+        await _open_service(service)
+        assert service.compiled_service_profile == profile
+
+        stage.hang_reserve = True
+        with pytest.raises(PersistentStateIndeterminate):
+            await service.reserve(**_lease_kwargs(1))
+        stage.hang_reserve = False
+        stage._hang_release.set()
+        await _wait_until(lambda: service.ready)
+
+        assert service.compiled_service_profile == profile
+        assert service.inventory is not None
+        assert service.inventory["service_profile_receipt_sha256"] == "a" * 64
         service.shutdown()
 
     asyncio.run(scenario())
