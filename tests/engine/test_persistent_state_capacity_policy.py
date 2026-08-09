@@ -701,7 +701,7 @@ def test_headroom_work_is_sublinear_in_capacity() -> None:
         nonlocal calls
         calls += 1
         assert len(counts) == 5
-        return Fraction(sum(counts))
+        return Fraction(1)
 
     headroom = _symbol("admission_headroom")(
         resident_counts_by_interval=(0, 0, 0, 0, 0),
