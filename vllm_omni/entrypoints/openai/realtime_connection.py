@@ -12,13 +12,19 @@ from uuid import uuid4
 import numpy as np
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
-from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
+from vllm.entrypoints.speech_to_text.realtime.protocol import (
+    ErrorEvent,
+    TranscriptionDelta,
+    TranscriptionDone,
+)
 from vllm.logger import init_logger
 
 from vllm_omni.engine.persistent_state_service import (
+    PersistentStateBackpressure,
     PersistentStateCapacityExhausted,
     PersistentStateIndeterminate,
     PersistentStateServiceUnavailable,
+    PersistentStateUnsupportedServiceInterval,
     StateLease,
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -100,6 +106,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         if self.session_configuration_timeout <= 0:
             raise ValueError("session_configuration_timeout must be positive")
         self._configuration_timeout_task: asyncio.Task[None] | None = None
+        self._unadmitted_timeout_task: asyncio.Task[None] | None = None
+        self._unadmitted_deadline_ns: int | None = None
+        self._unadmitted_timed_out = False
+        self._pre_admission_timeouts_started = False
+        self._admission_lock = asyncio.Lock()
+        self._next_admission_retry_ns = 0
+        self._effective_session: dict[str, Any] | None = None
         self._session_lifecycle = SessionLifecycleDeadline(
             idle_timeout_s=(
                 runtime.session_idle_timeout_s
@@ -132,19 +145,63 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     async def handle_connection(self):
         """Arm model-admission lifetime separately from transport lifetime."""
-        self._configuration_timeout_task = asyncio.create_task(
-            self._configuration_timeout(),
-            name=f"realtime-config-{self.connection_id}",
-        )
+        self._start_pre_admission_timeouts()
         try:
             return await super().handle_connection()
         finally:
-            if self._configuration_timeout_task is not None:
-                self._configuration_timeout_task.cancel()
-                await asyncio.gather(
-                    self._configuration_timeout_task,
-                    return_exceptions=True,
-                )
+            await self._cancel_pre_admission_timeouts()
+
+    # @spec PORT-SESS-012
+    def _start_pre_admission_timeouts(self) -> None:
+        """Arm distinct configuration and total-unadmitted clocks once."""
+        if self._pre_admission_timeouts_started:
+            return
+        self._pre_admission_timeouts_started = True
+        runtime = self._runtime_config
+        configuration_timeout_s = float(
+            getattr(
+                runtime,
+                "session_configuration_timeout_s",
+                self.session_configuration_timeout,
+            )
+        )
+        self.session_configuration_timeout = configuration_timeout_s
+        total_timeout_s = float(
+            getattr(
+                runtime,
+                "unadmitted_connection_timeout_s",
+                configuration_timeout_s,
+            )
+        )
+        loop = asyncio.get_running_loop()
+        self._unadmitted_deadline_ns = time.monotonic_ns() + int(
+            total_timeout_s * 1_000_000_000
+        )
+        self._configuration_timeout_task = loop.create_task(
+            self._configuration_timeout(),
+            name=f"realtime-config-{self.connection_id}",
+        )
+        self._unadmitted_timeout_task = loop.create_task(
+            self._unadmitted_timeout(total_timeout_s),
+            name=f"realtime-unadmitted-{self.connection_id}",
+        )
+
+    async def _cancel_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _cancel_configuration_timeout(self) -> None:
+        task = self._configuration_timeout_task
+        self._configuration_timeout_task = None
+        await self._cancel_task(task)
+
+    async def _cancel_pre_admission_timeouts(self) -> None:
+        await self._cancel_configuration_timeout()
+        task = self._unadmitted_timeout_task
+        self._unadmitted_timeout_task = None
+        await self._cancel_task(task)
 
     async def _configuration_timeout(self) -> None:
         await asyncio.sleep(self.session_configuration_timeout)
@@ -159,6 +216,20 @@ class RealtimeConnection(VllmRealtimeConnection):
         close = getattr(self.websocket, "close", None)
         if close is not None:
             await close(code=1008)
+
+    async def _unadmitted_timeout(self, timeout_s: float) -> None:
+        await asyncio.sleep(timeout_s)
+        if self._is_model_validated:
+            return
+        self._unadmitted_timed_out = True
+        await self.send_error(
+            "Persistent-state admission lifetime expired.",
+            "capacity_exhausted",
+        )
+        self._is_connected = False
+        close = getattr(self.websocket, "close", None)
+        if close is not None:
+            await close(code=1013)
 
     async def _native_audio_controls(self) -> AsyncGenerator[np.ndarray, None]:
         """Wake the admitted FIFO without duplicating accepted audio.
@@ -341,6 +412,13 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     async def _configure_persistent_session(self, event: dict) -> None:
         """Reserve state, construct the session, then publish model admission."""
+        async with self._admission_lock:
+            await self._configure_persistent_session_locked(event)
+
+    async def _configure_persistent_session_locked(self, event: dict) -> None:
+        """Linearize one configuration/admission attempt per connection."""
+        if not self._is_connected or self._unadmitted_timed_out:
+            return
         model = event.get("model")
         if model is None:
             await self.send_error("Missing required field: model", "invalid_event")
@@ -350,7 +428,26 @@ class RealtimeConnection(VllmRealtimeConnection):
             await self.send_error(err.error.message, "model_not_found")
             return
         if self._is_model_validated:
-            # Model identity and state ownership are immutable after admission.
+            locale = event.get("locale")
+            if locale is not None and self._nemotron_session is not None:
+                await self._nemotron_session.update_locale(str(locale))
+                assert self._effective_session is not None
+                self._effective_session["locale"] = str(locale)
+                await self._send_session_updated()
+            return
+
+        await self._cancel_configuration_timeout()
+        now_ns = time.monotonic_ns()
+        if now_ns < self._next_admission_retry_ns:
+            retry_after_ms = max(
+                1,
+                (self._next_admission_retry_ns - now_ns + 999_999) // 1_000_000,
+            )
+            await self.send_error(
+                "Persistent-state admission retry floor is active.",
+                "capacity_exhausted",
+                retry_after_ms=retry_after_ms,
+            )
             return
 
         service = self._persistent_state_service
@@ -362,6 +459,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         )
         reserve_operation_id = uuid4().hex
         session_key = f"rt-{self.connection_id}-{uuid4().hex}"
+        cadence = str(event.get("cadence", "560ms"))
+        try:
+            service_interval_ms = int(cadence.removesuffix("ms"))
+        except ValueError:
+            await self.send_error("Invalid cadence.", "invalid_event")
+            return
         try:
             if check_health is not None:
                 await check_health()
@@ -373,12 +476,38 @@ class RealtimeConnection(VllmRealtimeConnection):
                 session_key=session_key,
                 schema_id=schema_id,
                 profile_id=profile_id,
+                service_interval_ms=service_interval_ms,
             )
-        except PersistentStateCapacityExhausted:
+        except PersistentStateUnsupportedServiceInterval as error:
             await self.send_error(
-                "Persistent-state capacity is exhausted.",
-                "capacity_exhausted",
+                str(error),
+                "unsupported_service_interval",
             )
+            return
+        except (PersistentStateCapacityExhausted, PersistentStateBackpressure) as error:
+            retry_after_ms = getattr(error, "retry_after_ms", None)
+            if retry_after_ms is None:
+                runtime = self._runtime_config
+                retry_after_ms = int(
+                    getattr(runtime, "admission_retry_floor_ms", 0)
+                )
+            await self.send_error(
+                str(error),
+                "capacity_exhausted",
+                retry_after_ms=retry_after_ms,
+            )
+            self._next_admission_retry_ns = time.monotonic_ns() + int(
+                retry_after_ms * 1_000_000
+            )
+            deadline = self._unadmitted_deadline_ns
+            if (
+                deadline is not None
+                and self._next_admission_retry_ns >= deadline
+            ):
+                self._is_connected = False
+                close = getattr(self.websocket, "close", None)
+                if close is not None:
+                    await close(code=1013)
             return
         except PersistentStateIndeterminate:
             # The service reconciles the same operation.  The connection does
@@ -400,9 +529,18 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._state_operation_id = release_operation_id
         self._state_session_key = session_key
         self._arm_pending_claim_timeout()
+        if self._unadmitted_timed_out or not self._is_connected:
+            await self._release_state_lease("unadmitted_connection_timeout")
+            return
         if self._configuration_timed_out:
             await self._release_state_lease("configuration_timeout")
             return
+        endpoint = event.get("endpointing") or {}
+        resolved_endpoint = {
+            "mode": str(endpoint.get("mode", "greedy_blank")),
+            "stop_history_ms": int(endpoint.get("stop_history_ms", 800)),
+            "residue_frames": int(endpoint.get("residue_frames", 2)),
+        }
         try:
             model_config = getattr(self.serving, "model_config", None)
             if model_config is not None:
@@ -411,12 +549,11 @@ class RealtimeConnection(VllmRealtimeConnection):
                     raise RuntimeError(
                         "admitted persistent-state session has no runtime envelope"
                     )
-                endpoint = event.get("endpointing") or {}
                 hf = getattr(model_config, "hf_config", model_config)
                 endpoint_policy = EndpointPolicy.resolve(
-                    mode=str(endpoint.get("mode", "greedy_blank")),
-                    stop_history_ms=endpoint.get("stop_history_ms", 800),
-                    residue_frames=int(endpoint.get("residue_frames", 2)),
+                    mode=resolved_endpoint["mode"],
+                    stop_history_ms=resolved_endpoint["stop_history_ms"],
+                    residue_frames=resolved_endpoint["residue_frames"],
                     frame_stride_ms=80,
                     history_capacity_frames=int(
                         getattr(hf, "endpoint_history_capacity_frames", 12)
@@ -426,7 +563,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 engine_epoch = str(getattr(lease, "engine_epoch"))
                 self._nemotron_session = NemotronRealtimeSession.from_model_config(
                     model_config,
-                    cadence=str(event.get("cadence", "560ms")),
+                    cadence=cadence,
                     locale=str(event.get("locale", "auto")),
                     endpoint_policy=endpoint_policy,
                     request_id=session_key,
@@ -449,9 +586,28 @@ class RealtimeConnection(VllmRealtimeConnection):
             await self._release_state_lease("configuration_error")
             raise
         self._is_model_validated = True
+        self._effective_session = {
+            "model": str(model),
+            "cadence": cadence,
+            "locale": str(event.get("locale", "auto")),
+            "endpointing": resolved_endpoint,
+        }
         self._arm_session_lifecycle_timeout("idle")
-        if self._configuration_timeout_task is not None:
-            self._configuration_timeout_task.cancel()
+        task = self._unadmitted_timeout_task
+        self._unadmitted_timeout_task = None
+        await self._cancel_task(task)
+        await self._send_session_updated()
+
+    async def _send_session_updated(self) -> None:
+        """Emit the standard acknowledgement after configuration commits."""
+        if self._effective_session is None:
+            return
+        await self.send_json(
+            {
+                "type": "session.updated",
+                "session": self._effective_session,
+            }
+        )
 
     def _check_model(self, model: str | None) -> None | ErrorResponse:
         """Wrap the inherited model-validation gate with PORT-OBS-007.
@@ -1000,17 +1156,27 @@ class RealtimeConnection(VllmRealtimeConnection):
         await super().cleanup()
         if generation_task is not None:
             await asyncio.gather(generation_task, return_exceptions=True)
-        if self._configuration_timeout_task is not None:
-            configuration_task = self._configuration_timeout_task
-            if configuration_task is not asyncio.current_task():
-                configuration_task.cancel()
-                await asyncio.gather(
-                    configuration_task,
-                    return_exceptions=True,
-                )
+        await self._cancel_pre_admission_timeouts()
         await self._release_state_lease(
             getattr(self, "_terminal_code", None) or "connection_cleanup"
         )
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))
+
+    async def send_error(
+        self,
+        message: str,
+        code: str | None = None,
+        *,
+        retry_after_ms: int | None = None,
+    ) -> None:
+        """Send the inherited error shape with optional Omni retry metadata."""
+        error = ErrorEvent(
+            error=message,
+            code=code,
+            retry_after_ms=retry_after_ms,
+        )
+        await self.websocket.send_text(
+            error.model_dump_json(exclude_none=True)
+        )

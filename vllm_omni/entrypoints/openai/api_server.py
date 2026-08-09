@@ -97,6 +97,9 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
+from vllm_omni.engine.persistent_state_service import (
+    PersistentStateServiceUnavailable,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.launcher import serve_http
 from vllm_omni.entrypoints.openai.application_plugins import (
@@ -2170,9 +2173,9 @@ async def health(raw_request: Request) -> JSONResponse:
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             )
         return JSONResponse(content={"status": "healthy"})
-    except EngineDeadError:
+    except (EngineDeadError, PersistentStateServiceUnavailable) as error:
         return JSONResponse(
-            content={"status": "unhealthy"},
+            content={"status": "unhealthy", "reason": str(error)},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 

@@ -419,16 +419,16 @@ async def test_completed_operations_are_bounded_tombstones_and_retry_exactly() -
     assert await service.claim_pending_cleanup(lease) is True
     assert stage.pending_cleanup_calls == 2
 
-    with pytest.raises(
-        module.PersistentStateServiceUnavailable,
-        match="tombstone|operation horizon",
-    ):
+    with pytest.raises(module.PersistentStateBackpressure) as info:
         await service.reserve(
             operation_id="reserve-b",
             session_key="session-b",
             schema_id="schema-a",
             profile_id="profile-a",
         )
+    assert info.value.retryable
+    assert info.value.cause == "tombstone_horizon"
+    assert service.ready
 
     first_release = await service.release(
         operation_id="release-a",
