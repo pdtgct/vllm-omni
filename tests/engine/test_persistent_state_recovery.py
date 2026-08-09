@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from dataclasses import dataclass
+from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from vllm_omni.engine.persistent_state_service import (
+    PersistentStateBackpressure,
     PersistentStateIndeterminate,
     PersistentStateService,
     PersistentStateServiceUnavailable,
@@ -232,6 +235,61 @@ async def _wait_until(
     await asyncio.wait_for(poll(), timeout=timeout_s)
 
 
+def _compiled_admission_profile(
+    *,
+    derating_factor: Fraction = Fraction(1, 2),
+) -> Any:
+    from vllm_omni.engine.persistent_state_capacity import (
+        ServiceExecutionTier,
+        ServiceProfileContext,
+        ServiceRoundExecution,
+        compile_provisional_service_profile,
+    )
+
+    intervals = (80, 160, 320, 560, 1120)
+    executions = tuple(
+        ServiceRoundExecution(
+            tier_id="all",
+            active_population=2,
+            elapsed_ns=50_000_000,
+            service_interval_ms=interval,
+            geometry_id=geometry,
+            completed_legal_parks=2,
+            completed_model_rows=None,
+            post_jit=True,
+            continuously_loaded=True,
+            dummy_run=False,
+            is_profile=False,
+        )
+        for geometry, interval in enumerate(intervals)
+    )
+    return compile_provisional_service_profile(
+        executions,
+        execution_tiers=(ServiceExecutionTier("all", 2),),
+        max_population=2,
+        reference_interval_ms=1120,
+        reference_geometry_id=4,
+        admitted_geometry_ids=(0, 1, 2, 3, 4),
+        trailing_rounds=1,
+        derating_factor=derating_factor,
+        context=ServiceProfileContext(
+            pre_override_physical_bound=4,
+            allocated_pool=2,
+            count_cap=2,
+            execution_claim_ceiling=2,
+            service_budget_source="measured_fallback",
+            service_budget_coefficients=(Fraction(1),),
+            derating_factor=derating_factor,
+            slot_bytes=6_314_936,
+            execution_environment_key="phase6-cpu-referee",
+            precision_policy="fp32",
+            state_profile="test-profile",
+            compiler_version="test-v1",
+            mixed_composition_policy="homogeneous_upper_sum",
+        ),
+    )
+
+
 def _lease_kwargs(n: int) -> dict[str, str]:
     return {
         "operation_id": f"op-{n}",
@@ -401,6 +459,181 @@ def test_recovery_reinstalls_the_cold_start_profile_without_remeasuring() -> Non
         assert service.compiled_service_profile == profile
         assert service.inventory is not None
         assert service.inventory["service_profile_receipt_sha256"] == "a" * 64
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-004 / PORT-STATE-027 / PORT-STATE-028
+def test_service_waits_before_reserve_and_release_wakes_the_oldest_head() -> None:
+    """The serving adapter must reach the bounded controller, not bypass it."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        clock = _Clock()
+        service = _recovering_service(
+            stage,
+            clock,
+            compiled_service_profile=_compiled_admission_profile(),
+        )
+        await _open_service(service)
+        first = await service.reserve(
+            **_lease_kwargs(1),
+            service_interval_ms=1120,
+            connection_id="connection-1",
+        )
+        second_task = asyncio.create_task(
+            service.reserve(
+                **_lease_kwargs(2),
+                service_interval_ms=1120,
+                connection_id="connection-2",
+            )
+        )
+        await _wait_until(
+            lambda: (
+                service.admission_snapshot is not None
+                and service.admission_snapshot.waiter_count == 1
+            )
+        )
+        await asyncio.sleep(0)
+        assert stage.reserve_calls == 1
+        assert not second_task.done()
+
+        await service.release(
+            operation_id="release-1",
+            lease=first,
+            reason="test",
+        )
+        second = await asyncio.wait_for(second_task, timeout=0.25)
+
+        assert stage.reserve_calls == 2
+        assert second.session_key == "session-2"
+        await service.release(
+            operation_id="release-2",
+            lease=second,
+            reason="test",
+        )
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-024 / PORT-STATE-027
+def test_service_wait_deadline_sheds_without_submitting_to_engine() -> None:
+    """A bounded waiting-room expiry is typed shed, never core work."""
+
+    async def scenario() -> None:
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionControllerConfig,
+        )
+
+        stage = _RecoveryStage()
+        service = _service(
+            stage,
+            _Clock(),
+            monotonic=time.monotonic,
+            admission_config=AdmissionControllerConfig(
+                waiter_capacity=4,
+                max_inflight_reserves=1,
+                dispatch_budget=1,
+                aging_threshold_ns=1_000_000,
+                admission_wait_timeout_s=0.01,
+                retry_floor_ms=10,
+                retry_jitter_ms=0,
+                recovery_backoff_s=(0.001,),
+                release_convergence_timeout_s=0.1,
+                supported_intervals_ms=(80, 160, 320, 560, 1120),
+            ),
+            compiled_service_profile=_compiled_admission_profile(),
+        )
+        await _open_service(service)
+        first = await service.reserve(
+            **_lease_kwargs(1),
+            service_interval_ms=1120,
+        )
+
+        with pytest.raises(PersistentStateBackpressure) as info:
+            await asyncio.wait_for(
+                service.reserve(
+                    **_lease_kwargs(2),
+                    service_interval_ms=1120,
+                ),
+                timeout=0.1,
+            )
+
+        assert info.value.cause == "wait_deadline"
+        assert stage.reserve_calls == 1
+        assert service.ready
+        await service.release(
+            operation_id="release-1",
+            lease=first,
+            reason="test",
+        )
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+# @spec PORT-STATE-027 / PORT-PERF-008
+def test_four_concurrent_streams_dispatch_in_bounded_fifo_waves() -> None:
+    """c=4 composes J=2 submission with release-driven admission."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _recovering_service(
+            stage,
+            _Clock(),
+            compiled_service_profile=_compiled_admission_profile(
+                derating_factor=Fraction(1),
+            ),
+        )
+        await _open_service(service)
+        tasks = [
+            asyncio.create_task(
+                service.reserve(
+                    **_lease_kwargs(index),
+                    service_interval_ms=1120,
+                    connection_id=f"connection-{index}",
+                )
+            )
+            for index in range(4)
+        ]
+        await _wait_until(lambda: stage.reserve_calls == 2)
+        await _wait_until(lambda: tasks[0].done() and tasks[1].done())
+        assert not tasks[2].done()
+        assert not tasks[3].done()
+
+        first_wave = await asyncio.gather(*tasks[:2])
+        await asyncio.gather(
+            *(
+                service.release(
+                    operation_id=f"release-{index}",
+                    lease=lease,
+                    reason="test",
+                )
+                for index, lease in enumerate(first_wave)
+            )
+        )
+        second_wave = await asyncio.wait_for(
+            asyncio.gather(*tasks[2:]),
+            timeout=0.25,
+        )
+
+        assert stage.reserve_calls == 4
+        assert [lease.session_key for lease in second_wave] == [
+            "session-2",
+            "session-3",
+        ]
+        await asyncio.gather(
+            *(
+                service.release(
+                    operation_id=f"release-final-{index}",
+                    lease=lease,
+                    reason="test",
+                )
+                for index, lease in enumerate(second_wave)
+            )
+        )
         service.shutdown()
 
     asyncio.run(scenario())

@@ -477,6 +477,22 @@ class RealtimeConnection(VllmRealtimeConnection):
                 schema_id=schema_id,
                 profile_id=profile_id,
                 service_interval_ms=service_interval_ms,
+                connection_id=str(self.connection_id),
+                connection_handle=str(self.connection_id),
+                admission_deadline_ns=(
+                    time.monotonic_ns()
+                    + int(
+                        float(
+                            getattr(
+                                self._runtime_config,
+                                "admission_wait_timeout_s",
+                                self.session_configuration_timeout,
+                            )
+                        )
+                        * 1_000_000_000
+                    )
+                ),
+                unadmitted_deadline_ns=self._unadmitted_deadline_ns,
             )
         except PersistentStateUnsupportedServiceInterval as error:
             await self.send_error(

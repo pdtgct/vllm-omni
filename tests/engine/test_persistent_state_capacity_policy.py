@@ -28,6 +28,7 @@ _SYMBOL_SPECS = {
     "compile_service_demand_profile": "PORT-STATE-025",
     "derive_provisional_profile": "PORT-STATE-025",
     "fallback_transaction_duration_ns": "PORT-STATE-026",
+    "project_fixed_dispatch_capacity": "PORT-PERF-008",
     "resolve_pool_capacity": "PORT-STATE-004",
     "evaluate_admission": "PORT-STATE-026",
 }
@@ -542,11 +543,11 @@ def test_provisional_mixed_transaction_repeats_homogeneous_setup() -> None:
     """@spec PORT-STATE-026 / PORT-PERF-008: no unproved separability."""
 
     tables = (
-        (0, 100, 180),
-        (0, 200, 350),
-        (0, 300, 520),
-        (0, 400, 700),
-        (0, 500, 880),
+        (100, 180),
+        (200, 350),
+        (300, 520),
+        (400, 700),
+        (500, 880),
     )
     duration = _symbol("fallback_transaction_duration_ns")(
         resident_counts_by_geometry=(1, 1, 0, 0, 0),
@@ -563,6 +564,50 @@ def test_provisional_mixed_transaction_repeats_homogeneous_setup() -> None:
         )
 
 
+def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> None:
+    """@spec PORT-STATE-027 / PORT-PERF-008: serving is fixed-cardinality."""
+
+    profile = _compile_profile(
+        _geometry_rounds(
+            single_elapsed_ns=50_000_000,
+            small_elapsed_ns=100_000_000,
+        )
+    )
+    empty = dict.fromkeys(_SERVICE_INTERVALS_MS, 0)
+    inventory = {
+        "resident_count": 0,
+        "effective_capacity": 4,
+        "configured_limit": 4,
+    }
+    project = _symbol("project_fixed_dispatch_capacity")
+
+    available = project(
+        profile=profile,
+        inventory=inventory,
+        resident_counts_by_interval=empty,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+    )
+
+    assert available.hard_headroom == 4
+    assert available.candidate_supported_by_interval[1_120]
+    assert available.nominal_dispatchable_by_interval[1_120] == 2
+
+    resident = dict(empty)
+    resident[1_120] = 2
+    saturated = project(
+        profile=profile,
+        inventory={**inventory, "resident_count": 2},
+        resident_counts_by_interval=resident,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+    )
+
+    assert saturated.hard_headroom == 2
+    assert saturated.charged_units == saturated.service_budget_units
+    assert saturated.nominal_dispatchable_by_interval[1_120] == 0
+
+
 def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
     """@spec PORT-PERF-006 / PORT-INT-005: receipt identity is complete."""
 
@@ -577,6 +622,13 @@ def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
     assert receipt.compiler_version == "persistent-state-capacity-v2"
     assert receipt.reference_interval_ms == 1_120
     assert receipt.reference_geometry_id == 4
+    assert receipt.service_interval_ms_by_geometry == {
+        0: 80,
+        1: 160,
+        2: 320,
+        3: 560,
+        4: 1_120,
+    }
     assert receipt.execution_tier_maxima == {"single": 1, "small": 4}
     assert receipt.measured_upper_duration_ns_by_geometry_and_tier[4] == {
         "single": 100_000_000,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -293,6 +294,7 @@ class ServiceProfileReceipt:
     measured_upper_duration_ns_by_geometry_and_tier: Mapping[
         int, Mapping[str, int]
     ]
+    service_interval_ms_by_geometry: Mapping[int, int]
     expanded_duration_table_sha256: str
     mixed_composition_policy: str
     service_demand_scale: int
@@ -319,6 +321,7 @@ class ServiceProfileReceipt:
 class StartupServiceProfile:
     upper_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
     upper_duration_ns_by_geometry_and_tier: Mapping[int, Mapping[str, int]]
+    service_interval_ms_by_geometry: Mapping[int, int]
     diagnostic_rows_per_second_by_geometry_and_tier: Mapping[
         int, Mapping[str, Fraction]
     ]
@@ -328,6 +331,19 @@ class StartupServiceProfile:
     compiled_demand: CompiledServiceDemandProfile
     profile_candidate: ServiceProfileCandidate
     receipt: ServiceProfileReceipt
+
+
+@dataclass(frozen=True)
+class FixedDispatchCapacity:
+    """One fixed-cardinality projection consumed by a dispatch turn."""
+
+    hard_headroom: int
+    candidate_supported_by_interval: Mapping[int, bool]
+    nominal_dispatchable_by_interval: Mapping[int, int]
+    charged_units: int
+    service_budget_units: int
+    execution_claims: int
+    max_num_seqs: int
 
 
 def _hash_json(value: object) -> str:
@@ -499,6 +515,7 @@ def compile_provisional_service_profile(
         "reference_interval_ms": reference_interval_ms,
         "reference_geometry_id": reference_geometry_id,
         "execution_tier_maxima": tier_maxima,
+        "service_interval_ms_by_geometry": geometry_intervals,
         "upper": upper_by_tier,
         "expanded_sha256": expanded_hash,
         "mixed_composition_policy": context.mixed_composition_policy,
@@ -518,6 +535,7 @@ def compile_provisional_service_profile(
         reference_geometry_id=reference_geometry_id,
         execution_tier_maxima=tier_maxima,
         measured_upper_duration_ns_by_geometry_and_tier=upper_by_tier,
+        service_interval_ms_by_geometry=geometry_intervals,
         expanded_duration_table_sha256=expanded_hash,
         mixed_composition_policy=context.mixed_composition_policy,
         service_demand_scale=compiled.scale,
@@ -542,6 +560,7 @@ def compile_provisional_service_profile(
     return StartupServiceProfile(
         upper_duration_ns_by_geometry_and_population=expanded,
         upper_duration_ns_by_geometry_and_tier=upper_by_tier,
+        service_interval_ms_by_geometry=geometry_intervals,
         diagnostic_rows_per_second_by_geometry_and_tier=row_rates,
         measured_capacity=measured_capacity,
         provisional_capacity=provisional,
@@ -573,10 +592,155 @@ def fallback_transaction_duration_ns(
         raise ValueError("unknown mixed composition policy")
     total = 0
     for count, table in zip(counts, tables):
-        if count >= len(table):
+        if count > len(table):
             raise ValueError("population exceeds measured homogeneous table")
-        total += table[count]
+        if count:
+            total += table[count - 1]
     return total
+
+
+# @spec PORT-STATE-004, PORT-STATE-026, PORT-STATE-027, PORT-PERF-008
+def project_fixed_dispatch_capacity(
+    *,
+    profile: StartupServiceProfile,
+    inventory: Mapping[str, object],
+    resident_counts_by_interval: Mapping[int, int],
+    submitted_counts_by_interval: Mapping[int, int],
+    authority_open: bool,
+) -> FixedDispatchCapacity:
+    """Project one dispatch decision from five counters and table lookups.
+
+    The serving path never calls the population-shaped rational oracle. It
+    charges the compiled integer profile and evaluates at most one candidate
+    per cadence against the immutable homogeneous upper-duration tables.
+    Each cadence result is the exact additional count admitted by the
+    compiled integer budget and monotone duration table. It uses one binary
+    search per cadence, never a loop over resident or pending sessions.
+    """
+
+    intervals = profile.compiled_demand.intervals_ms
+    if intervals != _SERVICE_INTERVALS_MS:
+        raise ValueError(
+            "compiled service profile must cover the five admitted intervals"
+        )
+    interval_to_geometry: dict[int, int] = {}
+    for geometry_id, interval in profile.service_interval_ms_by_geometry.items():
+        if interval in interval_to_geometry:
+            raise ValueError(
+                "service interval must identify exactly one profiled geometry"
+            )
+        interval_to_geometry[interval] = geometry_id
+    if set(interval_to_geometry) != set(intervals):
+        raise ValueError("service profile lacks an admitted interval geometry")
+
+    if set(resident_counts_by_interval) != set(intervals) or set(
+        submitted_counts_by_interval
+    ) != set(intervals):
+        raise ValueError("capacity counters must cover each admitted interval")
+    counts = {
+        interval: int(resident_counts_by_interval[interval])
+        + int(submitted_counts_by_interval[interval])
+        for interval in intervals
+    }
+    if any(count < 0 for count in counts.values()):
+        raise ValueError("capacity counters cannot be negative")
+    def inventory_int(name: str, default: int | None = None) -> int:
+        value = inventory.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"capacity inventory {name} must be an integer")
+        return value
+
+    resident_count = inventory_int("resident_count")
+    if resident_count != sum(resident_counts_by_interval.values()):
+        raise ValueError(
+            "manager resident inventory and API cadence charges disagree"
+        )
+    submitted_count = sum(submitted_counts_by_interval.values())
+    execution_claims = resident_count + submitted_count
+    allocated_slots = inventory_int("effective_capacity")
+    count_limit = min(
+        allocated_slots,
+        inventory_int("configured_limit", allocated_slots),
+    )
+    max_num_seqs = profile.receipt.execution_claim_ceiling
+    hard = max(
+        0,
+        min(
+            allocated_slots - resident_count - submitted_count,
+            count_limit - resident_count - submitted_count,
+            max_num_seqs - execution_claims,
+        ),
+    )
+    units = dict(
+        zip(
+            profile.compiled_demand.intervals_ms,
+            profile.compiled_demand.demand_units,
+        )
+    )
+    charged = sum(counts[interval] * units[interval] for interval in intervals)
+    budget = profile.compiled_demand.budget
+
+    def transaction_duration_ns(candidate_interval: int | None) -> int:
+        total = 0
+        for interval in intervals:
+            population = counts[interval] + int(interval == candidate_interval)
+            if population == 0:
+                continue
+            geometry = interval_to_geometry[interval]
+            table = profile.upper_duration_ns_by_geometry_and_population[geometry]
+            if population > len(table):
+                return _INT64_MAX
+            total += table[population - 1]
+        return total
+
+    supported: dict[int, bool] = {}
+    dispatchable: dict[int, int] = {}
+    for interval in intervals:
+        geometry = interval_to_geometry[interval]
+        table = profile.upper_duration_ns_by_geometry_and_population[geometry]
+        candidate_supported = (
+            bool(table)
+            and units[interval] <= budget
+            and table[0] <= interval * 1_000_000
+        )
+        supported[interval] = candidate_supported
+        current_population = counts[interval]
+        other_duration_ns = transaction_duration_ns(None)
+        if current_population:
+            other_duration_ns -= table[current_population - 1]
+        active_deadline_ms = interval
+        for current, population in counts.items():
+            if population:
+                active_deadline_ms = min(active_deadline_ms, current)
+        budget_cap = max(0, (budget - charged) // units[interval])
+        residual_ns = active_deadline_ms * 1_000_000 - other_duration_ns
+        duration_cap = max(
+            0,
+            bisect_right(table, residual_ns) - current_population,
+        )
+        if (
+            profile.receipt.mixed_composition_policy == "homogeneous_only"
+            and any(
+                population
+                for current, population in counts.items()
+                if current != interval
+            )
+        ):
+            duration_cap = 0
+        dispatchable[interval] = (
+            min(hard, budget_cap, duration_cap)
+            if authority_open and candidate_supported
+            else 0
+        )
+    return FixedDispatchCapacity(
+        hard_headroom=hard if authority_open else 0,
+        candidate_supported_by_interval=supported,
+        nominal_dispatchable_by_interval=dispatchable,
+        charged_units=charged,
+        service_budget_units=budget,
+        execution_claims=execution_claims,
+        max_num_seqs=max_num_seqs,
+    )
 
 
 @dataclass(frozen=True)
