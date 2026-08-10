@@ -480,6 +480,21 @@ def test_equal_row_rates_do_not_create_equal_session_capacity() -> None:
     assert slow.measured_capacity == 1
 
 
+def test_profile_names_reference_interval_and_measured_duration_on_failure() -> None:
+    """@spec PORT-PERF-006: an infeasible fallback leaves a usable receipt."""
+
+    with pytest.raises(
+        ValueError,
+        match=r"1120ms.*1200000000ns|1200000000ns.*1120ms",
+    ):
+        _compile_profile(
+            _geometry_rounds(
+                single_elapsed_ns=1_200_000_000,
+                small_elapsed_ns=1_500_000_000,
+            )
+        )
+
+
 @pytest.mark.parametrize("marker", ["dummy_run", "is_profile"])
 def test_service_capacity_never_uses_memory_profile_dummy(
     marker: str,
