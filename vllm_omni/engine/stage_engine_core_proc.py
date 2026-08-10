@@ -69,6 +69,40 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._publish_persistent_state_warmup_attestation()
+
+    def _publish_persistent_state_warmup_attestation(self) -> None:
+        """Publish all-worker resident-scatter warmup into the manager."""
+
+        from vllm_omni.model_executor.persistent_state.manager import (
+            PersistentStateManager,
+        )
+
+        managers = self.scheduler.kv_cache_manager.coordinator.single_type_managers
+        matches = [
+            manager
+            for manager in managers
+            if isinstance(manager, PersistentStateManager)
+        ]
+        if not matches:
+            return
+        if len(matches) != 1:
+            raise RuntimeError(
+                "persistent_state requires exactly one resident manager"
+            )
+
+        # @spec PORT-ADV-003, ENV-MIG-012
+        attestations = self.model_executor.collective_rpc(
+            "persistent_state_warmup_attestation"
+        )
+        if not attestations or not all(result is True for result in attestations):
+            raise RuntimeError(
+                "persistent-state worker warmup attestation is incomplete"
+            )
+        matches[0].resident_state_scatter_warmup_complete = True
+
     def preprocess_add_request(
         self,
         request: EngineCoreRequest,

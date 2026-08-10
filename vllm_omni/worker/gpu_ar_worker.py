@@ -58,6 +58,11 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             is not None
         )
 
+    def persistent_state_warmup_attestation(self) -> bool:
+        """Return whether this worker completed resident-scatter warmup."""
+
+        return bool(getattr(self, "_persistent_state_warmup_complete", False))
+
     @instrument(span_name="Warmup persistent-only model (GPU)")
     def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
         """Finish eager worker warmup without inventing token-cache requests.
@@ -74,6 +79,8 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         qualify the corresponding core warmup/capture behavior.
         """
 
+        # @spec PORT-ADV-003, ENV-MIG-012
+        self._persistent_state_warmup_complete = False
         if not self.model_config.enforce_eager:
             raise RuntimeError(
                 "persistent-only warmup requires eager execution"
@@ -98,6 +105,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                 "persistent-only model does not expose resident-state warmup"
             )
         warmup_resident_state()
+        self._persistent_state_warmup_complete = True
 
         # Profiling and warmup must not perturb request-time randomness.
         set_random_seed(self.model_config.seed)
