@@ -12,6 +12,8 @@ it — via the thin ``SupportsRealtime.buffer_realtime_audio`` classmethod
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
@@ -125,18 +127,14 @@ async def buffer_stream(
         if accepted_audio_budget_s is not None:
             if accepted_audio_budget_s <= 0:
                 raise ValueError("accepted_audio_budget_s must be positive")
-            accepted_audio_capacity_samples = int(
-                accepted_audio_budget_s * FRONTEND_CONSTANTS["sample_rate"]
-            )
+            accepted_audio_capacity_samples = int(accepted_audio_budget_s * FRONTEND_CONSTANTS["sample_rate"])
         session = NemotronRealtimeSession.from_model_config(
             model_config,
             accepted_audio_capacity_samples=accepted_audio_capacity_samples,
             request_id=session_key or "unbound",
             observer=observer,
             accepted_audio_budget_s=(
-                accepted_audio_budget_s
-                if accepted_audio_budget_s is not None
-                else ACCEPTED_AUDIO_BUDGET_DEFAULT_S
+                accepted_audio_budget_s if accepted_audio_budget_s is not None else ACCEPTED_AUDIO_BUDGET_DEFAULT_S
             ),
         )
     geometry = session.geometry
@@ -187,13 +185,23 @@ async def buffer_stream(
 
     async def dispatch_ready() -> AsyncGenerator[dict[str, Any], None]:
         while authority.ready_units:
-            unit = authority.dispatch_next()
+            now_ns = time.monotonic_ns()
+            unit = authority.dispatch_next(now_ns=now_ns)
             if unit is None:
-                raise RuntimeError("ready audio could not become in-flight")
+                eligibility_ns = authority.next_eligibility_ns
+                if eligibility_ns is None:
+                    raise RuntimeError("ready audio could not become in-flight")
+                await asyncio.sleep(max(0, eligibility_ns - now_ns) / 1e9)
+                continue
             handle = session.take_ready_handle(unit.logical_sequence)
             if active_observer is not None and handle is not None:
                 observe_safely(active_observer.unit_minted, handle)
-            yield prompt(unit)
+            rendered = prompt(unit)
+            authority.record_submission(
+                unit,
+                submitted_at_ns=time.monotonic_ns(),
+            )
+            yield rendered
             await hold_until_park()
             authority.park(
                 request_id=authority.request_id,
@@ -212,19 +220,13 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        prior_sequences = {
-            unit.logical_sequence for unit in authority.ready_units
-        }
+        prior_sequences = {unit.logical_sequence for unit in authority.ready_units}
         if before_audio_accept is not None:
             before_audio_accept()
         session.accept_audio(frame)
         if on_audio_accepted is not None:
             on_audio_accepted()
-        new_units = tuple(
-            unit
-            for unit in authority.ready_units
-            if unit.logical_sequence not in prior_sequences
-        )
+        new_units = tuple(unit for unit in authority.ready_units if unit.logical_sequence not in prior_sequences)
         if ledger is not None:
             for unit in new_units:
                 if unit.kind != "forced_eou":
@@ -242,18 +244,10 @@ async def buffer_stream(
     # exactly zero. The frontend owns the zero-frame decision; the
     # session transition still needs the final marker (PORT-SESS-003).
     if not authority.snapshot().finalizing:
-        finalize_at_ns = (
-            None
-            if final_tail_ready_stamp_s is None
-            else int(final_tail_ready_stamp_s * 1_000_000_000)
-        )
+        finalize_at_ns = None if final_tail_ready_stamp_s is None else int(final_tail_ready_stamp_s * 1_000_000_000)
         session.begin_finalize(finalize_at_ns=finalize_at_ns)
     final_tail = next(
-        (
-            unit
-            for unit in reversed(authority.ready_units)
-            if unit.kind == "final_tail"
-        ),
+        (unit for unit in reversed(authority.ready_units) if unit.kind == "final_tail"),
         None,
     )
     if ledger is not None and final_tail is not None:

@@ -603,9 +603,7 @@ class NemotronRealtimeSession:
         # per-session accepted-audio queue occupancy budget, enforced by
         # buffer_stream on both the native and leased paths regardless of
         # whether an observer is attached.
-        if accepted_audio_budget_s <= 0 or not math.isfinite(
-            accepted_audio_budget_s
-        ):
+        if accepted_audio_budget_s <= 0 or not math.isfinite(accepted_audio_budget_s):
             raise ValueError("accepted_audio_budget_s must be positive and finite")
         self._accepted_audio_budget_s = accepted_audio_budget_s
         # Bind the correlation key into the armed ledger so its fallback
@@ -724,9 +722,7 @@ class NemotronRealtimeSession:
 
         installed_capacity = endpoint_history_capacity_frames
         if installed_capacity is None:
-            installed_capacity = int(
-                getattr(hf, "endpoint_history_capacity_frames", 12)
-            )
+            installed_capacity = int(getattr(hf, "endpoint_history_capacity_frames", 12))
         if installed_capacity <= 0:
             raise ValueError("endpoint history capacity must be positive")
 
@@ -745,9 +741,7 @@ class NemotronRealtimeSession:
             if len(set(controls)) != len(controls):
                 raise ValueError("session control token ids must be distinct")
             num_asr_labels = getattr(hf, "num_asr_labels", None)
-            if isinstance(num_asr_labels, int) and any(
-                token_id <= num_asr_labels for token_id in controls
-            ):
+            if isinstance(num_asr_labels, int) and any(token_id <= num_asr_labels for token_id in controls):
                 raise ValueError("session control token id overlaps label space")
             vocab_size = getattr(hf, "vocab_size", None)
             if isinstance(vocab_size, int) and max(controls) >= vocab_size:
@@ -767,24 +761,19 @@ class NemotronRealtimeSession:
                 history_capacity_frames=installed_capacity,
             )
         if endpoint_policy.history_capacity_frames > installed_capacity:
-            raise ValueError(
-                "endpoint policy exceeds installed history capacity"
-            )
+            raise ValueError("endpoint policy exceeds installed history capacity")
 
         if accepted_audio_capacity_samples is None:
-            accepted_audio_capacity_samples = int(
-                accepted_audio_budget_s * _SAMPLE_RATE_HZ
-            )
+            accepted_audio_capacity_samples = int(accepted_audio_budget_s * _SAMPLE_RATE_HZ)
         accepted_audio = AcceptedAudioAuthority(
             request_id=request_id,
             engine_epoch=engine_epoch,
             lease_generation=lease_generation,
             chunk_samples=geometry.chunk_samples,
             capacity_samples=accepted_audio_capacity_samples,
-            carrier_sequence_modulus=int(
-                SESSION_LIMITS["carrier_sequence_modulus"]
-            ),
+            carrier_sequence_modulus=int(SESSION_LIMITS["carrier_sequence_modulus"]),
             max_session_samples=max_session_samples,
+            cadence_ns=int(cadence_ms_label(geometry.cadence)) * 1_000_000,
         )
         accepted_audio.update_locale(resolved_locale)
         transcript = BoundedTranscript(
@@ -919,9 +908,7 @@ class NemotronRealtimeSession:
 
     def accept_audio(self, samples: Any) -> AcceptedPiece:
         """Atomically accept one whole application-audio piece."""
-        prior_sequences = {
-            unit.logical_sequence for unit in self._accepted_audio.ready_units
-        }
+        prior_sequences = {unit.logical_sequence for unit in self._accepted_audio.ready_units}
         try:
             # Measured at the call site rather than inside the authority:
             # the span then includes any wait for the authority's lock,
@@ -929,10 +916,7 @@ class NemotronRealtimeSession:
             with phase("port.ingest"):
                 accepted = self._accepted_audio.accept(samples)
         except ValueError as error:
-            if (
-                self._observer is not None
-                and "buffer_overflow" in str(error)
-            ):
+            if self._observer is not None and "buffer_overflow" in str(error):
                 observe_safely(self._observer.overflow, kind="input_queue")
             raise
         if self._observer is not None:
@@ -954,9 +938,7 @@ class NemotronRealtimeSession:
         """Close audio acceptance and queue exactly one final tail."""
         if self._accepted_audio.snapshot().finalizing:
             return
-        prior_sequences = {
-            unit.logical_sequence for unit in self._accepted_audio.ready_units
-        }
+        prior_sequences = {unit.logical_sequence for unit in self._accepted_audio.ready_units}
         self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
         if self._observer is not None:
             self._observe_new_ready_units(prior_sequences)
@@ -965,10 +947,7 @@ class NemotronRealtimeSession:
         """Publish newly ready carrier units from the state authority."""
         assert self._observer is not None
         for unit in self._accepted_audio.ready_units:
-            if (
-                unit.logical_sequence in prior_sequences
-                or unit.kind == "forced_eou"
-            ):
+            if unit.logical_sequence in prior_sequences or unit.kind == "forced_eou":
                 continue
             handle = observe_safely(
                 self._observer.unit_ready,

@@ -20,9 +20,10 @@ class ServicePrimingBudgetCell:
     tier_id: str
     max_active_population: int
     repetitions: int
+    scenario_id: str = "ordinary"
 
     def __post_init__(self) -> None:
-        if self.geometry_id < 0 or not self.tier_id:
+        if self.geometry_id < 0 or not self.tier_id or not self.scenario_id:
             raise ValueError("priming budget cell identity must be valid")
         if self.max_active_population <= 0 or self.repetitions <= 0:
             raise ValueError("priming budget cell bounds must be positive")
@@ -35,49 +36,54 @@ class ServicePrimingBudgetDescriptor:
     policy_version: str
     configured_population_ceiling: int
     cells: tuple[ServicePrimingBudgetCell, ...]
+    declared_bootstrap_operation_budget: int | None = None
 
     def __post_init__(self) -> None:
         if not self.policy_version or self.configured_population_ceiling <= 0:
             raise ValueError("priming budget identity and population must be valid")
         if not self.cells:
             raise ValueError("priming budget must declare at least one cell")
-        identities = tuple((cell.geometry_id, cell.tier_id) for cell in self.cells)
+        identities = tuple((cell.geometry_id, cell.tier_id, cell.scenario_id) for cell in self.cells)
         if len(set(identities)) != len(identities):
             raise ValueError("priming budget cell identities must be unique")
-        if any(
-            cell.max_active_population > self.configured_population_ceiling
-            for cell in self.cells
+        if any(cell.max_active_population > self.configured_population_ceiling for cell in self.cells):
+            raise ValueError("priming budget cell exceeds configured population ceiling")
+        exact_operations = 2 * sum(cell.max_active_population * cell.repetitions for cell in self.cells)
+        if (
+            self.declared_bootstrap_operation_budget is not None
+            and self.declared_bootstrap_operation_budget < exact_operations
         ):
-            raise ValueError(
-                "priming budget cell exceeds configured population ceiling"
-            )
+            raise ValueError("declared bootstrap operation budget is below its cells")
 
     @property
     def bootstrap_operation_budget(self) -> int:
         """Worst-case reserve plus release identities for the plan."""
 
-        return 2 * sum(
-            cell.max_active_population * cell.repetitions
-            for cell in self.cells
-        )
+        if self.declared_bootstrap_operation_budget is not None:
+            return self.declared_bootstrap_operation_budget
+        return 2 * sum(cell.max_active_population * cell.repetitions for cell in self.cells)
 
     @property
     def canonical_json(self) -> str:
         payload = {
             "policy_version": self.policy_version,
-            "configured_population_ceiling": (
-                self.configured_population_ceiling
-            ),
+            "configured_population_ceiling": (self.configured_population_ceiling),
+            "declared_bootstrap_operation_budget": (self.declared_bootstrap_operation_budget),
             "cells": [
                 {
                     "geometry_id": cell.geometry_id,
                     "tier_id": cell.tier_id,
+                    "scenario_id": cell.scenario_id,
                     "max_active_population": cell.max_active_population,
                     "repetitions": cell.repetitions,
                 }
                 for cell in sorted(
                     self.cells,
-                    key=lambda item: (item.geometry_id, item.tier_id),
+                    key=lambda item: (
+                        item.geometry_id,
+                        item.tier_id,
+                        item.scenario_id,
+                    ),
                 )
             ],
         }
@@ -103,9 +109,7 @@ class PersistentStatePrimingCleanupError(RuntimeError):
         if not errors:
             raise ValueError("cleanup error aggregate cannot be empty")
         self.errors = errors
-        super().__init__(
-            f"persistent-state priming cleanup failed ({len(errors)} errors)"
-        )
+        super().__init__(f"persistent-state priming cleanup failed ({len(errors)} errors)")
 
 
 @dataclass(frozen=True)
@@ -121,6 +125,8 @@ class ServicePrimingRound:
     tier_id: str = "default"
     post_jit: bool = True
     continuously_loaded: bool = True
+    scenario_id: str = "ordinary"
+    expected_legal_parks_per_lease: int = 1
 
     def __post_init__(self) -> None:
         if not self.round_id:
@@ -131,6 +137,8 @@ class ServicePrimingRound:
             raise ValueError("service-priming population must be positive")
         if not self.schema_id or not self.profile_id:
             raise ValueError("service-priming state identity cannot be empty")
+        if not self.scenario_id or self.expected_legal_parks_per_lease <= 0:
+            raise ValueError("service-priming scenario and park count must be valid")
 
     @property
     def dummy_run(self) -> bool:
@@ -159,6 +167,7 @@ class ServicePrimingObservation:
     continuously_loaded: bool = True
     dummy_run: bool = False
     is_profile: bool = False
+    scenario_id: str = "ordinary"
 
 
 PrimingExecutor = Callable[
@@ -177,39 +186,35 @@ def validate_service_priming_plan(
 
     if not rounds:
         raise ValueError("service-priming plan cannot be empty")
-    cells = {
-        (cell.geometry_id, cell.tier_id): cell for cell in descriptor.cells
-    }
-    repetitions: dict[tuple[int, str], int] = {}
+    cells = {(cell.geometry_id, cell.tier_id, cell.scenario_id): cell for cell in descriptor.cells}
+    repetitions: dict[tuple[int, str, str], int] = {}
     payload: list[dict[str, object]] = []
     for round_spec in rounds:
-        identity = (round_spec.geometry_id, round_spec.tier_id)
+        identity = (
+            round_spec.geometry_id,
+            round_spec.tier_id,
+            round_spec.scenario_id,
+        )
         cell = cells.get(identity)
         if cell is None:
-            raise ValueError(
-                f"service-priming plan cell {identity!r} is outside its budget"
-            )
+            raise ValueError(f"service-priming plan cell {identity!r} is outside its budget")
         if round_spec.active_population > cell.max_active_population:
-            raise ValueError(
-                "service-priming plan population exceeds its budget cell"
-            )
+            raise ValueError("service-priming plan population exceeds its budget cell")
         repetitions[identity] = repetitions.get(identity, 0) + 1
         if repetitions[identity] > cell.repetitions:
-            raise ValueError(
-                "service-priming plan repetitions exceed its budget cell"
-            )
+            raise ValueError("service-priming plan repetitions exceed its budget cell")
         payload.append(
             {
                 "round_id": round_spec.round_id,
                 "geometry_id": round_spec.geometry_id,
                 "tier_id": round_spec.tier_id,
+                "scenario_id": round_spec.scenario_id,
                 "active_population": round_spec.active_population,
                 "service_interval_ms": round_spec.service_interval_ms,
+                "expected_legal_parks_per_lease": (round_spec.expected_legal_parks_per_lease),
             }
         )
-    operation_count = 2 * sum(
-        round_spec.active_population for round_spec in rounds
-    )
+    operation_count = 2 * sum(round_spec.active_population for round_spec in rounds)
     if operation_count > descriptor.bootstrap_operation_budget:
         raise ValueError("service-priming plan exceeds bootstrap operation budget")
     encoded = json.dumps(
@@ -256,18 +261,10 @@ async def _release_priming_leases(
         if error is not None:
             errors.append(error)
     if pending:
-        errors.append(
-            asyncio.TimeoutError(
-                "persistent-state priming cleanup exceeded rollback timeout"
-            )
-        )
+        errors.append(asyncio.TimeoutError("persistent-state priming cleanup exceeded rollback timeout"))
         for task in pending:
             task.cancel()
-            task.add_done_callback(
-                lambda completed: (
-                    None if completed.cancelled() else completed.exception()
-                )
-            )
+            task.add_done_callback(lambda completed: (None if completed.cancelled() else completed.exception()))
     return tuple(errors)
 
 
@@ -296,13 +293,10 @@ async def run_service_priming_round(
             leases.append(lease)
         result = await execute(round_spec, tuple(leases))
         if bool(result.dummy_run) or bool(result.is_profile):
-            raise ValueError(
-                "service priming cannot consume dummy/profile execution"
-            )
-        if result.completed_legal_parks != round_spec.active_population:
-            raise ValueError(
-                "service priming must complete one legal park per lease"
-            )
+            raise ValueError("service priming cannot consume dummy/profile execution")
+        expected_parks = round_spec.active_population * round_spec.expected_legal_parks_per_lease
+        if result.completed_legal_parks != expected_parks:
+            raise ValueError(f"service priming must complete the scenario's exact legal park count ({expected_parks})")
         observation = ServicePrimingObservation(
             round_id=round_spec.round_id,
             service_interval_ms=round_spec.service_interval_ms,
@@ -310,14 +304,11 @@ async def run_service_priming_round(
             active_population=round_spec.active_population,
             elapsed_ns=int(result.elapsed_ns),
             completed_legal_parks=int(result.completed_legal_parks),
-            completed_model_rows=(
-                None
-                if result.completed_model_rows is None
-                else int(result.completed_model_rows)
-            ),
+            completed_model_rows=(None if result.completed_model_rows is None else int(result.completed_model_rows)),
             tier_id=round_spec.tier_id,
             post_jit=round_spec.post_jit,
             continuously_loaded=round_spec.continuously_loaded,
+            scenario_id=round_spec.scenario_id,
         )
     except BaseException as error:
         primary = error

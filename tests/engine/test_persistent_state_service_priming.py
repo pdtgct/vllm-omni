@@ -74,6 +74,8 @@ def _round(*, active_population: int = 2) -> Any:
         active_population=active_population,
         schema_id="schema-a",
         profile_id="profile-a",
+        scenario_id="ordinary",
+        expected_legal_parks_per_lease=1,
     )
 
 
@@ -98,9 +100,7 @@ def test_budget_descriptor_is_immutable_hashed_and_population_bounded() -> None:
 
     assert descriptor.bootstrap_operation_budget == 360
     assert len(descriptor.sha256) == 64
-    assert descriptor.sha256 == hashlib.sha256(
-        descriptor.canonical_json.encode()
-    ).hexdigest()
+    assert descriptor.sha256 == hashlib.sha256(descriptor.canonical_json.encode()).hexdigest()
     with pytest.raises(ValueError, match="population ceiling"):
         descriptor_type(
             policy_version="priming-budget-v1",
@@ -113,6 +113,46 @@ def test_budget_descriptor_is_immutable_hashed_and_population_bounded() -> None:
                     repetitions=1,
                 ),
             ),
+        )
+
+
+def test_budget_descriptor_distinguishes_exceptional_control_scenarios() -> None:
+    """@spec PORT-PERF-005 / PORT-INT-013: assurance expands the plan."""
+    cell = _symbol("ServicePrimingBudgetCell")
+    descriptor = _symbol("ServicePrimingBudgetDescriptor")(
+        policy_version="priming-budget-v2",
+        configured_population_ceiling=2,
+        cells=tuple(
+            cell(
+                geometry_id=0,
+                tier_id="bulk",
+                scenario_id=scenario_id,
+                max_active_population=2,
+                repetitions=2,
+            )
+            for scenario_id in (
+                "ordinary",
+                "forced_eou_then_chunk",
+                "final_tail_then_flush",
+            )
+        ),
+    )
+
+    assert descriptor.bootstrap_operation_budget == 24
+    assert all(
+        scenario_id in descriptor.canonical_json
+        for scenario_id in (
+            "ordinary",
+            "forced_eou_then_chunk",
+            "final_tail_then_flush",
+        )
+    )
+    with pytest.raises(ValueError, match="operation budget|below"):
+        _symbol("ServicePrimingBudgetDescriptor")(
+            policy_version="priming-budget-v2",
+            configured_population_ceiling=2,
+            cells=descriptor.cells,
+            declared_bootstrap_operation_budget=23,
         )
 
 
@@ -187,6 +227,43 @@ def test_service_priming_uses_ordinary_leased_requests_through_legal_park() -> N
         assert observation.completed_legal_parks == 2
         assert observation.active_population == 2
         assert service.resident == 0
+
+    asyncio.run(scenario())
+
+
+def test_exceptional_control_round_requires_two_parks_per_lease() -> None:
+    """@spec PORT-PERF-005: a canary proves both ordered transactions."""
+
+    async def scenario() -> None:
+        service = _PrimingService([])
+        round_spec = _symbol("ServicePrimingRound")(
+            round_id="forced-bulk-repeat-1",
+            service_interval_ms=320,
+            geometry_id=2,
+            active_population=2,
+            schema_id="schema-a",
+            profile_id="profile-a",
+            tier_id="bulk",
+            scenario_id="forced_eou_then_chunk",
+            expected_legal_parks_per_lease=2,
+        )
+
+        async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
+            assert spec.scenario_id == "forced_eou_then_chunk"
+            return SimpleNamespace(
+                completed_legal_parks=3,
+                elapsed_ns=1,
+                completed_model_rows=None,
+                dummy_run=False,
+                is_profile=False,
+            )
+
+        with pytest.raises(ValueError, match="two|park|legal"):
+            await _symbol("run_service_priming_round")(
+                service=service,
+                round_spec=round_spec,
+                execute=execute,
+            )
 
     asyncio.run(scenario())
 
@@ -354,9 +431,7 @@ def test_timeout_cancellation_cannot_interrupt_inflight_release_fanout() -> None
             await task
 
         assert service.resident == 0
-        assert len(
-            [event for event in service.events if event[0] == "release-done"]
-        ) == 2
+        assert len([event for event in service.events if event[0] == "release-done"]) == 2
 
     asyncio.run(scenario())
 

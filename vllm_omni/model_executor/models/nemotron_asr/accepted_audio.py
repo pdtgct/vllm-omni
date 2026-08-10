@@ -76,6 +76,7 @@ class AcceptedAudioAuthority:
         carrier_sequence_modulus: int,
         initial_logical_sequence: int = 0,
         max_session_samples: int | None = None,
+        cadence_ns: int | None = None,
     ) -> None:
         if chunk_samples <= 0:
             raise ValueError("chunk_samples must be positive")
@@ -87,6 +88,8 @@ class AcceptedAudioAuthority:
             raise ValueError("initial_logical_sequence must be nonnegative")
         if max_session_samples is not None and max_session_samples <= 0:
             raise ValueError("max_session_samples must be positive")
+        if cadence_ns is not None and cadence_ns <= 0:
+            raise ValueError("cadence_ns must be positive when set")
 
         self.request_id = request_id
         self.engine_epoch = engine_epoch
@@ -95,6 +98,7 @@ class AcceptedAudioAuthority:
         self.capacity_samples = capacity_samples
         self.carrier_sequence_modulus = carrier_sequence_modulus
         self.max_session_samples = max_session_samples
+        self.cadence_ns = cadence_ns
 
         self._lock = threading.Lock()
         self._pieces: deque[np.ndarray] = deque()
@@ -102,6 +106,8 @@ class AcceptedAudioAuthority:
         self._residual_samples = 0
         self._ready: deque[ReadyAudioUnit] = deque()
         self._in_flight: ReadyAudioUnit | None = None
+        self._in_flight_submitted = False
+        self._prior_ordinary_submission_ns: int | None = None
         self._next_logical_sequence = initial_logical_sequence
         self._accepted_samples = 0
         self._parked_samples = 0
@@ -121,6 +127,24 @@ class AcceptedAudioAuthority:
         """The ordered unit awaiting legal park, if one exists."""
         with self._lock:
             return self._in_flight
+
+    def _eligibility_ns(self, unit: ReadyAudioUnit) -> int | None:
+        if self.cadence_ns is None or unit.kind == "forced_eou":
+            return None
+        if self._prior_ordinary_submission_ns is None:
+            return unit.ready_at_ns
+        return max(
+            unit.ready_at_ns,
+            self._prior_ordinary_submission_ns + self.cadence_ns,
+        )
+
+    @property
+    def next_eligibility_ns(self) -> int | None:
+        """Earliest release of the FIFO head under the cadence clock."""
+        with self._lock:
+            if self._cleared or self._in_flight is not None or not self._ready:
+                return None
+            return self._eligibility_ns(self._ready[0])
 
     def _outstanding_samples(self) -> int:
         ready = sum(unit.sample_count for unit in self._ready)
@@ -155,9 +179,7 @@ class AcceptedAudioAuthority:
             piece = self._pieces[0]
             available = piece.shape[0] - self._head
             take = min(count - written, available)
-            output[written : written + take] = piece[
-                self._head : self._head + take
-            ]
+            output[written : written + take] = piece[self._head : self._head + take]
             written += take
             self._head += take
             if self._head == piece.shape[0]:
@@ -276,12 +298,36 @@ class AcceptedAudioAuthority:
             )
 
     # @spec PORT-SESS-001, PORT-SESS-013
-    def dispatch_next(self) -> ReadyAudioUnit | None:
+    def dispatch_next(self, *, now_ns: int | None = None) -> ReadyAudioUnit | None:
         with self._lock:
             if self._cleared or self._in_flight is not None or not self._ready:
                 return None
+            eligibility_ns = self._eligibility_ns(self._ready[0])
+            if eligibility_ns is not None:
+                current_ns = time.monotonic_ns() if now_ns is None else now_ns
+                if current_ns < eligibility_ns:
+                    return None
             self._in_flight = self._ready.popleft()
+            self._in_flight_submitted = False
             return self._in_flight
+
+    # @spec PORT-SESS-001, PORT-STATE-026
+    def record_submission(
+        self,
+        unit: ReadyAudioUnit,
+        *,
+        submitted_at_ns: int | None = None,
+    ) -> None:
+        """Advance the ordinary release clock from actual submission."""
+        submitted_ns = time.monotonic_ns() if submitted_at_ns is None else submitted_at_ns
+        with self._lock:
+            if self._in_flight is not unit:
+                raise ValueError("submission does not match in-flight unit")
+            if self._in_flight_submitted:
+                raise ValueError("in-flight unit was already submitted")
+            if unit.kind != "forced_eou":
+                self._prior_ordinary_submission_ns = submitted_ns
+            self._in_flight_submitted = True
 
     # @spec PORT-INT-004, PORT-SESS-013
     def park(
@@ -313,10 +359,13 @@ class AcceptedAudioAuthority:
             )
             if actual != expected:
                 raise ValueError("park identity or generation mismatch")
+            if self.cadence_ns is not None and not self._in_flight_submitted:
+                raise ValueError("paced unit reached park before submission")
             self._parked_samples += unit.sample_count
             if unit.kind == "forced_eou":
                 self._force_pending = False
             self._in_flight = None
+            self._in_flight_submitted = False
 
     # @spec PORT-SESS-013
     def clear(self, error: BaseException) -> None:
@@ -330,15 +379,14 @@ class AcceptedAudioAuthority:
             self._residual_samples = 0
             self._ready.clear()
             self._in_flight = None
+            self._in_flight_submitted = False
             self._force_pending = False
             self._cleared = True
 
     def snapshot(self) -> AcceptedAudioSnapshot:
         with self._lock:
             ready = sum(unit.sample_count for unit in self._ready)
-            in_flight = (
-                0 if self._in_flight is None else self._in_flight.sample_count
-            )
+            in_flight = 0 if self._in_flight is None else self._in_flight.sample_count
             outstanding = self._residual_samples + ready + in_flight
             return AcceptedAudioSnapshot(
                 accepted_samples=self._accepted_samples,

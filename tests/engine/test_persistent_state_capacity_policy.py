@@ -81,9 +81,7 @@ def _evaluate(**overrides: Any) -> Any:
         "charged_demand": Fraction(0),
         "service_budget": Fraction(1),
         "candidate_demand": Fraction(1, 8),
-        "transaction_duration_ms": lambda counts: Fraction(
-            40 * sum(counts)
-        ),
+        "transaction_duration_ms": lambda counts: Fraction(40 * sum(counts)),
     }
     values.update(overrides)
     return _symbol("evaluate_admission")(**values)
@@ -99,9 +97,7 @@ def _controller(**overrides: Any) -> Any:
             reference_interval_ms=320,
             reference_demand=Fraction(1, 4),
         ),
-        "transaction_duration_ms": lambda intervals: Fraction(
-            40 * len(intervals)
-        ),
+        "transaction_duration_ms": lambda intervals: Fraction(40 * len(intervals)),
     }
     values.update(overrides)
     return _symbol("PersistentStateAdmissionController")(**values)
@@ -234,11 +230,7 @@ def _service_round(
         elapsed_ns=elapsed_ns,
         service_interval_ms=service_interval_ms,
         geometry_id=geometry_id,
-        completed_legal_parks=(
-            active_population
-            if completed_legal_parks is None
-            else completed_legal_parks
-        ),
+        completed_legal_parks=(active_population if completed_legal_parks is None else completed_legal_parks),
         completed_model_rows=completed_model_rows,
         post_jit=post_jit,
         continuously_loaded=continuously_loaded,
@@ -261,7 +253,7 @@ def _profile_context(**overrides: Any) -> Any:
         "precision_policy": "fp32",
         "state_profile": "nemotron-asr-fp32-v1",
         "compiler_version": "persistent-state-capacity-v2",
-        "mixed_composition_policy": "homogeneous_upper_sum",
+        "mixed_composition_policy": "periodic_limited_preemption_edf",
     }
     values.update(overrides)
     return _symbol("ServiceProfileContext")(**values)
@@ -277,9 +269,7 @@ def _geometry_rounds(
 ) -> tuple[Any, ...]:
     return tuple(
         execution
-        for geometry_id, service_interval_ms in enumerate(
-            _SERVICE_INTERVALS_MS
-        )
+        for geometry_id, service_interval_ms in enumerate(_SERVICE_INTERVALS_MS)
         for execution in (
             _service_round(
                 tier_id="single",
@@ -318,11 +308,7 @@ def _compile_profile(
         kwargs["startup_priming_receipt"] = startup_priming_receipt
     return _symbol("compile_provisional_service_profile")(
         executions,
-        execution_tiers=(
-            (_service_tier("single", 1), _service_tier("small", 4))
-            if tiers is None
-            else tiers
-        ),
+        execution_tiers=((_service_tier("single", 1), _service_tier("small", 4)) if tiers is None else tiers),
         max_population=max_population,
         reference_interval_ms=1_120,
         reference_geometry_id=4,
@@ -332,7 +318,12 @@ def _compile_profile(
         context=_profile_context(
             allocated_pool=max_population,
             count_cap=max_population,
+            derating_factor=derating_factor,
         ),
+        # This legacy arithmetic fixture isolates regular-round compilation;
+        # periodic control-envelope behavior is covered in the dedicated
+        # capacity suite.
+        control_dominance_sha256="d" * 64,
         **kwargs,
     )
 
@@ -354,8 +345,11 @@ def test_profile_expands_runner_tier_upper_bounds_without_interpolation() -> Non
         100_000_000,
     )
     assert result.measured_capacity == 4
-    assert result.provisional_capacity == 2
-    assert result.reference_demand == Fraction(1, 2)
+    # The retired population-scaling rule produced 2.  Exact duration-supply
+    # derating retains all four because worst-fragmented work is 400 ms
+    # against a 560 ms budget.
+    assert result.provisional_capacity == 4
+    assert result.reference_demand == Fraction(1, 4)
 
 
 def test_profile_uses_worst_trailing_complete_round_and_legal_park() -> None:
@@ -470,12 +464,8 @@ def test_equal_row_rates_do_not_create_equal_session_capacity() -> None:
         derating_factor=Fraction(1),
     )
 
-    assert fast.diagnostic_rows_per_second_by_geometry_and_tier[4][
-        "small"
-    ] == Fraction(10)
-    assert slow.diagnostic_rows_per_second_by_geometry_and_tier[4][
-        "small"
-    ] == Fraction(10)
+    assert fast.diagnostic_rows_per_second_by_geometry_and_tier[4]["small"] == Fraction(10)
+    assert slow.diagnostic_rows_per_second_by_geometry_and_tier[4]["small"] == Fraction(10)
     assert fast.measured_capacity == 4
     assert slow.measured_capacity == 1
 
@@ -612,7 +602,7 @@ def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> N
 
     assert available.hard_headroom == 4
     assert available.candidate_supported_by_interval[1_120]
-    assert available.nominal_dispatchable_by_interval[1_120] == 2
+    assert available.nominal_dispatchable_by_interval[1_120] == 4
 
     resident = dict(empty)
     resident[1_120] = 2
@@ -625,8 +615,8 @@ def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> N
     )
 
     assert saturated.hard_headroom == 2
-    assert saturated.charged_units == saturated.service_budget_units
-    assert saturated.nominal_dispatchable_by_interval[1_120] == 0
+    assert saturated.charged_units < saturated.service_budget_units
+    assert saturated.nominal_dispatchable_by_interval[1_120] == 2
 
 
 def test_fixed_dispatch_projection_uses_exact_noncontiguous_served_subset() -> None:
@@ -691,7 +681,7 @@ def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
         "small": 800_000_000,
     }
     assert len(receipt.expanded_duration_table_sha256) == 64
-    assert receipt.mixed_composition_policy == "homogeneous_upper_sum"
+    assert receipt.mixed_composition_policy == "periodic_limited_preemption_edf"
     assert receipt.service_demand_scale > 0
     assert len(receipt.service_demand_units) == 5
     assert receipt.aggregate_rounding_bound == Fraction(
@@ -699,7 +689,10 @@ def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
         receipt.service_demand_scale,
     )
     assert receipt.least_rational_demand > receipt.aggregate_rounding_bound
-    assert receipt.provisional_capacity == 2
+    # Population two inherits the measured population-four 800 ms upper;
+    # its fragmented work exceeds the 560 ms derated budget, so the exact
+    # periodic frontier is one rather than the retired scalar value two.
+    assert receipt.provisional_capacity == 1
     assert receipt.derating_factor == Fraction(1, 2)
     assert len(receipt.receipt_sha256) == 64
     assert result.profile_candidate.qualified is False
@@ -730,10 +723,7 @@ def test_profile_receipt_hash_covers_startup_priming_identity() -> None:
     without_identity = _compile_profile(executions)
 
     assert with_identity.receipt.startup_priming == startup
-    assert (
-        with_identity.receipt.receipt_sha256
-        != without_identity.receipt.receipt_sha256
-    )
+    assert with_identity.receipt.receipt_sha256 != without_identity.receipt.receipt_sha256
 
 
 def test_mixed_pool_pressure_waits_instead_of_becoming_a_refusal() -> None:
@@ -751,8 +741,7 @@ def test_mixed_pool_pressure_waits_instead_of_becoming_a_refusal() -> None:
     assert decision.nominal_dispatchable is False
     assert decision.nominal_reason == "transaction_time"
     assert not hasattr(decision, "refusal"), (
-        "the capacity projection must not turn nominal pressure into a "
-        "client-visible refusal"
+        "the capacity projection must not turn nominal pressure into a client-visible refusal"
     )
 
 

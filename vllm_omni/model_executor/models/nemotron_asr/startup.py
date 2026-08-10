@@ -26,6 +26,23 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     RAW_SAMPLES_PER_CHUNK,
 )
 
+_PRIMING_SCENARIOS = (
+    "ordinary",
+    "forced_eou_then_chunk",
+    "final_tail_then_flush",
+)
+_PRIMING_BUDGET_ANCHOR_COUNT = 11
+
+
+def _max_visited_populations(population: int) -> int:
+    if population == 1:
+        return 1
+    bisection_depth = (population - 2).bit_length()
+    return min(
+        population,
+        _PRIMING_BUDGET_ANCHOR_COUNT + bisection_depth,
+    )
+
 
 @dataclass(frozen=True)
 class NemotronServicePrimingPlan:
@@ -55,19 +72,27 @@ class NemotronPersistentStateStartupProvider:
         if configured_population_ceiling > 1:
             tiers.append(("eager-bulk", configured_population_ceiling))
         repetitions = trailing_rounds + 1
+        max_visited = _max_visited_populations(configured_population_ceiling)
+        canary_populations = 1 if configured_population_ceiling == 1 else 2
+        declared_operations = (
+            2 * len(CADENCES) * repetitions * configured_population_ceiling * (max_visited + 2 * canary_populations)
+        )
         return ServicePrimingBudgetDescriptor(
-            policy_version="nemotron-service-priming-v1",
+            policy_version="nemotron-service-priming-v2",
             configured_population_ceiling=configured_population_ceiling,
             cells=tuple(
                 ServicePrimingBudgetCell(
                     geometry_id=geometry_id,
                     tier_id=tier_id,
+                    scenario_id=scenario_id,
                     max_active_population=population,
                     repetitions=repetitions,
                 )
                 for geometry_id in range(len(CADENCES))
                 for tier_id, population in tiers
+                for scenario_id in _PRIMING_SCENARIOS
             ),
+            declared_bootstrap_operation_budget=declared_operations,
         )
 
     def build_priming_plan(
@@ -84,9 +109,7 @@ class NemotronPersistentStateStartupProvider:
             int(inventory["execution_claim_ceiling"]),
         )
         if maximum_population <= 0:
-            raise RuntimeError(
-                "persistent-state priming requires positive effective capacity"
-            )
+            raise RuntimeError("persistent-state priming requires positive effective capacity")
         trailing_rounds = int(runtime_config.service_profile_trailing_rounds)
         tiers = [
             ServiceExecutionTier(
@@ -107,47 +130,37 @@ class NemotronPersistentStateStartupProvider:
             "supported_num_lookahead_tokens",
             None,
         )
-        supported = (
-            None
-            if declared_lookaheads is None
-            else {int(value) for value in declared_lookaheads}
-        )
+        supported = None if declared_lookaheads is None else {int(value) for value in declared_lookaheads}
         admitted_geometries = tuple(
             (geometry_id, cadence)
-            for geometry_id, (cadence, (_, lookahead)) in enumerate(
-                CADENCES.items()
-            )
+            for geometry_id, (cadence, (_, lookahead)) in enumerate(CADENCES.items())
             if supported is None or lookahead in supported
         )
         if not admitted_geometries:
-            raise ValueError(
-                "served configuration declares no supported manifest geometry"
-            )
+            raise ValueError("served configuration declares no supported manifest geometry")
 
         rounds: list[ServicePrimingRound] = []
         for geometry_id, cadence in admitted_geometries:
             service_interval_ms = int(cadence.removesuffix("ms"))
             for tier in tiers:
-                for repeat in range(trailing_rounds + 1):
-                    rounds.append(
-                        ServicePrimingRound(
-                            round_id=(
-                                f"geometry-{geometry_id}-{tier.tier_id}-"
-                                f"repeat-{repeat}"
-                            ),
-                            service_interval_ms=service_interval_ms,
-                            geometry_id=geometry_id,
-                            active_population=tier.max_active_population,
-                            schema_id=str(inventory["schema_id"]),
-                            profile_id=str(inventory["profile_id"]),
-                            tier_id=tier.tier_id,
-                            post_jit=repeat > 0,
-                            continuously_loaded=True,
+                for scenario_id in _PRIMING_SCENARIOS:
+                    for repeat in range(trailing_rounds + 1):
+                        rounds.append(
+                            ServicePrimingRound(
+                                round_id=(f"geometry-{geometry_id}-{tier.tier_id}-{scenario_id}-repeat-{repeat}"),
+                                service_interval_ms=service_interval_ms,
+                                geometry_id=geometry_id,
+                                active_population=tier.max_active_population,
+                                schema_id=str(inventory["schema_id"]),
+                                profile_id=str(inventory["profile_id"]),
+                                tier_id=tier.tier_id,
+                                post_jit=repeat > 0,
+                                continuously_loaded=True,
+                                scenario_id=scenario_id,
+                                expected_legal_parks_per_lease=(1 if scenario_id == "ordinary" else 2),
+                            )
                         )
-                    )
-        derating = Fraction(
-            str(runtime_config.service_profile_derating_factor)
-        )
+        derating = Fraction(str(runtime_config.service_profile_derating_factor))
         rounds_tuple = tuple(rounds)
         budget = runtime_config.priming_budget_descriptor
         plan_identity = validate_service_priming_plan(
@@ -158,20 +171,16 @@ class NemotronPersistentStateStartupProvider:
             pre_override_physical_bound=int(inventory["physical_capacity"]),
             allocated_pool=int(inventory["physical_capacity"]),
             count_cap=int(inventory["configured_limit"]),
-            execution_claim_ceiling=int(
-                inventory["execution_claim_ceiling"]
-            ),
+            execution_claim_ceiling=int(inventory["execution_claim_ceiling"]),
             service_budget_source="measured_fallback",
             service_budget_coefficients=(),
             derating_factor=derating,
             slot_bytes=int(inventory["slot_bytes"]),
-            execution_environment_key=str(
-                inventory["execution_environment_key"]
-            ),
+            execution_environment_key=str(inventory["execution_environment_key"]),
             precision_policy=str(inventory["precision_policy"]),
             state_profile=str(inventory["profile_id"]),
             compiler_version="persistent-state-service-v1",
-            mixed_composition_policy="homogeneous_upper_sum",
+            mixed_composition_policy="periodic_limited_preemption_edf",
         )
         reference_geometry_id, reference_cadence = max(
             admitted_geometries,
@@ -182,31 +191,23 @@ class NemotronPersistentStateStartupProvider:
             compile_kwargs={
                 "execution_tiers": tuple(tiers),
                 "max_population": maximum_population,
-                "reference_interval_ms": int(
-                    reference_cadence.removesuffix("ms")
-                ),
+                "reference_interval_ms": int(reference_cadence.removesuffix("ms")),
                 "reference_geometry_id": reference_geometry_id,
-                "admitted_geometry_ids": tuple(
-                    geometry_id for geometry_id, _ in admitted_geometries
-                ),
+                "admitted_geometry_ids": tuple(geometry_id for geometry_id, _ in admitted_geometries),
                 "trailing_rounds": trailing_rounds,
                 "derating_factor": derating,
                 "context": context,
+                "evidence_class": "probe",
                 "startup_priming_receipt": {
                     "budget_sha256": budget.sha256,
-                    "bootstrap_operation_budget": (
-                        budget.bootstrap_operation_budget
-                    ),
+                    "bootstrap_operation_budget": (budget.bootstrap_operation_budget),
                     "actual_plan_sha256": plan_identity.sha256,
                     "actual_operation_count": plan_identity.operation_count,
                 },
             },
             actual_plan_sha256=plan_identity.sha256,
             actual_operation_count=plan_identity.operation_count,
-            served_intervals_ms=tuple(
-                int(cadence.removesuffix("ms"))
-                for _, cadence in admitted_geometries
-            ),
+            served_intervals_ms=tuple(int(cadence.removesuffix("ms")) for _, cadence in admitted_geometries),
         )
 
     async def execute_priming_round(
@@ -237,9 +238,7 @@ class NemotronPersistentStateStartupProvider:
         )
         prompts = getattr(hf_config, "prompt_dictionary", None)
         if not isinstance(prompts, dict) or not prompts:
-            raise RuntimeError(
-                "persistent-state priming requires the served prompt dictionary"
-            )
+            raise RuntimeError("persistent-state priming requires the served prompt dictionary")
         locale = str(next(iter(prompts)))
         bound: list[NemotronSessionLease] = []
         for state_lease in leases:
@@ -266,7 +265,19 @@ class NemotronPersistentStateStartupProvider:
         )
         started_ns = time.monotonic_ns()
         try:
-            await asyncio.gather(*(lease.feed(samples) for lease in bound))
+            if round_spec.scenario_id == "ordinary":
+                await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                completed_legal_parks = len(bound)
+            elif round_spec.scenario_id == "forced_eou_then_chunk":
+                await asyncio.gather(*(lease.force_segment() for lease in bound))
+                await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                completed_legal_parks = 2 * len(bound)
+            elif round_spec.scenario_id == "final_tail_then_flush":
+                await asyncio.gather(*(lease.feed(samples[:-1]) for lease in bound))
+                await asyncio.gather(*(lease.flush() for lease in bound))
+                completed_legal_parks = 2 * len(bound)
+            else:
+                raise ValueError(f"unknown persistent-state priming scenario {round_spec.scenario_id}")
             elapsed_ns = time.monotonic_ns() - started_ns
         finally:
             await asyncio.gather(
@@ -274,7 +285,7 @@ class NemotronPersistentStateStartupProvider:
                 return_exceptions=True,
             )
         return SimpleNamespace(
-            completed_legal_parks=len(bound),
+            completed_legal_parks=completed_legal_parks,
             elapsed_ns=elapsed_ns,
             completed_model_rows=None,
             dummy_run=False,

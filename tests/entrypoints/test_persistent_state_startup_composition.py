@@ -131,9 +131,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     model_config = object()
     engine = SimpleNamespace(model_config=model_config)
     provider = _Provider(events, runtime, model_config)
-    profile = SimpleNamespace(
-        compiled_demand=SimpleNamespace(intervals_ms=(80, 320, 560, 1120))
-    )
+    profile = SimpleNamespace(compiled_demand=SimpleNamespace(intervals_ms=(80, 320, 560, 1120)))
 
     class _Service:
         def __init__(self, stage_client: Any, **kwargs: Any) -> None:
@@ -173,6 +171,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         return SimpleNamespace(round_id="round-0")
 
     monkeypatch.setattr(module, "PersistentStateService", _Service)
+
     def _derive_config(
         value: Any,
         *,
@@ -192,9 +191,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     monkeypatch.setattr(
         module,
         "compile_provisional_service_profile",
-        lambda observations, **kwargs: (
-            events.append("compile") or profile
-        ),
+        lambda observations, **kwargs: (events.append("compile") or profile),
     )
 
     service = await prepare(
@@ -380,10 +377,7 @@ async def test_api_install_delegates_to_one_typed_preparation_function(
         return prepared
 
     if not hasattr(api_server, "prepare_persistent_state_service"):
-        _fail(
-            "PORT-INT-013 API server does not expose the typed PORT "
-            "preparation join"
-        )
+        _fail("PORT-INT-013 API server does not expose the typed PORT preparation join")
     monkeypatch.setattr(model_loader, "get_model_cls", lambda config: _PersistentModel)
     monkeypatch.setattr(api_server, "prepare_persistent_state_service", _prepare)
     engine = object.__new__(async_omni_module.AsyncOmni)
@@ -393,11 +387,7 @@ async def test_api_install_delegates_to_one_typed_preparation_function(
     monkeypatch.setattr(
         persistent_state_config.PersistentStateRuntimeConfig,
         "from_vllm_config",
-        classmethod(
-            lambda cls, config, *, startup_provider: (
-                runtime if startup_provider is provider else None
-            )
-        ),
+        classmethod(lambda cls, config, *, startup_provider: (runtime if startup_provider is provider else None)),
     )
 
     def fatal(error: BaseException) -> None:
@@ -431,9 +421,7 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
     if not hasattr(api_server, "_persistent_state_host_fatal_callback"):
         _fail("PORT-STATE-014 missing API host-fatal supervision adapter")
     events: list[str] = []
-    engine = SimpleNamespace(
-        report_persistent_state_fatal=lambda error: events.append("report")
-    )
+    engine = SimpleNamespace(report_persistent_state_fatal=lambda error: events.append("report"))
     server = object()
     state = SimpleNamespace(server=server)
     monkeypatch.setattr(
@@ -499,11 +487,7 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
     plan = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_plan(
         runtime_config=runtime,
         inventory=inventory,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                supported_num_lookahead_tokens=[3, 0, 6, 13]
-            )
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(supported_num_lookahead_tokens=[3, 0, 6, 13])),
     )
 
     tiers = plan.compile_kwargs["execution_tiers"]
@@ -511,28 +495,36 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
         ("single", 1),
         ("eager-bulk", 4),
     ]
-    assert len(plan.rounds) == 4 * 2 * 4
-    assert plan.actual_operation_count == 160
+    assert len(plan.rounds) == 4 * 2 * 4 * 3
+    assert plan.actual_operation_count == 480
     assert len(plan.actual_plan_sha256) == 64
     assert plan.compile_kwargs["startup_priming_receipt"] == {
         "budget_sha256": runtime.priming_budget_descriptor.sha256,
-        "bootstrap_operation_budget": 360,
+        "bootstrap_operation_budget": 3_840,
         "actual_plan_sha256": plan.actual_plan_sha256,
-        "actual_operation_count": 160,
+        "actual_operation_count": 480,
     }
-    assert sum(not round_spec.post_jit for round_spec in plan.rounds) == 8
-    assert {
-        (round_spec.geometry_id, round_spec.tier_id)
-        for round_spec in plan.rounds
-    } == {
-        (geometry_id, tier_id)
+    assert sum(not round_spec.post_jit for round_spec in plan.rounds) == 24
+    assert {(round_spec.geometry_id, round_spec.tier_id, round_spec.scenario_id) for round_spec in plan.rounds} == {
+        (geometry_id, tier_id, scenario_id)
         for geometry_id in (0, 2, 3, 4)
         for tier_id in ("single", "eager-bulk")
+        for scenario_id in (
+            "ordinary",
+            "forced_eou_then_chunk",
+            "final_tail_then_flush",
+        )
     }
+    assert all(
+        round_spec.expected_legal_parks_per_lease == (1 if round_spec.scenario_id == "ordinary" else 2)
+        for round_spec in plan.rounds
+    )
     assert plan.compile_kwargs["admitted_geometry_ids"] == (0, 2, 3, 4)
     assert plan.compile_kwargs["reference_geometry_id"] == 4
     assert plan.compile_kwargs["reference_interval_ms"] == 1120
     assert plan.served_intervals_ms == (80, 320, 560, 1120)
+    assert plan.compile_kwargs.get("control_upper_ns_by_window_and_population") is None
+    assert plan.compile_kwargs.get("control_dominance_sha256") is None
 
 
 def test_nemotron_provider_keeps_all_manifest_geometries_without_declaration() -> None:
@@ -605,11 +597,7 @@ def test_nemotron_provider_rejects_empty_served_geometry_before_plan() -> None:
         NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_plan(
             runtime_config=runtime,
             inventory=inventory,
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    supported_num_lookahead_tokens=[999]
-                )
-            ),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(supported_num_lookahead_tokens=[999])),
         )
 
 
@@ -625,14 +613,18 @@ def test_nemotron_budget_uses_configured_not_inventory_population() -> None:
     )
 
     assert budget.configured_population_ceiling == 8
-    assert budget.bootstrap_operation_budget == 360
+    assert budget.bootstrap_operation_budget == 3_840
     assert {
-        (cell.geometry_id, cell.tier_id, cell.max_active_population)
-        for cell in budget.cells
+        (cell.geometry_id, cell.tier_id, cell.scenario_id, cell.max_active_population) for cell in budget.cells
     } == {
-        (geometry_id, tier_id, population)
+        (geometry_id, tier_id, scenario_id, population)
         for geometry_id in range(5)
         for tier_id, population in (("single", 1), ("eager-bulk", 8))
+        for scenario_id in (
+            "ordinary",
+            "forced_eou_then_chunk",
+            "final_tail_then_flush",
+        )
     }
 
     single = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
@@ -643,8 +635,8 @@ def test_nemotron_budget_uses_configured_not_inventory_population() -> None:
         configured_population_ceiling=1_000,
         trailing_rounds=3,
     )
-    assert single.bootstrap_operation_budget == 40
-    assert target.bootstrap_operation_budget == 40_040
+    assert single.bootstrap_operation_budget == 120
+    assert target.bootstrap_operation_budget == 1_000_000
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -674,6 +666,13 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
             events.append(("feed", self.request_id))
             return [""]
 
+        async def force_segment(self) -> None:
+            events.append(("force", self.request_id))
+
+        async def flush(self) -> SimpleNamespace:
+            events.append(("flush", self.request_id))
+            return SimpleNamespace(text="")
+
         async def abort(self) -> None:
             events.append(("abort", self.request_id))
 
@@ -683,11 +682,7 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
         "from_model_config",
         lambda *args, **kwargs: SimpleNamespace(),
     )
-    engine = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(prompt_dictionary={"en-US": 0})
-        )
-    )
+    engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(prompt_dictionary={"en-US": 0})))
     leases = tuple(
         SimpleNamespace(
             session_key=f"session-{index}",
@@ -696,7 +691,10 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
         )
         for index in range(2)
     )
-    round_spec = SimpleNamespace(service_interval_ms=80)
+    round_spec = SimpleNamespace(
+        service_interval_ms=80,
+        scenario_id="ordinary",
+    )
 
     result = await NEMOTRON_PERSISTENT_STATE_STARTUP.execute_priming_round(
         engine_client=engine,
@@ -713,3 +711,77 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
         ("abort", "session-0"),
         ("abort", "session-1"),
     }
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize(
+    ("scenario_id", "expected_action_order"),
+    [
+        ("forced_eou_then_chunk", ("force", "feed")),
+        ("final_tail_then_flush", ("feed", "flush")),
+    ],
+)
+async def test_nemotron_provider_executes_exceptional_control_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario_id: str,
+    expected_action_order: tuple[str, ...],
+) -> None:
+    """@spec PORT-PERF-005/006: canaries traverse the real lease API."""
+    from vllm_omni.entrypoints import nemotron_session as binding_module
+    from vllm_omni.model_executor.models.nemotron_asr import (
+        session as session_module,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    events: list[tuple[str, str]] = []
+
+    class _Bound:
+        def __init__(self, **kwargs: Any) -> None:
+            self.request_id = str(kwargs["request_id"])
+
+        async def feed(self, samples: Any) -> list[str]:
+            expected_samples = 1_279 if scenario_id == "final_tail_then_flush" else 1_280
+            assert samples.shape == (expected_samples,)
+            events.append(("feed", self.request_id))
+            return [""]
+
+        async def force_segment(self) -> None:
+            events.append(("force", self.request_id))
+
+        async def flush(self) -> SimpleNamespace:
+            events.append(("flush", self.request_id))
+            return SimpleNamespace(text="")
+
+        async def abort(self) -> None:
+            events.append(("abort", self.request_id))
+
+    monkeypatch.setattr(binding_module, "NemotronSessionLease", _Bound)
+    monkeypatch.setattr(
+        session_module.NemotronRealtimeSession,
+        "from_model_config",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(prompt_dictionary={"en-US": 0})))
+    leases = (
+        SimpleNamespace(
+            session_key="session-0",
+            engine_epoch="epoch-a",
+            generation=1,
+        ),
+    )
+    round_spec = SimpleNamespace(
+        service_interval_ms=80,
+        scenario_id=scenario_id,
+    )
+
+    result = await NEMOTRON_PERSISTENT_STATE_STARTUP.execute_priming_round(
+        engine_client=engine,
+        round_spec=round_spec,
+        leases=leases,
+    )
+
+    assert result.completed_legal_parks == 2
+    assert tuple(action for action, _ in events[:-1]) == expected_action_order
+    assert events[-1] == ("abort", "session-0")
