@@ -510,6 +510,17 @@ def test_nemotron_budget_uses_configured_not_inventory_population() -> None:
         for tier_id, population in (("single", 1), ("eager-bulk", 8))
     }
 
+    single = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+        configured_population_ceiling=1,
+        trailing_rounds=3,
+    )
+    target = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+        configured_population_ceiling=1_000,
+        trailing_rounds=3,
+    )
+    assert single.bootstrap_operation_budget == 40
+    assert target.bootstrap_operation_budget == 40_040
+
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_nemotron_provider_executes_bound_requests_to_legal_park(
