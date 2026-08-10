@@ -1,16 +1,24 @@
-# Target vllm version: v0.24.0 (releases/v0.24.0 branch).
+# Target vLLM version: v0.25.0.
 # The pinned VLLM_PRECOMPILED_WHEEL_COMMIT and VLLM_BASE_TAG below must
 # be updated on every rebase to match the new upstream vllm commit/tag.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
 ARG VLLM_BASE_TAG=v0.25.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
+ARG VLLM_OMNI_VERSION=0.25.0
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
 COPY . .
 
+# RunPod's image extractor rejects a layer whose venv package files are
+# represented as hardlinks into uv's cache.  Copying preserves the installed
+# bytes while making the resulting OCI layer portable across the local Docker
+# builder, Kaniko, and the RunPod runtime.
+ENV UV_LINK_MODE=copy \
+    VLLM_OMNI_VERSION_OVERRIDE=${VLLM_OMNI_VERSION}
+
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y espeak-ng git jq && \
+    apt-get install -y espeak-ng git jq openssh-server && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
