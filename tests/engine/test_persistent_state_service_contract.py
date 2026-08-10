@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -207,6 +208,35 @@ def test_engine_core_process_exposes_only_named_omni_utility_methods() -> None:
         assert "EngineCoreRequestType" not in source
 
 
+def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    manager, _, _ = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=3
+    )
+    manager.resident_state_scatter_warmup_complete = True
+    core = object.__new__(StageEngineCoreProc)
+    core.vllm_config = SimpleNamespace(
+        additional_config=dict(_EXPLICIT_A36_ENVELOPE)
+    )
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=(manager,))
+        )
+    )
+
+    snapshot = core.persistent_state_snapshot()
+
+    assert snapshot.get("resident_state_scatter_warmup_complete") is True, (
+        "ENV-MIG-012 engine inventory omitted scatter-warmup attestation"
+    )
+
+
 def test_health_includes_selected_service_readiness() -> None:
     # @spec PORT-STATE-004 / PORT-STATE-015 / PORT-STATE-016
     from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -337,6 +367,7 @@ class _TombstoneStage:
                 "stage": 0,
                 "replica": 0,
                 "capabilities": ["resident"],
+                "resident_state_scatter_warmup_complete": True,
                 "schema_id": "schema-a",
                 "profile_id": "profile-a",
                 "persistent_state_tombstone_ttl_s": 10.0,
@@ -393,6 +424,57 @@ class _TombstoneStage:
             self.pending_cleanup_calls += 1
             return True
         raise AssertionError(name)
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_public_reserve_is_unavailable_until_profile_is_sealed() -> None:
+    """@spec PORT-STATE-027 / PORT-PERF-005 / ENV-MIG-012."""
+    module = _service_module()
+    from vllm_omni.engine.persistent_state_admission import (
+        AdmissionControllerConfig,
+    )
+
+    stage = _TombstoneStage()
+    service = module.PersistentStateService(
+        stage,
+        tombstone_ttl_s=10.0,
+        max_tombstones=2,
+        admission_config=AdmissionControllerConfig(
+            waiter_capacity=4,
+            max_inflight_reserves=2,
+            dispatch_budget=1,
+            aging_threshold_ns=1_000_000,
+            admission_wait_timeout_s=0.1,
+            retry_floor_ms=10,
+            retry_jitter_ms=0,
+            recovery_backoff_s=(0.01,),
+            release_convergence_timeout_s=0.1,
+            supported_intervals_ms=(80, 160, 320, 560, 1120),
+        ),
+    )
+
+    try:
+        await service.reserve(
+            operation_id="public-before-seal",
+            session_key="session-a",
+            schema_id="schema-a",
+            profile_id="profile-a",
+            service_interval_ms=80,
+        )
+    except module.PersistentStateServiceUnavailable as error:
+        assert any(
+            name in str(error)
+            for name in ("profile", "seal", "bootstrap", "admission")
+        )
+    else:
+        pytest.fail(
+            "PORT-STATE-027 public reserve bypassed the profile seal",
+            pytrace=False,
+        )
+
+    assert stage.reserve_calls == 0
+    assert not service.ready
+    service.shutdown()
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -462,7 +544,7 @@ async def test_completed_operations_are_bounded_tombstones_and_retry_exactly() -
     service.shutdown()
 
 
-_QUALIFIED_ENVELOPE = {
+_EXPLICIT_A36_ENVELOPE = {
     "persistent_state_safety_reserve_slots": 1,
     "max_resident_sessions": 8,
     "persistent_state_reserve_queue_capacity": 8,
@@ -475,29 +557,43 @@ _QUALIFIED_ENVELOPE = {
     "streaming_session_finalization_timeout_s": 40.0,
     "streaming_accepted_audio_capacity_samples": 480_000,
     "streaming_max_retained_transcript_bytes": 1 << 20,
+    "persistent_state_admission_waiter_capacity": 16,
+    "persistent_state_admission_max_inflight_reserves": 4,
+    "persistent_state_admission_dispatch_budget": 1,
+    "persistent_state_admission_aging_threshold_s": 1.0,
+    "persistent_state_admission_wait_timeout_s": 5.0,
+    "persistent_state_admission_retry_floor_ms": 100,
+    "persistent_state_admission_retry_jitter_ms": 25,
+    "persistent_state_recovery_backoff_s": (0.1, 0.5, 1.0),
+    "persistent_state_release_convergence_timeout_s": 61.0,
+    "streaming_unadmitted_connection_timeout_s": 31.125,
+    "persistent_state_service_profile_trailing_rounds": 3,
+    "persistent_state_service_profile_derating_factor": 0.5,
 }
 
 
-def test_runtime_config_resolves_the_qualified_envelope_by_default() -> None:
-    """Omission resolves through PORT-owned defaults (ENV-MIG-009).
-
-    The default envelope IS the qualified one: an explicit full envelope
-    and a defaults-only boot resolve to the same values, so the
-    fingerprint records identical resolved fields either way.
-    """
-    # @spec PORT-STATE-012 / PORT-STATE-013 / ENV-MIG-009
+def test_runtime_config_requires_the_complete_a36_envelope() -> None:
+    """A36 admission fields have no omission defaults before qualification."""
+    # @spec PORT-STATE-012 / PORT-STATE-027 / ENV-MIG-011
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
 
     explicit = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config=dict(_QUALIFIED_ENVELOPE))
+        SimpleNamespace(additional_config=dict(_EXPLICIT_A36_ENVELOPE))
     )
     for defaults_source in (None, {}):
-        defaulted = PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=defaults_source)
-        )
-        assert defaulted == explicit
+        try:
+            PersistentStateRuntimeConfig.from_vllm_config(
+                SimpleNamespace(additional_config=defaults_source)
+            )
+        except ValueError as error:
+            assert "persistent_state_admission" in str(error)
+        else:
+            pytest.fail(
+                "ENV-MIG-011 omitted A36 fields silently resolved",
+                pytrace=False,
+            )
 
     assert explicit.tombstone_ttl_s == 600.0
     assert explicit.max_tombstones == 32
@@ -507,6 +603,54 @@ def test_runtime_config_resolves_the_qualified_envelope_by_default() -> None:
     assert explicit.safe_finalization_timeout_s == pytest.approx(32.24)
     assert explicit.session_finalization_timeout_s == 40.0
     assert explicit.max_session_duration_s is None
+    assert explicit.admission_waiter_capacity == 16
+    assert explicit.admission_max_inflight_reserves == 4
+    assert explicit.admission_dispatch_budget == 1
+    assert explicit.admission_retry_floor_ms == 100
+    assert explicit.unadmitted_connection_timeout_s == pytest.approx(31.125)
+    assert explicit.service_profile_trailing_rounds == 3
+    assert explicit.service_profile_derating_factor == pytest.approx(0.5)
+
+
+def test_runtime_config_reports_every_missing_a36_field_together() -> None:
+    """@spec ENV-MIG-011: one validation error names the complete missing set."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    missing = {
+        "persistent_state_admission_waiter_capacity",
+        "persistent_state_admission_max_inflight_reserves",
+        "persistent_state_admission_dispatch_budget",
+        "persistent_state_admission_aging_threshold_s",
+        "persistent_state_admission_wait_timeout_s",
+        "persistent_state_admission_retry_floor_ms",
+        "persistent_state_admission_retry_jitter_ms",
+        "persistent_state_recovery_backoff_s",
+        "persistent_state_release_convergence_timeout_s",
+        "streaming_unadmitted_connection_timeout_s",
+        "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_service_profile_derating_factor",
+    }
+    old_envelope = {
+        key: value
+        for key, value in _EXPLICIT_A36_ENVELOPE.items()
+        if key not in missing
+    }
+
+    try:
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=old_envelope)
+        )
+    except ValueError as error:
+        message = str(error)
+    else:
+        pytest.fail(
+            "ENV-MIG-011 missing-field set did not fail validation",
+            pytrace=False,
+        )
+
+    assert all(name in message for name in missing)
 
 
 def test_runtime_config_partial_override_stays_self_consistent() -> None:
@@ -517,7 +661,20 @@ def test_runtime_config_partial_override_stays_self_consistent() -> None:
     )
 
     resolved = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config={"max_resident_sessions": 16})
+        SimpleNamespace(
+            additional_config={
+                **{
+                    key: value
+                    for key, value in _EXPLICIT_A36_ENVELOPE.items()
+                    if key
+                    not in {
+                        "persistent_state_reserve_queue_capacity",
+                        "persistent_state_max_tombstones",
+                    }
+                },
+                "max_resident_sessions": 16,
+            }
+        )
     )
     assert resolved.max_resident_sessions == 16
     assert resolved.reserve_queue_capacity == 16
@@ -528,7 +685,16 @@ def test_runtime_config_partial_override_stays_self_consistent() -> None:
     # default with it, instead of failing the cross-field check.
     slow = PersistentStateRuntimeConfig.from_vllm_config(
         SimpleNamespace(
-            additional_config={"persistent_state_operation_timeout_s": 45.0}
+            additional_config={
+                **{
+                    key: value
+                    for key, value in _EXPLICIT_A36_ENVELOPE.items()
+                    if key != "persistent_state_reconciliation_timeout_s"
+                },
+                "persistent_state_operation_timeout_s": 45.0,
+                "persistent_state_release_convergence_timeout_s": 91.0,
+                "streaming_unadmitted_connection_timeout_s": 101.125,
+            }
         )
     )
     assert slow.reconciliation_timeout_s == 45.0
@@ -536,6 +702,7 @@ def test_runtime_config_partial_override_stays_self_consistent() -> None:
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(
                 additional_config={
+                    **_EXPLICIT_A36_ENVELOPE,
                     "persistent_state_operation_timeout_s": 45.0,
                     "persistent_state_reconciliation_timeout_s": 30.0,
                 }
@@ -547,6 +714,11 @@ def test_runtime_config_partial_override_stays_self_consistent() -> None:
     wide = PersistentStateRuntimeConfig.from_vllm_config(
         SimpleNamespace(
             additional_config={
+                **{
+                    key: value
+                    for key, value in _EXPLICIT_A36_ENVELOPE.items()
+                    if key != "streaming_session_finalization_timeout_s"
+                },
                 "streaming_accepted_audio_capacity_samples": 960_000
             }
         )
@@ -564,10 +736,17 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
         PersistentStateRuntimeConfig,
     )
 
-    for key in _QUALIFIED_ENVELOPE:
-        with pytest.raises(ValueError, match=key):
+    for key in _EXPLICIT_A36_ENVELOPE:
+        try:
             PersistentStateRuntimeConfig.from_vllm_config(
                 SimpleNamespace(additional_config={key: None})
+            )
+        except ValueError as error:
+            assert key in str(error)
+        else:
+            pytest.fail(
+                f"ENV-MIG-009/011 explicit null was accepted for {key}",
+                pytrace=False,
             )
 
     with pytest.raises(ValueError, match="streaming_session_idle_timeout_s"):
@@ -577,14 +756,14 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
             )
         )
 
-    unprefixed = dict(_QUALIFIED_ENVELOPE)
+    unprefixed = dict(_EXPLICIT_A36_ENVELOPE)
     unprefixed["session_idle_timeout_s"] = 60.0
     with pytest.raises(ValueError, match="streaming_ prefix"):
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(additional_config=unprefixed)
         )
 
-    too_short = dict(_QUALIFIED_ENVELOPE)
+    too_short = dict(_EXPLICIT_A36_ENVELOPE)
     too_short["streaming_session_finalization_timeout_s"] = 32.0
     with pytest.raises(ValueError, match="safe drain bound"):
         PersistentStateRuntimeConfig.from_vllm_config(
@@ -594,6 +773,59 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
     with pytest.raises(ValueError, match="must be a mapping"):
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(additional_config="not-a-mapping")
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"persistent_state_admission_dispatch_budget": 5},
+            "dispatch|inflight",
+        ),
+        (
+            {"persistent_state_admission_aging_threshold_s": 5.0},
+            "aging|wait",
+        ),
+        (
+            {"persistent_state_admission_retry_floor_ms": 0},
+            "retry.*floor",
+        ),
+        (
+            {"streaming_unadmitted_connection_timeout_s": 30.0},
+            "unadmitted|retry cycle",
+        ),
+        (
+            {"persistent_state_release_convergence_timeout_s": 60.0},
+            "release.*convergence|reconciliation",
+        ),
+        (
+            {"persistent_state_recovery_backoff_s": ()},
+            "recovery.*backoff",
+        ),
+    ],
+)
+def test_runtime_config_enforces_a36_cross_field_ordering(
+    updates: dict[str, Any],
+    message: str,
+) -> None:
+    """@spec ENV-MIG-011: unsafe controller timing cannot reach serving."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    try:
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(
+                additional_config={**_EXPLICIT_A36_ENVELOPE, **updates}
+            )
+        )
+    except ValueError as error:
+        assert re.search(message, str(error))
+    else:
+        pytest.fail(
+            f"ENV-MIG-011 unsafe cross-field values were accepted: {updates}",
+            pytrace=False,
         )
 
 
@@ -651,20 +883,14 @@ def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
     manager, _, spec = make_manager(
         require_persistent_state_module(), num_gpu_blocks=3
     )
-    runtime_values = {
-        "persistent_state_safety_reserve_slots": 1,
-        "max_resident_sessions": 1,
-        "persistent_state_reserve_queue_capacity": 1,
-        "persistent_state_operation_timeout_s": 10.0,
-        "persistent_state_reconciliation_timeout_s": 30.0,
-        "persistent_state_tombstone_ttl_s": 10.0,
-        "persistent_state_max_tombstones": 2,
-        "persistent_state_pending_claim_timeout_s": 15.0,
-        "streaming_session_configuration_timeout_s": 10.0,
-        "streaming_session_finalization_timeout_s": 40.0,
-        "streaming_accepted_audio_capacity_samples": 480_000,
-        "streaming_max_retained_transcript_bytes": 1 << 20,
-    }
+    runtime_values = dict(
+        _EXPLICIT_A36_ENVELOPE,
+        max_resident_sessions=1,
+        persistent_state_reserve_queue_capacity=1,
+        persistent_state_admission_max_inflight_reserves=1,
+        persistent_state_tombstone_ttl_s=10.0,
+        persistent_state_max_tombstones=2,
+    )
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)
     core.scheduler = SimpleNamespace(
@@ -716,20 +942,14 @@ def _state_core_for_cleanup_tests() -> tuple[Any, Any, Any]:
     manager, _, spec = make_manager(
         require_persistent_state_module(), num_gpu_blocks=4
     )
-    runtime_values = {
-        "persistent_state_safety_reserve_slots": 1,
-        "max_resident_sessions": 2,
-        "persistent_state_reserve_queue_capacity": 2,
-        "persistent_state_operation_timeout_s": 10.0,
-        "persistent_state_reconciliation_timeout_s": 30.0,
-        "persistent_state_tombstone_ttl_s": 10.0,
-        "persistent_state_max_tombstones": 4,
-        "persistent_state_pending_claim_timeout_s": 15.0,
-        "streaming_session_configuration_timeout_s": 10.0,
-        "streaming_session_finalization_timeout_s": 40.0,
-        "streaming_accepted_audio_capacity_samples": 480_000,
-        "streaming_max_retained_transcript_bytes": 1 << 20,
-    }
+    runtime_values = dict(
+        _EXPLICIT_A36_ENVELOPE,
+        max_resident_sessions=2,
+        persistent_state_reserve_queue_capacity=2,
+        persistent_state_admission_max_inflight_reserves=2,
+        persistent_state_tombstone_ttl_s=10.0,
+        persistent_state_max_tombstones=4,
+    )
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)
     core.scheduler = SimpleNamespace(

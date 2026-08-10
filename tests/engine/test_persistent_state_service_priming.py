@@ -42,6 +42,13 @@ class _PrimingService:
     resident: int = 0
 
     async def reserve(self, **kwargs: Any) -> Any:
+        del kwargs
+        pytest.fail(
+            "PORT-PERF-005 priming crossed the public reserve surface",
+            pytrace=False,
+        )
+
+    async def reserve_for_priming(self, **kwargs: Any) -> Any:
         operation_id = str(kwargs["operation_id"])
         session_key = str(kwargs["session_key"])
         self.events.append(("reserve", operation_id))
