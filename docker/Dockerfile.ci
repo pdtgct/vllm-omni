@@ -5,7 +5,10 @@ ARG VLLM_BASE_IMAGE=vllm/vllm-openai
 ARG VLLM_BASE_TAG=v0.25.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG VLLM_OMNI_VERSION=0.25.0
-ARG APP_DIR=/workspace/vllm-omni
+# `/workspace` is reserved for the persistent RunPod volume.  Keep the image
+# source outside it so the container's working directory and installed wheel
+# are not shadowed when the volume is mounted.
+ARG APP_DIR=/opt/vllm-omni
 WORKDIR ${APP_DIR}
 COPY . .
 
