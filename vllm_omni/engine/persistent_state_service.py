@@ -851,7 +851,7 @@ class PersistentStateService:
                 service_source=str(
                     getattr(receipt, "service_budget_source", "measured_fallback")
                 ),
-                service_budget=1.0,
+                service_budget=float(profile.derating_factor),
                 charged_demand=float(inventory["charged_demand"]),
                 execution_claims=projection.execution_claims,
                 max_num_seqs=projection.max_num_seqs,
