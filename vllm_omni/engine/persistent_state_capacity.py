@@ -618,7 +618,7 @@ def project_fixed_dispatch_capacity(
     submitted_counts_by_interval: Mapping[int, int],
     authority_open: bool,
 ) -> FixedDispatchCapacity:
-    """Project one dispatch decision from five counters and table lookups.
+    """Project one dispatch decision from bounded counters and table lookups.
 
     The serving path never calls the population-shaped rational oracle. It
     charges the compiled integer profile and evaluates at most one candidate
@@ -629,9 +629,13 @@ def project_fixed_dispatch_capacity(
     """
 
     intervals = profile.compiled_demand.intervals_ms
-    if intervals != _SERVICE_INTERVALS_MS:
+    if (
+        not 1 <= len(intervals) <= len(_SERVICE_INTERVALS_MS)
+        or len(set(intervals)) != len(intervals)
+        or any(interval <= 0 for interval in intervals)
+    ):
         raise ValueError(
-            "compiled service profile must cover the five admitted intervals"
+            "compiled service profile must cover one to five unique intervals"
         )
     interval_to_geometry: dict[int, int] = {}
     for geometry_id, interval in profile.service_interval_ms_by_geometry.items():

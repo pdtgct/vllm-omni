@@ -20,7 +20,6 @@ from vllm_omni.engine.persistent_state_priming import (
 )
 from vllm_omni.engine.persistent_state_service import PersistentStateService
 
-_SUPPORTED_SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1120)
 _REQUIRED_STARTUP_INVENTORY = frozenset(
     {
         "configured_limit",
@@ -39,6 +38,8 @@ _REQUIRED_STARTUP_INVENTORY = frozenset(
 # @spec PORT-STATE-027 / ENV-MIG-011
 def derive_admission_controller_config(
     runtime_config: Any,
+    *,
+    supported_intervals_ms: tuple[int, ...],
 ) -> AdmissionControllerConfig:
     """Project the validated process envelope into controller-native units."""
 
@@ -61,7 +62,7 @@ def derive_admission_controller_config(
         release_convergence_timeout_s=float(
             runtime_config.release_convergence_timeout_s
         ),
-        supported_intervals_ms=_SUPPORTED_SERVICE_INTERVALS_MS,
+        supported_intervals_ms=supported_intervals_ms,
     )
 
 
@@ -120,7 +121,6 @@ async def prepare_persistent_state_service(
 ) -> PersistentStateService:
     """Bootstrap, prime, compile, and seal one selected state service."""
 
-    admission_config = derive_admission_controller_config(runtime_config)
     service = PersistentStateService(
         stage_client,
         reserve_queue_capacity=int(runtime_config.reserve_queue_capacity),
@@ -160,6 +160,7 @@ async def prepare_persistent_state_service(
             inventory=inventory,
             model_config=engine_client.model_config,
         )
+        service.configure_bootstrap_intervals(plan.served_intervals_ms)
         async def run_plan() -> list[Any]:
             observations: list[Any] = []
             for round_spec in plan.rounds:
@@ -214,6 +215,10 @@ async def prepare_persistent_state_service(
         compiled = compile_provisional_service_profile(
             _service_executions(observations),
             **compile_kwargs,
+        )
+        admission_config = derive_admission_controller_config(
+            runtime_config,
+            supported_intervals_ms=compiled.compiled_demand.intervals_ms,
         )
         service.seal_startup_profile(
             admission_config=admission_config,
