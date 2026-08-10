@@ -95,6 +95,9 @@ from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.engine.persistent_state_service import (
     PersistentStateServiceUnavailable,
 )
+from vllm_omni.engine.persistent_state_startup import (
+    prepare_persistent_state_service,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -712,6 +715,8 @@ async def build_async_omni_from_stage_config(
 async def _install_persistent_state_service(
     engine_client: EngineClient,
     vllm_config: Any,
+    *,
+    host_fatal_callback: Any | None = None,
 ) -> Any | None:
     """Install and inventory one selected model's state service."""
 
@@ -733,30 +738,40 @@ async def _install_persistent_state_service(
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
-    from vllm_omni.engine.persistent_state_service import (
-        PersistentStateService,
-    )
-
     runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
-    service = PersistentStateService(
-        stage_clients[0],
-        reserve_queue_capacity=runtime.reserve_queue_capacity,
-        cleanup_queue_capacity=runtime.cleanup_queue_capacity,
-        operation_timeout_s=runtime.operation_timeout_s,
-        reconciliation_timeout_s=runtime.reconciliation_timeout_s,
-        tombstone_ttl_s=runtime.tombstone_ttl_s,
-        max_tombstones=runtime.max_tombstones,
-        pending_claim_timeout_s=runtime.pending_claim_timeout_s,
-        runtime_config=runtime,
+    startup_provider = getattr(
+        model_cls,
+        "persistent_state_startup_provider",
+        None,
     )
-    try:
-        await service.check_health()
-    except BaseException:
-        service.shutdown()
-        raise
+    if startup_provider is None:
+        raise RuntimeError(
+            "persistent-state model is missing its startup provider"
+        )
+    service = await prepare_persistent_state_service(
+        engine_client=engine_client,
+        stage_client=stage_clients[0],
+        runtime_config=runtime,
+        startup_provider=startup_provider,
+        host_fatal_callback=host_fatal_callback,
+    )
     engine_client.install_persistent_state_service(service)
     logger.info("Persistent-state service installed and ready")
     return service
+
+
+def _persistent_state_host_fatal_callback(
+    *,
+    state: State,
+    engine_client: Any,
+) -> Any:
+    """Route one state-authority fatal into upstream engine supervision."""
+
+    def report(error: BaseException) -> None:
+        engine_client.report_persistent_state_fatal(error)
+        terminate_if_errored(server=state.server, engine=engine_client)
+
+    return report
 
 
 def _install_streaming_observer_and_build_realtime_serving(
@@ -947,7 +962,12 @@ async def omni_init_app_state(
     # before any serving object can admit audio or readiness can succeed.
     if vllm_config is not None:
         state.persistent_state_service = await _install_persistent_state_service(
-            engine_client, vllm_config
+            engine_client,
+            vllm_config,
+            host_fatal_callback=_persistent_state_host_fatal_callback(
+                state=state,
+                engine_client=engine_client,
+            ),
         )
 
     # Get supported tasks
@@ -1812,7 +1832,15 @@ async def health(raw_request: Request) -> JSONResponse:
     try:
         await engine_client.check_health()
         return JSONResponse(content={"status": "healthy"})
-    except (EngineDeadError, PersistentStateServiceUnavailable) as error:
+    except PersistentStateServiceUnavailable:
+        return JSONResponse(
+            content={
+                "status": "unhealthy",
+                "reason": "persistent_state_unavailable",
+            },
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    except EngineDeadError as error:
         return JSONResponse(
             content={"status": "unhealthy", "reason": str(error)},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,

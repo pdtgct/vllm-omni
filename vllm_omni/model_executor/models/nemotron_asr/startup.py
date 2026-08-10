@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Model-owned startup priming plan for Nemotron streaming ASR."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass
+from fractions import Fraction
+from types import SimpleNamespace
+from typing import Any
+
+from vllm_omni.engine.persistent_state_capacity import (
+    ServiceExecutionTier,
+    ServiceProfileContext,
+)
+from vllm_omni.engine.persistent_state_priming import ServicePrimingRound
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    CADENCES,
+    RAW_SAMPLES_PER_CHUNK,
+)
+
+
+@dataclass(frozen=True)
+class NemotronServicePrimingPlan:
+    """Finite eager-runner geometry plan and arithmetic compiler inputs."""
+
+    rounds: tuple[ServicePrimingRound, ...]
+    compile_kwargs: dict[str, Any]
+
+
+class NemotronPersistentStateStartupProvider:
+    """Construct ordinary synthetic requests below the public session API."""
+
+    def build_priming_plan(
+        self,
+        *,
+        runtime_config: Any,
+        inventory: dict[str, Any],
+    ) -> NemotronServicePrimingPlan:
+        maximum_population = min(
+            int(inventory["effective_capacity"]),
+            int(inventory["execution_claim_ceiling"]),
+        )
+        if maximum_population <= 0:
+            raise RuntimeError(
+                "persistent-state priming requires positive effective capacity"
+            )
+        trailing_rounds = int(runtime_config.service_profile_trailing_rounds)
+        tiers = [
+            ServiceExecutionTier(
+                tier_id="single",
+                max_active_population=1,
+            )
+        ]
+        if maximum_population > 1:
+            tiers.append(
+                ServiceExecutionTier(
+                    tier_id="eager-bulk",
+                    max_active_population=maximum_population,
+                )
+            )
+        rounds: list[ServicePrimingRound] = []
+        for geometry_id, cadence in enumerate(CADENCES):
+            service_interval_ms = int(cadence.removesuffix("ms"))
+            for tier in tiers:
+                for repeat in range(trailing_rounds + 1):
+                    rounds.append(
+                        ServicePrimingRound(
+                            round_id=(
+                                f"geometry-{geometry_id}-{tier.tier_id}-"
+                                f"repeat-{repeat}"
+                            ),
+                            service_interval_ms=service_interval_ms,
+                            geometry_id=geometry_id,
+                            active_population=tier.max_active_population,
+                            schema_id=str(inventory["schema_id"]),
+                            profile_id=str(inventory["profile_id"]),
+                            tier_id=tier.tier_id,
+                            post_jit=repeat > 0,
+                            continuously_loaded=True,
+                        )
+                    )
+        derating = Fraction(
+            str(runtime_config.service_profile_derating_factor)
+        )
+        context = ServiceProfileContext(
+            pre_override_physical_bound=int(inventory["physical_capacity"]),
+            allocated_pool=int(inventory["physical_capacity"]),
+            count_cap=int(inventory["configured_limit"]),
+            execution_claim_ceiling=int(
+                inventory["execution_claim_ceiling"]
+            ),
+            service_budget_source="measured_fallback",
+            service_budget_coefficients=(),
+            derating_factor=derating,
+            slot_bytes=int(inventory["slot_bytes"]),
+            execution_environment_key=str(
+                inventory["execution_environment_key"]
+            ),
+            precision_policy=str(inventory["precision_policy"]),
+            state_profile=str(inventory["profile_id"]),
+            compiler_version="persistent-state-service-v1",
+            mixed_composition_policy="homogeneous_upper_sum",
+        )
+        return NemotronServicePrimingPlan(
+            rounds=tuple(rounds),
+            compile_kwargs={
+                "execution_tiers": tuple(tiers),
+                "max_population": maximum_population,
+                "reference_interval_ms": 1120,
+                "reference_geometry_id": len(CADENCES) - 1,
+                "admitted_geometry_ids": tuple(range(len(CADENCES))),
+                "trailing_rounds": trailing_rounds,
+                "derating_factor": derating,
+                "context": context,
+            },
+        )
+
+    async def execute_priming_round(
+        self,
+        *,
+        engine_client: Any,
+        round_spec: ServicePrimingRound,
+        leases: tuple[Any, ...],
+    ) -> Any:
+        """Drive one complete homogeneous round through legal park."""
+
+        import numpy as np
+
+        from vllm_omni.entrypoints.nemotron_session import (
+            NemotronSessionLease,
+        )
+        from vllm_omni.model_executor.models.nemotron_asr.session import (
+            NemotronRealtimeSession,
+        )
+
+        cadence = f"{round_spec.service_interval_ms}ms"
+        if cadence not in CADENCES:
+            raise ValueError(f"unknown priming cadence {cadence}")
+        hf_config = getattr(
+            engine_client.model_config,
+            "hf_config",
+            engine_client.model_config,
+        )
+        prompts = getattr(hf_config, "prompt_dictionary", None)
+        if not isinstance(prompts, dict) or not prompts:
+            raise RuntimeError(
+                "persistent-state priming requires the served prompt dictionary"
+            )
+        locale = str(next(iter(prompts)))
+        bound: list[NemotronSessionLease] = []
+        for state_lease in leases:
+            session = NemotronRealtimeSession.from_model_config(
+                engine_client.model_config,
+                cadence=cadence,
+                locale=locale,
+                with_ledger=True,
+                request_id=str(state_lease.session_key),
+                engine_epoch=str(state_lease.engine_epoch),
+                lease_generation=int(state_lease.generation),
+            )
+            bound.append(
+                NemotronSessionLease(
+                    engine=engine_client,
+                    session=session,
+                    request_id=str(state_lease.session_key),
+                    state_lease=state_lease,
+                )
+            )
+        samples = np.zeros(
+            RAW_SAMPLES_PER_CHUNK[cadence],
+            dtype=np.float32,
+        )
+        started_ns = time.monotonic_ns()
+        try:
+            await asyncio.gather(*(lease.feed(samples) for lease in bound))
+            elapsed_ns = time.monotonic_ns() - started_ns
+        finally:
+            await asyncio.gather(
+                *(lease.abort() for lease in bound),
+                return_exceptions=True,
+            )
+        return SimpleNamespace(
+            completed_legal_parks=len(bound),
+            elapsed_ns=elapsed_ns,
+            completed_model_rows=None,
+            dummy_run=False,
+            is_profile=False,
+        )
+
+
+NEMOTRON_PERSISTENT_STATE_STARTUP = NemotronPersistentStateStartupProvider()
+
+
+__all__ = [
+    "NEMOTRON_PERSISTENT_STATE_STARTUP",
+    "NemotronPersistentStateStartupProvider",
+    "NemotronServicePrimingPlan",
+]
