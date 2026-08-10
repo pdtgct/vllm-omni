@@ -15,7 +15,12 @@ from vllm_omni.engine.persistent_state_capacity import (
     ServiceExecutionTier,
     ServiceProfileContext,
 )
-from vllm_omni.engine.persistent_state_priming import ServicePrimingRound
+from vllm_omni.engine.persistent_state_priming import (
+    ServicePrimingBudgetCell,
+    ServicePrimingBudgetDescriptor,
+    ServicePrimingRound,
+    validate_service_priming_plan,
+)
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
     RAW_SAMPLES_PER_CHUNK,
@@ -28,10 +33,41 @@ class NemotronServicePrimingPlan:
 
     rounds: tuple[ServicePrimingRound, ...]
     compile_kwargs: dict[str, Any]
+    actual_plan_sha256: str
+    actual_operation_count: int
 
 
 class NemotronPersistentStateStartupProvider:
     """Construct ordinary synthetic requests below the public session API."""
+
+    def build_priming_budget_descriptor(
+        self,
+        *,
+        configured_population_ceiling: int,
+        trailing_rounds: int,
+    ) -> ServicePrimingBudgetDescriptor:
+        """Declare the maximum plan before either control plane exists."""
+
+        if configured_population_ceiling <= 0 or trailing_rounds <= 0:
+            raise ValueError("priming budget inputs must be positive")
+        tiers = [("single", 1)]
+        if configured_population_ceiling > 1:
+            tiers.append(("eager-bulk", configured_population_ceiling))
+        repetitions = trailing_rounds + 1
+        return ServicePrimingBudgetDescriptor(
+            policy_version="nemotron-service-priming-v1",
+            configured_population_ceiling=configured_population_ceiling,
+            cells=tuple(
+                ServicePrimingBudgetCell(
+                    geometry_id=geometry_id,
+                    tier_id=tier_id,
+                    max_active_population=population,
+                    repetitions=repetitions,
+                )
+                for geometry_id in range(len(CADENCES))
+                for tier_id, population in tiers
+            ),
+        )
 
     def build_priming_plan(
         self,
@@ -85,6 +121,12 @@ class NemotronPersistentStateStartupProvider:
         derating = Fraction(
             str(runtime_config.service_profile_derating_factor)
         )
+        rounds_tuple = tuple(rounds)
+        budget = runtime_config.priming_budget_descriptor
+        plan_identity = validate_service_priming_plan(
+            descriptor=budget,
+            rounds=rounds_tuple,
+        )
         context = ServiceProfileContext(
             pre_override_physical_bound=int(inventory["physical_capacity"]),
             allocated_pool=int(inventory["physical_capacity"]),
@@ -105,7 +147,7 @@ class NemotronPersistentStateStartupProvider:
             mixed_composition_policy="homogeneous_upper_sum",
         )
         return NemotronServicePrimingPlan(
-            rounds=tuple(rounds),
+            rounds=rounds_tuple,
             compile_kwargs={
                 "execution_tiers": tuple(tiers),
                 "max_population": maximum_population,
@@ -115,7 +157,17 @@ class NemotronPersistentStateStartupProvider:
                 "trailing_rounds": trailing_rounds,
                 "derating_factor": derating,
                 "context": context,
+                "startup_priming_receipt": {
+                    "budget_sha256": budget.sha256,
+                    "bootstrap_operation_budget": (
+                        budget.bootstrap_operation_budget
+                    ),
+                    "actual_plan_sha256": plan_identity.sha256,
+                    "actual_operation_count": plan_identity.operation_count,
+                },
             },
+            actual_plan_sha256=plan_identity.sha256,
+            actual_operation_count=plan_identity.operation_count,
         )
 
     async def execute_priming_round(

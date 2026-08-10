@@ -43,8 +43,35 @@ def _persistent_state_runtime_values() -> dict[str, Any]:
         "persistent_state_release_convergence_timeout_s": 60.01,
         "streaming_unadmitted_connection_timeout_s": 20.21,
         "persistent_state_service_profile_trailing_rounds": 3,
+        "persistent_state_startup_priming_timeout_s": 120.0,
         "persistent_state_service_profile_derating_factor": 0.5,
     }
+
+
+class _StartupProvider:
+    def build_priming_budget_descriptor(
+        self,
+        *,
+        configured_population_ceiling: int,
+        trailing_rounds: int,
+    ) -> Any:
+        from vllm_omni.engine.persistent_state_priming import (
+            ServicePrimingBudgetCell,
+            ServicePrimingBudgetDescriptor,
+        )
+
+        return ServicePrimingBudgetDescriptor(
+            policy_version="test-v1",
+            configured_population_ceiling=configured_population_ceiling,
+            cells=(
+                ServicePrimingBudgetCell(
+                    geometry_id=0,
+                    tier_id="test",
+                    max_active_population=1,
+                    repetitions=trailing_rounds + 1,
+                ),
+            ),
+        )
 
 
 class _WebSocket:
@@ -957,7 +984,7 @@ async def test_app_state_inventories_service_before_install(
 
     class _PersistentModel:
         supports_persistent_state = True
-        persistent_state_startup_provider = object()
+        persistent_state_startup_provider = _StartupProvider()
 
     class _Stage:
         def __init__(self) -> None:
@@ -1007,7 +1034,11 @@ async def test_app_state_inventories_service_before_install(
         engine,
         SimpleNamespace(
             model_config=object(),
-            additional_config=_persistent_state_runtime_values(),
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            additional_config={
+                **_persistent_state_runtime_values(),
+                "persistent_state_max_tombstones": 40,
+            },
         ),
     )
 
@@ -1029,7 +1060,7 @@ async def test_failed_inventory_never_installs_service(
 
     class _PersistentModel:
         supports_persistent_state = True
-        persistent_state_startup_provider = object()
+        persistent_state_startup_provider = _StartupProvider()
 
     class _Stage:
         async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
@@ -1053,7 +1084,11 @@ async def test_failed_inventory_never_installs_service(
             engine,
             SimpleNamespace(
                 model_config=object(),
-                additional_config=_persistent_state_runtime_values(),
+                scheduler_config=SimpleNamespace(max_num_seqs=4),
+                additional_config={
+                    **_persistent_state_runtime_values(),
+                    "persistent_state_max_tombstones": 40,
+                },
             ),
         )
 

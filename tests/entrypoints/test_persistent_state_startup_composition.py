@@ -355,7 +355,11 @@ async def test_api_install_delegates_to_one_typed_preparation_function(
     monkeypatch.setattr(
         persistent_state_config.PersistentStateRuntimeConfig,
         "from_vllm_config",
-        classmethod(lambda cls, config: runtime),
+        classmethod(
+            lambda cls, config, *, startup_provider: (
+                runtime if startup_provider is provider else None
+            )
+        ),
     )
 
     def fatal(error: BaseException) -> None:

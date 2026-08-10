@@ -810,7 +810,9 @@ def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:
     }
     config = SimpleNamespace(
         additional_config=values,
-        model_config=SimpleNamespace(architectures=(ARCHITECTURE,)),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 
@@ -840,7 +842,9 @@ def test_selected_model_rejects_tombstone_horizon_below_derived_minimum() -> Non
             **_EXPLICIT_A36_ENVELOPE,
             "persistent_state_max_tombstones": 391,
         },
-        model_config=SimpleNamespace(architectures=(ARCHITECTURE,)),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 

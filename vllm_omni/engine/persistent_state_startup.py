@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from fractions import Fraction
 from typing import Any
 
@@ -158,24 +159,53 @@ async def prepare_persistent_state_service(
             runtime_config=runtime_config,
             inventory=inventory,
         )
-        observations: list[Any] = []
-        for round_spec in plan.rounds:
+        async def run_plan() -> list[Any]:
+            observations: list[Any] = []
+            for round_spec in plan.rounds:
 
-            async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
-                return await startup_provider.execute_priming_round(
-                    engine_client=engine_client,
-                    round_spec=spec,
-                    leases=leases,
-                )
+                async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
+                    return await startup_provider.execute_priming_round(
+                        engine_client=engine_client,
+                        round_spec=spec,
+                        leases=leases,
+                    )
 
-            observations.append(
-                await run_service_priming_round(
-                    service=service,
-                    round_spec=round_spec,
-                    execute=execute,
+                observations.append(
+                    await run_service_priming_round(
+                        service=service,
+                        round_spec=round_spec,
+                        execute=execute,
+                        rollback_timeout_s=float(
+                            runtime_config.release_convergence_timeout_s
+                        ),
+                    )
                 )
-            )
+            return observations
+
+        observations = await asyncio.wait_for(
+            run_plan(),
+            timeout=float(runtime_config.startup_priming_timeout_s),
+        )
         compile_kwargs = dict(plan.compile_kwargs)
+        startup_receipt = dict(
+            compile_kwargs.get("startup_priming_receipt", {})
+        )
+        if startup_receipt:
+            startup_receipt.update(
+                {
+                    "configured_population_ceiling": (
+                        runtime_config.priming_configured_population_ceiling
+                    ),
+                    "runtime_tombstone_allowance": (
+                        runtime_config.runtime_tombstone_allowance
+                    ),
+                    "resolved_max_tombstones": runtime_config.max_tombstones,
+                    "startup_priming_timeout_s": (
+                        runtime_config.startup_priming_timeout_s
+                    ),
+                }
+            )
+            compile_kwargs["startup_priming_receipt"] = startup_receipt
         if "derating_factor" in compile_kwargs:
             compile_kwargs["derating_factor"] = Fraction(
                 compile_kwargs["derating_factor"]

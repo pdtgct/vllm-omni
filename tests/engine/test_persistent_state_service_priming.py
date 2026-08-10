@@ -308,6 +308,59 @@ def test_cleanup_failure_without_primary_fails_the_round() -> None:
     asyncio.run(scenario())
 
 
+def test_timeout_cancellation_cannot_interrupt_inflight_release_fanout() -> None:
+    """@spec ENV-MIG-012: the primary clock cannot abandon rollback."""
+
+    class SlowReleaseService(_PrimingService):
+        def __init__(self, events: list[tuple[str, str]]) -> None:
+            super().__init__(events)
+            self.release_started = asyncio.Event()
+            self.release_count = 0
+
+        async def release(self, **kwargs: Any) -> None:
+            lease = kwargs["lease"]
+            self.events.append(("release-start", str(lease.operation_id)))
+            self.release_count += 1
+            if self.release_count == 2:
+                self.release_started.set()
+            await asyncio.sleep(0.02)
+            self.resident -= 1
+            self.events.append(("release-done", str(lease.operation_id)))
+
+    async def scenario() -> None:
+        service = SlowReleaseService([])
+
+        async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
+            del spec
+            return SimpleNamespace(
+                completed_legal_parks=len(leases),
+                elapsed_ns=1,
+                completed_model_rows=None,
+                dummy_run=False,
+                is_profile=False,
+            )
+
+        task = asyncio.create_task(
+            _symbol("run_service_priming_round")(
+                service=service,
+                round_spec=_round(active_population=2),
+                execute=execute,
+                rollback_timeout_s=0.5,
+            )
+        )
+        await service.release_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert service.resident == 0
+        assert len(
+            [event for event in service.events if event[0] == "release-done"]
+        ) == 2
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("marker", ["dummy_run", "is_profile"])
 def test_service_priming_rejects_memory_profile_markers(marker: str) -> None:
     """@spec PORT-MIG-005 / PORT-PERF-005: profile authorities never merge."""

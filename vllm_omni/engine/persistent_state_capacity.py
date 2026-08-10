@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from math import floor
+from types import MappingProxyType
 from typing import Protocol
 
 _INT64_MAX = 2**63 - 1
@@ -315,6 +316,7 @@ class ServiceProfileReceipt:
     precision_policy: str
     state_profile: str
     receipt_sha256: str
+    startup_priming: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -385,6 +387,7 @@ def compile_provisional_service_profile(
     trailing_rounds: int,
     derating_factor: Fraction,
     context: ServiceProfileContext,
+    startup_priming_receipt: Mapping[str, object] | None = None,
 ) -> StartupServiceProfile:
     """Compile complete post-JIT legal-park rounds into startup authority."""
     if max_population <= 0 or trailing_rounds <= 0:
@@ -528,6 +531,8 @@ def compile_provisional_service_profile(
             for key, value in asdict(context).items()
         },
     }
+    if startup_priming_receipt is not None:
+        receipt_payload["startup_priming"] = dict(startup_priming_receipt)
     receipt_hash = _hash_json(receipt_payload)
     receipt = ServiceProfileReceipt(
         compiler_version=context.compiler_version,
@@ -556,6 +561,11 @@ def compile_provisional_service_profile(
         precision_policy=context.precision_policy,
         state_profile=context.state_profile,
         receipt_sha256=receipt_hash,
+        startup_priming=(
+            None
+            if startup_priming_receipt is None
+            else MappingProxyType(dict(startup_priming_receipt))
+        ),
     )
     return StartupServiceProfile(
         upper_duration_ns_by_geometry_and_population=expanded,

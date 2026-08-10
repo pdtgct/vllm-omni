@@ -1164,6 +1164,29 @@ class PersistentStateService:
             raise PersistentStateServiceUnavailable(
                 "persistent-state tombstone count disagrees across processes"
             )
+        runtime = self._runtime_config
+        if runtime is not None:
+            expected = {
+                "persistent_state_priming_budget_sha256": str(
+                    runtime.priming_budget_sha256
+                ),
+                "persistent_state_bootstrap_operation_budget": int(
+                    runtime.bootstrap_operation_budget
+                ),
+                "persistent_state_runtime_tombstone_allowance": int(
+                    runtime.runtime_tombstone_allowance
+                ),
+            }
+            mismatched = [
+                name
+                for name, value in expected.items()
+                if snapshot.get(name) != value
+            ]
+            if mismatched:
+                raise PersistentStateServiceUnavailable(
+                    "persistent-state priming budget disagrees across "
+                    f"processes: {mismatched}"
+                )
         await self._reconcile_failed_releases(snapshot)
         await self._reconcile_orphan_bindings(snapshot)
         self._ensure_dispatcher()
