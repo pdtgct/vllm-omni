@@ -487,7 +487,12 @@ def compile_provisional_service_profile(
         default=0,
     )
     if measured_capacity == 0:
-        raise ValueError("reference service interval cannot support one session")
+        raise ValueError(
+            "reference service interval "
+            f"{reference_interval_ms}ms cannot support one session; "
+            "measured population-one upper duration is "
+            f"{reference_upper[0]}ns"
+        )
     provisional = max(1, floor(measured_capacity * derating_factor))
     reference_demand = Fraction(1, provisional)
     demand_model = OnePointServiceDemand(reference_interval_ms, reference_demand)
