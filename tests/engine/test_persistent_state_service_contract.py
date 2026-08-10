@@ -706,6 +706,7 @@ _EXPLICIT_A36_ENVELOPE = {
     "persistent_state_release_convergence_timeout_s": 61.0,
     "streaming_unadmitted_connection_timeout_s": 31.125,
     "persistent_state_service_profile_trailing_rounds": 3,
+    "persistent_state_startup_priming_timeout_s": 120.0,
     "persistent_state_service_profile_derating_factor": 0.5,
 }
 
@@ -747,6 +748,7 @@ def test_runtime_config_requires_the_complete_a36_envelope() -> None:
     assert explicit.admission_retry_floor_ms == 100
     assert explicit.unadmitted_connection_timeout_s == pytest.approx(31.125)
     assert explicit.service_profile_trailing_rounds == 3
+    assert explicit.startup_priming_timeout_s == pytest.approx(120.0)
     assert explicit.service_profile_derating_factor == pytest.approx(0.5)
 
 
@@ -768,6 +770,7 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         "persistent_state_release_convergence_timeout_s",
         "streaming_unadmitted_connection_timeout_s",
         "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_timeout_s",
         "persistent_state_service_profile_derating_factor",
     }
     old_envelope = {
@@ -789,6 +792,60 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         )
 
     assert all(name in message for name in missing)
+
+
+def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:
+    """@spec ENV-MIG-009/012 / PORT-STATE-012: startup cannot eat runtime."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.identity import (
+        ARCHITECTURE,
+    )
+
+    values = {
+        key: value
+        for key, value in _EXPLICIT_A36_ENVELOPE.items()
+        if key != "persistent_state_max_tombstones"
+    }
+    config = SimpleNamespace(
+        additional_config=values,
+        model_config=SimpleNamespace(architectures=(ARCHITECTURE,)),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+
+    api_runtime = PersistentStateRuntimeConfig.from_vllm_config(config)
+    core_runtime = PersistentStateRuntimeConfig.from_vllm_config(config)
+
+    assert api_runtime.priming_configured_population_ceiling == 8
+    assert api_runtime.bootstrap_operation_budget == 360
+    assert api_runtime.runtime_tombstone_allowance == 32
+    assert api_runtime.max_tombstones == 392
+    assert len(api_runtime.priming_budget_sha256) == 64
+    assert core_runtime.priming_budget_sha256 == api_runtime.priming_budget_sha256
+    assert core_runtime.max_tombstones == api_runtime.max_tombstones
+
+
+def test_selected_model_rejects_tombstone_horizon_below_derived_minimum() -> None:
+    """@spec ENV-MIG-009/012: explicit horizon cannot underfund bootstrap."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.identity import (
+        ARCHITECTURE,
+    )
+
+    config = SimpleNamespace(
+        additional_config={
+            **_EXPLICIT_A36_ENVELOPE,
+            "persistent_state_max_tombstones": 391,
+        },
+        model_config=SimpleNamespace(architectures=(ARCHITECTURE,)),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+
+    with pytest.raises(ValueError, match="bootstrap|392|tombstone"):
+        PersistentStateRuntimeConfig.from_vllm_config(config)
 
 
 def test_runtime_config_partial_override_stays_self_consistent() -> None:
