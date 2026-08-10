@@ -310,7 +310,11 @@ def _compile_profile(
     max_population: int = 4,
     trailing_rounds: int = 1,
     derating_factor: Fraction = Fraction(1, 2),
+    startup_priming_receipt: dict[str, object] | None = None,
 ) -> Any:
+    kwargs: dict[str, object] = {}
+    if startup_priming_receipt is not None:
+        kwargs["startup_priming_receipt"] = startup_priming_receipt
     return _symbol("compile_provisional_service_profile")(
         executions,
         execution_tiers=(
@@ -328,6 +332,7 @@ def _compile_profile(
             allocated_pool=max_population,
             count_cap=max_population,
         ),
+        **kwargs,
     )
 
 
@@ -648,6 +653,36 @@ def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
     assert len(receipt.receipt_sha256) == 64
     assert result.profile_candidate.qualified is False
     assert result.profile_candidate.installable is False
+
+
+def test_profile_receipt_hash_covers_startup_priming_identity() -> None:
+    """@spec PORT-PERF-006 / PORT-INT-005: startup plan is receipted."""
+    startup = {
+        "budget_sha256": "a" * 64,
+        "configured_population_ceiling": 8,
+        "bootstrap_operation_budget": 360,
+        "actual_plan_sha256": "b" * 64,
+        "actual_operation_count": 200,
+        "runtime_tombstone_allowance": 32,
+        "resolved_max_tombstones": 392,
+        "startup_priming_timeout_s": 120.0,
+    }
+    executions = _geometry_rounds(
+        single_elapsed_ns=100_000_000,
+        small_elapsed_ns=800_000_000,
+    )
+
+    with_identity = _compile_profile(
+        executions,
+        startup_priming_receipt=startup,
+    )
+    without_identity = _compile_profile(executions)
+
+    assert with_identity.receipt.startup_priming == startup
+    assert (
+        with_identity.receipt.receipt_sha256
+        != without_identity.receipt.receipt_sha256
+    )
 
 
 def test_mixed_pool_pressure_waits_instead_of_becoming_a_refusal() -> None:

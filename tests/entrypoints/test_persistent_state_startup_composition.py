@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from types import ModuleType, SimpleNamespace
 from typing import Any, NoReturn
@@ -62,8 +63,17 @@ def _runtime() -> SimpleNamespace:
         recovery_backoff_s=(0.01, 0.02),
         release_convergence_timeout_s=60.01,
         service_profile_trailing_rounds=3,
+        startup_priming_timeout_s=0.5,
         service_profile_derating_factor=0.5,
         reserve_queue_capacity=8,
+        priming_budget_descriptor=SimpleNamespace(
+            sha256="budget-a",
+            bootstrap_operation_budget=8,
+        ),
+        priming_budget_sha256="budget-a",
+        bootstrap_operation_budget=8,
+        runtime_tombstone_allowance=32,
+        max_tombstones=40,
     )
 
 
@@ -255,6 +265,59 @@ async def test_preparation_rejects_incomplete_startup_inventory(
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_preparation_timeout_is_primary_and_never_seals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec ENV-MIG-012 / PORT-PERF-005: the complete plan is bounded."""
+    module = _startup_module()
+    prepare = _startup_symbol("prepare_persistent_state_service")
+    events: list[str] = []
+    runtime = _runtime()
+    runtime.startup_priming_timeout_s = 0.01
+
+    class _Service:
+        def __init__(self, stage_client: Any, **kwargs: Any) -> None:
+            del stage_client, kwargs
+
+        async def bootstrap_handshake(self) -> dict[str, Any]:
+            return _startup_inventory()
+
+        def seal_startup_profile(self, **kwargs: Any) -> None:
+            del kwargs
+            events.append("seal")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    async def _blocked_prime(**kwargs: Any) -> Any:
+        del kwargs
+        await asyncio.sleep(0.05)
+        pytest.fail(
+            "PORT-PERF-005 startup priming exceeded its process bound",
+            pytrace=False,
+        )
+
+    monkeypatch.setattr(module, "PersistentStateService", _Service)
+    monkeypatch.setattr(
+        module,
+        "derive_admission_controller_config",
+        lambda value: "controller-config",
+    )
+    monkeypatch.setattr(module, "run_service_priming_round", _blocked_prime)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await prepare(
+            engine_client="engine",
+            stage_client="stage",
+            runtime_config=runtime,
+            startup_provider=_Provider(events),
+            host_fatal_callback=lambda error: None,
+        )
+
+    assert events == ["plan", "shutdown"]
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_api_install_delegates_to_one_typed_preparation_function(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -372,6 +435,12 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
     runtime = SimpleNamespace(
         service_profile_trailing_rounds=3,
         service_profile_derating_factor=0.5,
+        priming_budget_descriptor=(
+            NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+                configured_population_ceiling=8,
+                trailing_rounds=3,
+            )
+        ),
     )
     inventory = {
         "physical_capacity": 5,
@@ -396,6 +465,14 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
         ("eager-bulk", 4),
     ]
     assert len(plan.rounds) == 5 * 2 * 4
+    assert plan.actual_operation_count == 200
+    assert len(plan.actual_plan_sha256) == 64
+    assert plan.compile_kwargs["startup_priming_receipt"] == {
+        "budget_sha256": runtime.priming_budget_descriptor.sha256,
+        "bootstrap_operation_budget": 360,
+        "actual_plan_sha256": plan.actual_plan_sha256,
+        "actual_operation_count": 200,
+    }
     assert sum(not round_spec.post_jit for round_spec in plan.rounds) == 10
     assert {
         (round_spec.geometry_id, round_spec.tier_id)
@@ -404,6 +481,29 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
         (geometry_id, tier_id)
         for geometry_id in range(5)
         for tier_id in ("single", "eager-bulk")
+    }
+
+
+def test_nemotron_budget_uses_configured_not_inventory_population() -> None:
+    """@spec PORT-INT-013 / ENV-MIG-012: pre-control-plane budget covers P."""
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    budget = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+        configured_population_ceiling=8,
+        trailing_rounds=3,
+    )
+
+    assert budget.configured_population_ceiling == 8
+    assert budget.bootstrap_operation_budget == 360
+    assert {
+        (cell.geometry_id, cell.tier_id, cell.max_active_population)
+        for cell in budget.cells
+    } == {
+        (geometry_id, tier_id, population)
+        for geometry_id in range(5)
+        for tier_id, population in (("single", 1), ("eager-bulk", 8))
     }
 
 
