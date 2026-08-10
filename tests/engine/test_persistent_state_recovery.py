@@ -342,6 +342,48 @@ def test_bootstrap_profile_seal_is_one_shot_and_opens_public_authority() -> None
     asyncio.run(scenario())
 
 
+def test_service_projection_exports_the_exact_installed_derating() -> None:
+    """@spec PORT-OBS-012: the budget gauge is the installed exact f."""
+
+    class _MetricsSink:
+        def __init__(self) -> None:
+            self.capacity: list[dict[str, Any]] = []
+
+        def observe_persistent_state_capacity(
+            self,
+            _stage: str,
+            _replica: str,
+            **values: Any,
+        ) -> None:
+            self.capacity.append(values)
+
+        def observe_persistent_state_slots(
+            self,
+            _stage: str,
+            _replica: str,
+            _values: dict[str, int],
+        ) -> None:
+            pass
+
+    async def scenario() -> None:
+        service = _recovering_service(_RecoveryStage(), _Clock())
+        await service.bootstrap_handshake()
+        service.seal_startup_profile(
+            compiled_service_profile=_compiled_admission_profile(
+                derating_factor=Fraction(1, 2),
+            )
+        )
+        metrics = _MetricsSink()
+
+        service.install_metrics(metrics)
+
+        assert metrics.capacity
+        assert metrics.capacity[-1]["service_budget"] == 0.5
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_profile_seal_installs_one_exact_noncontiguous_interval_authority() -> None:
     """@spec PORT-STATE-027: profile, counters, and queues share one subset."""
 
