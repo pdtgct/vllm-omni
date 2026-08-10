@@ -446,6 +446,35 @@ def test_feed_projects_committed_segments_before_returning_park_hypothesis() -> 
     _run(scenario())
 
 
+# @spec PORT-SEG-004, PORT-RTC-002
+def test_forced_eou_park_is_ticketless_before_following_chunk() -> None:
+    """A control park cannot consume the following CHUNK's ticket."""
+
+    async def scenario() -> None:
+        def forced_then_chunk(item: Any, index: int) -> list[Any]:
+            if "multi_modal_data" not in item:
+                return [_out([EOU_ID, PARK_ID])]
+            return [_out([7, PARK_ID], text=f" w{index}")]
+
+        engine = FakeAsyncOmni(script=forced_then_chunk)
+        lease, _ = _make_lease(engine)
+
+        assert await _wait(lease.feed(_audio(_CHUNK))) == [" w0"]
+        await _wait(lease.force_segment())
+        assert await _wait(lease.feed(_audio(_CHUNK))) == [" w0 w2"]
+
+        assert ["multi_modal_data" in item for item in engine.prompts] == [
+            True,
+            False,
+            True,
+        ]
+        assert lease.session.ledger.pending == ()
+        await _wait(lease.abort())
+        await lease.release()
+
+    _run(scenario())
+
+
 # @spec PORT-RTC-004, ING-FE-005
 def test_feed_notifies_piece_acceptance_before_carrier_completion() -> None:
     """The callback releases transport credit at receipt, not at park."""

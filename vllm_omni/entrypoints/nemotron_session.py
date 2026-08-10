@@ -514,6 +514,7 @@ class NemotronSessionLease:
                 first = stage_outputs[0]
                 ids = list(first.token_ids)
                 in_flight = self._session.accepted_audio.in_flight_unit
+                in_flight_kind = getattr(in_flight, "kind", None)
                 if ids:
                     self._input_stream.put_nowait(ids)
                 self._session.transcript.commit_result(first.text or "")
@@ -525,7 +526,7 @@ class NemotronSessionLease:
                         text="",
                         reason=(
                             "forced"
-                            if getattr(in_flight, "kind", None) == "forced_eou"
+                            if in_flight_kind == "forced_eou"
                             else "model"
                         ),
                     )
@@ -553,7 +554,14 @@ class NemotronSessionLease:
                         handle = observe_safely(observer.complete_inflight, self._session.session_key)
                         if handle is not None:
                             observe_safely(observer.unit_parked, handle, park_stamp_s=time.monotonic())
-                    if self._ledger.pending:
+                    if in_flight_kind == "forced_eou":
+                        # @spec PORT-SEG-004, PORT-RTC-002
+                        # A forced boundary is an ordered scheduler barrier,
+                        # not an audio carrier. Its legal park completes no
+                        # ledger ticket and must not consume a later CHUNK's
+                        # ticket if the input driver ever gains prefetch.
+                        pass
+                    elif self._ledger.pending:
                         self._ledger.complete_next(
                             self._session.transcript.complete_text
                         )
