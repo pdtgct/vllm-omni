@@ -314,6 +314,25 @@ def test_engine_core_rejects_incomplete_worker_warmup_attestation(
     assert not hasattr(manager, "resident_state_scatter_warmup_complete")
 
 
+def test_engine_core_skips_worker_warmup_attestation_without_persistent_manager() -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    core = object.__new__(StageEngineCoreProc)
+    core.model_executor = SimpleNamespace(
+        collective_rpc=lambda method: pytest.fail(
+            f"unexpected worker RPC without persistent state: {method}"
+        )
+    )
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=())
+        )
+    )
+
+    _publish_warmup_attestation(core)
+
+
 def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
