@@ -69,14 +69,14 @@ class AdmissionControllerConfig:
             or self.release_convergence_timeout_s <= 0
         ):
             raise ValueError("recovery bounds must be positive")
+        interval_count = len(self.supported_intervals_ms)
         if (
-            len(self.supported_intervals_ms) != 5
-            or len(set(self.supported_intervals_ms))
-            != len(self.supported_intervals_ms)
+            not 1 <= interval_count <= 5
+            or len(set(self.supported_intervals_ms)) != interval_count
             or any(value <= 0 for value in self.supported_intervals_ms)
         ):
             raise ValueError(
-                "exactly five supported intervals must be unique and positive"
+                "one to at most five supported intervals must be unique and positive"
             )
 
 

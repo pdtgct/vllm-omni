@@ -24,6 +24,8 @@ StateLocation = Literal["resident", "offloaded", "absent"]
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_DIRECT_SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1120)
+
 
 class PersistentStateServiceError(RuntimeError):
     """Base failure raised by the persistent-state admission service."""
@@ -266,14 +268,20 @@ class PersistentStateService:
         ] = [None] * waiter_capacity
         self._admission_drain_task: asyncio.Task[None] | None = None
         self._admission_timer: asyncio.TimerHandle | None = None
-        self._resident_interval_counts = dict.fromkeys(
-            (80, 160, 320, 560, 1120), 0
+        counter_intervals = (
+            tuple(admission_config.supported_intervals_ms)
+            if admission_config is not None
+            else (
+                ()
+                if runtime_config is not None
+                else _LEGACY_DIRECT_SERVICE_INTERVALS_MS
+            )
         )
-        self._submitted_interval_counts = dict.fromkeys(
-            (80, 160, 320, 560, 1120), 0
-        )
+        self._resident_interval_counts = dict.fromkeys(counter_intervals, 0)
+        self._submitted_interval_counts = dict.fromkeys(counter_intervals, 0)
         self._failed_release_interval_counts = dict.fromkeys(
-            (80, 160, 320, 560, 1120), 0
+            counter_intervals,
+            0,
         )
 
     @property
@@ -1233,6 +1241,39 @@ class PersistentStateService:
         self._admission_attached = [False] * waiter_capacity
         self._admission_resource_tasks = [None] * waiter_capacity
 
+    def configure_bootstrap_intervals(
+        self,
+        intervals_ms: tuple[int, ...],
+    ) -> None:
+        """Install the model-owned interval subset before priming reserves."""
+
+        if not self._bootstrap_complete or self._startup_profile_sealed:
+            raise RuntimeError(
+                "persistent-state bootstrap intervals require an open bootstrap"
+            )
+        if (
+            not 1 <= len(intervals_ms) <= 5
+            or len(set(intervals_ms)) != len(intervals_ms)
+            or any(interval <= 0 for interval in intervals_ms)
+        ):
+            raise ValueError(
+                "bootstrap intervals must contain one to five unique values"
+            )
+        if (
+            self._pending_service_intervals
+            or self._service_intervals
+            or self._failed_releases
+            or any(self._resident_interval_counts.values())
+            or any(self._submitted_interval_counts.values())
+            or any(self._failed_release_interval_counts.values())
+        ):
+            raise RuntimeError(
+                "persistent-state bootstrap interval authority is not empty"
+            )
+        self._resident_interval_counts = dict.fromkeys(intervals_ms, 0)
+        self._submitted_interval_counts = dict.fromkeys(intervals_ms, 0)
+        self._failed_release_interval_counts = dict.fromkeys(intervals_ms, 0)
+
     def seal_startup_profile(
         self,
         *,
@@ -1252,8 +1293,37 @@ class PersistentStateService:
             raise RuntimeError(
                 "persistent-state admission configuration is required at seal"
             )
+        profile_intervals = tuple(
+            compiled_service_profile.compiled_demand.intervals_ms
+        )
+        admission_intervals = tuple(resolved_admission.supported_intervals_ms)
+        if profile_intervals != admission_intervals:
+            raise ValueError(
+                "compiled profile and admission controller intervals disagree"
+            )
+        if tuple(self._resident_interval_counts) != profile_intervals:
+            raise ValueError(
+                "bootstrap and compiled profile intervals disagree"
+            )
+        if (
+            self._pending_service_intervals
+            or self._service_intervals
+            or self._failed_releases
+            or any(self._resident_interval_counts.values())
+            or any(self._submitted_interval_counts.values())
+            or any(self._failed_release_interval_counts.values())
+        ):
+            raise RuntimeError(
+                "persistent-state priming authority is not empty at seal"
+            )
         self._admission_config = resolved_admission
         self._compiled_service_profile = compiled_service_profile
+        self._resident_interval_counts = dict.fromkeys(profile_intervals, 0)
+        self._submitted_interval_counts = dict.fromkeys(profile_intervals, 0)
+        self._failed_release_interval_counts = dict.fromkeys(
+            profile_intervals,
+            0,
+        )
         self._reset_admission_storage(int(resolved_admission.waiter_capacity))
         self._startup_profile_sealed = True
         self._ready = True

@@ -35,6 +35,7 @@ class NemotronServicePrimingPlan:
     compile_kwargs: dict[str, Any]
     actual_plan_sha256: str
     actual_operation_count: int
+    served_intervals_ms: tuple[int, ...]
 
 
 class NemotronPersistentStateStartupProvider:
@@ -202,6 +203,10 @@ class NemotronPersistentStateStartupProvider:
             },
             actual_plan_sha256=plan_identity.sha256,
             actual_operation_count=plan_identity.operation_count,
+            served_intervals_ms=tuple(
+                int(cadence.removesuffix("ms"))
+                for _, cadence in admitted_geometries
+            ),
         )
 
     async def execute_priming_round(
