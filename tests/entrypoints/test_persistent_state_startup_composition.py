@@ -318,7 +318,7 @@ async def test_preparation_timeout_is_primary_and_never_seals(
 
     with pytest.raises(asyncio.TimeoutError):
         await prepare(
-            engine_client="engine",
+            engine_client=SimpleNamespace(model_config=object()),
             stage_client="stage",
             runtime_config=runtime,
             startup_provider=_Provider(events),
