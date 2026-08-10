@@ -181,6 +181,9 @@ class StageEngineCoreProc(EngineCoreProc):
         manager = self._persistent_state_manager()
         control = self._persistent_state_control()
         self._prune_persistent_state_operations(control)
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        model_config = getattr(self.vllm_config, "model_config", None)
+        compute_hash = getattr(self.vllm_config, "compute_hash", None)
         return {
             "engine_epoch": control["engine_epoch"],
             "manager_revision": control["revision"],
@@ -189,9 +192,28 @@ class StageEngineCoreProc(EngineCoreProc):
             "safety_reserve": manager.safety_reserve_slots,
             "configured_limit": manager.configured_limit,
             "effective_capacity": manager.effective_capacity,
+            "slot_bytes": manager.persistent_state_spec.page_size_bytes,
+            "execution_claim_ceiling": int(
+                getattr(
+                    scheduler_config,
+                    "max_num_seqs",
+                    manager.effective_capacity,
+                )
+            ),
+            "execution_environment_key": (
+                compute_hash() if callable(compute_hash) else "test-unavailable"
+            ),
+            "precision_policy": str(getattr(model_config, "dtype", "unknown")),
             "stage": manager.stage,
             "replica": manager.replica,
             "capabilities": ["resident"],
+            "resident_state_scatter_warmup_complete": bool(
+                getattr(
+                    manager,
+                    "resident_state_scatter_warmup_complete",
+                    False,
+                )
+            ),
             "schema_id": manager.persistent_state_spec.schema_id,
             "profile_id": manager.profile_id,
             "persistent_state_tombstone_ttl_s": control[

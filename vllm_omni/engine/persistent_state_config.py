@@ -42,6 +42,21 @@ _DEFAULT_FINALIZATION_FLOOR_S = 40.0
 _DEFAULT_ACCEPTED_AUDIO_CAPACITY_SAMPLES = 30 * _RFC1_SAMPLE_RATE_HZ
 _DEFAULT_MAX_RETAINED_TRANSCRIPT_BYTES = 1 << 20
 
+_A36_REQUIRED_KEYS = (
+    "persistent_state_admission_waiter_capacity",
+    "persistent_state_admission_max_inflight_reserves",
+    "persistent_state_admission_dispatch_budget",
+    "persistent_state_admission_aging_threshold_s",
+    "persistent_state_admission_wait_timeout_s",
+    "persistent_state_admission_retry_floor_ms",
+    "persistent_state_admission_retry_jitter_ms",
+    "persistent_state_recovery_backoff_s",
+    "persistent_state_release_convergence_timeout_s",
+    "streaming_unadmitted_connection_timeout_s",
+    "persistent_state_service_profile_trailing_rounds",
+    "persistent_state_service_profile_derating_factor",
+)
+
 
 def _validated_int(name: str, value: object, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -60,6 +75,83 @@ def _validated_duration(name: str, value: object) -> float:
     if not math.isfinite(resolved) or resolved <= 0:
         raise ValueError(
             f"{name} must be a positive finite duration, got {value!r}"
+        )
+    return resolved
+
+
+def _validated_ratio(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite ratio in (0, 1], got {value!r}")
+    resolved = float(value)
+    if not math.isfinite(resolved) or not 0 < resolved <= 1:
+        raise ValueError(f"{name} must be a finite ratio in (0, 1], got {value!r}")
+    return resolved
+
+
+def _validated_backoff(name: str, value: object) -> tuple[float, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"{name} must be a non-empty sequence of positive durations"
+        )
+    try:
+        resolved = tuple(_validated_duration(name, item) for item in value)
+    except ValueError as error:
+        raise ValueError(
+            f"{name} must be a non-empty sequence of positive durations"
+        ) from error
+    if not resolved:
+        raise ValueError(
+            f"{name} must be a non-empty sequence of positive durations"
+        )
+    return resolved
+
+
+def _resolve_a36_envelope(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the mandatory A36 fields and report all omissions together."""
+
+    missing = [name for name in _A36_REQUIRED_KEYS if name not in values]
+    invalid: list[str] = []
+    resolved: dict[str, Any] = {}
+
+    def positive_int(name: str, value: object) -> int:
+        return _validated_int(name, value, minimum=1)
+
+    validators = {
+        "persistent_state_admission_waiter_capacity": positive_int,
+        "persistent_state_admission_max_inflight_reserves": positive_int,
+        "persistent_state_admission_dispatch_budget": positive_int,
+        "persistent_state_admission_aging_threshold_s": _validated_duration,
+        "persistent_state_admission_wait_timeout_s": _validated_duration,
+        "persistent_state_admission_retry_floor_ms": lambda name, value: _validated_int(
+            name, value, minimum=1
+        ),
+        "persistent_state_admission_retry_jitter_ms": lambda name, value: _validated_int(
+            name, value, minimum=0
+        ),
+        "persistent_state_recovery_backoff_s": _validated_backoff,
+        "persistent_state_release_convergence_timeout_s": _validated_duration,
+        "streaming_unadmitted_connection_timeout_s": _validated_duration,
+        "persistent_state_service_profile_trailing_rounds": lambda name, value: (
+            _validated_int(name, value, minimum=3)
+        ),
+        "persistent_state_service_profile_derating_factor": _validated_ratio,
+    }
+    for name in _A36_REQUIRED_KEYS:
+        if name not in values:
+            continue
+        try:
+            resolved[name] = validators[name](name, values[name])
+        except ValueError:
+            invalid.append(name)
+    if missing or invalid:
+        parts = []
+        if missing:
+            parts.append(f"missing={missing}")
+        if invalid:
+            parts.append(f"invalid={invalid}")
+        raise ValueError(
+            "persistent-state A36 admission envelope is incomplete or invalid: "
+            + ", ".join(parts)
         )
     return resolved
 
@@ -125,6 +217,18 @@ class PersistentStateRuntimeConfig:
     accepted_audio_capacity_samples: int
     max_retained_transcript_bytes: int
     max_session_duration_s: float | None
+    admission_waiter_capacity: int
+    admission_max_inflight_reserves: int
+    admission_dispatch_budget: int
+    admission_aging_threshold_s: float
+    admission_wait_timeout_s: float
+    admission_retry_floor_ms: int
+    admission_retry_jitter_ms: int
+    recovery_backoff_s: tuple[float, ...]
+    release_convergence_timeout_s: float
+    unadmitted_connection_timeout_s: float
+    service_profile_trailing_rounds: int
+    service_profile_derating_factor: float
 
     @property
     def cleanup_queue_capacity(self) -> int:
@@ -173,6 +277,17 @@ class PersistentStateRuntimeConfig:
                 "streaming serving keys in additional_config require the "
                 f"streaming_ prefix: {unprefixed}"
             )
+        invalid_nulls = sorted(
+            name
+            for name, value in raw.items()
+            if value is None and name != "streaming_max_session_duration_s"
+        )
+        if invalid_nulls:
+            raise ValueError(
+                "explicit null is invalid for persistent-state serving keys: "
+                f"{invalid_nulls}"
+            )
+        a36 = _resolve_a36_envelope(raw)
         operation_timeout_s = _resolved_duration(
             raw,
             "persistent_state_operation_timeout_s",
@@ -267,6 +382,40 @@ class PersistentStateRuntimeConfig:
                 "streaming_max_session_duration_s",
                 default=None,
             ),
+            admission_waiter_capacity=a36[
+                "persistent_state_admission_waiter_capacity"
+            ],
+            admission_max_inflight_reserves=a36[
+                "persistent_state_admission_max_inflight_reserves"
+            ],
+            admission_dispatch_budget=a36[
+                "persistent_state_admission_dispatch_budget"
+            ],
+            admission_aging_threshold_s=a36[
+                "persistent_state_admission_aging_threshold_s"
+            ],
+            admission_wait_timeout_s=a36[
+                "persistent_state_admission_wait_timeout_s"
+            ],
+            admission_retry_floor_ms=a36[
+                "persistent_state_admission_retry_floor_ms"
+            ],
+            admission_retry_jitter_ms=a36[
+                "persistent_state_admission_retry_jitter_ms"
+            ],
+            recovery_backoff_s=a36["persistent_state_recovery_backoff_s"],
+            release_convergence_timeout_s=a36[
+                "persistent_state_release_convergence_timeout_s"
+            ],
+            unadmitted_connection_timeout_s=a36[
+                "streaming_unadmitted_connection_timeout_s"
+            ],
+            service_profile_trailing_rounds=a36[
+                "persistent_state_service_profile_trailing_rounds"
+            ],
+            service_profile_derating_factor=a36[
+                "persistent_state_service_profile_derating_factor"
+            ],
         )
         if (
             resolved.session_finalization_timeout_s
@@ -276,5 +425,56 @@ class PersistentStateRuntimeConfig:
                 "streaming_session_finalization_timeout_s must be at least "
                 "the safe "
                 f"drain bound {resolved.safe_finalization_timeout_s:.3f}s"
+            )
+        if not (
+            1
+            <= resolved.admission_dispatch_budget
+            <= resolved.admission_max_inflight_reserves
+            <= min(
+                resolved.admission_waiter_capacity,
+                resolved.reserve_queue_capacity,
+            )
+        ):
+            raise ValueError(
+                "persistent_state_admission_dispatch_budget must be <= "
+                "persistent_state_admission_max_inflight_reserves, and both "
+                "must fit the waiter and reserve capacities"
+            )
+        if (
+            resolved.admission_aging_threshold_s
+            >= resolved.admission_wait_timeout_s
+        ):
+            raise ValueError(
+                "persistent_state_admission_aging_threshold_s must be shorter "
+                "than persistent_state_admission_wait_timeout_s"
+            )
+        minimum_unadmitted_lifetime_s = 2 * (
+            resolved.session_configuration_timeout_s
+            + resolved.admission_wait_timeout_s
+        ) + (
+            resolved.admission_retry_floor_ms
+            + resolved.admission_retry_jitter_ms
+        ) / 1000
+        if (
+            resolved.unadmitted_connection_timeout_s
+            < minimum_unadmitted_lifetime_s
+        ):
+            raise ValueError(
+                "streaming_unadmitted_connection_timeout_s must cover two "
+                "complete configuration/admission attempts and one retry cycle "
+                f"({minimum_unadmitted_lifetime_s:.3f}s)"
+            )
+        minimum_release_convergence_s = (
+            2 * resolved.reconciliation_timeout_s
+            + resolved.recovery_backoff_s[0]
+        )
+        if (
+            resolved.release_convergence_timeout_s
+            < minimum_release_convergence_s
+        ):
+            raise ValueError(
+                "persistent_state_release_convergence_timeout_s must cover "
+                "two reconciliation windows and the first recovery backoff "
+                f"({minimum_release_convergence_s:.3f}s)"
             )
         return resolved

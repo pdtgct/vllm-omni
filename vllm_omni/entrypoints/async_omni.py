@@ -153,6 +153,7 @@ class AsyncOmni(EngineClient, OmniBase):
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._persistent_state_service: Any | None = None
+        self._persistent_state_fatal: BaseException | None = None
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         self._sleeping_tags: set[str] = set()
@@ -1083,7 +1084,11 @@ class AsyncOmni(EngineClient, OmniBase):
         """Check if the engine is running."""
         orchestrator_alive = self.engine.is_alive()
         task_alive = self.final_output_task is not None and not self.final_output_task.done()
-        return orchestrator_alive and task_alive
+        return (
+            self._persistent_state_fatal is None
+            and orchestrator_alive
+            and task_alive
+        )
 
     @property
     def errored(self) -> bool:
@@ -1095,7 +1100,9 @@ class AsyncOmni(EngineClient, OmniBase):
         mechanism does not resolve abstract methods from sibling MRO
         entries).
         """
-        return OmniBase.errored.fget(self)  # type: ignore[union-attr]
+        return self._persistent_state_fatal is not None or OmniBase.errored.fget(
+            self
+        )  # type: ignore[union-attr]
 
     @property
     def _name(self) -> str:
@@ -1109,7 +1116,7 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def dead_error(self) -> BaseException:
         """EngineClient abstract property implementation."""
-        return OmniEngineDeadError()
+        return self._persistent_state_fatal or OmniEngineDeadError()
 
     # ==================== EngineClient Interface ====================
 
@@ -1184,6 +1191,12 @@ class AsyncOmni(EngineClient, OmniBase):
         if self._persistent_state_service is not None:
             raise RuntimeError("persistent state service already installed")
         self._persistent_state_service = service
+
+    def report_persistent_state_fatal(self, error: BaseException) -> None:
+        """Make a non-converging state authority visible to supervision."""
+
+        if self._persistent_state_fatal is None:
+            self._persistent_state_fatal = error
 
     def get_persistent_state_service(self) -> Any:
         """Return the installed service or fail closed before admission."""

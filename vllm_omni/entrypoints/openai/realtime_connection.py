@@ -158,20 +158,16 @@ class RealtimeConnection(VllmRealtimeConnection):
             return
         self._pre_admission_timeouts_started = True
         runtime = self._runtime_config
-        configuration_timeout_s = float(
-            getattr(
-                runtime,
-                "session_configuration_timeout_s",
-                self.session_configuration_timeout,
-            )
+        configuration_timeout_s = (
+            self.session_configuration_timeout
+            if runtime is None
+            else float(runtime.session_configuration_timeout_s)
         )
         self.session_configuration_timeout = configuration_timeout_s
-        total_timeout_s = float(
-            getattr(
-                runtime,
-                "unadmitted_connection_timeout_s",
-                configuration_timeout_s,
-            )
+        total_timeout_s = (
+            configuration_timeout_s
+            if runtime is None
+            else float(runtime.unadmitted_connection_timeout_s)
         )
         loop = asyncio.get_running_loop()
         self._unadmitted_deadline_ns = time.monotonic_ns() + int(
@@ -452,6 +448,8 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         service = self._persistent_state_service
         assert service is not None
+        runtime = self._runtime_config
+        assert runtime is not None
         check_health = getattr(
             service,
             "check_admission",
@@ -483,11 +481,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     time.monotonic_ns()
                     + int(
                         float(
-                            getattr(
-                                self._runtime_config,
-                                "admission_wait_timeout_s",
-                                self.session_configuration_timeout,
-                            )
+                            runtime.admission_wait_timeout_s
                         )
                         * 1_000_000_000
                     )
@@ -501,12 +495,12 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
             return
         except (PersistentStateCapacityExhausted, PersistentStateBackpressure) as error:
-            retry_after_ms = getattr(error, "retry_after_ms", None)
-            if retry_after_ms is None:
-                runtime = self._runtime_config
-                retry_after_ms = int(
-                    getattr(runtime, "admission_retry_floor_ms", 0)
-                )
+            advertised_retry_ms = getattr(error, "retry_after_ms", None)
+            retry_after_ms = (
+                int(runtime.admission_retry_floor_ms)
+                if advertised_retry_ms is None
+                else int(advertised_retry_ms)
+            )
             await self.send_error(
                 str(error),
                 "capacity_exhausted",

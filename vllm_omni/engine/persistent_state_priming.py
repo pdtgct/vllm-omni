@@ -19,6 +19,9 @@ class ServicePrimingRound:
     active_population: int
     schema_id: str
     profile_id: str
+    tier_id: str = "default"
+    post_jit: bool = True
+    continuously_loaded: bool = True
 
     def __post_init__(self) -> None:
         if not self.round_id:
@@ -52,6 +55,9 @@ class ServicePrimingObservation:
     elapsed_ns: int
     completed_legal_parks: int
     completed_model_rows: int | None
+    tier_id: str = "default"
+    post_jit: bool = True
+    continuously_loaded: bool = True
     dummy_run: bool = False
     is_profile: bool = False
 
@@ -74,11 +80,12 @@ async def run_service_priming_round(
     try:
         for index in range(round_spec.active_population):
             operation_id = f"{round_spec.round_id}:reserve:{index}"
-            lease = await service.reserve(
+            lease = await service.reserve_for_priming(
                 operation_id=operation_id,
                 session_key=f"{round_spec.round_id}:session:{index}",
                 schema_id=round_spec.schema_id,
                 profile_id=round_spec.profile_id,
+                service_interval_ms=round_spec.service_interval_ms,
             )
             leases.append(lease)
         result = await execute(round_spec, tuple(leases))
@@ -102,11 +109,14 @@ async def run_service_priming_round(
                 if result.completed_model_rows is None
                 else int(result.completed_model_rows)
             ),
+            tier_id=round_spec.tier_id,
+            post_jit=round_spec.post_jit,
+            continuously_loaded=round_spec.continuously_loaded,
         )
     finally:
-        for lease in leases:
+        for index, lease in enumerate(leases):
             await service.release(
-                operation_id=f"{lease.operation_id}:release",
+                operation_id=f"{round_spec.round_id}:release:{index}",
                 lease=lease,
                 reason="service_priming_complete",
             )

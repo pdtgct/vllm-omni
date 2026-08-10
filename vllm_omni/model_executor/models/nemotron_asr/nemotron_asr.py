@@ -81,6 +81,9 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     Predictor,
     greedy_decode_chunk,
 )
+from vllm_omni.model_executor.models.nemotron_asr.startup import (
+    NEMOTRON_PERSISTENT_STATE_STARTUP,
+)
 from vllm_omni.model_executor.models.nemotron_asr.state_profile import (
     NemotronStatePools,
     build_nemotron_persistent_state_spec,
@@ -292,6 +295,7 @@ class NemotronASRForRNNT(nn.Module):
     supports_realtime = True
     supports_transcription_only = False
     supports_persistent_state = True
+    persistent_state_startup_provider = NEMOTRON_PERSISTENT_STATE_STARTUP
     realtime_max_tokens = 142
     num_logits = 13_092
 

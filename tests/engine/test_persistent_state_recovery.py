@@ -979,7 +979,7 @@ def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> N
 
 # @spec PORT-STATE-014 / PORT-STATE-022
 def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
-    """A release-pending record cannot keep admission closed forever."""
+    """Repeated demotion keeps one clock and cannot postpone fatal exit."""
 
     async def scenario() -> None:
         stage = _RecoveryStage()
@@ -1007,6 +1007,8 @@ def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
             }
         ]
         stage.release_failures_remaining = 1_000
+        stage.snapshot_gate = asyncio.Event()
+        snapshots_before = stage.snapshot_calls
 
         with pytest.raises(PersistentStateServiceUnavailable):
             await service.release(
@@ -1015,6 +1017,16 @@ def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
                 reason="client_disconnect",
             )
 
+        recovery = getattr(service, "_recovery_task", None)
+        assert recovery is not None and not recovery.done()
+        await _wait_until(lambda: stage.snapshot_calls > snapshots_before)
+        service._demote()
+        assert service._recovery_task is recovery, (
+            "PORT-STATE-022 replaced the live recovery driver and reset "
+            "PORT-STATE-014's convergence clock"
+        )
+
+        stage.snapshot_gate.set()
         await _wait_until(lambda: len(fatal_errors) == 1)
         await asyncio.sleep(0.05)
         assert len(fatal_errors) == 1
