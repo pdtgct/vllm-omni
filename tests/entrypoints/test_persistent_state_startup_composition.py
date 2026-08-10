@@ -78,18 +78,27 @@ def _runtime() -> SimpleNamespace:
 
 
 class _Provider:
-    def __init__(self, events: list[str], runtime: Any | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        runtime: Any | None = None,
+        expected_model_config: Any | None = None,
+    ) -> None:
         self.events = events
         self.runtime = runtime
+        self.expected_model_config = expected_model_config
 
     def build_priming_plan(
         self,
         *,
         runtime_config: Any,
         inventory: Any,
+        model_config: Any | None = None,
     ) -> Any:
         if self.runtime is not None:
             assert runtime_config is self.runtime
+        if self.expected_model_config is not None:
+            assert model_config is self.expected_model_config
         assert inventory["resident_state_scatter_warmup_complete"] is True
         self.events.append("plan")
         return SimpleNamespace(
@@ -118,7 +127,9 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     prepare = _startup_symbol("prepare_persistent_state_service")
     events: list[str] = []
     runtime = _runtime()
-    provider = _Provider(events, runtime)
+    model_config = object()
+    engine = SimpleNamespace(model_config=model_config)
+    provider = _Provider(events, runtime, model_config)
     profile = object()
 
     class _Service:
@@ -167,7 +178,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     )
 
     service = await prepare(
-        engine_client="engine",
+        engine_client=engine,
         stage_client="stage",
         runtime_config=runtime,
         startup_provider=provider,
@@ -461,6 +472,11 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
     plan = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_plan(
         runtime_config=runtime,
         inventory=inventory,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                supported_num_lookahead_tokens=[3, 0, 6, 13]
+            )
+        ),
     )
 
     tiers = plan.compile_kwargs["execution_tiers"]
@@ -468,24 +484,104 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
         ("single", 1),
         ("eager-bulk", 4),
     ]
-    assert len(plan.rounds) == 5 * 2 * 4
-    assert plan.actual_operation_count == 200
+    assert len(plan.rounds) == 4 * 2 * 4
+    assert plan.actual_operation_count == 160
     assert len(plan.actual_plan_sha256) == 64
     assert plan.compile_kwargs["startup_priming_receipt"] == {
         "budget_sha256": runtime.priming_budget_descriptor.sha256,
         "bootstrap_operation_budget": 360,
         "actual_plan_sha256": plan.actual_plan_sha256,
-        "actual_operation_count": 200,
+        "actual_operation_count": 160,
     }
-    assert sum(not round_spec.post_jit for round_spec in plan.rounds) == 10
+    assert sum(not round_spec.post_jit for round_spec in plan.rounds) == 8
     assert {
         (round_spec.geometry_id, round_spec.tier_id)
         for round_spec in plan.rounds
     } == {
         (geometry_id, tier_id)
-        for geometry_id in range(5)
+        for geometry_id in (0, 2, 3, 4)
         for tier_id in ("single", "eager-bulk")
     }
+    assert plan.compile_kwargs["admitted_geometry_ids"] == (0, 2, 3, 4)
+    assert plan.compile_kwargs["reference_geometry_id"] == 4
+    assert plan.compile_kwargs["reference_interval_ms"] == 1120
+
+
+def test_nemotron_provider_keeps_all_manifest_geometries_without_declaration() -> None:
+    """@spec PORT-PERF-005: absence preserves the full manifest table."""
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    runtime = SimpleNamespace(
+        service_profile_trailing_rounds=1,
+        service_profile_derating_factor=0.5,
+        priming_budget_descriptor=(
+            NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+                configured_population_ceiling=1,
+                trailing_rounds=1,
+            )
+        ),
+    )
+    plan = NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_plan(
+        runtime_config=runtime,
+        inventory={
+            "physical_capacity": 1,
+            "effective_capacity": 1,
+            "configured_limit": 1,
+            "execution_claim_ceiling": 1,
+            "slot_bytes": 6_314_936,
+            "execution_environment_key": "env-a",
+            "precision_policy": "torch.float32",
+            "schema_id": "schema-a",
+            "profile_id": "profile-a",
+        },
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+
+    assert plan.compile_kwargs["admitted_geometry_ids"] == (0, 1, 2, 3, 4)
+    assert plan.compile_kwargs["reference_geometry_id"] == 4
+    assert plan.compile_kwargs["reference_interval_ms"] == 1120
+
+
+def test_nemotron_provider_rejects_empty_served_geometry_before_plan() -> None:
+    """@spec PORT-PERF-005: unsupported declarations cannot mint a plan."""
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    runtime = SimpleNamespace(
+        service_profile_trailing_rounds=1,
+        service_profile_derating_factor=0.5,
+        priming_budget_descriptor=(
+            NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_budget_descriptor(
+                configured_population_ceiling=1,
+                trailing_rounds=1,
+            )
+        ),
+    )
+    inventory = {
+        "physical_capacity": 1,
+        "effective_capacity": 1,
+        "configured_limit": 1,
+        "execution_claim_ceiling": 1,
+        "slot_bytes": 6_314_936,
+        "execution_environment_key": "env-a",
+        "precision_policy": "torch.float32",
+        "schema_id": "schema-a",
+        "profile_id": "profile-a",
+    }
+
+    with pytest.raises(ValueError, match="no supported manifest geometry"):
+        NEMOTRON_PERSISTENT_STATE_STARTUP.build_priming_plan(
+            runtime_config=runtime,
+            inventory=inventory,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    supported_num_lookahead_tokens=[999]
+                )
+            ),
+        )
 
 
 def test_nemotron_budget_uses_configured_not_inventory_population() -> None:
