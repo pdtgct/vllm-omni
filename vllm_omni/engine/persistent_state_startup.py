@@ -158,6 +158,7 @@ async def prepare_persistent_state_service(
         plan = startup_provider.build_priming_plan(
             runtime_config=runtime_config,
             inventory=inventory,
+            model_config=engine_client.model_config,
         )
         async def run_plan() -> list[Any]:
             observations: list[Any] = []

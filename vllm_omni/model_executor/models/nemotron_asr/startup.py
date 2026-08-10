@@ -74,7 +74,10 @@ class NemotronPersistentStateStartupProvider:
         *,
         runtime_config: Any,
         inventory: dict[str, Any],
+        model_config: Any,
     ) -> NemotronServicePrimingPlan:
+        """Build the served configuration's covered executable plan."""
+
         maximum_population = min(
             int(inventory["effective_capacity"]),
             int(inventory["execution_claim_ceiling"]),
@@ -97,8 +100,31 @@ class NemotronPersistentStateStartupProvider:
                     max_active_population=maximum_population,
                 )
             )
+        hf_config = getattr(model_config, "hf_config", model_config)
+        declared_lookaheads = getattr(
+            hf_config,
+            "supported_num_lookahead_tokens",
+            None,
+        )
+        supported = (
+            None
+            if declared_lookaheads is None
+            else {int(value) for value in declared_lookaheads}
+        )
+        admitted_geometries = tuple(
+            (geometry_id, cadence)
+            for geometry_id, (cadence, (_, lookahead)) in enumerate(
+                CADENCES.items()
+            )
+            if supported is None or lookahead in supported
+        )
+        if not admitted_geometries:
+            raise ValueError(
+                "served configuration declares no supported manifest geometry"
+            )
+
         rounds: list[ServicePrimingRound] = []
-        for geometry_id, cadence in enumerate(CADENCES):
+        for geometry_id, cadence in admitted_geometries:
             service_interval_ms = int(cadence.removesuffix("ms"))
             for tier in tiers:
                 for repeat in range(trailing_rounds + 1):
@@ -146,14 +172,22 @@ class NemotronPersistentStateStartupProvider:
             compiler_version="persistent-state-service-v1",
             mixed_composition_policy="homogeneous_upper_sum",
         )
+        reference_geometry_id, reference_cadence = max(
+            admitted_geometries,
+            key=lambda item: int(item[1].removesuffix("ms")),
+        )
         return NemotronServicePrimingPlan(
             rounds=rounds_tuple,
             compile_kwargs={
                 "execution_tiers": tuple(tiers),
                 "max_population": maximum_population,
-                "reference_interval_ms": 1120,
-                "reference_geometry_id": len(CADENCES) - 1,
-                "admitted_geometry_ids": tuple(range(len(CADENCES))),
+                "reference_interval_ms": int(
+                    reference_cadence.removesuffix("ms")
+                ),
+                "reference_geometry_id": reference_geometry_id,
+                "admitted_geometry_ids": tuple(
+                    geometry_id for geometry_id, _ in admitted_geometries
+                ),
                 "trailing_rounds": trailing_rounds,
                 "derating_factor": derating,
                 "context": context,
