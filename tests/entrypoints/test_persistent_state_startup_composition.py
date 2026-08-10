@@ -104,6 +104,7 @@ class _Provider:
         return SimpleNamespace(
             rounds=(SimpleNamespace(round_id="round-0"),),
             compile_kwargs={"trailing_rounds": 3},
+            served_intervals_ms=(80, 320, 560, 1120),
         )
 
     async def execute_priming_round(
@@ -130,7 +131,9 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     model_config = object()
     engine = SimpleNamespace(model_config=model_config)
     provider = _Provider(events, runtime, model_config)
-    profile = object()
+    profile = SimpleNamespace(
+        compiled_demand=SimpleNamespace(intervals_ms=(80, 320, 560, 1120))
+    )
 
     class _Service:
         def __init__(self, stage_client: Any, **kwargs: Any) -> None:
@@ -142,6 +145,13 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         async def bootstrap_handshake(self) -> dict[str, Any]:
             events.append("handshake")
             return _startup_inventory()
+
+        def configure_bootstrap_intervals(
+            self,
+            intervals_ms: tuple[int, ...],
+        ) -> None:
+            assert intervals_ms == (80, 320, 560, 1120)
+            events.append("configure")
 
         def seal_startup_profile(
             self,
@@ -163,10 +173,20 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         return SimpleNamespace(round_id="round-0")
 
     monkeypatch.setattr(module, "PersistentStateService", _Service)
+    def _derive_config(
+        value: Any,
+        *,
+        supported_intervals_ms: tuple[int, ...],
+    ) -> str:
+        assert value is runtime
+        assert supported_intervals_ms == (80, 320, 560, 1120)
+        events.append("validate")
+        return "controller-config"
+
     monkeypatch.setattr(
         module,
         "derive_admission_controller_config",
-        lambda value: events.append("validate") or "controller-config",
+        _derive_config,
     )
     monkeypatch.setattr(module, "run_service_priming_round", _prime)
     monkeypatch.setattr(
@@ -187,12 +207,13 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
 
     assert service.ready
     assert events == [
-        "validate",
         "construct",
         "handshake",
         "plan",
+        "configure",
         "prime",
         "compile",
+        "validate",
         "seal",
     ]
 
@@ -292,6 +313,12 @@ async def test_preparation_timeout_is_primary_and_never_seals(
 
         async def bootstrap_handshake(self) -> dict[str, Any]:
             return _startup_inventory()
+
+        def configure_bootstrap_intervals(
+            self,
+            intervals_ms: tuple[int, ...],
+        ) -> None:
+            assert intervals_ms == (80, 320, 560, 1120)
 
         def seal_startup_profile(self, **kwargs: Any) -> None:
             del kwargs
@@ -505,6 +532,7 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
     assert plan.compile_kwargs["admitted_geometry_ids"] == (0, 2, 3, 4)
     assert plan.compile_kwargs["reference_geometry_id"] == 4
     assert plan.compile_kwargs["reference_interval_ms"] == 1120
+    assert plan.served_intervals_ms == (80, 320, 560, 1120)
 
 
 def test_nemotron_provider_keeps_all_manifest_geometries_without_declaration() -> None:
@@ -542,6 +570,7 @@ def test_nemotron_provider_keeps_all_manifest_geometries_without_declaration() -
     assert plan.compile_kwargs["admitted_geometry_ids"] == (0, 1, 2, 3, 4)
     assert plan.compile_kwargs["reference_geometry_id"] == 4
     assert plan.compile_kwargs["reference_interval_ms"] == 1120
+    assert plan.served_intervals_ms == (80, 160, 320, 560, 1120)
 
 
 def test_nemotron_provider_rejects_empty_served_geometry_before_plan() -> None:

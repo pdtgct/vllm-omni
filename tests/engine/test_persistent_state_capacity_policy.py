@@ -311,6 +311,7 @@ def _compile_profile(
     trailing_rounds: int = 1,
     derating_factor: Fraction = Fraction(1, 2),
     startup_priming_receipt: dict[str, object] | None = None,
+    admitted_geometry_ids: tuple[int, ...] = (0, 1, 2, 3, 4),
 ) -> Any:
     kwargs: dict[str, object] = {}
     if startup_priming_receipt is not None:
@@ -325,7 +326,7 @@ def _compile_profile(
         max_population=max_population,
         reference_interval_ms=1_120,
         reference_geometry_id=4,
-        admitted_geometry_ids=(0, 1, 2, 3, 4),
+        admitted_geometry_ids=admitted_geometry_ids,
         trailing_rounds=trailing_rounds,
         derating_factor=derating_factor,
         context=_profile_context(
@@ -611,6 +612,41 @@ def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> N
     assert saturated.hard_headroom == 2
     assert saturated.charged_units == saturated.service_budget_units
     assert saturated.nominal_dispatchable_by_interval[1_120] == 0
+
+
+def test_fixed_dispatch_projection_uses_exact_noncontiguous_served_subset() -> None:
+    """@spec PORT-STATE-027 / PORT-PERF-008: budget-only arms vanish."""
+
+    served_ids = (0, 2, 3, 4)
+    served_intervals = (80, 320, 560, 1_120)
+    rounds = tuple(
+        round_spec
+        for round_spec in _geometry_rounds(
+            single_elapsed_ns=50_000_000,
+            small_elapsed_ns=100_000_000,
+        )
+        if round_spec.geometry_id in served_ids
+    )
+    profile = _compile_profile(
+        rounds,
+        admitted_geometry_ids=served_ids,
+    )
+    empty = dict.fromkeys(served_intervals, 0)
+
+    projection = _symbol("project_fixed_dispatch_capacity")(
+        profile=profile,
+        inventory={
+            "resident_count": 0,
+            "effective_capacity": 4,
+            "configured_limit": 4,
+        },
+        resident_counts_by_interval=empty,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+    )
+
+    assert tuple(projection.candidate_supported_by_interval) == served_intervals
+    assert 160 not in projection.candidate_supported_by_interval
 
 
 def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:

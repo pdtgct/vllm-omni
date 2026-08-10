@@ -70,6 +70,21 @@ def _controller(clock: _Clock, **overrides: Any) -> Any:
     )
 
 
+def test_controller_accepts_exact_noncontiguous_served_interval_subset() -> None:
+    """@spec PORT-STATE-027: active queues follow the served subset."""
+
+    served = (80, 320, 560, 1120)
+    config = _config(supported_intervals_ms=served)
+    controller = _controller(_Clock(), supported_intervals_ms=served)
+
+    assert config.supported_intervals_ms == served
+    assert tuple(controller.pending_counts) == served
+    with pytest.raises(ValueError, match="non-empty|at most five"):
+        _config(supported_intervals_ms=())
+    with pytest.raises(ValueError, match="at most five"):
+        _config(supported_intervals_ms=(1, 2, 3, 4, 5, 6))
+
+
 def _attempt(
     n: int,
     *,

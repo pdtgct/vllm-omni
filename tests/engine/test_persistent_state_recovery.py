@@ -240,6 +240,7 @@ def _compiled_admission_profile(
     *,
     derating_factor: Fraction = Fraction(1, 2),
     maximum_population: int = 2,
+    admitted_geometry_ids: tuple[int, ...] = (0, 1, 2, 3, 4),
 ) -> Any:
     from vllm_omni.engine.persistent_state_capacity import (
         ServiceExecutionTier,
@@ -264,6 +265,7 @@ def _compiled_admission_profile(
             is_profile=False,
         )
         for geometry, interval in enumerate(intervals)
+        if geometry in admitted_geometry_ids
     )
     return compile_provisional_service_profile(
         executions,
@@ -271,7 +273,7 @@ def _compiled_admission_profile(
         max_population=maximum_population,
         reference_interval_ms=1120,
         reference_geometry_id=4,
-        admitted_geometry_ids=(0, 1, 2, 3, 4),
+        admitted_geometry_ids=admitted_geometry_ids,
         trailing_rounds=1,
         derating_factor=derating_factor,
         context=ServiceProfileContext(
@@ -336,6 +338,49 @@ def test_bootstrap_profile_seal_is_one_shot_and_opens_public_authority() -> None
             match="bootstrap|seal|priming",
         ):
             await reserve_for_priming(**_lease_kwargs(99))
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_profile_seal_installs_one_exact_noncontiguous_interval_authority() -> None:
+    """@spec PORT-STATE-027: profile, counters, and queues share one subset."""
+
+    async def scenario() -> None:
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionControllerConfig,
+        )
+
+        served_ids = (0, 2, 3, 4)
+        served_intervals = (80, 320, 560, 1120)
+        config = AdmissionControllerConfig(
+            waiter_capacity=4,
+            max_inflight_reserves=2,
+            dispatch_budget=1,
+            aging_threshold_ns=10_000_000,
+            admission_wait_timeout_s=0.25,
+            retry_floor_ms=10,
+            retry_jitter_ms=0,
+            recovery_backoff_s=(0.001, 0.002),
+            release_convergence_timeout_s=0.03,
+            supported_intervals_ms=served_intervals,
+        )
+        service = _service(
+            _RecoveryStage(),
+            _Clock(),
+            admission_config=config,
+        )
+        await service.bootstrap_handshake()
+        profile = _compiled_admission_profile(
+            admitted_geometry_ids=served_ids,
+        )
+
+        service.seal_startup_profile(compiled_service_profile=profile)
+
+        assert tuple(service._resident_interval_counts) == served_intervals
+        assert tuple(service._submitted_interval_counts) == served_intervals
+        assert tuple(service._failed_release_interval_counts) == served_intervals
+        assert tuple(service._admission_controller.pending_counts) == served_intervals
         service.shutdown()
 
     asyncio.run(scenario())
