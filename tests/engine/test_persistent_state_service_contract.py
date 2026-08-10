@@ -237,6 +237,125 @@ def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
     )
 
 
+def _publish_warmup_attestation(core: Any) -> None:
+    publish = getattr(
+        core,
+        "_publish_persistent_state_warmup_attestation",
+        None,
+    )
+    if not callable(publish):
+        pytest.fail(
+            "ENV-MIG-012 missing worker-to-manager warmup attestation join",
+            pytrace=False,
+        )
+    publish()
+
+
+@pytest.mark.parametrize("worker_attestations", ([True], [True, True]))
+def test_engine_core_publishes_all_worker_warmup_attestations(
+    worker_attestations: list[bool],
+) -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    manager, _, _ = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=3
+    )
+    core = object.__new__(StageEngineCoreProc)
+    core.model_executor = SimpleNamespace(
+        collective_rpc=lambda method: (
+            worker_attestations
+            if method == "persistent_state_warmup_attestation"
+            else pytest.fail(f"unexpected worker RPC: {method}")
+        )
+    )
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=(manager,))
+        )
+    )
+
+    _publish_warmup_attestation(core)
+
+    assert manager.resident_state_scatter_warmup_complete is True
+
+
+@pytest.mark.parametrize("worker_attestations", ([], [False], [True, False]))
+def test_engine_core_rejects_incomplete_worker_warmup_attestation(
+    worker_attestations: list[bool],
+) -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    manager, _, _ = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=3
+    )
+    core = object.__new__(StageEngineCoreProc)
+    core.model_executor = SimpleNamespace(
+        collective_rpc=lambda method: worker_attestations
+    )
+    core.scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=(manager,))
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="worker.*warmup.*attestation"):
+        _publish_warmup_attestation(core)
+
+    assert not hasattr(manager, "resident_state_scatter_warmup_complete")
+
+
+def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from tests.model_executor.persistent_state._helpers import (
+        make_manager,
+        require_persistent_state_module,
+    )
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+
+    manager, _, _ = make_manager(
+        require_persistent_state_module(), num_gpu_blocks=3
+    )
+    events: list[str] = []
+
+    def fake_base_init(core: Any, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        events.append("base-init")
+        core.model_executor = SimpleNamespace(
+            collective_rpc=lambda method: (
+                events.append(method) or [True]
+            )
+        )
+        core.scheduler = SimpleNamespace(
+            kv_cache_manager=SimpleNamespace(
+                coordinator=SimpleNamespace(single_type_managers=(manager,))
+            )
+        )
+
+    monkeypatch.setattr(EngineCoreProc, "__init__", fake_base_init)
+
+    StageEngineCoreProc(object(), False, "", object, False)
+
+    assert events == [
+        "base-init",
+        "persistent_state_warmup_attestation",
+    ]
+    assert manager.resident_state_scatter_warmup_complete is True
+
+
 def test_health_includes_selected_service_readiness() -> None:
     # @spec PORT-STATE-004 / PORT-STATE-015 / PORT-STATE-016
     from vllm_omni.entrypoints.async_omni import AsyncOmni
