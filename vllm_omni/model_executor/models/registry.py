@@ -1,3 +1,7 @@
+import importlib
+from collections.abc import Sequence
+from typing import Any
+
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
@@ -376,6 +380,33 @@ _OMNI_MODELS = {
         "AuraQwen3VLForConditionalGeneration",
     ),
 }
+
+_PERSISTENT_STATE_STARTUP_PROVIDERS = {
+    NEMOTRON_ASR_ARCHITECTURE: (
+        "vllm_omni.model_executor.models.nemotron_asr.startup",
+        "NEMOTRON_PERSISTENT_STATE_STARTUP",
+    ),
+}
+
+
+def get_persistent_state_startup_provider(
+    architectures: Sequence[str],
+) -> Any | None:
+    """Resolve a dependency-light startup provider by model architecture."""
+
+    matches = [
+        _PERSISTENT_STATE_STARTUP_PROVIDERS[architecture]
+        for architecture in architectures
+        if architecture in _PERSISTENT_STATE_STARTUP_PROVIDERS
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError(
+            "persistent-state startup requires exactly one provider"
+        )
+    module_name, symbol_name = matches[0]
+    return getattr(importlib.import_module(module_name), symbol_name)
 
 
 _VLLM_OMNI_MODELS = {

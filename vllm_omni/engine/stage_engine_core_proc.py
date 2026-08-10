@@ -166,6 +166,13 @@ class StageEngineCoreProc(EngineCoreProc):
                 "binding_created": {},
                 "tombstone_ttl_s": runtime.tombstone_ttl_s,
                 "max_tombstones": runtime.max_tombstones,
+                "priming_budget_sha256": runtime.priming_budget_sha256,
+                "bootstrap_operation_budget": (
+                    runtime.bootstrap_operation_budget
+                ),
+                "runtime_tombstone_allowance": (
+                    runtime.runtime_tombstone_allowance
+                ),
                 "pending_claim_timeout_s": runtime.pending_claim_timeout_s,
             }
             self._persistent_state_control_state = control
@@ -254,6 +261,15 @@ class StageEngineCoreProc(EngineCoreProc):
                 "tombstone_ttl_s"
             ],
             "persistent_state_max_tombstones": control["max_tombstones"],
+            "persistent_state_priming_budget_sha256": control[
+                "priming_budget_sha256"
+            ],
+            "persistent_state_bootstrap_operation_budget": control[
+                "bootstrap_operation_budget"
+            ],
+            "persistent_state_runtime_tombstone_allowance": control[
+                "runtime_tombstone_allowance"
+            ],
             # PORT-STATE-023: binding inventory for handshake-time orphan
             # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
             # across processes on one host, which is the deployment shape

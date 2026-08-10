@@ -1088,7 +1088,6 @@ async def _install_persistent_state_service(
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
-    runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
     startup_provider = getattr(
         model_cls,
         "persistent_state_startup_provider",
@@ -1098,6 +1097,10 @@ async def _install_persistent_state_service(
         raise RuntimeError(
             "persistent-state model is missing its startup provider"
         )
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(
+        vllm_config,
+        startup_provider=startup_provider,
+    )
     service = await prepare_persistent_state_service(
         engine_client=engine_client,
         stage_client=stage_clients[0],

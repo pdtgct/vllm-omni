@@ -54,6 +54,7 @@ _A36_REQUIRED_KEYS = (
     "persistent_state_release_convergence_timeout_s",
     "streaming_unadmitted_connection_timeout_s",
     "persistent_state_service_profile_trailing_rounds",
+    "persistent_state_startup_priming_timeout_s",
     "persistent_state_service_profile_derating_factor",
 )
 
@@ -134,6 +135,7 @@ def _resolve_a36_envelope(values: Mapping[str, Any]) -> dict[str, Any]:
         "persistent_state_service_profile_trailing_rounds": lambda name, value: (
             _validated_int(name, value, minimum=3)
         ),
+        "persistent_state_startup_priming_timeout_s": _validated_duration,
         "persistent_state_service_profile_derating_factor": _validated_ratio,
     }
     for name in _A36_REQUIRED_KEYS:
@@ -228,7 +230,13 @@ class PersistentStateRuntimeConfig:
     release_convergence_timeout_s: float
     unadmitted_connection_timeout_s: float
     service_profile_trailing_rounds: int
+    startup_priming_timeout_s: float
     service_profile_derating_factor: float
+    priming_budget_descriptor: Any | None
+    priming_budget_sha256: str
+    priming_configured_population_ceiling: int
+    bootstrap_operation_budget: int
+    runtime_tombstone_allowance: int
 
     @property
     def cleanup_queue_capacity(self) -> int:
@@ -263,7 +271,12 @@ class PersistentStateRuntimeConfig:
         )
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any) -> PersistentStateRuntimeConfig:
+    def from_vllm_config(
+        cls,
+        vllm_config: Any,
+        *,
+        startup_provider: Any | None = None,
+    ) -> PersistentStateRuntimeConfig:
         raw = getattr(vllm_config, "additional_config", None)
         if raw is None:
             raw = {}
@@ -309,6 +322,68 @@ class PersistentStateRuntimeConfig:
             default=_DEFAULT_MAX_RESIDENT_SESSIONS,
             minimum=1,
         )
+        if startup_provider is None:
+            model_config = getattr(vllm_config, "model_config", None)
+            architectures = getattr(model_config, "architectures", None)
+            if architectures is None:
+                hf_config = getattr(model_config, "hf_config", None)
+                architectures = getattr(hf_config, "architectures", ())
+            if isinstance(architectures, str):
+                architectures = (architectures,)
+            from vllm_omni.model_executor.models.registry import (
+                get_persistent_state_startup_provider,
+            )
+
+            startup_provider = get_persistent_state_startup_provider(
+                tuple(architectures or ())
+            )
+        runtime_tombstone_allowance = max(
+            _DEFAULT_TOMBSTONE_FLOOR,
+            4 * max_resident_sessions,
+        )
+        priming_budget_descriptor = None
+        priming_budget_sha256 = ""
+        priming_configured_population_ceiling = 0
+        bootstrap_operation_budget = 0
+        if startup_provider is not None:
+            scheduler_config = getattr(vllm_config, "scheduler_config", None)
+            execution_ceiling = _validated_int(
+                "scheduler.max_num_seqs",
+                getattr(scheduler_config, "max_num_seqs", None),
+                minimum=1,
+            )
+            priming_configured_population_ceiling = min(
+                max_resident_sessions,
+                execution_ceiling,
+            )
+            priming_budget_descriptor = (
+                startup_provider.build_priming_budget_descriptor(
+                    configured_population_ceiling=(
+                        priming_configured_population_ceiling
+                    ),
+                    trailing_rounds=a36[
+                        "persistent_state_service_profile_trailing_rounds"
+                    ],
+                )
+            )
+            priming_budget_sha256 = str(priming_budget_descriptor.sha256)
+            bootstrap_operation_budget = int(
+                priming_budget_descriptor.bootstrap_operation_budget
+            )
+        minimum_tombstones = (
+            bootstrap_operation_budget + runtime_tombstone_allowance
+        )
+        max_tombstones = _resolved_int(
+            raw,
+            "persistent_state_max_tombstones",
+            default=minimum_tombstones,
+            minimum=1,
+        )
+        if startup_provider is not None and max_tombstones < minimum_tombstones:
+            raise ValueError(
+                "persistent_state_max_tombstones cannot fund the bootstrap "
+                f"operation budget and runtime allowance; need {minimum_tombstones}"
+            )
         accepted_audio_capacity_samples = _resolved_int(
             raw,
             "streaming_accepted_audio_capacity_samples",
@@ -340,14 +415,7 @@ class PersistentStateRuntimeConfig:
                 "persistent_state_tombstone_ttl_s",
                 default=_DEFAULT_TOMBSTONE_TTL_S,
             ),
-            max_tombstones=_resolved_int(
-                raw,
-                "persistent_state_max_tombstones",
-                default=max(
-                    _DEFAULT_TOMBSTONE_FLOOR, 4 * max_resident_sessions
-                ),
-                minimum=1,
-            ),
+            max_tombstones=max_tombstones,
             pending_claim_timeout_s=_resolved_duration(
                 raw,
                 "persistent_state_pending_claim_timeout_s",
@@ -413,9 +481,19 @@ class PersistentStateRuntimeConfig:
             service_profile_trailing_rounds=a36[
                 "persistent_state_service_profile_trailing_rounds"
             ],
+            startup_priming_timeout_s=a36[
+                "persistent_state_startup_priming_timeout_s"
+            ],
             service_profile_derating_factor=a36[
                 "persistent_state_service_profile_derating_factor"
             ],
+            priming_budget_descriptor=priming_budget_descriptor,
+            priming_budget_sha256=priming_budget_sha256,
+            priming_configured_population_ceiling=(
+                priming_configured_population_ceiling
+            ),
+            bootstrap_operation_budget=bootstrap_operation_budget,
+            runtime_tombstone_allowance=runtime_tombstone_allowance,
         )
         if (
             resolved.session_finalization_timeout_s

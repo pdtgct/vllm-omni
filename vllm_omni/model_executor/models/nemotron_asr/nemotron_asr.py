@@ -278,7 +278,10 @@ def derive_state_pool_blocks(vllm_config: Any) -> int:
         PersistentStateRuntimeConfig,
     )
 
-    runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(
+        vllm_config,
+        startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
     return runtime.max_resident_sessions + runtime.safety_reserve_slots + 1
 
 
