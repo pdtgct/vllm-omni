@@ -57,19 +57,13 @@ def test_service_api_is_async_and_operation_id_explicit() -> None:
     assert "session_key" in reserve.parameters
     assert "schema_id" in reserve.parameters
     assert "profile_id" in reserve.parameters
-    assert "service_interval_ms" in reserve.parameters, (
-        "PORT-STATE-025 missing reserve-to-release cadence authority"
-    )
+    assert "service_interval_ms" in reserve.parameters, "PORT-STATE-025 missing reserve-to-release cadence authority"
     assert "operation_id" in release.parameters
     assert "lease" in release.parameters
     assert "reason" in release.parameters
     constructor = inspect.signature(service_cls)
-    assert "admission_config" in constructor.parameters, (
-        "PORT-STATE-027 missing resolved controller configuration"
-    )
-    assert "host_fatal_callback" in constructor.parameters, (
-        "PORT-STATE-014 missing host-fatal recovery escalation"
-    )
+    assert "admission_config" in constructor.parameters, "PORT-STATE-027 missing resolved controller configuration"
+    assert "host_fatal_callback" in constructor.parameters, "PORT-STATE-014 missing host-fatal recovery escalation"
 
 
 def test_refusal_types_encode_retryability_without_message_matching() -> None:
@@ -87,9 +81,7 @@ def test_refusal_types_encode_retryability_without_message_matching() -> None:
             cause="hard_pressure",
             binding_authority="physical_slots",
         )
-        unavailable = module.PersistentStateServiceUnavailable(
-            "control path closed"
-        )
+        unavailable = module.PersistentStateServiceUnavailable("control path closed")
     except TypeError:
         pytest.fail(
             "PORT-STATE-024 missing typed retry metadata on refusal errors",
@@ -178,16 +170,14 @@ def test_cleanup_capacity_and_priority_are_declared_separately_from_reserve() ->
     dispatcher_sources = [
         inspect.getsource(method)
         for _, method in inspect.getmembers(service_cls, inspect.isfunction)
-        if "reserve_queue" in inspect.getsource(method)
-        and "cleanup_queue" in inspect.getsource(method)
+        if "reserve_queue" in inspect.getsource(method) and "cleanup_queue" in inspect.getsource(method)
     ]
 
     assert "reserve_queue" in source
     assert "cleanup_queue" in source
     assert dispatcher_sources
     assert any(
-        method_source.index("cleanup_queue")
-        < method_source.index("reserve_queue")
+        method_source.index("cleanup_queue") < method_source.index("reserve_queue")
         for method_source in dispatcher_sources
     )
     assert "coalesc" in source.lower()
@@ -216,18 +206,12 @@ def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
     )
     from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
-    manager, _, _ = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=3
-    )
+    manager, _, _ = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     manager.resident_state_scatter_warmup_complete = True
     core = object.__new__(StageEngineCoreProc)
-    core.vllm_config = SimpleNamespace(
-        additional_config=dict(_EXPLICIT_A36_ENVELOPE)
-    )
+    core.vllm_config = SimpleNamespace(additional_config=dict(_EXPLICIT_A36_ENVELOPE))
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=(manager,))
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
     )
 
     snapshot = core.persistent_state_snapshot()
@@ -262,9 +246,7 @@ def test_engine_core_publishes_all_worker_warmup_attestations(
     )
     from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
-    manager, _, _ = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=3
-    )
+    manager, _, _ = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     core = object.__new__(StageEngineCoreProc)
     core.model_executor = SimpleNamespace(
         collective_rpc=lambda method: (
@@ -274,9 +256,7 @@ def test_engine_core_publishes_all_worker_warmup_attestations(
         )
     )
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=(manager,))
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
     )
 
     _publish_warmup_attestation(core)
@@ -295,17 +275,11 @@ def test_engine_core_rejects_incomplete_worker_warmup_attestation(
     )
     from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
-    manager, _, _ = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=3
-    )
+    manager, _, _ = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     core = object.__new__(StageEngineCoreProc)
-    core.model_executor = SimpleNamespace(
-        collective_rpc=lambda method: worker_attestations
-    )
+    core.model_executor = SimpleNamespace(collective_rpc=lambda method: worker_attestations)
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=(manager,))
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
     )
 
     with pytest.raises(RuntimeError, match="worker.*warmup.*attestation"):
@@ -320,14 +294,10 @@ def test_engine_core_skips_worker_warmup_attestation_without_persistent_manager(
 
     core = object.__new__(StageEngineCoreProc)
     core.model_executor = SimpleNamespace(
-        collective_rpc=lambda method: pytest.fail(
-            f"unexpected worker RPC without persistent state: {method}"
-        )
+        collective_rpc=lambda method: pytest.fail(f"unexpected worker RPC without persistent state: {method}")
     )
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=())
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=()))
     )
 
     _publish_warmup_attestation(core)
@@ -345,23 +315,15 @@ def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
     )
     from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
-    manager, _, _ = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=3
-    )
+    manager, _, _ = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     events: list[str] = []
 
     def fake_base_init(core: Any, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         events.append("base-init")
-        core.model_executor = SimpleNamespace(
-            collective_rpc=lambda method: (
-                events.append(method) or [True]
-            )
-        )
+        core.model_executor = SimpleNamespace(collective_rpc=lambda method: (events.append(method) or [True]))
         core.scheduler = SimpleNamespace(
-            kv_cache_manager=SimpleNamespace(
-                coordinator=SimpleNamespace(single_type_managers=(manager,))
-            )
+            kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
         )
 
     monkeypatch.setattr(EngineCoreProc, "__init__", fake_base_init)
@@ -490,9 +452,7 @@ class _TombstoneStage:
         self.resident = 0
         self.revision = 0
 
-    async def call_utility_async(
-        self, name: str, *args: Any
-    ) -> dict[str, Any]:
+    async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
         if name == "persistent_state_snapshot":
             return {
                 "engine_epoch": "epoch-a",
@@ -600,10 +560,7 @@ async def test_public_reserve_is_unavailable_until_profile_is_sealed() -> None:
             service_interval_ms=80,
         )
     except module.PersistentStateServiceUnavailable as error:
-        assert any(
-            name in str(error)
-            for name in ("profile", "seal", "bootstrap", "admission")
-        )
+        assert any(name in str(error) for name in ("profile", "seal", "bootstrap", "admission"))
     else:
         pytest.fail(
             "PORT-STATE-027 public reserve bypassed the profile seal",
@@ -723,9 +680,7 @@ def test_runtime_config_requires_the_complete_a36_envelope() -> None:
     )
     for defaults_source in (None, {}):
         try:
-            PersistentStateRuntimeConfig.from_vllm_config(
-                SimpleNamespace(additional_config=defaults_source)
-            )
+            PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=defaults_source))
         except ValueError as error:
             assert "persistent_state_admission" in str(error)
         else:
@@ -773,16 +728,10 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         "persistent_state_startup_priming_timeout_s",
         "persistent_state_service_profile_derating_factor",
     }
-    old_envelope = {
-        key: value
-        for key, value in _EXPLICIT_A36_ENVELOPE.items()
-        if key not in missing
-    }
+    old_envelope = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key not in missing}
 
     try:
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=old_envelope)
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=old_envelope))
     except ValueError as error:
         message = str(error)
     else:
@@ -803,16 +752,10 @@ def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:
         ARCHITECTURE,
     )
 
-    values = {
-        key: value
-        for key, value in _EXPLICIT_A36_ENVELOPE.items()
-        if key != "persistent_state_max_tombstones"
-    }
+    values = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key != "persistent_state_max_tombstones"}
     config = SimpleNamespace(
         additional_config=values,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 
@@ -820,9 +763,9 @@ def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:
     core_runtime = PersistentStateRuntimeConfig.from_vllm_config(config)
 
     assert api_runtime.priming_configured_population_ceiling == 8
-    assert api_runtime.bootstrap_operation_budget == 360
+    assert api_runtime.bootstrap_operation_budget == 3_840
     assert api_runtime.runtime_tombstone_allowance == 32
-    assert api_runtime.max_tombstones == 392
+    assert api_runtime.max_tombstones == 3_872
     assert len(api_runtime.priming_budget_sha256) == 64
     assert core_runtime.priming_budget_sha256 == api_runtime.priming_budget_sha256
     assert core_runtime.max_tombstones == api_runtime.max_tombstones
@@ -842,9 +785,7 @@ def test_selected_model_rejects_tombstone_horizon_below_derived_minimum() -> Non
             **_EXPLICIT_A36_ENVELOPE,
             "persistent_state_max_tombstones": 391,
         },
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=(ARCHITECTURE,))),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 
@@ -918,14 +859,12 @@ def test_runtime_config_partial_override_stays_self_consistent() -> None:
                     for key, value in _EXPLICIT_A36_ENVELOPE.items()
                     if key != "streaming_session_finalization_timeout_s"
                 },
-                "streaming_accepted_audio_capacity_samples": 960_000
+                "streaming_accepted_audio_capacity_samples": 960_000,
             }
         )
     )
     assert wide.accepted_audio_budget_s == 60.0
-    assert wide.session_finalization_timeout_s == pytest.approx(
-        wide.safe_finalization_timeout_s
-    )
+    assert wide.session_finalization_timeout_s == pytest.approx(wide.safe_finalization_timeout_s)
 
 
 def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
@@ -937,9 +876,7 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
 
     for key in _EXPLICIT_A36_ENVELOPE:
         try:
-            PersistentStateRuntimeConfig.from_vllm_config(
-                SimpleNamespace(additional_config={key: None})
-            )
+            PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config={key: None}))
         except ValueError as error:
             assert key in str(error)
         else:
@@ -950,29 +887,21 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
 
     with pytest.raises(ValueError, match="streaming_session_idle_timeout_s"):
         PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(
-                additional_config={"streaming_session_idle_timeout_s": None}
-            )
+            SimpleNamespace(additional_config={"streaming_session_idle_timeout_s": None})
         )
 
     unprefixed = dict(_EXPLICIT_A36_ENVELOPE)
     unprefixed["session_idle_timeout_s"] = 60.0
     with pytest.raises(ValueError, match="streaming_ prefix"):
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=unprefixed)
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=unprefixed))
 
     too_short = dict(_EXPLICIT_A36_ENVELOPE)
     too_short["streaming_session_finalization_timeout_s"] = 32.0
     with pytest.raises(ValueError, match="safe drain bound"):
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=too_short)
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=too_short))
 
     with pytest.raises(ValueError, match="must be a mapping"):
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config="not-a-mapping")
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config="not-a-mapping"))
 
 
 @pytest.mark.parametrize(
@@ -1015,9 +944,7 @@ def test_runtime_config_enforces_a36_cross_field_ordering(
 
     try:
         PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(
-                additional_config={**_EXPLICIT_A36_ENVELOPE, **updates}
-            )
+            SimpleNamespace(additional_config={**_EXPLICIT_A36_ENVELOPE, **updates})
         )
     except ValueError as error:
         assert re.search(message, str(error))
@@ -1079,9 +1006,7 @@ def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
 
     clock = _Clock()
     monkeypatch.setattr(core_module.time, "monotonic", clock)
-    manager, _, spec = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=3
-    )
+    manager, _, spec = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     runtime_values = dict(
         _EXPLICIT_A36_ENVELOPE,
         max_resident_sessions=1,
@@ -1093,40 +1018,20 @@ def test_engine_core_never_evicts_an_unexpired_operation_tombstone(
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=(manager,))
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
     )
 
-    first = core.persistent_state_reserve(
-        "reserve-a", "session-a", spec.schema_id, "default"
-    )
-    assert (
-        core.persistent_state_reserve(
-            "reserve-a", "session-a", spec.schema_id, "default"
-        )
-        == first
-    )
+    first = core.persistent_state_reserve("reserve-a", "session-a", spec.schema_id, "default")
+    assert core.persistent_state_reserve("reserve-a", "session-a", spec.schema_id, "default") == first
     with pytest.raises(RuntimeError, match="tombstone horizon"):
-        core.persistent_state_reserve(
-            "reserve-b", "session-b", spec.schema_id, "default"
-        )
+        core.persistent_state_reserve("reserve-b", "session-b", spec.schema_id, "default")
 
-    released = core.persistent_state_release(
-        "release-a", first["lease"], "test"
-    )
-    assert (
-        core.persistent_state_release(
-            "release-a", first["lease"], "test"
-        )
-        == released
-    )
+    released = core.persistent_state_release("release-a", first["lease"], "test")
+    assert core.persistent_state_release("release-a", first["lease"], "test") == released
     assert len(core._persistent_state_control_state["operations"]) == 2
 
     clock.now += 10.0
-    second = core.persistent_state_reserve(
-        "reserve-b", "session-b", spec.schema_id, "default"
-    )
+    second = core.persistent_state_reserve("reserve-b", "session-b", spec.schema_id, "default")
     assert second["lease"]["session_key"] == "session-b"
     assert len(core._persistent_state_control_state["operations"]) == 1
 
@@ -1138,9 +1043,7 @@ def _state_core_for_cleanup_tests() -> tuple[Any, Any, Any]:
     )
     from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
-    manager, _, spec = make_manager(
-        require_persistent_state_module(), num_gpu_blocks=4
-    )
+    manager, _, spec = make_manager(require_persistent_state_module(), num_gpu_blocks=4)
     runtime_values = dict(
         _EXPLICIT_A36_ENVELOPE,
         max_resident_sessions=2,
@@ -1152,9 +1055,7 @@ def _state_core_for_cleanup_tests() -> tuple[Any, Any, Any]:
     core = object.__new__(StageEngineCoreProc)
     core.vllm_config = SimpleNamespace(additional_config=runtime_values)
     core.scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            coordinator=SimpleNamespace(single_type_managers=(manager,))
-        )
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
     )
     return core, manager, spec
 
@@ -1176,9 +1077,7 @@ def _claim_payload(lease: dict[str, Any]) -> dict[str, Any]:
 def test_pending_cleanup_claim_serializes_against_scheduler_claim() -> None:
     # @spec PORT-STATE-014 / PORT-STATE-019
     core, manager, spec = _state_core_for_cleanup_tests()
-    reserved = core.persistent_state_reserve(
-        "reserve-a", "session-a", spec.schema_id, "default"
-    )
+    reserved = core.persistent_state_reserve("reserve-a", "session-a", spec.schema_id, "default")
     lease = reserved["lease"]
 
     assert core.persistent_state_begin_pending_cleanup(lease) is True
@@ -1186,25 +1085,19 @@ def test_pending_cleanup_claim_serializes_against_scheduler_claim() -> None:
     with pytest.raises(ValueError, match="pending claim mismatch"):
         core.claim_pending_lease(**_claim_payload(lease))
 
-    released = core.persistent_state_release(
-        "release-a", lease, "pending_claim_timeout"
-    )
+    released = core.persistent_state_release("release-a", lease, "pending_claim_timeout")
     assert released["resident_count"] == 0
     assert manager.get_state_binding("session-a") is None
     revision = core._persistent_state_control_state["revision"]
     with pytest.raises(ValueError, match="stale"):
-        core.persistent_state_release(
-            "different-release", lease, "late_duplicate"
-        )
+        core.persistent_state_release("different-release", lease, "late_duplicate")
     assert core._persistent_state_control_state["revision"] == revision
 
 
 def test_claimed_state_cannot_be_released_until_scheduler_terminality() -> None:
     # @spec PORT-STATE-014 / PORT-STATE-019
     core, manager, spec = _state_core_for_cleanup_tests()
-    reserved = core.persistent_state_reserve(
-        "reserve-a", "session-a", spec.schema_id, "default"
-    )
+    reserved = core.persistent_state_reserve("reserve-a", "session-a", spec.schema_id, "default")
     lease = reserved["lease"]
     binding = core.claim_pending_lease(**_claim_payload(lease))
 
@@ -1214,7 +1107,5 @@ def test_claimed_state_cannot_be_released_until_scheduler_terminality() -> None:
     assert manager.get_state_binding("session-a") == binding
 
     core.mark_terminal(binding)
-    released = core.persistent_state_release(
-        "release-a", lease, "cleanup"
-    )
+    released = core.persistent_state_release("release-a", lease, "cleanup")
     assert released["resident_count"] == 0

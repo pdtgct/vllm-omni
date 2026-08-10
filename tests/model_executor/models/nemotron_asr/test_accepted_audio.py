@@ -27,9 +27,7 @@ def _fail(message: str) -> NoReturn:
 
 def _module() -> Any:
     try:
-        return importlib.import_module(
-            "vllm_omni.model_executor.models.nemotron_asr.accepted_audio"
-        )
+        return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.accepted_audio")
     except ModuleNotFoundError:
         _fail("PORT-SESS-001 missing the bounded accepted-audio authority")
 
@@ -54,6 +52,27 @@ def _authority(
     )
 
 
+def _paced_authority(
+    *,
+    cadence_ns: int = 80,
+    chunk_samples: int = 4,
+    capacity_samples: int = 32,
+) -> Any:
+    cls = _module().AcceptedAudioAuthority
+    try:
+        return cls(
+            request_id="request-a",
+            engine_epoch="epoch-a",
+            lease_generation=7,
+            chunk_samples=chunk_samples,
+            capacity_samples=capacity_samples,
+            carrier_sequence_modulus=2**24,
+            cadence_ns=cadence_ns,
+        )
+    except TypeError as error:
+        _fail(f"PORT-SESS-001 missing the server-regulated cadence release clock: {error}")
+
+
 def _samples(start: int, count: int) -> np.ndarray:
     return np.arange(start, start + count, dtype=np.float32)
 
@@ -61,14 +80,10 @@ def _samples(start: int, count: int) -> np.ndarray:
 def _snapshot(authority: Any) -> Any:
     snapshot = authority.snapshot()
     assert snapshot.accepted_samples == (
-        snapshot.parked_samples
-        + snapshot.cleared_samples
-        + snapshot.outstanding_samples
+        snapshot.parked_samples + snapshot.cleared_samples + snapshot.outstanding_samples
     )
     assert snapshot.outstanding_samples == (
-        snapshot.residual_samples
-        + snapshot.ready_samples
-        + snapshot.in_flight_samples
+        snapshot.residual_samples + snapshot.ready_samples + snapshot.in_flight_samples
     )
     return snapshot
 
@@ -121,11 +136,15 @@ def test_packetization_does_not_change_cadence_units_or_final_tail() -> None:
             _park_current(authority, unit)
         return collected
 
-    assert collect(left) == collect(right) == [
-        ("regular", [0.0, 1.0, 2.0, 3.0]),
-        ("regular", [4.0, 5.0, 6.0, 7.0]),
-        ("final_tail", [8.0, 9.0, 10.0]),
-    ]
+    assert (
+        collect(left)
+        == collect(right)
+        == [
+            ("regular", [0.0, 1.0, 2.0, 3.0]),
+            ("regular", [4.0, 5.0, 6.0, 7.0]),
+            ("final_tail", [8.0, 9.0, 10.0]),
+        ]
+    )
     assert _snapshot(left).outstanding_samples == 0
     assert _snapshot(right).outstanding_samples == 0
 
@@ -234,6 +253,78 @@ def test_one_large_piece_queues_every_complete_unit_before_dispatch() -> None:
     assert snapshot.in_flight_samples == 0
 
 
+def test_burst_keeps_true_readiness_but_releases_one_unit_per_cadence() -> None:
+    # @spec PORT-SESS-001 / PORT-STATE-026
+    authority = _paced_authority(cadence_ns=80)
+    authority.accept(_samples(0, 12), accepted_at_ns=100)
+
+    assert [unit.ready_at_ns for unit in authority.ready_units] == [100, 100, 100]
+    first = authority.dispatch_next(now_ns=100)
+    assert first is not None
+    authority.record_submission(first, submitted_at_ns=120)
+    _park_current(authority, first)
+
+    assert authority.dispatch_next(now_ns=199) is None
+    assert authority.next_eligibility_ns == 200
+    second = authority.dispatch_next(now_ns=200)
+    assert second is not None
+    authority.record_submission(second, submitted_at_ns=230)
+    _park_current(authority, second)
+
+    assert authority.dispatch_next(now_ns=309) is None
+    third = authority.dispatch_next(now_ns=310)
+    assert third is not None
+    assert [unit.ready_at_ns for unit in (first, second, third)] == [100, 100, 100]
+
+
+def test_release_clock_advances_from_actual_not_planned_submission() -> None:
+    # @spec PORT-SESS-001 / PORT-STATE-026
+    authority = _paced_authority(cadence_ns=80)
+    authority.accept(_samples(0, 8), accepted_at_ns=100)
+    first = authority.dispatch_next(now_ns=100)
+
+    authority.record_submission(first, submitted_at_ns=1_000)
+    _park_current(authority, first)
+
+    assert authority.next_eligibility_ns == 1_080
+    assert authority.dispatch_next(now_ns=1_079) is None
+    assert authority.dispatch_next(now_ns=1_080) is not None
+
+
+def test_final_tail_uses_the_same_ordinary_release_clock() -> None:
+    # @spec PORT-SESS-003 / PORT-STATE-026
+    authority = _paced_authority(cadence_ns=80)
+    authority.accept(_samples(0, 4), accepted_at_ns=100)
+    first = authority.dispatch_next(now_ns=100)
+    authority.record_submission(first, submitted_at_ns=120)
+    _park_current(authority, first)
+    authority.begin_finalize(finalize_at_ns=130)
+
+    assert authority.dispatch_next(now_ns=199) is None
+    tail = authority.dispatch_next(now_ns=200)
+    assert tail is not None
+    assert tail.kind == "final_tail"
+    assert tail.ready_at_ns == 130
+
+
+def test_forced_eou_does_not_advance_the_ordinary_release_clock() -> None:
+    # @spec PORT-SESS-001 / PORT-SEG-004 / PORT-STATE-026
+    authority = _paced_authority(cadence_ns=80)
+    authority.force_segment()
+    barrier = authority.dispatch_next(now_ns=100)
+
+    assert barrier is not None
+    assert barrier.kind == "forced_eou"
+    authority.record_submission(barrier, submitted_at_ns=120)
+    _park_current(authority, barrier)
+    assert authority.next_eligibility_ns is None
+
+    authority.accept(_samples(0, 4), accepted_at_ns=121)
+    regular = authority.dispatch_next(now_ns=121)
+    assert regular is not None
+    assert regular.kind == "regular"
+
+
 def test_dispatch_allows_at_most_one_in_flight_unit() -> None:
     # @spec PORT-SESS-001 / PORT-SESS-013
     authority = _authority()
@@ -333,9 +424,7 @@ def test_duplicate_forces_for_one_generation_coalesce_to_one_barrier() -> None:
     for _ in range(100):
         authority.force_segment()
 
-    assert [(unit.kind, unit.sample_count) for unit in authority.ready_units] == [
-        ("forced_eou", 0)
-    ]
+    assert [(unit.kind, unit.sample_count) for unit in authority.ready_units] == [("forced_eou", 0)]
     assert _snapshot(authority).outstanding_samples == 0
 
 
@@ -354,9 +443,7 @@ def test_finalize_first_rejects_later_audio_force_and_locale_update() -> None:
         authority.update_locale("en-US")
 
     assert authority.snapshot() == before
-    assert [(unit.kind, unit.sample_count) for unit in authority.ready_units] == [
-        ("final_tail", 3)
-    ]
+    assert [(unit.kind, unit.sample_count) for unit in authority.ready_units] == [("final_tail", 3)]
 
 
 def test_force_first_before_finalize_remains_before_final_tail() -> None:

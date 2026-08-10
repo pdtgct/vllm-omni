@@ -86,9 +86,7 @@ class _RecoveryStage:
         snapshot["bindings"] = [dict(b) for b in self.bindings]
         return snapshot
 
-    async def call_utility_async(
-        self, name: str, *args: Any
-    ) -> dict[str, Any]:
+    async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
         if name == "persistent_state_snapshot":
             self.snapshot_calls += 1
             if self.snapshot_gate is not None:
@@ -137,11 +135,7 @@ class _RecoveryStage:
                 raise RuntimeError("claimed lease is still running")
             self.resident = max(0, self.resident - 1)
             self.revision += 1
-            self.bindings = [
-                b
-                for b in self.bindings
-                if b["binding_token"] != lease["binding_token"]
-            ]
+            self.bindings = [b for b in self.bindings if b["binding_token"] != lease["binding_token"]]
             return {
                 "operation_id": operation_id,
                 "manager_revision": self.revision,
@@ -189,8 +183,7 @@ def _recovering_service(
     parameters = set(inspect.signature(PersistentStateService).parameters)
     if missing := required.difference(parameters):
         pytest.fail(
-            "PORT-STATE-014 / PORT-STATE-022 missing autonomous recovery "
-            f"constructor seams: {sorted(missing)}",
+            f"PORT-STATE-014 / PORT-STATE-022 missing autonomous recovery constructor seams: {sorted(missing)}",
             pytrace=False,
         )
     errors = fatal_errors if fatal_errors is not None else []
@@ -254,7 +247,10 @@ def _compiled_admission_profile(
         ServiceRoundExecution(
             tier_id="all",
             active_population=maximum_population,
-            elapsed_ns=50_000_000,
+            # At the two-session fixture, the 1120-ms bucket admits one
+            # under f=1/2 but fragmentation rejects two.  The c=4/J test
+            # selects its own f=1 profile and retains the fast table.
+            elapsed_ns=(300_000_000 if maximum_population == 2 and interval == 1120 else 50_000_000),
             service_interval_ms=interval,
             geometry_id=geometry,
             completed_legal_parks=maximum_population,
@@ -289,8 +285,11 @@ def _compiled_admission_profile(
             precision_policy="fp32",
             state_profile="test-profile",
             compiler_version="test-v1",
-            mixed_composition_policy="homogeneous_upper_sum",
+            mixed_composition_policy="periodic_limited_preemption_edf",
         ),
+        # Recovery tests isolate controller lifecycle with synthetic regular
+        # rounds; role/control compilation has its own exact contract suite.
+        control_dominance_sha256="d" * 64,
     )
 
 
@@ -548,8 +547,7 @@ def test_recovery_reinstalls_the_cold_start_profile_without_remeasuring() -> Non
         parameters = set(inspect.signature(PersistentStateService).parameters)
         if "compiled_service_profile" not in parameters:
             pytest.fail(
-                "PORT-STATE-022 missing immutable compiled service profile "
-                "on recovery",
+                "PORT-STATE-022 missing immutable compiled service profile on recovery",
                 pytrace=False,
             )
         service = _recovering_service(
@@ -603,10 +601,7 @@ def test_service_waits_before_reserve_and_release_wakes_the_oldest_head() -> Non
             )
         )
         await _wait_until(
-            lambda: (
-                service.admission_snapshot is not None
-                and service.admission_snapshot.waiter_count == 1
-            )
+            lambda: service.admission_snapshot is not None and service.admission_snapshot.waiter_count == 1
         )
         await asyncio.sleep(0)
         assert stage.reserve_calls == 1
@@ -726,10 +721,7 @@ def test_four_concurrent_streams_dispatch_in_bounded_fifo_waves() -> None:
             for index in range(4)
         ]
         await _wait_until(
-            lambda: (
-                service.admission_snapshot is not None
-                and service.admission_snapshot.submitted_count == 2
-            )
+            lambda: service.admission_snapshot is not None and service.admission_snapshot.submitted_count == 2
         )
         await asyncio.sleep(0.01)
         assert stage.reserve_calls == 1
@@ -855,9 +847,7 @@ def test_handshake_releases_expired_orphan_bindings_only() -> None:
         stage.hang_reserve = False
         await service.check_health()
         assert service.ready
-        released_tokens = [
-            lease["binding_token"] for _, lease in stage.release_calls
-        ]
+        released_tokens = [lease["binding_token"] for _, lease in stage.release_calls]
         assert released_tokens == ["binding-orphan"]
         service.shutdown()
 
@@ -912,9 +902,7 @@ def test_horizon_exhaustion_is_retryable_and_never_closes_admission() -> None:
         clock = _Clock()
         service = _service(stage, clock)
         await _open_service(service)
-        stage.reserve_error = RuntimeError(
-            "persistent_state_horizon_exhausted: retry after tombstone expiry"
-        )
+        stage.reserve_error = RuntimeError("persistent_state_horizon_exhausted: retry after tombstone expiry")
         with pytest.raises(Exception) as info:
             await service.reserve(**_lease_kwargs(1))
         assert getattr(info.value, "retryable", False), (
@@ -955,9 +943,7 @@ def test_full_reserve_bridge_is_retryable_shed() -> None:
         with pytest.raises(Exception) as info:
             await service.reserve(**_lease_kwargs(3))
 
-        assert getattr(info.value, "retryable", False), (
-            "PORT-STATE-024 requires queue-full to be typed shed"
-        )
+        assert getattr(info.value, "retryable", False), "PORT-STATE-024 requires queue-full to be typed shed"
         assert getattr(info.value, "cause", None) == "bridge_full"
         assert service.ready
         assert stage.reserve_calls == 1
@@ -1067,8 +1053,7 @@ def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
         await _wait_until(lambda: stage.snapshot_calls > snapshots_before)
         service._demote()
         assert service._recovery_task is recovery, (
-            "PORT-STATE-022 replaced the live recovery driver and reset "
-            "PORT-STATE-014's convergence clock"
+            "PORT-STATE-022 replaced the live recovery driver and reset PORT-STATE-014's convergence clock"
         )
 
         stage.snapshot_gate.set()
