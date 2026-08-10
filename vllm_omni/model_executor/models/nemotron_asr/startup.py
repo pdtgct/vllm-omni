@@ -269,6 +269,11 @@ class NemotronPersistentStateStartupProvider:
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
                 completed_legal_parks = len(bound)
             elif round_spec.scenario_id == "forced_eou_then_chunk":
+                # An EOU token is a continuing control row. Register the fresh
+                # request through the ordinary CHUNK path first; that common
+                # setup work is deliberately outside the two-park canary.
+                await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                started_ns = time.monotonic_ns()
                 await asyncio.gather(*(lease.force_segment() for lease in bound))
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
                 completed_legal_parks = 2 * len(bound)
