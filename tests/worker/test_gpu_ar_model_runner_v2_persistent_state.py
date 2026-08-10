@@ -766,10 +766,22 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
         lambda **kwargs: events.append("jit-monitor"),
     )
 
+    warmup_attestation = getattr(
+        worker_cls,
+        "persistent_state_warmup_attestation",
+        None,
+    )
+    if not callable(warmup_attestation):
+        pytest.fail(
+            "PORT-ADV-003 missing worker warmup attestation",
+            pytrace=False,
+        )
+    assert warmup_attestation(worker) is False
     result = worker_cls._compile_or_warm_up_persistent_only_model(worker)
 
     assert result.language_model == 1.5
     assert result.encoder == 2.5
+    assert warmup_attestation(worker) is True
     assert events == [
         "remove-loras",
         "kernel-warmup",
@@ -780,6 +792,48 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
         "gc-debug",
         "gpu-sync-check",
     ]
+
+
+def test_failed_resident_warmup_never_attests_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-ADV-003 / ENV-MIG-012."""
+    from vllm.config.compilation import CompilationMode
+
+    module = importlib.import_module("vllm_omni.worker.gpu_ar_worker")
+    worker_cls = _worker_cls()
+    worker = _worker(persistent=True, ordinary_groups=0)
+    worker.model_runner.maybe_remove_all_loras = lambda config: None
+    worker.model_runner.lora_config = None
+    worker.model_runner.model.warmup_resident_state = lambda: (_ for _ in ()).throw(
+        RuntimeError("scatter warmup failed")
+    )
+    worker.model_config = SimpleNamespace(enforce_eager=True, seed=17)
+    worker.compilation_config = SimpleNamespace(
+        mode=CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker.observability_config = SimpleNamespace(
+        jit_monitor_mode="off",
+        jit_monitor_verbose=False,
+    )
+    monkeypatch.setattr(module, "kernel_warmup", lambda value: None)
+
+    with pytest.raises(RuntimeError, match="scatter warmup failed"):
+        worker_cls._compile_or_warm_up_persistent_only_model(worker)
+
+    warmup_attestation = getattr(
+        worker_cls,
+        "persistent_state_warmup_attestation",
+        None,
+    )
+    if not callable(warmup_attestation):
+        pytest.fail(
+            "PORT-ADV-003 missing worker warmup attestation",
+            pytrace=False,
+        )
+    assert warmup_attestation(worker) is False
 
 
 def test_core_warmup_pin_guard_keeps_the_persistent_only_divergence_narrow() -> None:
