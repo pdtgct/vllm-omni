@@ -43,6 +43,7 @@ _SNAPSHOT_BASE: dict[str, Any] = {
     "stage": 0,
     "replica": 0,
     "capabilities": ["resident"],
+    "resident_state_scatter_warmup_complete": True,
     "schema_id": "schema-a",
     "profile_id": "profile-a",
     "persistent_state_tombstone_ttl_s": 10.0,
@@ -238,6 +239,7 @@ async def _wait_until(
 def _compiled_admission_profile(
     *,
     derating_factor: Fraction = Fraction(1, 2),
+    maximum_population: int = 2,
 ) -> Any:
     from vllm_omni.engine.persistent_state_capacity import (
         ServiceExecutionTier,
@@ -250,11 +252,11 @@ def _compiled_admission_profile(
     executions = tuple(
         ServiceRoundExecution(
             tier_id="all",
-            active_population=2,
+            active_population=maximum_population,
             elapsed_ns=50_000_000,
             service_interval_ms=interval,
             geometry_id=geometry,
-            completed_legal_parks=2,
+            completed_legal_parks=maximum_population,
             completed_model_rows=None,
             post_jit=True,
             continuously_loaded=True,
@@ -265,8 +267,8 @@ def _compiled_admission_profile(
     )
     return compile_provisional_service_profile(
         executions,
-        execution_tiers=(ServiceExecutionTier("all", 2),),
-        max_population=2,
+        execution_tiers=(ServiceExecutionTier("all", maximum_population),),
+        max_population=maximum_population,
         reference_interval_ms=1120,
         reference_geometry_id=4,
         admitted_geometry_ids=(0, 1, 2, 3, 4),
@@ -274,9 +276,9 @@ def _compiled_admission_profile(
         derating_factor=derating_factor,
         context=ServiceProfileContext(
             pre_override_physical_bound=4,
-            allocated_pool=2,
-            count_cap=2,
-            execution_claim_ceiling=2,
+            allocated_pool=maximum_population,
+            count_cap=maximum_population,
+            execution_claim_ceiling=maximum_population,
             service_budget_source="measured_fallback",
             service_budget_coefficients=(Fraction(1),),
             derating_factor=derating_factor,
@@ -288,6 +290,55 @@ def _compiled_admission_profile(
             mixed_composition_policy="homogeneous_upper_sum",
         ),
     )
+
+
+def test_recovery_uses_one_explicit_convergence_clock_authority() -> None:
+    """@spec PORT-STATE-014: no unread shadow clock can imply authority."""
+    service = _recovering_service(_RecoveryStage(), _Clock())
+    assert not hasattr(service, "_failed_release_started_at"), (
+        "PORT-STATE-014 retains an unread shadow convergence clock"
+    )
+    service.shutdown()
+
+
+def test_bootstrap_profile_seal_is_one_shot_and_opens_public_authority() -> None:
+    """@spec ENV-MIG-012 / PORT-STATE-027 / PORT-PERF-006."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _recovering_service(stage, _Clock())
+        bootstrap = getattr(service, "bootstrap_handshake", None)
+        seal = getattr(service, "seal_startup_profile", None)
+        if not callable(bootstrap) or not callable(seal):
+            pytest.fail(
+                "ENV-MIG-012 missing bootstrap/profile-seal lifecycle",
+                pytrace=False,
+            )
+        inventory = await bootstrap()
+        assert inventory["engine_epoch"] == "epoch-a"
+        assert not service.ready
+        profile = _compiled_admission_profile()
+
+        seal(compiled_service_profile=profile)
+
+        assert service.ready
+        assert service.compiled_service_profile is profile
+        with pytest.raises(RuntimeError, match="already.*seal|one.*shot"):
+            seal(compiled_service_profile=profile)
+        reserve_for_priming = getattr(service, "reserve_for_priming", None)
+        if not callable(reserve_for_priming):
+            pytest.fail(
+                "PORT-PERF-005 missing private bootstrap reserve",
+                pytrace=False,
+            )
+        with pytest.raises(
+            PersistentStateServiceUnavailable,
+            match="bootstrap|seal|priming",
+        ):
+            await reserve_for_priming(**_lease_kwargs(99))
+        service.shutdown()
+
+    asyncio.run(scenario())
 
 
 def _lease_kwargs(n: int) -> dict[str, str]:
@@ -387,7 +438,7 @@ def test_indeterminate_reserve_recovers_without_an_external_health_probe() -> No
 
 # @spec PORT-STATE-022
 def test_health_probes_join_one_inflight_recovery_authority() -> None:
-    """Concurrent health traffic must not start parallel handshakes."""
+    """Health joins recovery without blocking or starting another handshake."""
 
     async def scenario() -> None:
         stage = _RecoveryStage()
@@ -408,11 +459,28 @@ def test_health_probes_join_one_inflight_recovery_authority() -> None:
         snapshots_before = stage.snapshot_calls
         await _wait_until(lambda: stage.snapshot_calls > snapshots_before)
 
-        probes = [asyncio.create_task(service.check_health()) for _ in range(8)]
-        await asyncio.sleep(0)
+        async def probe() -> None:
+            with pytest.raises(
+                PersistentStateServiceUnavailable,
+                match="admission|unhandshaked|recovery|unavailable",
+            ):
+                await service.check_health()
+
+        probe_tasks = [asyncio.create_task(probe()) for _ in range(8)]
+        _, pending = await asyncio.wait(probe_tasks, timeout=0.05)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            stage.snapshot_gate.set()
+            pytest.fail(
+                "PORT-STATE-030 health blocked on authority recovery",
+                pytrace=False,
+            )
         assert stage.snapshot_calls == snapshots_before + 1
         stage.snapshot_gate.set()
-        await asyncio.gather(*probes)
+        await _wait_until(lambda: service.ready)
+        await service.check_health()
         assert stage.snapshot_calls == snapshots_before + 1
         service.shutdown()
 
@@ -576,15 +644,29 @@ def test_service_wait_deadline_sheds_without_submitting_to_engine() -> None:
 
 # @spec PORT-STATE-027 / PORT-PERF-008
 def test_four_concurrent_streams_dispatch_in_bounded_fifo_waves() -> None:
-    """c=4 composes J=2 submission with release-driven admission."""
+    """c=4 proves J=2 while every hard authority permits four."""
 
     async def scenario() -> None:
         stage = _RecoveryStage()
+        stage.hang_reserve = True
+        original_snapshot = stage._snapshot
+
+        def four_slot_snapshot() -> dict[str, Any]:
+            snapshot = original_snapshot()
+            snapshot.update(
+                physical_capacity=4,
+                configured_limit=4,
+                effective_capacity=4,
+            )
+            return snapshot
+
+        stage._snapshot = four_slot_snapshot  # type: ignore[method-assign]
         service = _recovering_service(
             stage,
             _Clock(),
             compiled_service_profile=_compiled_admission_profile(
                 derating_factor=Fraction(1),
+                maximum_population=4,
             ),
         )
         await _open_service(service)
@@ -598,22 +680,22 @@ def test_four_concurrent_streams_dispatch_in_bounded_fifo_waves() -> None:
             )
             for index in range(4)
         ]
-        await _wait_until(lambda: stage.reserve_calls == 2)
-        await _wait_until(lambda: tasks[0].done() and tasks[1].done())
-        assert not tasks[2].done()
-        assert not tasks[3].done()
-
-        first_wave = await asyncio.gather(*tasks[:2])
-        await asyncio.gather(
-            *(
-                service.release(
-                    operation_id=f"release-{index}",
-                    lease=lease,
-                    reason="test",
-                )
-                for index, lease in enumerate(first_wave)
+        await _wait_until(
+            lambda: (
+                service.admission_snapshot is not None
+                and service.admission_snapshot.submitted_count == 2
             )
         )
+        await asyncio.sleep(0.01)
+        assert stage.reserve_calls == 1
+        assert service.admission_snapshot is not None
+        assert service.admission_snapshot.submitted_count == 2
+        assert not any(task.done() for task in tasks)
+
+        stage.hang_reserve = False
+        stage._hang_release.set()
+        await _wait_until(lambda: tasks[0].done() and tasks[1].done())
+        first_wave = await asyncio.gather(*tasks[:2])
         second_wave = await asyncio.wait_for(
             asyncio.gather(*tasks[2:]),
             timeout=0.25,
@@ -631,7 +713,7 @@ def test_four_concurrent_streams_dispatch_in_bounded_fifo_waves() -> None:
                     lease=lease,
                     reason="test",
                 )
-                for index, lease in enumerate(second_wave)
+                for index, lease in enumerate((*first_wave, *second_wave))
             )
         )
         service.shutdown()

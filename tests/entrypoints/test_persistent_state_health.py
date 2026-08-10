@@ -63,14 +63,17 @@ async def test_state_authority_loss_maps_to_503_instead_of_generic_500() -> None
 
     engine = _Engine(
         PersistentStateServiceUnavailable(
-            "persistent-state authority is unhandshaked"
+            "persistent-state authority is unhandshaked: secret-operation-id"
         )
     )
 
     response = await _health_response(engine)
 
     assert response.status_code == 503
-    assert b"unhandshaked" in response.body
+    assert response.body == (
+        b'{"status":"unhealthy","reason":"persistent_state_unavailable"}'
+    ), "PORT-STATE-030 health exposed a variable causal reason"
+    assert b"secret-operation-id" not in response.body
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -85,4 +88,6 @@ async def test_restart_escalation_and_stopping_are_unready(
     response = await _health_response(engine)
 
     assert response.status_code == 503
-    assert state.encode() in response.body
+    assert response.body == (
+        b'{"status":"unhealthy","reason":"persistent_state_unavailable"}'
+    ), "PORT-STATE-030 health exposed a variable state reason"

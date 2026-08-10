@@ -18,7 +18,7 @@ from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _persistent_state_runtime_values() -> dict[str, int | float]:
+def _persistent_state_runtime_values() -> dict[str, Any]:
     return {
         "persistent_state_safety_reserve_slots": 1,
         "max_resident_sessions": 4,
@@ -32,6 +32,18 @@ def _persistent_state_runtime_values() -> dict[str, int | float]:
         "streaming_session_finalization_timeout_s": 40.0,
         "streaming_accepted_audio_capacity_samples": 480_000,
         "streaming_max_retained_transcript_bytes": 1 << 20,
+        "persistent_state_admission_waiter_capacity": 8,
+        "persistent_state_admission_max_inflight_reserves": 2,
+        "persistent_state_admission_dispatch_budget": 1,
+        "persistent_state_admission_aging_threshold_s": 0.05,
+        "persistent_state_admission_wait_timeout_s": 0.10,
+        "persistent_state_admission_retry_floor_ms": 10,
+        "persistent_state_admission_retry_jitter_ms": 0,
+        "persistent_state_recovery_backoff_s": (0.01, 0.02),
+        "persistent_state_release_convergence_timeout_s": 60.01,
+        "streaming_unadmitted_connection_timeout_s": 20.21,
+        "persistent_state_service_profile_trailing_rounds": 2,
+        "persistent_state_service_profile_derating_factor": 0.5,
     }
 
 
@@ -966,6 +978,7 @@ async def test_app_state_inventories_service_before_install(
                 "stage": 0,
                 "replica": 0,
                 "capabilities": ["resident"],
+                "resident_state_scatter_warmup_complete": True,
                 "schema_id": "schema",
                 "profile_id": "profile",
             }

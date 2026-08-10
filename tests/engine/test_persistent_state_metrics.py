@@ -65,7 +65,8 @@ class _StageClient:
                 "effective_capacity": 6,
                 "stage": 0,
                 "replica": 0,
-                "capabilities": ["resident"],
+                    "capabilities": ["resident"],
+                    "resident_state_scatter_warmup_complete": True,
                 "schema_id": "schema-1",
                 "profile_id": "profile-1",
             }
