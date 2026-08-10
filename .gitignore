@@ -213,6 +213,7 @@ kv_cache/
 # Logs
 logs/
 *.log
+*.profraw
 
 # Temporary files
 tmp/

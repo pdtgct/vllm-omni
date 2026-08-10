@@ -717,7 +717,7 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
 @pytest.mark.parametrize(
     ("scenario_id", "expected_action_order"),
     [
-        ("forced_eou_then_chunk", ("force", "feed")),
+        ("forced_eou_then_chunk", ("setup_feed", "force", "feed")),
         ("final_tail_then_flush", ("feed", "flush")),
     ],
 )
@@ -731,6 +731,7 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
     from vllm_omni.model_executor.models.nemotron_asr import (
         session as session_module,
     )
+    from vllm_omni.model_executor.models.nemotron_asr import startup as startup_module
     from vllm_omni.model_executor.models.nemotron_asr.startup import (
         NEMOTRON_PERSISTENT_STATE_STARTUP,
     )
@@ -740,14 +741,20 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
     class _Bound:
         def __init__(self, **kwargs: Any) -> None:
             self.request_id = str(kwargs["request_id"])
+            self._first_chunk_registered = False
 
         async def feed(self, samples: Any) -> list[str]:
             expected_samples = 1_279 if scenario_id == "final_tail_then_flush" else 1_280
             assert samples.shape == (expected_samples,)
-            events.append(("feed", self.request_id))
+            action = (
+                "setup_feed" if scenario_id == "forced_eou_then_chunk" and not self._first_chunk_registered else "feed"
+            )
+            self._first_chunk_registered = True
+            events.append((action, self.request_id))
             return [""]
 
         async def force_segment(self) -> None:
+            assert self._first_chunk_registered, "forced EOU must follow the first CHUNK"
             events.append(("force", self.request_id))
 
         async def flush(self) -> SimpleNamespace:
@@ -775,6 +782,9 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
         service_interval_ms=80,
         scenario_id=scenario_id,
     )
+    if scenario_id == "forced_eou_then_chunk":
+        clock = iter((100, 200, 230))
+        monkeypatch.setattr(startup_module.time, "monotonic_ns", lambda: next(clock))
 
     result = await NEMOTRON_PERSISTENT_STATE_STARTUP.execute_priming_round(
         engine_client=engine,
@@ -785,3 +795,5 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
     assert result.completed_legal_parks == 2
     assert tuple(action for action, _ in events[:-1]) == expected_action_order
     assert events[-1] == ("abort", "session-0")
+    if scenario_id == "forced_eou_then_chunk":
+        assert result.elapsed_ns == 30
