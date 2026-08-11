@@ -253,6 +253,106 @@ def _compile_with_canaries(
     )
 
 
+def _compile_with_bulk_canary(
+    *,
+    single_ordinary_ns: int = 50_000_000,
+    bulk_ordinary_ns: int = 397_265_692,
+    bulk_terminal_ns: int = 823_425_490,
+) -> Any:
+    execution_type = _symbol("ServiceRoundExecution", "PORT-PERF-006")
+    tiers = (
+        _symbol("ServiceExecutionTier", "PORT-PERF-006")(
+            tier_id="single",
+            max_active_population=1,
+        ),
+        _symbol("ServiceExecutionTier", "PORT-PERF-006")(
+            tier_id="eager-bulk",
+            max_active_population=8,
+        ),
+    )
+    executions = []
+    single_canary_ns = 2 * single_ordinary_ns
+    for tier, ordinary_ns, forced_ns, terminal_ns in (
+        (
+            tiers[0],
+            single_ordinary_ns,
+            single_canary_ns,
+            single_canary_ns,
+        ),
+        (tiers[1], bulk_ordinary_ns, 150_000_000, bulk_terminal_ns),
+    ):
+        executions.append(
+            execution_type(
+                scenario_id="ordinary",
+                tier_id=tier.tier_id,
+                active_population=tier.max_active_population,
+                elapsed_ns=ordinary_ns,
+                service_interval_ms=320,
+                geometry_id=0,
+                completed_legal_parks=tier.max_active_population,
+                completed_model_rows=None,
+                post_jit=True,
+                continuously_loaded=True,
+                dummy_run=False,
+                is_profile=False,
+            )
+        )
+        for scenario_id, elapsed_ns in (
+            ("forced_eou_then_chunk", forced_ns),
+            ("final_tail_then_flush", terminal_ns),
+        ):
+            executions.append(
+                execution_type(
+                    scenario_id=scenario_id,
+                    tier_id=tier.tier_id,
+                    active_population=tier.max_active_population,
+                    elapsed_ns=elapsed_ns,
+                    service_interval_ms=320,
+                    geometry_id=0,
+                    completed_legal_parks=(
+                        2 * tier.max_active_population
+                    ),
+                    completed_model_rows=None,
+                    post_jit=True,
+                    continuously_loaded=True,
+                    dummy_run=False,
+                    is_profile=False,
+                )
+            )
+    context = _symbol("ServiceProfileContext", "PORT-PERF-006")(
+        pre_override_physical_bound=8,
+        allocated_pool=8,
+        count_cap=8,
+        execution_claim_ceiling=8,
+        service_budget_source="measured_fallback",
+        service_budget_coefficients=(),
+        derating_factor=Fraction(1, 2),
+        slot_bytes=6_314_936,
+        execution_environment_key="irrelevant-bulk-canary-test",
+        precision_policy="fp32",
+        state_profile="nemotron-asr-fp32-v1",
+        compiler_version="persistent-state-capacity-v3",
+        mixed_composition_policy="periodic_limited_preemption_edf",
+    )
+    return _symbol(
+        "compile_provisional_service_profile",
+        "PORT-PERF-006",
+    )(
+        tuple(executions),
+        execution_tiers=tiers,
+        max_population=8,
+        reference_interval_ms=320,
+        reference_geometry_id=0,
+        admitted_geometry_ids=(0,),
+        trailing_rounds=1,
+        derating_factor=Fraction(1, 2),
+        context=context,
+        control_upper_ns_by_window_and_population=None,
+        control_dominance_sha256=None,
+        evidence_class="probe",
+    )
+
+
 def _evaluate(profile: Any, *counts: int) -> Any:
     intervals = tuple(profile.service_interval_ms_by_geometry.values())
     return _symbol("evaluate_periodic_schedulability")(
@@ -460,8 +560,37 @@ def test_exceptional_control_canaries_derive_zero_control_identity() -> None:
     assert profile.control_dominance_sha256 is not None
     assert len(profile.control_dominance_sha256) == 64
     assert profile.upper_duration_ns_by_geometry_and_population[0] == (100,)
-    assert profile.receipt.control_dominance_evidence["version"] == ("derated-control-dominance-v1")
+    assert profile.receipt.control_dominance_evidence["version"] == ("derated-control-dominance-v2")
     assert len(profile.receipt.control_dominance_evidence["cells"]) == 2
+
+
+def test_infeasible_bulk_canary_cannot_block_supported_single_service() -> None:
+    """@spec PORT-PERF-006: irrelevant stress cells cannot close readiness."""
+
+    profile = _compile_with_bulk_canary()
+
+    assert profile.homogeneous_capacity_by_interval[320] == 1
+    cells = profile.receipt.control_dominance_evidence["cells"]
+    terminal_bulk = next(
+        cell
+        for cell in cells
+        if cell["scenario_id"] == "final_tail_then_flush"
+        and cell["tier_id"] == "eager-bulk"
+    )
+    assert terminal_bulk["dominance_passed"] is False
+    assert terminal_bulk["admission_relevant"] is False
+    assert terminal_bulk["ordinary_feasible_populations"] == ()
+
+
+def test_bulk_canary_still_gates_a_partly_feasible_population_step() -> None:
+    """@spec PORT-PERF-006: relevance covers the tier's entire step."""
+
+    with pytest.raises(ValueError, match="final_tail_then_flush|dominance"):
+        _compile_with_bulk_canary(
+            single_ordinary_ns=30_000_000,
+            bulk_ordinary_ns=100_000_000,
+            bulk_terminal_ns=201_000_000,
+        )
 
 
 @pytest.mark.parametrize(
