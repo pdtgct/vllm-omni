@@ -302,6 +302,7 @@ def _compile_profile(
     derating_factor: Fraction = Fraction(1, 2),
     startup_priming_receipt: dict[str, object] | None = None,
     admitted_geometry_ids: tuple[int, ...] = (0, 1, 2, 3, 4),
+    admission_policy: str = "profile",
 ) -> Any:
     kwargs: dict[str, object] = {}
     if startup_priming_receipt is not None:
@@ -324,6 +325,7 @@ def _compile_profile(
         # periodic control-envelope behavior is covered in the dedicated
         # capacity suite.
         control_dominance_sha256="d" * 64,
+        admission_policy=admission_policy,
         **kwargs,
     )
 
@@ -697,6 +699,7 @@ def test_profile_receipt_stamps_the_complete_compiled_authority() -> None:
     # periodic frontier is one rather than the retired scalar value two.
     assert receipt.provisional_capacity == 1
     assert receipt.derating_factor == Fraction(1, 2)
+    assert receipt.admission_policy == "profile"
     assert len(receipt.receipt_sha256) == 64
     assert result.profile_candidate.qualified is False
     assert result.profile_candidate.installable is False

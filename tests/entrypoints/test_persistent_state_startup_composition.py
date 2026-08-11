@@ -205,10 +205,16 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         _derive_config,
     )
     monkeypatch.setattr(module, "run_service_priming_round", _prime)
+    def _compile(observations: Any, **kwargs: Any) -> Any:
+        del observations
+        assert kwargs["admission_policy"] == runtime.admission_policy
+        events.append("compile")
+        return profile
+
     monkeypatch.setattr(
         module,
         "compile_provisional_service_profile",
-        lambda observations, **kwargs: (events.append("compile") or profile),
+        _compile,
     )
 
     service = await prepare(
