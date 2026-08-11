@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 _RFC1_SAMPLE_RATE_HZ = 16_000
 _RFC1_MAX_CADENCE_S = 1.120
@@ -56,6 +56,7 @@ _A36_REQUIRED_KEYS = (
     "persistent_state_service_profile_trailing_rounds",
     "persistent_state_startup_priming_timeout_s",
     "persistent_state_service_profile_derating_factor",
+    "persistent_state_admission_policy",
 )
 
 
@@ -107,6 +108,19 @@ def _validated_backoff(name: str, value: object) -> tuple[float, ...]:
     return resolved
 
 
+def _validated_admission_policy(
+    name: str,
+    value: object,
+) -> Literal["profile", "hard_cap"]:
+    if value == "profile":
+        return "profile"
+    if value == "hard_cap":
+        return "hard_cap"
+    raise ValueError(
+        f"{name} must be exactly 'profile' or 'hard_cap', got {value!r}"
+    )
+
+
 def _resolve_a36_envelope(values: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the mandatory A36 fields and report all omissions together."""
 
@@ -137,6 +151,7 @@ def _resolve_a36_envelope(values: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "persistent_state_startup_priming_timeout_s": _validated_duration,
         "persistent_state_service_profile_derating_factor": _validated_ratio,
+        "persistent_state_admission_policy": _validated_admission_policy,
     }
     for name in _A36_REQUIRED_KEYS:
         if name not in values:
@@ -232,6 +247,7 @@ class PersistentStateRuntimeConfig:
     service_profile_trailing_rounds: int
     startup_priming_timeout_s: float
     service_profile_derating_factor: float
+    admission_policy: Literal["profile", "hard_cap"]
     priming_budget_descriptor: Any | None
     priming_budget_sha256: str
     priming_configured_population_ceiling: int
@@ -293,7 +309,9 @@ class PersistentStateRuntimeConfig:
         invalid_nulls = sorted(
             name
             for name, value in raw.items()
-            if value is None and name != "streaming_max_session_duration_s"
+            if value is None
+            and name != "streaming_max_session_duration_s"
+            and name not in _A36_REQUIRED_KEYS
         )
         if invalid_nulls:
             raise ValueError(
@@ -487,6 +505,7 @@ class PersistentStateRuntimeConfig:
             service_profile_derating_factor=a36[
                 "persistent_state_service_profile_derating_factor"
             ],
+            admission_policy=a36["persistent_state_admission_policy"],
             priming_budget_descriptor=priming_budget_descriptor,
             priming_budget_sha256=priming_budget_sha256,
             priming_configured_population_ceiling=(

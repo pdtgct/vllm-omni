@@ -11,10 +11,11 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 from math import floor, gcd
 from types import MappingProxyType
-from typing import Protocol
+from typing import Literal, Protocol
 
 _INT64_MAX = 2**63 - 1
 _SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1_120)
+AdmissionPolicy = Literal["profile", "hard_cap"]
 
 
 class ServiceDemand(Protocol):
@@ -370,6 +371,8 @@ class FixedDispatchCapacity:
     hard_headroom: int
     candidate_supported_by_interval: Mapping[int, bool]
     nominal_dispatchable_by_interval: Mapping[int, int]
+    dispatchable_by_interval: Mapping[int, int]
+    admission_policy: AdmissionPolicy
     charged_units: int
     service_budget_units: int
     execution_claims: int
@@ -1199,6 +1202,7 @@ def project_fixed_dispatch_capacity(
     resident_counts_by_interval: Mapping[int, int],
     submitted_counts_by_interval: Mapping[int, int],
     authority_open: bool,
+    admission_policy: AdmissionPolicy,
 ) -> FixedDispatchCapacity:
     """Project one dispatch decision from bounded counters and table lookups.
 
@@ -1210,6 +1214,8 @@ def project_fixed_dispatch_capacity(
     search per cadence, never a loop over resident or pending sessions.
     """
 
+    if admission_policy not in {"profile", "hard_cap"}:
+        raise ValueError("unknown persistent-state admission policy")
     intervals = profile.compiled_demand.intervals_ms
     if (
         not 1 <= len(intervals) <= len(_SERVICE_INTERVALS_MS)
@@ -1257,6 +1263,7 @@ def project_fixed_dispatch_capacity(
             allocated_slots - resident_count - submitted_count,
             count_limit - resident_count - submitted_count,
             max_num_seqs - execution_claims,
+            profile.receipt.maximum_charged_population - execution_claims,
         ),
     )
     current = evaluate_periodic_schedulability(
@@ -1277,7 +1284,7 @@ def project_fixed_dispatch_capacity(
         "service budget receipt",
     )
     supported: dict[int, bool] = {}
-    dispatchable: dict[int, int] = {}
+    nominal_dispatchable: dict[int, int] = {}
     for interval in intervals:
         candidate = {current_interval: 0 for current_interval in intervals}
         candidate[interval] = 1
@@ -1286,7 +1293,7 @@ def project_fixed_dispatch_capacity(
             population_by_interval=candidate,
         ).schedulable
         supported[interval] = candidate_supported
-        dispatchable[interval] = (
+        nominal_dispatchable[interval] = (
             periodic_admission_headroom(
                 profile=profile,
                 population_by_interval=counts,
@@ -1296,10 +1303,20 @@ def project_fixed_dispatch_capacity(
             if authority_open and candidate_supported
             else 0
         )
+    if admission_policy == "profile":
+        dispatchable = nominal_dispatchable
+    else:
+        supported = dict.fromkeys(intervals, True)
+        dispatchable = dict.fromkeys(
+            intervals,
+            hard if authority_open else 0,
+        )
     return FixedDispatchCapacity(
         hard_headroom=hard if authority_open else 0,
         candidate_supported_by_interval=supported,
-        nominal_dispatchable_by_interval=dispatchable,
+        nominal_dispatchable_by_interval=nominal_dispatchable,
+        dispatchable_by_interval=dispatchable,
+        admission_policy=admission_policy,
         charged_units=charged,
         service_budget_units=budget,
         execution_claims=execution_claims,

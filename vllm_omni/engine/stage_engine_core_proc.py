@@ -173,6 +173,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 "runtime_tombstone_allowance": (
                     runtime.runtime_tombstone_allowance
                 ),
+                "admission_policy": runtime.admission_policy,
                 "pending_claim_timeout_s": runtime.pending_claim_timeout_s,
             }
             self._persistent_state_control_state = control
@@ -269,6 +270,9 @@ class StageEngineCoreProc(EngineCoreProc):
             ],
             "persistent_state_runtime_tombstone_allowance": control[
                 "runtime_tombstone_allowance"
+            ],
+            "persistent_state_admission_policy": control[
+                "admission_policy"
             ],
             # PORT-STATE-023: binding inventory for handshake-time orphan
             # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
