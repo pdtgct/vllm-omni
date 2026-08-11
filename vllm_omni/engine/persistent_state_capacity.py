@@ -832,6 +832,32 @@ def compile_provisional_service_profile(
         )
         for geometry_id in geometries
     }
+
+    def ordinary_homogeneous_schedulable(
+        geometry_id: int,
+        population: int,
+    ) -> bool:
+        cadence_ns = interval_ns_by_geometry[geometry_id]
+        for window in window_ns:
+            demand = _checked_multiply(
+                window // cadence_ns,
+                fragmentation[geometry_id][population - 1],
+                "ordinary homogeneous periodic demand",
+            )
+            if demand == 0:
+                continue
+            if _checked_multiply(
+                derating_factor.denominator,
+                demand,
+                "ordinary derating comparison multiply",
+            ) > _checked_multiply(
+                derating_factor.numerator,
+                window,
+                "ordinary derating budget multiply",
+            ):
+                return False
+        return True
+
     control_table: dict[int, tuple[int, ...]] | None = None
     control_dominance_evidence: dict[str, object] | None = None
     if control_upper_ns_by_window_and_population is not None:
@@ -857,7 +883,24 @@ def compile_provisional_service_profile(
         )
         evidence_cells: list[dict[str, object]] = []
         for geometry_id in geometries:
+            preceding_maximum = 0
             for tier in tiers:
+                governed_populations = tuple(
+                    range(
+                        preceding_maximum + 1,
+                        min(tier.max_active_population, max_population) + 1,
+                    )
+                )
+                feasible_populations = tuple(
+                    population
+                    for population in governed_populations
+                    if ordinary_homogeneous_schedulable(
+                        geometry_id,
+                        population,
+                    )
+                )
+                admission_relevant = bool(feasible_populations)
+                preceding_maximum = tier.max_active_population
                 ordinary_upper = expanded[geometry_id][tier.max_active_population - 1]
                 for scenario_id in scenario_ids:
                     matching = tuple(
@@ -894,7 +937,8 @@ def compile_provisional_service_profile(
                         ordinary_upper,
                         "control-dominance ordinary multiply",
                     )
-                    if left > right:
+                    dominance_passed = left <= right
+                    if admission_relevant and not dominance_passed:
                         raise ValueError(
                             "control-dominance failed for "
                             f"{scenario_id} geometry {geometry_id} tier "
@@ -913,10 +957,16 @@ def compile_provisional_service_profile(
                             "derating_denominator": (derating_factor.denominator),
                             "left": left,
                             "right": right,
+                            "governed_populations": governed_populations,
+                            "ordinary_feasible_populations": (
+                                feasible_populations
+                            ),
+                            "admission_relevant": admission_relevant,
+                            "dominance_passed": dominance_passed,
                         }
                     )
         control_dominance_evidence = {
-            "version": "derated-control-dominance-v1",
+            "version": "derated-control-dominance-v2",
             "compiler_version": context.compiler_version,
             "execution_environment_key": (context.execution_environment_key),
             "precision_policy": context.precision_policy,
@@ -934,6 +984,11 @@ def compile_provisional_service_profile(
         raise ValueError("measured control-dominance identity must be sha256")
 
     def homogeneous_schedulable(geometry_id: int, population: int) -> bool:
+        if control_table is None:
+            return ordinary_homogeneous_schedulable(
+                geometry_id,
+                population,
+            )
         cadence_ns = interval_ns_by_geometry[geometry_id]
         for window in window_ns:
             demand = _checked_multiply(
