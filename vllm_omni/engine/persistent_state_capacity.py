@@ -313,6 +313,7 @@ class ServiceProfileReceipt:
     control_dominance_evidence: Mapping[str, object] | None
     fragmentation_table_sha256: str
     homogeneous_capacity_by_interval: Mapping[int, int]
+    admission_policy: AdmissionPolicy
     startup_priming: Mapping[str, object] | None = None
 
 
@@ -723,12 +724,15 @@ def compile_provisional_service_profile(
     trailing_rounds: int,
     derating_factor: Fraction,
     context: ServiceProfileContext,
+    admission_policy: AdmissionPolicy = "profile",
     startup_priming_receipt: Mapping[str, object] | None = None,
     control_upper_ns_by_window_and_population: Mapping[int, Sequence[int]] | None = None,
     control_dominance_sha256: str | None = None,
     evidence_class: str = "probe",
 ) -> StartupServiceProfile:
     """Compile complete post-JIT legal-park rounds into startup authority."""
+    if admission_policy not in {"profile", "hard_cap"}:
+        raise ValueError("unknown persistent-state admission policy")
     if max_population <= 0 or trailing_rounds <= 0:
         raise ValueError("population and trailing-round counts must be positive")
     if derating_factor <= 0:
@@ -1040,7 +1044,7 @@ def compile_provisional_service_profile(
         (population for population, duration in enumerate(reference_upper, start=1) if duration <= interval_ns),
         default=0,
     )
-    if measured_capacity == 0:
+    if measured_capacity == 0 and admission_policy == "profile":
         raise ValueError(
             "reference service interval "
             f"{reference_interval_ms}ms cannot support one session; "
@@ -1088,6 +1092,7 @@ def compile_provisional_service_profile(
         "control_dominance_evidence": control_dominance_evidence,
         "homogeneous_capacity_by_interval": homogeneous_capacity,
         "evidence_class": evidence_class,
+        "admission_policy": admission_policy,
         "mixed_composition_policy": context.mixed_composition_policy,
         "scale": compiled.scale,
         "demand_units": compiled.demand_units,
@@ -1137,6 +1142,7 @@ def compile_provisional_service_profile(
         fragmentation_table_sha256=fragmentation_hash,
         homogeneous_capacity_by_interval=MappingProxyType(dict(homogeneous_capacity)),
         startup_priming=(None if startup_priming_receipt is None else MappingProxyType(dict(startup_priming_receipt))),
+        admission_policy=admission_policy,
     )
     return StartupServiceProfile(
         upper_duration_ns_by_geometry_and_population=expanded,
