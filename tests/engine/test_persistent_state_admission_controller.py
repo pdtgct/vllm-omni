@@ -85,6 +85,31 @@ def test_controller_accepts_exact_noncontiguous_served_interval_subset() -> None
         _config(supported_intervals_ms=(1, 2, 3, 4, 5, 6))
 
 
+def test_hard_cap_policy_uses_the_same_bounded_queue_and_dispatch() -> None:
+    """@spec PORT-STATE-027: policy never selects direct reserve."""
+    clock = _Clock()
+    controller = _symbol("BoundedAdmissionController")(
+        config=_config(admission_policy="hard_cap"),
+        engine_epoch="epoch-a",
+        monotonic_ns=clock,
+        jitter_secret=b"hard-cap-controller",
+    )
+    handle = controller.enqueue(_attempt(91, interval_ms=1_120))
+
+    assert controller.snapshot.waiter_count == 1
+    dispatches = controller.drain(
+        _symbol("AdmissionCapacity")(
+            hard_headroom=1,
+            dispatchable_headroom_by_interval={1_120: 1},
+            authority="OPEN",
+        )
+    )
+
+    assert dispatches[0].handle == handle
+    assert dispatches[0].attempt.attempt_id == "attempt-91"
+    assert controller.snapshot.submitted_count == 1
+
+
 def _attempt(
     n: int,
     *,
@@ -114,7 +139,7 @@ def _capacity(
         nominal = dict.fromkeys(_INTERVALS, 8)
     return _symbol("AdmissionCapacity")(
         hard_headroom=hard,
-        nominal_headroom_by_interval=nominal,
+        dispatchable_headroom_by_interval=nominal,
         authority=authority,
     )
 

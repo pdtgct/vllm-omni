@@ -219,6 +219,7 @@ def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
     assert snapshot.get("resident_state_scatter_warmup_complete") is True, (
         "ENV-MIG-012 engine inventory omitted scatter-warmup attestation"
     )
+    assert snapshot["persistent_state_admission_policy"] == "profile"
 
 
 def _publish_warmup_attestation(core: Any) -> None:
@@ -665,6 +666,7 @@ _EXPLICIT_A36_ENVELOPE = {
     "persistent_state_service_profile_trailing_rounds": 3,
     "persistent_state_startup_priming_timeout_s": 120.0,
     "persistent_state_service_profile_derating_factor": 0.5,
+    "persistent_state_admission_policy": "profile",
 }
 
 
@@ -705,6 +707,7 @@ def test_runtime_config_requires_the_complete_a36_envelope() -> None:
     assert explicit.service_profile_trailing_rounds == 3
     assert explicit.startup_priming_timeout_s == pytest.approx(120.0)
     assert explicit.service_profile_derating_factor == pytest.approx(0.5)
+    assert explicit.admission_policy == "profile"
 
 
 def test_runtime_config_reports_every_missing_a36_field_together() -> None:
@@ -727,6 +730,7 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         "persistent_state_service_profile_trailing_rounds",
         "persistent_state_startup_priming_timeout_s",
         "persistent_state_service_profile_derating_factor",
+        "persistent_state_admission_policy",
     }
     old_envelope = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key not in missing}
 
@@ -741,6 +745,51 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         )
 
     assert all(name in message for name in missing)
+
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+def test_runtime_config_requires_and_fingerprints_admission_policy(
+    policy: str,
+) -> None:
+    """@spec ENV-MIG-011 / PORT-STATE-026: policy is explicit."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    values = {
+        **_EXPLICIT_A36_ENVELOPE,
+        "persistent_state_admission_policy": policy,
+    }
+    api_runtime = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config=values)
+    )
+    core_runtime = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config=values)
+    )
+
+    assert api_runtime.admission_policy == policy
+    assert core_runtime.admission_policy == policy
+
+
+@pytest.mark.parametrize("policy", (None, "", "benchmark", 1, ["profile"]))
+def test_runtime_config_rejects_missing_or_unknown_admission_policy(
+    policy: object,
+) -> None:
+    """@spec ENV-MIG-011: policy has no implicit or permissive fallback."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    values = dict(_EXPLICIT_A36_ENVELOPE)
+    if policy is None:
+        values.pop("persistent_state_admission_policy")
+    else:
+        values["persistent_state_admission_policy"] = policy
+
+    with pytest.raises(ValueError, match="persistent_state_admission_policy"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=values)
+        )
 
 
 def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:
