@@ -290,6 +290,7 @@ def _compiled_admission_profile(
         # Recovery tests isolate controller lifecycle with synthetic regular
         # rounds; role/control compilation has its own exact contract suite.
         control_dominance_sha256="d" * 64,
+        admission_policy="profile",
     )
 
 

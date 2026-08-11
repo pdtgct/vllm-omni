@@ -175,6 +175,7 @@ async def prepare_persistent_state_service(
             compile_kwargs["startup_priming_receipt"] = startup_receipt
         if "derating_factor" in compile_kwargs:
             compile_kwargs["derating_factor"] = Fraction(compile_kwargs["derating_factor"])
+        compile_kwargs["admission_policy"] = runtime_config.admission_policy
         compiled = compile_provisional_service_profile(
             _service_executions(observations),
             **compile_kwargs,

@@ -60,6 +60,7 @@ def _compile(
     control_ms: dict[int, tuple[int, ...]] | None = None,
     control_dominance_sha256: str | None = None,
     evidence_class: str = "probe",
+    admission_policy: str = "profile",
 ) -> Any:
     return _compile_ns(
         intervals_ms=intervals_ms,
@@ -68,6 +69,7 @@ def _compile(
         control_ms=control_ms,
         control_dominance_sha256=control_dominance_sha256,
         evidence_class=evidence_class,
+        admission_policy=admission_policy,
     )
 
 
@@ -79,6 +81,7 @@ def _compile_ns(
     control_ms: dict[int, tuple[int, ...]] | None = None,
     control_dominance_sha256: str | None = None,
     evidence_class: str = "probe",
+    admission_policy: str = "profile",
 ) -> Any:
     search_population = max(len(table) for table in tables_ns)
     tiers = tuple(
@@ -143,6 +146,7 @@ def _compile_ns(
             _dominance() if control_ms is None and control_dominance_sha256 is None else control_dominance_sha256
         ),
         "evidence_class": evidence_class,
+        "admission_policy": admission_policy,
     }
     try:
         return _symbol("compile_provisional_service_profile", "PORT-PERF-006")(
@@ -490,6 +494,34 @@ def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None
     )
     assert at_search_ceiling.hard_headroom == 0
     assert at_search_ceiling.dispatchable_by_interval == {320: 0}
+
+
+def test_hard_cap_compiler_retains_zero_frontier_as_advisory() -> None:
+    """@spec PORT-STATE-026: characterization can boot past nominal zero."""
+
+    with pytest.raises(ValueError, match="cannot support one session"):
+        _compile(
+            intervals_ms=(1_120,),
+            tables_ms=((1_130,),),
+            admission_policy="profile",
+        )
+
+    characterization = _compile(
+        intervals_ms=(1_120,),
+        tables_ms=((1_130,),),
+        admission_policy="hard_cap",
+    )
+
+    assert characterization.measured_capacity == 0
+    assert characterization.homogeneous_capacity_by_interval == {1_120: 0}
+    assert characterization.receipt.admission_policy == "hard_cap"
+
+    with pytest.raises(ValueError, match="admission policy"):
+        _compile(
+            intervals_ms=(1_120,),
+            tables_ms=((1_130,),),
+            admission_policy="unsafe",
+        )
 
 
 def test_dispatch_projection_rejects_unknown_admission_policy() -> None:
