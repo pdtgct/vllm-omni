@@ -379,6 +379,62 @@ def test_service_projection_exports_the_exact_installed_derating() -> None:
 
         assert metrics.capacity
         assert metrics.capacity[-1]["service_budget"] == 0.5
+        assert service.inventory is not None
+        assert service.inventory["admission_policy"] == "profile"
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_hard_cap_service_keeps_controller_and_advisory_zero_headroom() -> None:
+    """@spec PORT-STATE-026/027 / PORT-OBS-012: no reserve bypass."""
+
+    async def scenario() -> None:
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionControllerConfig,
+        )
+
+        stage = _RecoveryStage()
+        profile = _compiled_admission_profile(
+            derating_factor=Fraction(1, 100),
+            maximum_population=1,
+        )
+        service = _service(
+            stage,
+            _Clock(),
+            admission_config=AdmissionControllerConfig(
+                waiter_capacity=2,
+                max_inflight_reserves=1,
+                dispatch_budget=1,
+                aging_threshold_ns=1_000_000,
+                admission_wait_timeout_s=0.1,
+                retry_floor_ms=10,
+                retry_jitter_ms=0,
+                recovery_backoff_s=(0.001,),
+                release_convergence_timeout_s=0.1,
+                supported_intervals_ms=(80, 160, 320, 560, 1120),
+                admission_policy="hard_cap",
+            ),
+            compiled_service_profile=profile,
+        )
+        await _open_service(service)
+
+        lease = await service.reserve(
+            **_lease_kwargs(71),
+            service_interval_ms=1120,
+            connection_id="connection-hard-cap",
+        )
+
+        assert stage.reserve_calls == 1
+        assert service.admission_snapshot is not None
+        assert service.admission_snapshot.submitted_count == 0
+        assert service.inventory is not None
+        assert service.inventory["admission_policy"] == "hard_cap"
+        await service.release(
+            operation_id="release-hard-cap",
+            lease=lease,
+            reason="test",
+        )
         service.shutdown()
 
     asyncio.run(scenario())

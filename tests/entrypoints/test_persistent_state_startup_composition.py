@@ -53,6 +53,7 @@ def _startup_symbol(name: str) -> Any:
 
 def _runtime() -> SimpleNamespace:
     return SimpleNamespace(
+        admission_policy="profile",
         admission_waiter_capacity=8,
         admission_max_inflight_reserves=2,
         admission_dispatch_budget=1,
@@ -75,6 +76,22 @@ def _runtime() -> SimpleNamespace:
         runtime_tombstone_allowance=32,
         max_tombstones=40,
     )
+
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+def test_controller_config_carries_selected_admission_policy(
+    policy: str,
+) -> None:
+    """@spec PORT-STATE-027 / ENV-MIG-011: startup carries policy once."""
+    runtime = _runtime()
+    runtime.admission_policy = policy
+
+    config = _startup_symbol("derive_admission_controller_config")(
+        runtime,
+        supported_intervals_ms=(80, 320, 560, 1_120),
+    )
+
+    assert config.admission_policy == policy
 
 
 class _Provider:

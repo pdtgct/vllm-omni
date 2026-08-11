@@ -354,7 +354,13 @@ class PersistentStateService:
         controller = self._admission_controller
         inventory = self._inventory
         profile = self._compiled_service_profile
-        if controller is None or inventory is None or profile is None:
+        admission_config = self._admission_config
+        if (
+            controller is None
+            or inventory is None
+            or profile is None
+            or admission_config is None
+        ):
             raise PersistentStateServiceUnavailable(
                 "persistent-state admission capacity is not installed"
             )
@@ -371,6 +377,7 @@ class PersistentStateService:
             resident_counts_by_interval=self._resident_interval_counts,
             submitted_counts_by_interval=self._submitted_interval_counts,
             authority_open=self.ready,
+            admission_policy=admission_config.admission_policy,
         )
         return AdmissionCapacity(
             # One candidate per reactor turn makes every subsequent turn
@@ -378,9 +385,7 @@ class PersistentStateService:
             # concurrently submitted reserves; no stale multi-cadence
             # projection can over-launch a nominal authority.
             hard_headroom=min(projection.hard_headroom, 1),
-            nominal_headroom_by_interval=(
-                projection.nominal_dispatchable_by_interval
-            ),
+            dispatchable_headroom_by_interval=projection.dispatchable_by_interval,
             authority="OPEN" if self.ready else "UNHANDSHAKED",
         )
 
@@ -391,7 +396,8 @@ class PersistentStateService:
 
         inventory = self._inventory
         profile = self._compiled_service_profile
-        if inventory is None or profile is None:
+        admission_config = self._admission_config
+        if inventory is None or profile is None or admission_config is None:
             return False
         projection = project_fixed_dispatch_capacity(
             profile=profile,
@@ -399,6 +405,7 @@ class PersistentStateService:
             resident_counts_by_interval=self._resident_interval_counts,
             submitted_counts_by_interval=self._submitted_interval_counts,
             authority_open=self.ready,
+            admission_policy=admission_config.admission_policy,
         )
         return bool(
             projection.candidate_supported_by_interval.get(
@@ -817,8 +824,15 @@ class PersistentStateService:
             receipt_hash = getattr(receipt, "receipt_sha256", None)
             if receipt_hash is not None:
                 inventory["service_profile_receipt_sha256"] = str(receipt_hash)
+        admission_config = self._admission_config
+        if admission_config is not None:
+            inventory["admission_policy"] = admission_config.admission_policy
         controller = self._admission_controller
-        if controller is not None and profile is not None:
+        if (
+            controller is not None
+            and profile is not None
+            and admission_config is not None
+        ):
             from vllm_omni.engine.persistent_state_capacity import (
                 project_fixed_dispatch_capacity,
             )
@@ -829,6 +843,7 @@ class PersistentStateService:
                 resident_counts_by_interval=self._resident_interval_counts,
                 submitted_counts_by_interval=self._submitted_interval_counts,
                 authority_open=self.ready,
+                admission_policy=admission_config.admission_policy,
             )
             inventory["execution_claims"] = projection.execution_claims
             inventory["charged_demand"] = (
@@ -1184,6 +1199,9 @@ class PersistentStateService:
                 "persistent_state_runtime_tombstone_allowance": int(
                     runtime.runtime_tombstone_allowance
                 ),
+                "persistent_state_admission_policy": (
+                    runtime.admission_policy
+                ),
             }
             mismatched = [
                 name
@@ -1192,7 +1210,7 @@ class PersistentStateService:
             ]
             if mismatched:
                 raise PersistentStateServiceUnavailable(
-                    "persistent-state priming budget disagrees across "
+                    "persistent-state runtime envelope disagrees across "
                     f"processes: {mismatched}"
                 )
         await self._reconcile_failed_releases(snapshot)

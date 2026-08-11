@@ -435,8 +435,80 @@ def test_table_proven_mix_is_not_rejected_by_the_old_additive_ratio() -> None:
         resident_counts_by_interval={320: 2, 1_120: 0},
         submitted_counts_by_interval={320: 0, 1_120: 0},
         authority_open=True,
+        admission_policy="profile",
     )
     assert projection.nominal_dispatchable_by_interval[1_120] == 1
+
+
+def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None:
+    """@spec PORT-STATE-026 / PORT-OBS-012: characterize, do not lie."""
+    profile = _compile(
+        intervals_ms=(320,),
+        tables_ms=((200,),),
+        derating_factor=Fraction(1, 2),
+    )
+    empty = {320: 0}
+    inventory = {
+        "resident_count": 0,
+        "effective_capacity": 4,
+        "configured_limit": 4,
+    }
+    project = _symbol("project_fixed_dispatch_capacity")
+
+    guarded = project(
+        profile=profile,
+        inventory=inventory,
+        resident_counts_by_interval=empty,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+        admission_policy="profile",
+    )
+    characterization = project(
+        profile=profile,
+        inventory=inventory,
+        resident_counts_by_interval=empty,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+        admission_policy="hard_cap",
+    )
+
+    assert guarded.candidate_supported_by_interval == {320: False}
+    assert guarded.dispatchable_by_interval == {320: 0}
+    assert characterization.candidate_supported_by_interval == {320: True}
+    assert characterization.dispatchable_by_interval == {320: 1}
+    assert characterization.nominal_dispatchable_by_interval == {320: 0}
+    assert characterization.hard_headroom == 1
+    assert characterization.admission_policy == "hard_cap"
+
+    at_search_ceiling = project(
+        profile=profile,
+        inventory={**inventory, "resident_count": 1},
+        resident_counts_by_interval={320: 1},
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+        admission_policy="hard_cap",
+    )
+    assert at_search_ceiling.hard_headroom == 0
+    assert at_search_ceiling.dispatchable_by_interval == {320: 0}
+
+
+def test_dispatch_projection_rejects_unknown_admission_policy() -> None:
+    """@spec PORT-STATE-026: no third or implicit serving policy."""
+    profile = _compile(intervals_ms=(320,), tables_ms=((10,),))
+
+    with pytest.raises(ValueError, match="admission policy"):
+        _symbol("project_fixed_dispatch_capacity")(
+            profile=profile,
+            inventory={
+                "resident_count": 0,
+                "effective_capacity": 1,
+                "configured_limit": 1,
+            },
+            resident_counts_by_interval={320: 0},
+            submitted_counts_by_interval={320: 0},
+            authority_open=True,
+            admission_policy="unsafe",
+        )
 
 
 def test_dense_short_cadence_and_long_cadence_mix_uses_measured_work() -> None:

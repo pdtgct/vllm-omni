@@ -45,6 +45,7 @@ def _persistent_state_runtime_values() -> dict[str, Any]:
         "persistent_state_service_profile_trailing_rounds": 3,
         "persistent_state_startup_priming_timeout_s": 120.0,
         "persistent_state_service_profile_derating_factor": 0.5,
+        "persistent_state_admission_policy": "profile",
     }
 
 

@@ -598,6 +598,7 @@ def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> N
         resident_counts_by_interval=empty,
         submitted_counts_by_interval=empty,
         authority_open=True,
+        admission_policy="profile",
     )
 
     assert available.hard_headroom == 4
@@ -612,6 +613,7 @@ def test_fixed_dispatch_projection_uses_five_counters_not_population_rows() -> N
         resident_counts_by_interval=resident,
         submitted_counts_by_interval=empty,
         authority_open=True,
+        admission_policy="profile",
     )
 
     assert saturated.hard_headroom == 2
@@ -648,6 +650,7 @@ def test_fixed_dispatch_projection_uses_exact_noncontiguous_served_subset() -> N
         resident_counts_by_interval=empty,
         submitted_counts_by_interval=empty,
         authority_open=True,
+        admission_policy="profile",
     )
 
     assert tuple(projection.candidate_supported_by_interval) == served_intervals
