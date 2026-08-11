@@ -54,6 +54,7 @@ def derive_admission_controller_config(
         recovery_backoff_s=tuple(runtime_config.recovery_backoff_s),
         release_convergence_timeout_s=float(runtime_config.release_convergence_timeout_s),
         supported_intervals_ms=supported_intervals_ms,
+        admission_policy=runtime_config.admission_policy,
     )
 
 

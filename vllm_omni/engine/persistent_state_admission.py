@@ -16,6 +16,7 @@ from vllm_omni.engine.persistent_state_service import (
 
 AdmissionAuthority = Literal["OPEN", "UNHANDSHAKED"]
 AdmissionOutcome = Literal["admitted", "shed", "unavailable", "cancelled"]
+AdmissionPolicy = Literal["profile", "hard_cap"]
 
 
 class StaleAdmissionHandle(RuntimeError):  # noqa: N818
@@ -44,6 +45,7 @@ class AdmissionControllerConfig:
     recovery_backoff_s: tuple[float, ...]
     release_convergence_timeout_s: float
     supported_intervals_ms: tuple[int, ...]
+    admission_policy: AdmissionPolicy = "profile"
 
     def __post_init__(self) -> None:
         if self.waiter_capacity <= 0:
@@ -78,6 +80,8 @@ class AdmissionControllerConfig:
             raise ValueError(
                 "one to at most five supported intervals must be unique and positive"
             )
+        if self.admission_policy not in {"profile", "hard_cap"}:
+            raise ValueError("unknown persistent-state admission policy")
 
 
 @dataclass(frozen=True)
@@ -97,7 +101,7 @@ class AdmissionAttempt:
 @dataclass(frozen=True)
 class AdmissionCapacity:
     hard_headroom: int
-    nominal_headroom_by_interval: Mapping[int, int]
+    dispatchable_headroom_by_interval: Mapping[int, int]
     authority: str
 
 
@@ -487,7 +491,7 @@ class BoundedAdmissionController:
         return (
             capacity.authority == "OPEN"
             and capacity.hard_headroom > 0
-            and capacity.nominal_headroom_by_interval.get(
+            and capacity.dispatchable_headroom_by_interval.get(
                 entry.attempt.service_interval_ms,
                 0,
             )
@@ -555,8 +559,8 @@ class BoundedAdmissionController:
             self._last_launched = 1
             return launched
 
-        remaining_nominal = [
-            capacity.nominal_headroom_by_interval.get(interval, 0)
+        remaining_dispatchable = [
+            capacity.dispatchable_headroom_by_interval.get(interval, 0)
             for interval in self._config.supported_intervals_ms
         ]
         launched_items: list[AdmissionDispatch] = []
@@ -566,7 +570,7 @@ class BoundedAdmissionController:
             for index, interval in enumerate(
                 self._config.supported_intervals_ms
             ):
-                if remaining_nominal[index] <= 0:
+                if remaining_dispatchable[index] <= 0:
                     continue
                 entry = self._head(interval)
                 if entry is not None and (
@@ -577,7 +581,7 @@ class BoundedAdmissionController:
             if selected is None:
                 break
             launched_items.append(self._launch(selected))
-            remaining_nominal[selected_index] -= 1
+            remaining_dispatchable[selected_index] -= 1
         self._last_launched = len(launched_items)
         return tuple(launched_items)
 
