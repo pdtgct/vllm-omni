@@ -64,6 +64,7 @@ def _runtime() -> SimpleNamespace:
         recovery_backoff_s=(0.01, 0.02),
         release_convergence_timeout_s=60.01,
         service_profile_trailing_rounds=3,
+        startup_priming_round_timeout_s=0.25,
         startup_priming_timeout_s=0.5,
         service_profile_derating_factor=0.5,
         reserve_queue_capacity=8,
@@ -205,6 +206,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         _derive_config,
     )
     monkeypatch.setattr(module, "run_service_priming_round", _prime)
+
     def _compile(observations: Any, **kwargs: Any) -> Any:
         del observations
         assert kwargs["admission_policy"] == runtime.admission_policy
@@ -410,7 +412,7 @@ async def test_api_install_delegates_to_one_typed_preparation_function(
     monkeypatch.setattr(
         persistent_state_config.PersistentStateRuntimeConfig,
         "from_vllm_config",
-        classmethod(lambda cls, config, *, startup_provider: (runtime if startup_provider is provider else None)),
+        classmethod(lambda cls, config, *, startup_provider: runtime if startup_provider is provider else None),
     )
 
     def fatal(error: BaseException) -> None:
@@ -586,16 +588,13 @@ def test_nemotron_provider_resolves_hard_cap_intervals_without_a_priming_plan() 
     )
     if not callable(resolver):
         _fail("PORT-PERF-005 missing dependency-light served-interval resolver")
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            supported_num_lookahead_tokens=[3, 0, 6, 13]
-        )
-    )
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(supported_num_lookahead_tokens=[3, 0, 6, 13]))
 
     intervals = resolver(model_config=model_config)
 
     assert intervals == (80, 320, 560, 1_120)
     assert 160 not in intervals
+
 
 def test_async_omni_fatal_state_is_visible_to_launcher_supervision() -> None:
     """@spec PORT-STATE-014: the callback changes real engine properties."""

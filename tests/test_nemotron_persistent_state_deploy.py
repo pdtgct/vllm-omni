@@ -24,10 +24,10 @@ _HARD_CAP_PERSISTENT_STATE = """      persistent_state_admission_policy: hard_ca
       persistent_state_admission_retry_floor_ms: 100"""
 _PROFILE_ONLY_KEYS = frozenset(
     {
-    "persistent_state_service_profile_trailing_rounds",
-    "persistent_state_startup_priming_round_timeout_s",
-    "persistent_state_startup_priming_timeout_s",
-    "persistent_state_service_profile_derating_factor",
+        "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_round_timeout_s",
+        "persistent_state_startup_priming_timeout_s",
+        "persistent_state_service_profile_derating_factor",
     }
 )
 
@@ -51,7 +51,7 @@ def _persistent_state(stage: Any) -> dict[str, Any]:
         _fail("ENV-MIG-011 missing typed StageDeployConfig.persistent_state")
     if not is_dataclass(value) or type(value).__name__ != "PersistentStateDeployConfig":
         _fail("ENV-MIG-011 persistent_state is not PersistentStateDeployConfig")
-    return asdict(value)
+    return {key: item for key, item in asdict(value).items() if item is not None}
 
 
 def _resolved_stage(
@@ -162,6 +162,28 @@ class TestNemotronPersistentStateDeploy:
         assert additional["unrelated_explicit_key"] == "survives"
         assert stage.to_omegaconf().engine_args.additional_config == additional
 
+    def test_lowered_envelope_participates_in_vllm_execution_identity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """@spec ENV-MIG-011: API/Core consume one hash-bearing map."""
+
+        from vllm.config import VllmConfig
+
+        stage = _resolved_stage(_write_deploy(tmp_path, _HARD_CAP_PERSISTENT_STATE))
+        lowered = stage.to_omegaconf().engine_args.additional_config
+        api_config = VllmConfig(additional_config=dict(lowered))
+        core_config = VllmConfig(additional_config=dict(lowered))
+        changed = VllmConfig(
+            additional_config={
+                **dict(lowered),
+                "persistent_state_admission_retry_floor_ms": 125,
+            }
+        )
+
+        assert api_config.compute_hash() == core_config.compute_hash()
+        assert changed.compute_hash() != api_config.compute_hash()
+
     @pytest.mark.parametrize(
         "persistent_state",
         (
@@ -194,11 +216,13 @@ class TestNemotronPersistentStateDeploy:
     def test_packaged_nemotron_deploy_selects_hard_cap_at_eight_sessions(self) -> None:
         """@spec ENV-MIG-011/012: zero-argument registry boot is deterministic."""
         stage = _resolved_default_stage()
-        state = _persistent_state(stage)
+        additional = stage.yaml_engine_args.get("additional_config")
+        if not isinstance(additional, dict):
+            _fail("ENV-MIG-011 packaged deploy was not lowered to additional_config")
 
         assert stage.yaml_engine_args["max_num_seqs"] == 8
-        assert state["persistent_state_admission_policy"] == "hard_cap"
-        assert not _PROFILE_ONLY_KEYS & state.keys()
+        assert additional["persistent_state_admission_policy"] == "hard_cap"
+        assert not _PROFILE_ONLY_KEYS & additional.keys()
 
     def test_missing_packaged_nemotron_deploy_has_no_generic_fallback(
         self,
