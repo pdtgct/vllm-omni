@@ -6,5 +6,9 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
+    max_num_seqs: 8
     enforce_eager: true
     async_scheduling: false
+    persistent_state:
+      persistent_state_admission_policy: hard_cap
+      persistent_state_admission_retry_floor_ms: 100

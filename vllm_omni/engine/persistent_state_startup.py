@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from fractions import Fraction
 from typing import Any
 
@@ -12,6 +14,7 @@ from vllm_omni.engine.persistent_state_admission import (
     AdmissionControllerConfig,
 )
 from vllm_omni.engine.persistent_state_capacity import (
+    HardCapAuthority,
     ServiceRoundExecution,
     compile_provisional_service_profile,
 )
@@ -35,17 +38,85 @@ _REQUIRED_STARTUP_INVENTORY = frozenset(
 )
 
 
+# @spec PORT-STATE-009 / PORT-STATE-022 / PORT-STATE-027 / PORT-INT-005
+def derive_hard_cap_authority(
+    *,
+    served_intervals_ms: tuple[int, ...],
+    model_profile_id: str,
+    execution_environment_key: str,
+    precision_policy: str,
+    schema_id: str,
+    slot_bytes: int,
+    stage: int,
+    replica: int,
+    physical_capacity: int,
+    configured_limit: int,
+    effective_capacity: int,
+    max_num_seqs: int,
+    safety_reserve: int,
+    controller_identity: str,
+) -> HardCapAuthority:
+    """Derive one immutable hard-cap seal; dynamic occupancy is not input."""
+
+    configured_resident_limit = configured_limit
+    effective_state_slots = effective_capacity
+    static = {
+        "controller_identity": controller_identity,
+        "configured_resident_limit": configured_resident_limit,
+        "effective_state_slots": effective_state_slots,
+        "execution_environment_key": execution_environment_key,
+        "max_num_seqs": max_num_seqs,
+        "model_profile_id": model_profile_id,
+        "physical_capacity": physical_capacity,
+        "precision_policy": precision_policy,
+        "replica": replica,
+        "safety_reserve": safety_reserve,
+        "schema_id": schema_id,
+        "served_intervals_ms": served_intervals_ms,
+        "slot_bytes": slot_bytes,
+        "stage": stage,
+    }
+    digest = hashlib.sha256(json.dumps(static, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return HardCapAuthority(
+        served_intervals_ms=served_intervals_ms,
+        effective_state_slots=effective_state_slots,
+        configured_resident_limit=configured_resident_limit,
+        max_num_seqs=max_num_seqs,
+        model_profile_id=model_profile_id,
+        service_profile_identity=None,
+        execution_environment_key=execution_environment_key,
+        precision_policy=precision_policy,
+        hard_cap_envelope_sha256=digest,
+        physical_capacity=physical_capacity,
+        schema_id=schema_id,
+        slot_bytes=slot_bytes,
+        stage=stage,
+        replica=replica,
+        safety_reserve=safety_reserve,
+        controller_identity=controller_identity,
+    )
+
+
 # @spec PORT-STATE-027 / ENV-MIG-011
 def derive_admission_controller_config(
     runtime_config: Any,
     *,
     supported_intervals_ms: tuple[int, ...],
+    hard_cap_capacity: int | None = None,
 ) -> AdmissionControllerConfig:
     """Project the validated process envelope into controller-native units."""
 
+    waiter_capacity = int(runtime_config.admission_waiter_capacity)
+    max_inflight_reserves = int(runtime_config.admission_max_inflight_reserves)
+    if hard_cap_capacity is not None:
+        if hard_cap_capacity <= 0:
+            raise ValueError("hard-cap controller capacity must be positive")
+        waiter_capacity = 2 * hard_cap_capacity
+        max_inflight_reserves = min(4, hard_cap_capacity)
+
     return AdmissionControllerConfig(
-        waiter_capacity=int(runtime_config.admission_waiter_capacity),
-        max_inflight_reserves=int(runtime_config.admission_max_inflight_reserves),
+        waiter_capacity=waiter_capacity,
+        max_inflight_reserves=max_inflight_reserves,
         dispatch_budget=int(runtime_config.admission_dispatch_budget),
         aging_threshold_ns=int(float(runtime_config.admission_aging_threshold_s) * 1_000_000_000),
         admission_wait_timeout_s=float(runtime_config.admission_wait_timeout_s),
@@ -129,6 +200,59 @@ async def prepare_persistent_state_service(
         missing_inventory = sorted(_REQUIRED_STARTUP_INVENTORY - inventory.keys())
         if missing_inventory:
             raise RuntimeError("persistent-state startup inventory is incomplete: " + ", ".join(missing_inventory))
+        if runtime_config.admission_policy == "hard_cap":
+            intervals = tuple(startup_provider.served_intervals_ms(model_config=engine_client.model_config))
+            service.configure_bootstrap_intervals(intervals)
+            provisional_config = derive_admission_controller_config(
+                runtime_config,
+                supported_intervals_ms=intervals,
+            )
+            authority = derive_hard_cap_authority(
+                served_intervals_ms=intervals,
+                model_profile_id=str(inventory["profile_id"]),
+                execution_environment_key=str(inventory["execution_environment_key"]),
+                precision_policy=str(inventory["precision_policy"]),
+                schema_id=str(inventory["schema_id"]),
+                slot_bytes=int(inventory["slot_bytes"]),
+                stage=int(inventory.get("stage", 0)),
+                replica=int(inventory.get("replica", 0)),
+                physical_capacity=int(inventory["physical_capacity"]),
+                configured_limit=int(inventory["configured_limit"]),
+                effective_capacity=int(inventory["effective_capacity"]),
+                max_num_seqs=int(inventory["execution_claim_ceiling"]),
+                safety_reserve=int(inventory.get("safety_reserve", 0)),
+                controller_identity=repr(provisional_config),
+            )
+            admission_config = derive_admission_controller_config(
+                runtime_config,
+                supported_intervals_ms=intervals,
+                hard_cap_capacity=min(
+                    authority.effective_state_slots,
+                    authority.configured_resident_limit,
+                    authority.max_num_seqs,
+                ),
+            )
+            authority = derive_hard_cap_authority(
+                served_intervals_ms=intervals,
+                model_profile_id=str(inventory["profile_id"]),
+                execution_environment_key=str(inventory["execution_environment_key"]),
+                precision_policy=str(inventory["precision_policy"]),
+                schema_id=str(inventory["schema_id"]),
+                slot_bytes=int(inventory["slot_bytes"]),
+                stage=int(inventory.get("stage", 0)),
+                replica=int(inventory.get("replica", 0)),
+                physical_capacity=int(inventory["physical_capacity"]),
+                configured_limit=int(inventory["configured_limit"]),
+                effective_capacity=int(inventory["effective_capacity"]),
+                max_num_seqs=int(inventory["execution_claim_ceiling"]),
+                safety_reserve=int(inventory.get("safety_reserve", 0)),
+                controller_identity=repr(admission_config),
+            )
+            service.seal_startup_authority(
+                admission_config=admission_config,
+                authority=authority,
+            )
+            return service
         plan = startup_provider.build_priming_plan(
             runtime_config=runtime_config,
             inventory=inventory,
@@ -148,11 +272,14 @@ async def prepare_persistent_state_service(
                     )
 
                 observations.append(
-                    await run_service_priming_round(
-                        service=service,
-                        round_spec=round_spec,
-                        execute=execute,
-                        rollback_timeout_s=float(runtime_config.release_convergence_timeout_s),
+                    await asyncio.wait_for(
+                        run_service_priming_round(
+                            service=service,
+                            round_spec=round_spec,
+                            execute=execute,
+                            rollback_timeout_s=float(runtime_config.release_convergence_timeout_s),
+                        ),
+                        timeout=float(runtime_config.startup_priming_round_timeout_s),
                     )
                 )
             return observations

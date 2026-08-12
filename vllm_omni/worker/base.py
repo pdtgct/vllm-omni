@@ -111,7 +111,16 @@ class OmniGPUWorkerBase(GPUWorker):
             self.model_runner.profile_run()
             if current_omni_platform.is_rocm():
                 torch.accelerator.synchronize()
-            return kv_cache_memory_bytes
+            available_memory_bytes = int(kv_cache_memory_bytes)
+            from vllm_omni.worker.persistent_state import (
+                resolve_persistent_state_available_memory,
+            )
+
+            return resolve_persistent_state_available_memory(
+                self.vllm_config,
+                available_memory_bytes=available_memory_bytes,
+                cache_specs=self.model_runner.get_kv_cache_spec(),
+            )
 
         with memory_profiling(
             self.init_snapshot,
@@ -166,7 +175,15 @@ class OmniGPUWorkerBase(GPUWorker):
                 scope="local",
             )
 
-        return int(self.available_kv_cache_memory_bytes)
+        from vllm_omni.worker.persistent_state import (
+            resolve_persistent_state_available_memory,
+        )
+
+        return resolve_persistent_state_available_memory(
+            self.vllm_config,
+            available_memory_bytes=int(self.available_kv_cache_memory_bytes),
+            cache_specs=self.model_runner.get_kv_cache_spec(),
+        )
 
     # Provide memory pool context
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:

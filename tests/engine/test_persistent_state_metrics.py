@@ -63,6 +63,8 @@ class _StageClient:
                 "safety_reserve": 2,
                 "configured_limit": 7,
                 "effective_capacity": 6,
+                "slot_bytes": 1024,
+                "execution_claim_ceiling": 6,
                 "stage": 0,
                 "replica": 0,
                     "capabilities": ["resident"],

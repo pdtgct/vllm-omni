@@ -58,6 +58,25 @@ class NemotronServicePrimingPlan:
 class NemotronPersistentStateStartupProvider:
     """Construct ordinary synthetic requests below the public session API."""
 
+    def served_intervals_ms(self, *, model_config: Any) -> tuple[int, ...]:
+        """Resolve model-declared cadence support without synthetic inputs."""
+
+        hf_config = getattr(model_config, "hf_config", model_config)
+        declared = getattr(
+            hf_config,
+            "supported_num_lookahead_tokens",
+            None,
+        )
+        supported = None if declared is None else {int(value) for value in declared}
+        intervals = tuple(
+            int(cadence.removesuffix("ms"))
+            for cadence, (_, lookahead) in CADENCES.items()
+            if supported is None or lookahead in supported
+        )
+        if not intervals:
+            raise ValueError("served configuration declares no supported manifest geometry")
+        return intervals
+
     def build_priming_budget_descriptor(
         self,
         *,
@@ -124,17 +143,11 @@ class NemotronPersistentStateStartupProvider:
                     max_active_population=maximum_population,
                 )
             )
-        hf_config = getattr(model_config, "hf_config", model_config)
-        declared_lookaheads = getattr(
-            hf_config,
-            "supported_num_lookahead_tokens",
-            None,
-        )
-        supported = None if declared_lookaheads is None else {int(value) for value in declared_lookaheads}
+        served_intervals = self.served_intervals_ms(model_config=model_config)
         admitted_geometries = tuple(
             (geometry_id, cadence)
             for geometry_id, (cadence, (_, lookahead)) in enumerate(CADENCES.items())
-            if supported is None or lookahead in supported
+            if int(cadence.removesuffix("ms")) in served_intervals
         )
         if not admitted_geometries:
             raise ValueError("served configuration declares no supported manifest geometry")

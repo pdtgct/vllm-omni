@@ -29,6 +29,7 @@ class PoolCapacityResolution:
     profiled_block_bound: int
     allocated_total_blocks: int
     allocated_real_slots: int
+    requested_count_limit: int
     resolved_count_limit: int
     count_was_clamped: bool
     page_size_bytes: int
@@ -81,6 +82,7 @@ def resolve_pool_capacity(
         profiled_block_bound=profiled_block_bound,
         allocated_total_blocks=allocated_total,
         allocated_real_slots=allocated_total - fixed_blocks,
+        requested_count_limit=requested_count,
         resolved_count_limit=resolved_count,
         count_was_clamped=requested_count > available_real,
         page_size_bytes=page_size_bytes,
@@ -344,6 +346,50 @@ class StartupServiceProfile:
 
 
 @dataclass(frozen=True)
+class HardCapAuthority:
+    """Static, profile-free authority for bring-up and characterization."""
+
+    served_intervals_ms: tuple[int, ...]
+    effective_state_slots: int
+    configured_resident_limit: int
+    max_num_seqs: int
+    model_profile_id: str
+    service_profile_identity: None
+    execution_environment_key: str
+    precision_policy: str
+    hard_cap_envelope_sha256: str = ""
+    physical_capacity: int | None = None
+    schema_id: str | None = None
+    slot_bytes: int | None = None
+    stage: int = 0
+    replica: int = 0
+    safety_reserve: int = 0
+    controller_identity: str = ""
+    policy: Literal["hard_cap"] = "hard_cap"
+
+    def __post_init__(self) -> None:
+        if (
+            not self.served_intervals_ms
+            or len(set(self.served_intervals_ms)) != len(self.served_intervals_ms)
+            or any(interval <= 0 for interval in self.served_intervals_ms)
+        ):
+            raise ValueError("hard-cap served intervals must be positive and unique")
+        if (
+            min(
+                self.effective_state_slots,
+                self.configured_resident_limit,
+                self.max_num_seqs,
+            )
+            <= 0
+        ):
+            raise ValueError("hard-cap authorities must be positive")
+        if not self.model_profile_id:
+            raise ValueError("hard-cap model profile identity is required")
+        if not self.execution_environment_key or not self.precision_policy:
+            raise ValueError("hard-cap execution and precision identities are required")
+
+
+@dataclass(frozen=True)
 class PeriodicSchedulability:
     """Exact result for one fixed-cardinality periodic population."""
 
@@ -376,6 +422,18 @@ class FixedDispatchCapacity:
     admission_policy: AdmissionPolicy
     charged_units: int
     service_budget_units: int
+    execution_claims: int
+    max_num_seqs: int
+
+
+@dataclass(frozen=True)
+class HardCapDispatchCapacity:
+    """Profile-free projection from four fixed-cardinality counters."""
+
+    hard_headroom: int
+    candidate_supported_by_interval: Mapping[int, bool]
+    dispatchable_by_interval: Mapping[int, int]
+    admission_policy: Literal["hard_cap"]
     execution_claims: int
     max_num_seqs: int
 
@@ -733,6 +791,8 @@ def compile_provisional_service_profile(
     """Compile complete post-JIT legal-park rounds into startup authority."""
     if admission_policy not in {"profile", "hard_cap"}:
         raise ValueError("unknown persistent-state admission policy")
+    if admission_policy == "hard_cap":
+        raise ValueError("hard_cap is profile-free and cannot invoke the service-profile compiler")
     if max_population <= 0 or trailing_rounds <= 0:
         raise ValueError("population and trailing-round counts must be positive")
     if derating_factor <= 0:
@@ -965,9 +1025,7 @@ def compile_provisional_service_profile(
                             "left": left,
                             "right": right,
                             "governed_populations": governed_populations,
-                            "ordinary_feasible_populations": (
-                                feasible_populations
-                            ),
+                            "ordinary_feasible_populations": (feasible_populations),
                             "admission_relevant": admission_relevant,
                             "dominance_passed": dominance_passed,
                         }
@@ -1203,13 +1261,18 @@ def fallback_transaction_duration_ns(
 # @spec PORT-STATE-004, PORT-STATE-026, PORT-STATE-027, PORT-PERF-008
 def project_fixed_dispatch_capacity(
     *,
-    profile: StartupServiceProfile,
-    inventory: Mapping[str, object],
-    resident_counts_by_interval: Mapping[int, int],
-    submitted_counts_by_interval: Mapping[int, int],
+    profile: StartupServiceProfile | None = None,
+    inventory: Mapping[str, object] | None = None,
+    resident_counts_by_interval: Mapping[int, int] | None = None,
+    submitted_counts_by_interval: Mapping[int, int] | None = None,
     authority_open: bool,
-    admission_policy: AdmissionPolicy,
-) -> FixedDispatchCapacity:
+    admission_policy: AdmissionPolicy | None = None,
+    startup_authority: HardCapAuthority | None = None,
+    state_resident: int | None = None,
+    state_submitted: int | None = None,
+    execution_committed: int | None = None,
+    execution_submitted: int | None = None,
+) -> FixedDispatchCapacity | HardCapDispatchCapacity:
     """Project one dispatch decision from bounded counters and table lookups.
 
     The serving path never calls the population-shaped rational oracle. It
@@ -1220,7 +1283,52 @@ def project_fixed_dispatch_capacity(
     search per cadence, never a loop over resident or pending sessions.
     """
 
-    if admission_policy not in {"profile", "hard_cap"}:
+    if startup_authority is not None:
+        if profile is not None or inventory is not None:
+            raise ValueError("hard-cap and profile projection inputs cannot mix")
+        values = (
+            state_resident,
+            state_submitted,
+            execution_committed,
+            execution_submitted,
+        )
+        if any(value is None or value < 0 for value in values):
+            raise ValueError("hard-cap counters must be non-negative integers")
+        assert state_resident is not None
+        assert state_submitted is not None
+        assert execution_committed is not None
+        assert execution_submitted is not None
+        state_used = state_resident + state_submitted
+        execution_used = execution_committed + execution_submitted
+        hard = max(
+            0,
+            min(
+                startup_authority.effective_state_slots - state_used,
+                startup_authority.configured_resident_limit - state_used,
+                startup_authority.max_num_seqs - execution_used,
+            ),
+        )
+        visible = hard if authority_open else 0
+        return HardCapDispatchCapacity(
+            hard_headroom=visible,
+            candidate_supported_by_interval=dict.fromkeys(
+                startup_authority.served_intervals_ms,
+                True,
+            ),
+            dispatchable_by_interval=dict.fromkeys(
+                startup_authority.served_intervals_ms,
+                visible,
+            ),
+            admission_policy="hard_cap",
+            execution_claims=execution_used,
+            max_num_seqs=startup_authority.max_num_seqs,
+        )
+
+    if profile is None or inventory is None:
+        raise ValueError("profile projection requires profile and inventory")
+    if resident_counts_by_interval is None or submitted_counts_by_interval is None:
+        raise ValueError("profile projection requires cadence counters")
+    if admission_policy != "profile":
         raise ValueError("unknown persistent-state admission policy")
     intervals = profile.compiled_demand.intervals_ms
     if (
@@ -1309,14 +1417,7 @@ def project_fixed_dispatch_capacity(
             if authority_open and candidate_supported
             else 0
         )
-    if admission_policy == "profile":
-        dispatchable = nominal_dispatchable
-    else:
-        supported = dict.fromkeys(intervals, True)
-        dispatchable = dict.fromkeys(
-            intervals,
-            hard if authority_open else 0,
-        )
+    dispatchable = nominal_dispatchable
     return FixedDispatchCapacity(
         hard_headroom=hard if authority_open else 0,
         candidate_supported_by_interval=supported,

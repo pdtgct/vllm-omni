@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable
@@ -299,6 +300,119 @@ class PipelineConfig:
         return errors
 
 
+_PERSISTENT_STATE_PROFILE_KEYS = frozenset(
+    {
+        "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_round_timeout_s",
+        "persistent_state_startup_priming_timeout_s",
+        "persistent_state_service_profile_derating_factor",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PersistentStateDeployConfig:
+    """Model-scoped persistent-state deployment settings.
+
+    The deploy schema owns this compact selection block. It is lowered into
+    vLLM's shared ``additional_config`` namespace only after validation, so
+    it cannot be mistaken for an arbitrary engine argument.
+    """
+
+    persistent_state_admission_policy: str
+    persistent_state_admission_retry_floor_ms: int | None = None
+    persistent_state_service_profile_trailing_rounds: int | None = None
+    persistent_state_startup_priming_round_timeout_s: float | None = None
+    persistent_state_startup_priming_timeout_s: float | None = None
+    persistent_state_service_profile_derating_factor: float | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Any) -> PersistentStateDeployConfig:
+        """Parse and validate the typed model-scoped deploy block."""
+        if not isinstance(values, dict):
+            raise ValueError("persistent_state must be a mapping")
+        unknown = set(values) - {field.name for field in fields(cls)}
+        if unknown:
+            raise ValueError(f"unknown persistent_state key(s): {sorted(unknown)}")
+        if any(value is None for value in values.values()):
+            raise ValueError("persistent_state does not accept explicit null values")
+        try:
+            config = cls(**values)
+        except TypeError as exc:
+            raise ValueError(f"invalid persistent_state settings: {exc}") from exc
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        """Fail closed on an invalid policy/profile selection."""
+        if self.persistent_state_admission_policy not in {"hard_cap", "profile"}:
+            raise ValueError("persistent_state_admission_policy must be hard_cap or profile")
+        if self.persistent_state_admission_retry_floor_ms is not None and (
+            not isinstance(self.persistent_state_admission_retry_floor_ms, int)
+            or self.persistent_state_admission_retry_floor_ms <= 0
+        ):
+            raise ValueError("persistent_state_admission_retry_floor_ms must be a positive integer")
+
+        profile_values = {key: getattr(self, key) for key in _PERSISTENT_STATE_PROFILE_KEYS}
+        if self.persistent_state_admission_policy == "hard_cap":
+            if any(value is not None for value in profile_values.values()):
+                raise ValueError("hard_cap persistent_state deploy must not carry profile-only settings")
+            return
+
+        missing = sorted(key for key, value in profile_values.items() if value is None)
+        if missing:
+            raise ValueError(f"profile persistent_state deploy is missing {missing}")
+        if (
+            not isinstance(self.persistent_state_service_profile_trailing_rounds, int)
+            or isinstance(self.persistent_state_service_profile_trailing_rounds, bool)
+            or self.persistent_state_service_profile_trailing_rounds < 3
+        ):
+            raise ValueError("persistent_state_service_profile_trailing_rounds must be at least 3")
+        if not _is_positive_finite_number(self.persistent_state_startup_priming_round_timeout_s):
+            raise ValueError("persistent_state_startup_priming_round_timeout_s must be positive")
+        if not _is_positive_finite_number(self.persistent_state_startup_priming_timeout_s):
+            raise ValueError("persistent_state_startup_priming_timeout_s must be positive")
+        derating = self.persistent_state_service_profile_derating_factor
+        if not _is_positive_finite_number(derating):
+            raise ValueError("persistent_state_service_profile_derating_factor must be in (0, 1]")
+        assert isinstance(derating, (int, float))
+        if derating > 1:
+            raise ValueError("persistent_state_service_profile_derating_factor must be in (0, 1]")
+
+    def as_additional_config(self) -> dict[str, Any]:
+        """Return the non-null canonical engine-facing representation."""
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+def merge_persistent_state_additional_config(
+    base: dict[str, Any] | None,
+    override: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge and validate the persistent-state portion of additional config."""
+    if base is not None and not isinstance(base, dict):
+        raise ValueError("additional_config must be a mapping")
+    if override is not None and not isinstance(override, dict):
+        raise ValueError("additional_config must be a mapping")
+    merged = dict(base or {})
+    merged.update(override or {})
+
+    persistent_values = {
+        key: value
+        for key, value in merged.items()
+        if key == "persistent_state_admission_policy"
+        or key == "persistent_state_admission_retry_floor_ms"
+        or key in _PERSISTENT_STATE_PROFILE_KEYS
+    }
+    if persistent_values:
+        PersistentStateDeployConfig.from_mapping(persistent_values)
+    return merged
+
+
+def _is_positive_finite_number(value: Any) -> bool:
+    """Return whether ``value`` is a finite, strictly positive real number."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
 @dataclass
 class StageDeployConfig:
     """Per-stage deployment knobs.
@@ -398,6 +512,10 @@ class StageDeployConfig:
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
 
+    # Model-scoped capability settings. This is intentionally not a generic
+    # engine arg: it lowers into the canonical additional_config map below.
+    persistent_state: PersistentStateDeployConfig | None = None
+
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
@@ -449,6 +567,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "engine_extras",
         "engine_args",
         "runtime",
+        "persistent_state",
     }
 )
 
@@ -492,6 +611,8 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         "num_replicas": int(num_replicas),
         "env": env,
     }
+    if "persistent_state" in stage_data:
+        kwargs["persistent_state"] = PersistentStateDeployConfig.from_mapping(stage_data["persistent_state"])
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in flat_args:
             kwargs[name] = flat_args.pop(name)
@@ -795,6 +916,11 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
+        if ds.persistent_state is not None:
+            engine_args["additional_config"] = merge_persistent_state_additional_config(
+                engine_args.get("additional_config"),
+                ds.persistent_state.as_additional_config(),
+            )
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
@@ -938,6 +1064,13 @@ class StageConfig:
         # Start with YAML engine_args defaults
         engine_args: dict[str, Any] = dict(self.yaml_engine_args)
         runtime_overrides = dict(self.runtime_overrides)
+
+        additional_override = runtime_overrides.pop("additional_config", None)
+        if additional_override is not None:
+            engine_args["additional_config"] = merge_persistent_state_additional_config(
+                engine_args.get("additional_config"),
+                additional_override,
+            )
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage

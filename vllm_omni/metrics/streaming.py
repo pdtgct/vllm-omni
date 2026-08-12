@@ -47,6 +47,7 @@ class _SessionRecord:
     waiting: list[ChunkReadyHandle] = field(default_factory=list)
     inflight: ChunkReadyHandle | None = None
 
+
 _cadence_labels = list(defs.STREAMING_CADENCE_LABELS)
 _finished_labels = list(defs.STREAMING_FINISHED_LABELS)
 _chunk_latency_labels = list(defs.STREAMING_CHUNK_LATENCY_LABELS)
@@ -57,21 +58,11 @@ _overflow_labels = list(defs.STREAMING_OVERFLOW_LABELS)
 _open_rejection_labels = list(defs.STREAMING_OPEN_REJECTION_LABELS)
 _admission_rejection_labels = list(defs.STREAMING_ADMISSION_REJECTION_LABELS)
 _persistent_state_slot_labels = list(defs.PERSISTENT_STATE_SLOT_LABELS)
-_persistent_state_service_demand_labels = list(
-    defs.PERSISTENT_STATE_SERVICE_DEMAND_LABELS
-)
-_persistent_state_execution_claims_labels = list(
-    defs.PERSISTENT_STATE_EXECUTION_CLAIMS_LABELS
-)
-_persistent_state_admission_headroom_labels = list(
-    defs.PERSISTENT_STATE_ADMISSION_HEADROOM_LABELS
-)
-_persistent_state_admission_pending_labels = list(
-    defs.PERSISTENT_STATE_ADMISSION_PENDING_LABELS
-)
-_persistent_state_admission_wait_labels = list(
-    defs.PERSISTENT_STATE_ADMISSION_WAIT_LABELS
-)
+_persistent_state_service_demand_labels = list(defs.PERSISTENT_STATE_SERVICE_DEMAND_LABELS)
+_persistent_state_execution_claims_labels = list(defs.PERSISTENT_STATE_EXECUTION_CLAIMS_LABELS)
+_persistent_state_admission_headroom_labels = list(defs.PERSISTENT_STATE_ADMISSION_HEADROOM_LABELS)
+_persistent_state_admission_pending_labels = list(defs.PERSISTENT_STATE_ADMISSION_PENDING_LABELS)
+_persistent_state_admission_wait_labels = list(defs.PERSISTENT_STATE_ADMISSION_WAIT_LABELS)
 _input_audio_labels = list(defs.STREAMING_INPUT_AUDIO_LABELS)
 _batch_size_labels = list(defs.STREAMING_BATCH_SIZE_LABELS)
 
@@ -248,10 +239,7 @@ class OmniStreamingMetrics:
             return
         if set(inventory) != set(defs.PERSISTENT_STATE_SLOT_KINDS):
             return
-        if any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
-            for value in inventory.values()
-        ):
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in inventory.values()):
             return
         for kind in defs.PERSISTENT_STATE_SLOT_KINDS:
             _persistent_state_slots_family.labels(
@@ -267,9 +255,10 @@ class OmniStreamingMetrics:
         stage: str,
         replica: str,
         *,
-        service_source: str,
-        service_budget: float,
-        charged_demand: float,
+        admission_policy: str,
+        service_source: str | None,
+        service_budget: float | None,
+        charged_demand: float | None,
         execution_claims: int,
         max_num_seqs: int,
         headroom_by_cadence: dict[str, dict[str, int]],
@@ -280,19 +269,26 @@ class OmniStreamingMetrics:
             return
         if not stage or not replica:
             return
-        if service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES:
+        if admission_policy not in {"profile", "hard_cap"}:
             return
-        for kind, value in (
-            ("budget", service_budget),
-            ("charged_demand", charged_demand),
-        ):
-            _persistent_state_service_demand_family.labels(
-                model_name=self._model_name,
-                stage=stage,
-                replica=replica,
-                kind=kind,
-                source=service_source,
-            ).set(value)
+        if admission_policy == "profile":
+            if (
+                service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES
+                or service_budget is None
+                or charged_demand is None
+            ):
+                return
+            for kind, value in (
+                ("budget", service_budget),
+                ("charged_demand", charged_demand),
+            ):
+                _persistent_state_service_demand_family.labels(
+                    model_name=self._model_name,
+                    stage=stage,
+                    replica=replica,
+                    kind=kind,
+                    source=service_source,
+                ).set(value)
         for kind, value in (
             ("claims", execution_claims),
             ("max_num_seqs", max_num_seqs),
@@ -306,9 +302,10 @@ class OmniStreamingMetrics:
         for cadence_ms, headroom in headroom_by_cadence.items():
             if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES:
                 continue
-            if set(headroom) != set(
-                defs.PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS
-            ):
+            expected_kinds = (
+                set(defs.PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS) if admission_policy == "profile" else {"hard"}
+            )
+            if set(headroom) != expected_kinds:
                 continue
             for kind, value in headroom.items():
                 _persistent_state_admission_headroom_family.labels(
@@ -373,9 +370,9 @@ class OmniStreamingMetrics:
             return
         if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES or chunk_type not in defs.STREAMING_CHUNK_TYPES:
             return
-        _chunk_latency_family.labels(
-            model_name=self._model_name, cadence_ms=cadence_ms, chunk_type=chunk_type
-        ).observe(max(latency_s, 0.0))
+        _chunk_latency_family.labels(model_name=self._model_name, cadence_ms=cadence_ms, chunk_type=chunk_type).observe(
+            max(latency_s, 0.0)
+        )
 
     def observe_chunk_outcome(self, cadence_ms: str, chunk_type: str, outcome: str) -> None:
         """One unit's terminal disposition (parked/aborted/error)."""
@@ -512,8 +509,7 @@ class PrometheusStreamingObserver(StreamingObserver):
         # conflicting cadence is logged and ignored (PORT-OBS-003).
         if record.cadence_ms != cadence_ms:
             logger.warning(
-                "duplicate session open with conflicting cadence "
-                "(recorded=%s, ignored=%s); keeping the first",
+                "duplicate session open with conflicting cadence (recorded=%s, ignored=%s); keeping the first",
                 record.cadence_ms,
                 cadence_ms,
             )
@@ -574,8 +570,7 @@ class PrometheusStreamingObserver(StreamingObserver):
             # record, no backlog movement; the returned handle is inert
             # (all dispositions on it no-op via record membership).
             logger.warning(
-                "unit_ready for un-opened session key — ignored; "
-                "session open must precede ready (PORT-OBS-003)"
+                "unit_ready for un-opened session key — ignored; session open must precede ready (PORT-OBS-003)"
             )
             return handle
         record.waiting.append(handle)

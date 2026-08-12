@@ -41,12 +41,16 @@ _SNAPSHOT_BASE: dict[str, Any] = {
     "safety_reserve": 0,
     "configured_limit": 2,
     "effective_capacity": 2,
+    "slot_bytes": 6_314_936,
+    "execution_claim_ceiling": 2,
     "stage": 0,
     "replica": 0,
     "capabilities": ["resident"],
     "resident_state_scatter_warmup_complete": True,
     "schema_id": "schema-a",
     "profile_id": "profile-a",
+    "execution_environment_key": "env-a",
+    "precision_policy": "torch.float32",
     "persistent_state_tombstone_ttl_s": 10.0,
     "persistent_state_max_tombstones": 8,
 }
@@ -400,6 +404,12 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
         )
 
         stage = _RecoveryStage()
+        stage.snapshot_overrides.update(
+            {
+                "configured_limit": 4,
+                "effective_capacity": 4,
+            }
+        )
         derive = getattr(startup, "derive_hard_cap_authority", None)
         if not callable(derive):
             pytest.fail(
@@ -428,6 +438,8 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
         authority = derive(
             served_intervals_ms=(80, 320, 560, 1120),
             model_profile_id=inventory["profile_id"],
+            execution_environment_key=inventory["execution_environment_key"],
+            precision_policy=inventory["precision_policy"],
             schema_id=inventory["schema_id"],
             slot_bytes=6_314_936,
             stage=0,
@@ -470,8 +482,7 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
             )
         )
         await _wait_until(
-            lambda: service.admission_snapshot is not None
-            and service.admission_snapshot.waiter_count == 1
+            lambda: service.admission_snapshot is not None and service.admission_snapshot.waiter_count == 1
         )
 
         assert stage.reserve_calls == 2
@@ -507,7 +518,11 @@ def test_selected_service_without_sealed_controller_never_reserves_directly() ->
 
     async def scenario() -> None:
         stage = _RecoveryStage()
-        service = _service(stage, _Clock())
+        service = _service(
+            stage,
+            _Clock(),
+            runtime_config=SimpleNamespace(admission_policy="hard_cap"),
+        )
 
         with pytest.raises(
             PersistentStateServiceUnavailable,
@@ -538,6 +553,8 @@ def test_hard_cap_digest_structurally_excludes_dynamic_state_and_rejects_static_
     common = dict(
         served_intervals_ms=(80, 320, 560, 1_120),
         model_profile_id="profile-a",
+        execution_environment_key="env-a",
+        precision_policy="torch.float32",
         schema_id="schema-a",
         slot_bytes=6_314_936,
         stage=0,
@@ -556,6 +573,12 @@ def test_hard_cap_digest_structurally_excludes_dynamic_state_and_rejects_static_
     clamped = derive(
         **{**common, "effective_capacity": 3},
     )
+    changed_environment = derive(
+        **{**common, "execution_environment_key": "env-b"},
+    )
+    changed_precision = derive(
+        **{**common, "precision_policy": "torch.float16"},
+    )
 
     for dynamic_name in (
         "engine_epoch",
@@ -566,6 +589,8 @@ def test_hard_cap_digest_structurally_excludes_dynamic_state_and_rejects_static_
         assert not hasattr(authority, dynamic_name)
     assert authority.hard_cap_envelope_sha256 != changed_schema.hard_cap_envelope_sha256
     assert authority.hard_cap_envelope_sha256 != clamped.hard_cap_envelope_sha256
+    assert authority.hard_cap_envelope_sha256 != changed_environment.hard_cap_envelope_sha256
+    assert authority.hard_cap_envelope_sha256 != changed_precision.hard_cap_envelope_sha256
     assert authority.service_profile_identity is None
     assert authority.model_profile_id == "profile-a"
     assert clamped.configured_resident_limit == 8
@@ -574,7 +599,15 @@ def test_hard_cap_digest_structurally_excludes_dynamic_state_and_rejects_static_
 
 @pytest.mark.parametrize(
     ("drift_field", "drift_value"),
-    (("schema_id", "schema-b"), ("configured_limit", 1)),
+    (
+        ("schema_id", "schema-b"),
+        ("configured_limit", 1),
+        ("slot_bytes", 6_314_937),
+        ("safety_reserve", 1),
+        ("execution_claim_ceiling", 1),
+        ("execution_environment_key", "env-b"),
+        ("precision_policy", "torch.float16"),
+    ),
 )
 def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
     drift_field: str,
@@ -620,6 +653,8 @@ def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
         authority = derive(
             served_intervals_ms=intervals,
             model_profile_id=inventory["profile_id"],
+            execution_environment_key=inventory["execution_environment_key"],
+            precision_policy=inventory["precision_policy"],
             schema_id=inventory["schema_id"],
             slot_bytes=6_314_936,
             stage=0,
@@ -643,7 +678,7 @@ def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
         # The live lease changes revision and occupancy. Recovery must rebuild
         # dynamic counters while retaining the immutable hard-cap authority.
         service._demote()
-        await service.check_health()
+        await _wait_until(lambda: service.ready)
         assert service.ready
         assert fatal == []
         await service.release(

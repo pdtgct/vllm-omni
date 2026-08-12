@@ -322,7 +322,7 @@ def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
     def fake_base_init(core: Any, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         events.append("base-init")
-        core.model_executor = SimpleNamespace(collective_rpc=lambda method: (events.append(method) or [True]))
+        core.model_executor = SimpleNamespace(collective_rpc=lambda method: events.append(method) or [True])
         core.scheduler = SimpleNamespace(
             kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
         )
@@ -463,6 +463,8 @@ class _TombstoneStage:
                 "safety_reserve": 0,
                 "configured_limit": 1,
                 "effective_capacity": 1,
+                "slot_bytes": 1024,
+                "execution_claim_ceiling": 1,
                 "stage": 0,
                 "replica": 0,
                 "capabilities": ["resident"],
@@ -664,6 +666,7 @@ _EXPLICIT_A36_ENVELOPE = {
     "persistent_state_release_convergence_timeout_s": 61.0,
     "streaming_unadmitted_connection_timeout_s": 31.125,
     "persistent_state_service_profile_trailing_rounds": 3,
+    "persistent_state_startup_priming_round_timeout_s": 2.0,
     "persistent_state_startup_priming_timeout_s": 120.0,
     "persistent_state_service_profile_derating_factor": 0.5,
     "persistent_state_admission_policy": "profile",
@@ -728,6 +731,7 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
         "persistent_state_release_convergence_timeout_s",
         "streaming_unadmitted_connection_timeout_s",
         "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_round_timeout_s",
         "persistent_state_startup_priming_timeout_s",
         "persistent_state_service_profile_derating_factor",
         "persistent_state_admission_policy",
@@ -757,12 +761,8 @@ def test_runtime_config_requires_and_fingerprints_profile_policy() -> None:
         **_EXPLICIT_A36_ENVELOPE,
         "persistent_state_admission_policy": "profile",
     }
-    api_runtime = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config=values)
-    )
-    core_runtime = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config=values)
-    )
+    api_runtime = PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
+    core_runtime = PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
 
     assert api_runtime.admission_policy == "profile"
     assert core_runtime.admission_policy == "profile"
@@ -779,9 +779,7 @@ def test_hard_cap_rejects_profile_only_runtime_fields() -> None:
         "persistent_state_admission_policy": "hard_cap",
     }
     with pytest.raises(ValueError, match="hard_cap|profile-only|profile"):
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=values)
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
 
 
 def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
@@ -792,15 +790,13 @@ def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
 
     profile_only = {
         "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_round_timeout_s",
         "persistent_state_startup_priming_timeout_s",
         "persistent_state_service_profile_derating_factor",
     }
-    explicit_values = {
-        key: value
-        for key, value in _EXPLICIT_A36_ENVELOPE.items()
-        if key not in profile_only
-    }
+    explicit_values = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key not in profile_only}
     explicit_values["persistent_state_admission_policy"] = "hard_cap"
+    explicit_values["streaming_unadmitted_connection_timeout_s"] = 30.125
     common = dict(
         model_config=SimpleNamespace(architectures=("Nemotron3_5AsrForRNNT",)),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
@@ -808,9 +804,7 @@ def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
 
     defaults = PersistentStateRuntimeConfig.from_vllm_config(
         SimpleNamespace(
-            additional_config={
-                "persistent_state_admission_policy": "hard_cap"
-            },
+            additional_config={"persistent_state_admission_policy": "hard_cap"},
             **common,
         ),
         startup_provider=object(),
@@ -823,6 +817,7 @@ def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
     assert defaults == explicit
     assert defaults.admission_policy == "hard_cap"
     assert defaults.service_profile_trailing_rounds is None
+    assert defaults.startup_priming_round_timeout_s is None
     assert defaults.startup_priming_timeout_s is None
     assert defaults.service_profile_derating_factor is None
     assert defaults.priming_budget_descriptor is None
@@ -839,9 +834,7 @@ def test_explicit_profile_still_requires_every_profile_authority() -> None:
     with pytest.raises(ValueError) as info:
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(
-                additional_config={
-                    "persistent_state_admission_policy": "profile"
-                },
+                additional_config={"persistent_state_admission_policy": "profile"},
                 scheduler_config=SimpleNamespace(max_num_seqs=8),
             ),
             startup_provider=object(),
@@ -849,8 +842,41 @@ def test_explicit_profile_still_requires_every_profile_authority() -> None:
 
     message = str(info.value)
     assert "persistent_state_service_profile_trailing_rounds" in message
+    assert "persistent_state_startup_priming_round_timeout_s" in message
     assert "persistent_state_startup_priming_timeout_s" in message
     assert "persistent_state_service_profile_derating_factor" in message
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {
+            "persistent_state_admission_policy": "hard_cap",
+            "persistent_state_startup_priming_round_timeout_s": 2.0,
+        },
+        {
+            "persistent_state_admission_policy": "hard_cap",
+            "persistent_state_typo": 1,
+        },
+    ),
+)
+def test_hard_cap_rejects_profile_only_and_unknown_raw_keys(
+    values: dict[str, object],
+) -> None:
+    """@spec ENV-MIG-011: advanced additional_config fails closed."""
+
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    with pytest.raises(ValueError, match="profile-only|unknown"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(
+                additional_config=values,
+                scheduler_config=SimpleNamespace(max_num_seqs=8),
+            ),
+            startup_provider=object(),
+        )
 
 
 @pytest.mark.parametrize("policy", (None, "", "benchmark", 1, ["profile"]))
@@ -869,9 +895,7 @@ def test_runtime_config_rejects_missing_or_unknown_admission_policy(
         values["persistent_state_admission_policy"] = policy
 
     with pytest.raises(ValueError, match="persistent_state_admission_policy"):
-        PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config=values)
-        )
+        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
 
 
 def test_selected_model_budget_preserves_runtime_tombstone_allowance() -> None:

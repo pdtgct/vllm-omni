@@ -77,18 +77,10 @@ def test_additive_capacity_families_have_operator_vocabulary() -> None:
     assert _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO") == (
         "vllm_omni:persistent_state_service_demand_ratio"
     )
-    assert _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS") == (
-        "vllm_omni:persistent_state_execution_claims"
-    )
-    assert _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM") == (
-        "vllm_omni:persistent_state_admission_headroom"
-    )
-    assert _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING") == (
-        "vllm_omni:persistent_state_admission_pending"
-    )
-    assert _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_S") == (
-        "vllm_omni:persistent_state_admission_wait_s"
-    )
+    assert _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS") == ("vllm_omni:persistent_state_execution_claims")
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM") == ("vllm_omni:persistent_state_admission_headroom")
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING") == ("vllm_omni:persistent_state_admission_pending")
+    assert _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_S") == ("vllm_omni:persistent_state_admission_wait_s")
 
 
 def test_additive_capacity_labels_are_exact_and_bounded() -> None:
@@ -168,38 +160,25 @@ def test_capacity_projection_is_one_consistent_snapshot() -> None:
     execution = _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS")
     headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
     pending = _required(defs, "PERSISTENT_STATE_ADMISSION_PENDING")
-    assert _sample(
-        f'{budget}{{kind="budget",model_name="{_MODEL}",replica="0",'
-        'source="qualified_profile",stage="0"}'
-    ) == 1.0
-    assert _sample(
-        f'{budget}{{kind="charged_demand",model_name="{_MODEL}",'
-        'replica="0",source="qualified_profile",stage="0"}'
-    ) == 0.25
-    assert _sample(
-        f'{execution}{{kind="claims",model_name="{_MODEL}",replica="0",'
-        'stage="0"}'
-    ) == 2.0
-    assert _sample(
-        f'{execution}{{kind="max_num_seqs",model_name="{_MODEL}",'
-        'replica="0",stage="0"}'
-    ) == 8.0
-    assert _sample(
-        f'{headroom}{{cadence_ms="80",kind="hard",model_name="{_MODEL}",replica="0",'
-        'stage="0"}'
-    ) == 0.0
-    assert _sample(
-        f'{headroom}{{cadence_ms="1120",kind="nominal",model_name="{_MODEL}",replica="0",'
-        'stage="0"}'
-    ) == 4.0
-    assert _sample(
-        f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",'
-        'stage="0",state="waiting"}'
-    ) == 1.0
-    assert _sample(
-        f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",'
-        'stage="0",state="committed_cleanup"}'
-    ) == 4.0
+    assert (
+        _sample(f'{budget}{{kind="budget",model_name="{_MODEL}",replica="0",source="qualified_profile",stage="0"}}')
+        == 1.0
+    )
+    assert (
+        _sample(
+            f'{budget}{{kind="charged_demand",model_name="{_MODEL}",replica="0",source="qualified_profile",stage="0"}}'
+        )
+        == 0.25
+    )
+    assert _sample(f'{execution}{{kind="claims",model_name="{_MODEL}",replica="0",stage="0"}}') == 2.0
+    assert _sample(f'{execution}{{kind="max_num_seqs",model_name="{_MODEL}",replica="0",stage="0"}}') == 8.0
+    assert _sample(f'{headroom}{{cadence_ms="80",kind="hard",model_name="{_MODEL}",replica="0",stage="0"}}') == 0.0
+    assert _sample(f'{headroom}{{cadence_ms="1120",kind="nominal",model_name="{_MODEL}",replica="0",stage="0"}}') == 4.0
+    assert _sample(f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",stage="0",state="waiting"}}') == 1.0
+    assert (
+        _sample(f'{pending}{{cadence_ms="80",model_name="{_MODEL}",replica="0",stage="0",state="committed_cleanup"}}')
+        == 4.0
+    )
 
 
 def test_admission_wait_observation_uses_bounded_outcome_and_seconds() -> None:
@@ -213,13 +192,9 @@ def test_admission_wait_observation_uses_bounded_outcome_and_seconds() -> None:
 
     family = _required(defs, "PERSISTENT_STATE_ADMISSION_WAIT_S")
     count = _sample(
-        f'{family}_count{{cadence_ms="320",model_name="{_MODEL}",'
-        'outcome="admitted",replica="0",stage="0"}'
+        f'{family}_count{{cadence_ms="320",model_name="{_MODEL}",outcome="admitted",replica="0",stage="0"}}'
     )
-    total = _sample(
-        f'{family}_sum{{cadence_ms="320",model_name="{_MODEL}",'
-        'outcome="admitted",replica="0",stage="0"}'
-    )
+    total = _sample(f'{family}_sum{{cadence_ms="320",model_name="{_MODEL}",outcome="admitted",replica="0",stage="0"}}')
     assert count == 1.0
     assert total == 0.125
 
@@ -277,17 +252,9 @@ def test_hard_cap_projection_omits_every_profile_only_series() -> None:
     output = generate_latest(REGISTRY).decode()
     demand = _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO")
     headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
+    assert not any(line.startswith(demand) and f'model_name="{model}"' in line for line in output.splitlines())
     assert not any(
-        line.startswith(demand) and f'model_name="{model}"' in line
+        line.startswith(headroom) and f'model_name="{model}"' in line and 'kind="nominal"' in line
         for line in output.splitlines()
     )
-    assert not any(
-        line.startswith(headroom)
-        and f'model_name="{model}"' in line
-        and 'kind="nominal"' in line
-        for line in output.splitlines()
-    )
-    assert _sample(
-        f'{headroom}{{cadence_ms="1120",kind="hard",model_name="{model}",'
-        'replica="0",stage="0"}'
-    ) == 2.0
+    assert _sample(f'{headroom}{{cadence_ms="1120",kind="hard",model_name="{model}",replica="0",stage="0"}}') == 2.0

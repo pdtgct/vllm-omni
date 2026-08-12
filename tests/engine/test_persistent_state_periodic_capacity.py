@@ -313,9 +313,7 @@ def _compile_with_bulk_canary(
                     elapsed_ns=elapsed_ns,
                     service_interval_ms=320,
                     geometry_id=0,
-                    completed_legal_parks=(
-                        2 * tier.max_active_population
-                    ),
+                    completed_legal_parks=(2 * tier.max_active_population),
                     completed_model_rows=None,
                     post_jit=True,
                     continuously_loaded=True,
@@ -453,6 +451,8 @@ def test_hard_cap_dispatches_from_disjoint_hard_counters_without_profile() -> No
         max_num_seqs=8,
         model_profile_id="profile-a",
         service_profile_identity=None,
+        execution_environment_key="env-a",
+        precision_policy="torch.float32",
     )
     projection = _symbol("project_fixed_dispatch_capacity")(
         startup_authority=authority,
@@ -660,10 +660,7 @@ def test_infeasible_bulk_canary_cannot_block_supported_single_service() -> None:
     assert profile.homogeneous_capacity_by_interval[320] == 1
     cells = profile.receipt.control_dominance_evidence["cells"]
     terminal_bulk = next(
-        cell
-        for cell in cells
-        if cell["scenario_id"] == "final_tail_then_flush"
-        and cell["tier_id"] == "eager-bulk"
+        cell for cell in cells if cell["scenario_id"] == "final_tail_then_flush" and cell["tier_id"] == "eager-bulk"
     )
     assert terminal_bulk["dominance_passed"] is False
     assert terminal_bulk["admission_relevant"] is False
