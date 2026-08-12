@@ -81,26 +81,16 @@ class StageEngineCoreProc(EngineCoreProc):
         )
 
         managers = self.scheduler.kv_cache_manager.coordinator.single_type_managers
-        matches = [
-            manager
-            for manager in managers
-            if isinstance(manager, PersistentStateManager)
-        ]
+        matches = [manager for manager in managers if isinstance(manager, PersistentStateManager)]
         if not matches:
             return
         if len(matches) != 1:
-            raise RuntimeError(
-                "persistent_state requires exactly one resident manager"
-            )
+            raise RuntimeError("persistent_state requires exactly one resident manager")
 
         # @spec PORT-ADV-003, ENV-MIG-012
-        attestations = self.model_executor.collective_rpc(
-            "persistent_state_warmup_attestation"
-        )
+        attestations = self.model_executor.collective_rpc("persistent_state_warmup_attestation")
         if not attestations or not all(result is True for result in attestations):
-            raise RuntimeError(
-                "persistent-state worker warmup attestation is incomplete"
-            )
+            raise RuntimeError("persistent-state worker warmup attestation is incomplete")
         matches[0].resident_state_scatter_warmup_complete = True
 
     def preprocess_add_request(
@@ -125,19 +115,11 @@ class StageEngineCoreProc(EngineCoreProc):
         )
 
         managers = self.scheduler.kv_cache_manager.coordinator.single_type_managers
-        matches = [
-            manager
-            for manager in managers
-            if isinstance(manager, PersistentStateManager)
-        ]
+        matches = [manager for manager in managers if isinstance(manager, PersistentStateManager)]
         if len(matches) != 1:
-            raise RuntimeError(
-                "persistent_state requires exactly one resident manager"
-            )
+            raise RuntimeError("persistent_state requires exactly one resident manager")
         manager = matches[0]
-        runtime = PersistentStateRuntimeConfig.from_vllm_config(
-            self.vllm_config
-        )
+        runtime = PersistentStateRuntimeConfig.from_vllm_config(self.vllm_config)
         manager.configure_capacity(
             safety_reserve_slots=runtime.safety_reserve_slots,
             max_resident_sessions=runtime.max_resident_sessions,
@@ -148,13 +130,30 @@ class StageEngineCoreProc(EngineCoreProc):
         control = getattr(self, "_persistent_state_control_state", None)
         if control is None:
             manager = self._persistent_state_manager()
-            runtime = PersistentStateRuntimeConfig.from_vllm_config(
-                self.vllm_config
+            runtime = PersistentStateRuntimeConfig.from_vllm_config(self.vllm_config)
+            scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+            execution_ceiling = int(
+                getattr(
+                    scheduler_config,
+                    "max_num_seqs",
+                    manager.effective_capacity,
+                )
             )
-            if runtime.max_tombstones < 2 * manager.effective_capacity:
+            hard_capacity = min(
+                manager.effective_capacity,
+                manager.configured_limit,
+                execution_ceiling,
+            )
+            raw = getattr(self.vllm_config, "additional_config", {}) or {}
+            runtime_allowance = max(32, 4 * hard_capacity)
+            max_tombstones = (
+                runtime.max_tombstones
+                if "persistent_state_max_tombstones" in raw
+                else runtime.bootstrap_operation_budget + runtime_allowance
+            )
+            if max_tombstones < 2 * hard_capacity:
                 raise ValueError(
-                    "persistent_state_max_tombstones must reserve one "
-                    "reserve and one release record per effective slot"
+                    "persistent_state_max_tombstones must reserve one reserve and one release record per hard-cap slot"
                 )
             control = {
                 "engine_epoch": manager.engine_epoch,
@@ -165,14 +164,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 "cleanup": {},
                 "binding_created": {},
                 "tombstone_ttl_s": runtime.tombstone_ttl_s,
-                "max_tombstones": runtime.max_tombstones,
+                "max_tombstones": max_tombstones,
                 "priming_budget_sha256": runtime.priming_budget_sha256,
-                "bootstrap_operation_budget": (
-                    runtime.bootstrap_operation_budget
-                ),
-                "runtime_tombstone_allowance": (
-                    runtime.runtime_tombstone_allowance
-                ),
+                "bootstrap_operation_budget": (runtime.bootstrap_operation_budget),
+                "runtime_tombstone_allowance": runtime_allowance,
                 "admission_policy": runtime.admission_policy,
                 "pending_claim_timeout_s": runtime.pending_claim_timeout_s,
             }
@@ -186,9 +181,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
         now = time.monotonic()
         expired = [
-            operation_id
-            for operation_id, record in control["operations"].items()
-            if float(record["expires_at"]) <= now
+            operation_id for operation_id, record in control["operations"].items() if float(record["expires_at"]) <= now
         ]
         for operation_id in expired:
             control["operations"].pop(operation_id)
@@ -209,13 +202,10 @@ class StageEngineCoreProc(EngineCoreProc):
         result: dict[str, Any],
     ) -> None:
         if len(control["operations"]) >= int(control["max_tombstones"]):
-            raise RuntimeError(
-                "persistent-state operation tombstone invariant exceeded"
-            )
+            raise RuntimeError("persistent-state operation tombstone invariant exceeded")
         control["operations"][operation_id] = {
             "result": result,
-            "expires_at": time.monotonic()
-            + float(control["tombstone_ttl_s"]),
+            "expires_at": time.monotonic() + float(control["tombstone_ttl_s"]),
         }
 
     def persistent_state_snapshot(self) -> dict[str, Any]:
@@ -242,9 +232,7 @@ class StageEngineCoreProc(EngineCoreProc):
                     manager.effective_capacity,
                 )
             ),
-            "execution_environment_key": (
-                compute_hash() if callable(compute_hash) else "test-unavailable"
-            ),
+            "execution_environment_key": (compute_hash() if callable(compute_hash) else "test-unavailable"),
             "precision_policy": str(getattr(model_config, "dtype", "unknown")),
             "stage": manager.stage,
             "replica": manager.replica,
@@ -258,22 +246,12 @@ class StageEngineCoreProc(EngineCoreProc):
             ),
             "schema_id": manager.persistent_state_spec.schema_id,
             "profile_id": manager.profile_id,
-            "persistent_state_tombstone_ttl_s": control[
-                "tombstone_ttl_s"
-            ],
+            "persistent_state_tombstone_ttl_s": control["tombstone_ttl_s"],
             "persistent_state_max_tombstones": control["max_tombstones"],
-            "persistent_state_priming_budget_sha256": control[
-                "priming_budget_sha256"
-            ],
-            "persistent_state_bootstrap_operation_budget": control[
-                "bootstrap_operation_budget"
-            ],
-            "persistent_state_runtime_tombstone_allowance": control[
-                "runtime_tombstone_allowance"
-            ],
-            "persistent_state_admission_policy": control[
-                "admission_policy"
-            ],
+            "persistent_state_priming_budget_sha256": control["priming_budget_sha256"],
+            "persistent_state_bootstrap_operation_budget": control["bootstrap_operation_budget"],
+            "persistent_state_runtime_tombstone_allowance": control["runtime_tombstone_allowance"],
+            "persistent_state_admission_policy": control["admission_policy"],
             # PORT-STATE-023: binding inventory for handshake-time orphan
             # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
             # across processes on one host, which is the deployment shape
@@ -298,9 +276,7 @@ class StageEngineCoreProc(EngineCoreProc):
                         "schema_id": binding.schema_id,
                         "profile_id": binding.profile_id,
                         "engine_epoch": binding.engine_epoch,
-                        "claim_expires_at": (
-                            None if created is None else created + horizon
-                        ),
+                        "claim_expires_at": (None if created is None else created + horizon),
                     }
                 )
         return inventory
@@ -315,21 +291,15 @@ class StageEngineCoreProc(EngineCoreProc):
         """Commit one pending persistent_state lease before audio admission."""
         manager = self._persistent_state_manager()
         control = self._persistent_state_control()
-        previous = self._persistent_state_operation_result(
-            control, operation_id
-        )
+        previous = self._persistent_state_operation_result(control, operation_id)
         if previous is not None:
             return previous
-        if (
-            len(control["operations"]) + len(manager._bindings) + 2
-            > int(control["max_tombstones"])
-        ):
+        if len(control["operations"]) + len(manager._bindings) + 2 > int(control["max_tombstones"]):
             # PORT-STATE-024: typed, retryable backpressure - the horizon
             # frees by tombstone expiry (pruned on every attempt and probe)
             # and by release; this is never an invariant failure.
             raise RuntimeError(
-                "persistent_state_horizon_exhausted: operation tombstone "
-                "horizon is full; retry after tombstone expiry"
+                "persistent_state_horizon_exhausted: operation tombstone horizon is full; retry after tombstone expiry"
             )
         if schema_id != manager.persistent_state_spec.schema_id:
             raise ValueError("persistent_state schema mismatch")
@@ -365,9 +335,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 "transition": "reserved",
             },
         }
-        self._record_persistent_state_operation(
-            control, operation_id, result
-        )
+        self._record_persistent_state_operation(control, operation_id, result)
         return result
 
     def claim_pending_lease(
@@ -384,11 +352,7 @@ class StageEngineCoreProc(EngineCoreProc):
         control = self._persistent_state_control()
         if binding_token is None:
             candidates = list(control["pending"].items())
-            matches = [
-                item
-                for item in candidates
-                if item[1].request_id == session_key
-            ]
+            matches = [item for item in candidates if item[1].request_id == session_key]
             if len(matches) != 1:
                 raise ValueError("persistent_state pending claim is ambiguous")
             binding_token, binding = matches[0]
@@ -402,12 +366,16 @@ class StageEngineCoreProc(EngineCoreProc):
             profile_id,
         )
         actual = (
-            binding.engine_epoch,
-            binding.request_id,
-            binding.generation,
-            binding.schema_id,
-            binding.profile_id,
-        ) if binding is not None else None
+            (
+                binding.engine_epoch,
+                binding.request_id,
+                binding.generation,
+                binding.schema_id,
+                binding.profile_id,
+            )
+            if binding is not None
+            else None
+        )
         if actual != expected:
             raise ValueError("persistent_state pending claim mismatch")
         control["pending"].pop(binding_token)
@@ -491,18 +459,11 @@ class StageEngineCoreProc(EngineCoreProc):
         del reason
         manager = self._persistent_state_manager()
         control = self._persistent_state_control()
-        previous = self._persistent_state_operation_result(
-            control, operation_id
-        )
+        previous = self._persistent_state_operation_result(control, operation_id)
         if previous is not None:
             return previous
-        if (
-            len(control["operations"]) + len(manager._bindings)
-            > int(control["max_tombstones"])
-        ):
-            raise RuntimeError(
-                "persistent-state cleanup tombstone headroom was not reserved"
-            )
+        if len(control["operations"]) + len(manager._bindings) > int(control["max_tombstones"]):
+            raise RuntimeError("persistent-state cleanup tombstone headroom was not reserved")
         binding_token = lease["binding_token"]
         binding = control["pending"].get(binding_token)
         owner = "pending"
@@ -511,12 +472,8 @@ class StageEngineCoreProc(EngineCoreProc):
             owner = "cleanup"
         if binding is None:
             claimed = control["claimed"].get(binding_token)
-            if claimed is not None and not manager.is_terminal(
-                claimed.request_id
-            ):
-                raise RuntimeError(
-                    "persistent-state claimed lease is still running"
-                )
+            if claimed is not None and not manager.is_terminal(claimed.request_id):
+                raise RuntimeError("persistent-state claimed lease is still running")
             binding = claimed
             owner = "claimed"
         if binding is None:
@@ -555,9 +512,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 "transition": "released",
             },
         }
-        self._record_persistent_state_operation(
-            control, operation_id, result
-        )
+        self._record_persistent_state_operation(control, operation_id, result)
         return result
 
     @staticmethod

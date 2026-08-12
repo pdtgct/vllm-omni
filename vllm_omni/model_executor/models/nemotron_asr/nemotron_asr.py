@@ -264,27 +264,6 @@ __all__ = [
 ]
 
 
-def derive_state_pool_blocks(vllm_config: Any) -> int:
-    """The exact page-pool size the resolved envelope needs.
-
-    One aggregate page holds one session's complete state, so the pool
-    needs the resolved resident-session cap, plus the safety reserve,
-    plus the manager's null block — nothing else. Derived from the same
-    envelope resolution serving uses (defaults equal the qualified
-    profile), so a defaults-only boot and an explicit envelope size the
-    pool identically.
-    """
-    from vllm_omni.engine.persistent_state_config import (
-        PersistentStateRuntimeConfig,
-    )
-
-    runtime = PersistentStateRuntimeConfig.from_vllm_config(
-        vllm_config,
-        startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP,
-    )
-    return runtime.max_resident_sessions + runtime.safety_reserve_slots + 1
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     NemotronASRMultiModalProcessor,
     info=NemotronASRProcessingInfo,
@@ -352,25 +331,10 @@ class NemotronASRForRNNT(nn.Module):
                 "deploy data. Pass --dtype float32 or repair the "
                 "installation."
             )
-        # The state pool's size is DERIVED, never swept: one aggregate
-        # page per session (~6 MiB at the shipped profile), so the pool
-        # needs exactly the resolved session cap plus the safety
-        # reserve plus the null block — tens of MiB. Left to vLLM's LLM
-        # utilization sweep, the pool instead grabs
-        # gpu_memory_utilization of the card and OOMs any GPU smaller
-        # than the profiling machine (observed on A10G: a 20.5 GiB
-        # request for a 60 MiB need). An operator-set override wins.
-        cache_config = getattr(vllm_config, "cache_config", None)
-        if (
-            cache_config is not None
-            and getattr(cache_config, "num_gpu_blocks_override", None) is None
-        ):
-            cache_config.num_gpu_blocks_override = derive_state_pool_blocks(
-                vllm_config
-            )
-        reject_unsupported_outer_graph_mode(
-            getattr(vllm_config, "compilation_config", None)
-        )
+        # Pool sizing is resolved after vLLM's real memory profile in the
+        # common worker. The model constructor deliberately does not invent
+        # physical capacity or mutate ``num_gpu_blocks_override``.
+        reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
         policy = FP32_BRINGUP
@@ -448,8 +412,7 @@ class NemotronASRForRNNT(nn.Module):
             tensor = self._normalize_checkpoint_tensor(name, tensor)
             if tuple(target.shape) != tuple(tensor.shape):
                 raise ValueError(
-                    f"shape mismatch for {name!r}: expected "
-                    f"{tuple(target.shape)}, got {tuple(tensor.shape)}"
+                    f"shape mismatch for {name!r}: expected {tuple(target.shape)}, got {tuple(tensor.shape)}"
                 )
             with torch.no_grad():
                 target.copy_(tensor)
@@ -477,19 +440,11 @@ class NemotronASRForRNNT(nn.Module):
                     target.copy_(tensor)
                 consumed.add(name)
             missing = required - consumed
-        lid_missing = sorted(
-            name for name in missing if LID_REQUIRED_PATTERN.search(name)
-        )
+        lid_missing = sorted(name for name in missing if LID_REQUIRED_PATTERN.search(name))
         if lid_missing:
-            raise ValueError(
-                f"LID weights absent ({lid_missing}); conditioned "
-                "transcription never degrades silently"
-            )
+            raise ValueError(f"LID weights absent ({lid_missing}); conditioned transcription never degrades silently")
         if missing:
-            raise ValueError(
-                f"{len(missing)} expected weights not provided, e.g. "
-                f"{sorted(missing)[:3]}"
-            )
+            raise ValueError(f"{len(missing)} expected weights not provided, e.g. {sorted(missing)[:3]}")
         return {f"core.{name}" for name in consumed}
 
     @staticmethod
@@ -550,9 +505,7 @@ class NemotronASRForRNNT(nn.Module):
             groups = request.block_ids
             if len(groups) != 1 or len(groups[0]) != 1:
                 raise ValueError("persistent state requires one slot per request")
-            endpoint_mode, endpoint_threshold, endpoint_residue = (
-                self._endpoint_controls(request)
-            )
+            endpoint_mode, endpoint_threshold, endpoint_residue = self._endpoint_controls(request)
             rows.append(
                 ObservedRow(
                     request_id=str(request_id),
@@ -564,9 +517,7 @@ class NemotronASRForRNNT(nn.Module):
                         placeholder_id=int(self.config.audio_chunk_token_id),
                         num_computed_tokens=computed,
                         mm_features=request.mm_features,
-                        scheduled_encoder_input_ids=scheduled_encoder_inputs.get(
-                            request_id, ()
-                        ),
+                        scheduled_encoder_input_ids=scheduled_encoder_inputs.get(request_id, ()),
                     ),
                     endpoint_mode=endpoint_mode,
                     endpoint_threshold_frames=endpoint_threshold,
@@ -625,9 +576,7 @@ class NemotronASRForRNNT(nn.Module):
         if metadata is None:
             raise RuntimeError("MRv2 projection omitted request metadata")
         rows: list[ObservedRow] = []
-        for index, (request_id, binding) in enumerate(
-            zip(projection.req_ids, projection.bindings)
-        ):
+        for index, (request_id, binding) in enumerate(zip(projection.req_ids, projection.bindings)):
             if int(input_batch.num_scheduled_tokens[index]) != 1:
                 raise ValueError("every streaming row must be single-token")
             request = metadata[request_id]
@@ -638,9 +587,7 @@ class NemotronASRForRNNT(nn.Module):
             if not 0 <= computed < len(token_ids):
                 raise RuntimeError("MRv2 scheduled token is outside request data")
             token = int(token_ids[computed])
-            endpoint_mode, endpoint_threshold, endpoint_residue = (
-                self._endpoint_controls(request)
-            )
+            endpoint_mode, endpoint_threshold, endpoint_residue = self._endpoint_controls(request)
             rows.append(
                 ObservedRow(
                     request_id=request_id,
@@ -652,9 +599,7 @@ class NemotronASRForRNNT(nn.Module):
                         placeholder_id=int(self.config.audio_chunk_token_id),
                         num_computed_tokens=computed,
                         mm_features=request.mm_features,
-                        scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(
-                            request_id, ()
-                        ),
+                        scheduled_encoder_input_ids=projection.scheduled_encoder_inputs.get(request_id, ()),
                     ),
                     endpoint_mode=endpoint_mode,
                     endpoint_threshold_frames=endpoint_threshold,
@@ -732,10 +677,10 @@ class NemotronASRForRNNT(nn.Module):
         rows = []
         for chunk in audios:
             envelope = (
-                chunk
-                if isinstance(chunk, torch.Tensor)
-                else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
-            ).reshape(-1).to(dtype=torch.float32)
+                (chunk if isinstance(chunk, torch.Tensor) else torch.as_tensor(getattr(chunk, "audio_arrays", chunk)))
+                .reshape(-1)
+                .to(dtype=torch.float32)
+            )
             if envelope.shape[0] < ENVELOPE_HEADER_SLOTS:
                 raise ValueError("audio envelope is smaller than its header")
             if envelope.shape[0] > hidden:

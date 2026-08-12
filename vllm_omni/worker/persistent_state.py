@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from vllm.config import get_layers_from_vllm_config
+from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -24,6 +26,8 @@ from vllm_omni.model_executor.persistent_state import (
     persistent_state_storage_from_raw,
 )
 
+logger = init_logger(__name__)
+
 
 @dataclass(frozen=True)
 class PersistentStatePartition:
@@ -32,6 +36,58 @@ class PersistentStatePartition:
     ordinary_config: KVCacheConfig
     state_group: KVCacheGroupSpec | None
     state_tensor: KVCacheTensor | None
+
+
+def resolve_persistent_state_available_memory(
+    vllm_config: Any,
+    *,
+    available_memory_bytes: int,
+    cache_specs: Mapping[str, Any],
+) -> int:
+    """Cap a persistent-only pool from the real post-profile memory bound.
+
+    vLLM consumes the returned byte count when it constructs the cache
+    configuration.  Therefore the physical bound remains independent of an
+    operator count, while a smaller count can still return memory to the
+    deployment.  An explicit block override is validated against, never used
+    to manufacture, the post-profile bound.
+    """
+
+    persistent_specs = discover_persistent_state_specs(vllm_config)
+    if not persistent_specs:
+        return available_memory_bytes
+    if len(persistent_specs) != 1:
+        raise ValueError("persistent-state allocation requires one aggregate spec")
+    if set(cache_specs) != set(persistent_specs):
+        raise ValueError("persistent-state byte allocation requires a persistent-only cache layout")
+    spec = next(iter(persistent_specs.values()))
+    from vllm_omni.engine.persistent_state_capacity import (
+        resolve_pool_capacity,
+    )
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
+    profiled_block_bound = available_memory_bytes // spec.page_size_bytes
+    resolution = resolve_pool_capacity(
+        profiled_block_bound=profiled_block_bound,
+        safety_reserve_slots=runtime.safety_reserve_slots,
+        max_resident_sessions=runtime.max_resident_sessions,
+        num_gpu_blocks_override=getattr(
+            vllm_config.cache_config,
+            "num_gpu_blocks_override",
+            None,
+        ),
+        page_size_bytes=spec.page_size_bytes,
+    )
+    if resolution.count_was_clamped:
+        logger.warning(
+            "Clamping requested persistent-state capacity from %d to %d slots against the post-profile physical bound",
+            resolution.requested_count_limit,
+            resolution.resolved_count_limit,
+        )
+    return resolution.allocated_total_blocks * int(spec.page_size_bytes)
 
 
 def discover_persistent_state_specs(vllm_config: Any) -> dict[str, PersistentStateSpec]:

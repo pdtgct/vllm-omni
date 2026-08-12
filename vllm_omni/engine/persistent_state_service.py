@@ -89,8 +89,7 @@ class PersistentStateUnsupportedServiceInterval(  # noqa: N818
         self.requested_interval_ms = requested_interval_ms
         self.resolved_envelope = resolved_envelope
         super().__init__(
-            "persistent-state service interval "
-            f"{requested_interval_ms}ms is unsupported by {resolved_envelope}"
+            f"persistent-state service interval {requested_interval_ms}ms is unsupported by {resolved_envelope}"
         )
 
 
@@ -194,23 +193,15 @@ class PersistentStateService:
     ) -> None:
         if reserve_queue_capacity <= 0 or cleanup_queue_capacity <= 0:
             raise ValueError("persistent-state queue capacities must be positive")
-        if (
-            operation_timeout_s <= 0
-            or reconciliation_timeout_s <= 0
-            or pending_claim_timeout_s <= 0
-        ):
+        if operation_timeout_s <= 0 or reconciliation_timeout_s <= 0 or pending_claim_timeout_s <= 0:
             raise ValueError("persistent-state timeouts must be positive")
         if tombstone_ttl_s <= 0:
             raise ValueError("persistent-state tombstone TTL must be positive")
         if max_tombstones <= 0:
             raise ValueError("persistent-state tombstone count must be positive")
         self._stage_client = stage_client
-        self.reserve_queue: asyncio.Queue[_ReserveCommand] = asyncio.Queue(
-            maxsize=reserve_queue_capacity
-        )
-        self.cleanup_queue: asyncio.Queue[
-            _ReleaseCommand | _BeginCleanupCommand
-        ] = asyncio.Queue(
+        self.reserve_queue: asyncio.Queue[_ReserveCommand] = asyncio.Queue(maxsize=reserve_queue_capacity)
+        self.cleanup_queue: asyncio.Queue[_ReleaseCommand | _BeginCleanupCommand] = asyncio.Queue(
             maxsize=cleanup_queue_capacity
         )
         self._operation_timeout_s = operation_timeout_s
@@ -222,12 +213,11 @@ class PersistentStateService:
         self._admission_config = admission_config
         self._host_fatal_callback = host_fatal_callback
         self._compiled_service_profile = compiled_service_profile
+        self._startup_authority: Any | None = None
         self._bootstrap_active = runtime_config is not None
         self._bootstrap_complete = False
         self._startup_profile_sealed = compiled_service_profile is not None
-        self._admission_jitter_secret = (
-            admission_jitter_secret or secrets.token_bytes(16)
-        )
+        self._admission_jitter_secret = admission_jitter_secret or secrets.token_bytes(16)
         self._monotonic = monotonic
         self._operations: dict[str, asyncio.Future[Any]] = {}
         self._operation_expires_at: dict[str, float] = {}
@@ -252,30 +242,18 @@ class PersistentStateService:
         self._host_fatal_reported = False
         self._recovery_task: asyncio.Task[None] | None = None
         self._admission_controller: Any | None = None
-        waiter_capacity = (
-            0
-            if admission_config is None
-            else int(admission_config.waiter_capacity)
-        )
-        self._admission_futures: list[
-            asyncio.Future[StateLease] | None
-        ] = [None] * waiter_capacity
+        waiter_capacity = 0 if admission_config is None else int(admission_config.waiter_capacity)
+        self._admission_futures: list[asyncio.Future[StateLease] | None] = [None] * waiter_capacity
         self._admission_generations = [0] * waiter_capacity
         self._admission_enqueued_at = [0.0] * waiter_capacity
         self._admission_attached = [False] * waiter_capacity
-        self._admission_resource_tasks: list[
-            asyncio.Task[None] | None
-        ] = [None] * waiter_capacity
+        self._admission_resource_tasks: list[asyncio.Task[None] | None] = [None] * waiter_capacity
         self._admission_drain_task: asyncio.Task[None] | None = None
         self._admission_timer: asyncio.TimerHandle | None = None
         counter_intervals = (
             tuple(admission_config.supported_intervals_ms)
             if admission_config is not None
-            else (
-                ()
-                if runtime_config is not None
-                else _LEGACY_DIRECT_SERVICE_INTERVALS_MS
-            )
+            else (() if runtime_config is not None else _LEGACY_DIRECT_SERVICE_INTERVALS_MS)
         )
         self._resident_interval_counts = dict.fromkeys(counter_intervals, 0)
         self._submitted_interval_counts = dict.fromkeys(counter_intervals, 0)
@@ -287,11 +265,7 @@ class PersistentStateService:
     @property
     def ready(self) -> bool:
         """Whether capability inventory is known and admission is open."""
-        return (
-            self._ready
-            and self._admission_open
-            and self._fatal_error is None
-        )
+        return self._ready and self._admission_open and self._fatal_error is None
 
     @property
     def inventory(self) -> dict[str, Any] | None:
@@ -330,14 +304,16 @@ class PersistentStateService:
             return
         config = self._admission_config
         profile = self._compiled_service_profile
+        authority = self._startup_authority
         epoch = self._engine_epoch
-        if config is None or profile is None or epoch is None:
+        if config is None or (profile is None and authority is None) or epoch is None:
             return
         from vllm_omni.engine.persistent_state_capacity import (
+            HardCapAuthority,
             StartupServiceProfile,
         )
 
-        if not isinstance(profile, StartupServiceProfile):
+        if not isinstance(profile, StartupServiceProfile) and not isinstance(authority, HardCapAuthority):
             return
         from vllm_omni.engine.persistent_state_admission import (
             BoundedAdmissionController,
@@ -354,16 +330,15 @@ class PersistentStateService:
         controller = self._admission_controller
         inventory = self._inventory
         profile = self._compiled_service_profile
+        authority = self._startup_authority
         admission_config = self._admission_config
         if (
             controller is None
             or inventory is None
-            or profile is None
+            or (profile is None and authority is None)
             or admission_config is None
         ):
-            raise PersistentStateServiceUnavailable(
-                "persistent-state admission capacity is not installed"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state admission capacity is not installed")
         from vllm_omni.engine.persistent_state_admission import (
             AdmissionCapacity,
         )
@@ -371,14 +346,24 @@ class PersistentStateService:
             project_fixed_dispatch_capacity,
         )
 
-        projection = project_fixed_dispatch_capacity(
-            profile=profile,
-            inventory=inventory,
-            resident_counts_by_interval=self._resident_interval_counts,
-            submitted_counts_by_interval=self._submitted_interval_counts,
-            authority_open=self.ready,
-            admission_policy=admission_config.admission_policy,
-        )
+        if authority is not None:
+            projection = project_fixed_dispatch_capacity(
+                startup_authority=authority,
+                state_resident=int(inventory["resident_count"]),
+                state_submitted=sum(self._submitted_interval_counts.values()),
+                execution_committed=len(self._service_intervals),
+                execution_submitted=len(self._pending_service_intervals),
+                authority_open=self.ready,
+            )
+        else:
+            projection = project_fixed_dispatch_capacity(
+                profile=profile,
+                inventory=inventory,
+                resident_counts_by_interval=self._resident_interval_counts,
+                submitted_counts_by_interval=self._submitted_interval_counts,
+                authority_open=self.ready,
+                admission_policy=admission_config.admission_policy,
+            )
         return AdmissionCapacity(
             # One candidate per reactor turn makes every subsequent turn
             # re-read the just-installed provisional charge. J still bounds
@@ -396,17 +381,28 @@ class PersistentStateService:
 
         inventory = self._inventory
         profile = self._compiled_service_profile
+        authority = self._startup_authority
         admission_config = self._admission_config
-        if inventory is None or profile is None or admission_config is None:
+        if inventory is None or (profile is None and authority is None) or admission_config is None:
             return False
-        projection = project_fixed_dispatch_capacity(
-            profile=profile,
-            inventory=inventory,
-            resident_counts_by_interval=self._resident_interval_counts,
-            submitted_counts_by_interval=self._submitted_interval_counts,
-            authority_open=self.ready,
-            admission_policy=admission_config.admission_policy,
-        )
+        if authority is not None:
+            projection = project_fixed_dispatch_capacity(
+                startup_authority=authority,
+                state_resident=int(inventory["resident_count"]),
+                state_submitted=sum(self._submitted_interval_counts.values()),
+                execution_committed=len(self._service_intervals),
+                execution_submitted=len(self._pending_service_intervals),
+                authority_open=self.ready,
+            )
+        else:
+            projection = project_fixed_dispatch_capacity(
+                profile=profile,
+                inventory=inventory,
+                resident_counts_by_interval=self._resident_interval_counts,
+                submitted_counts_by_interval=self._submitted_interval_counts,
+                authority_open=self.ready,
+                admission_policy=admission_config.admission_policy,
+            )
         return bool(
             projection.candidate_supported_by_interval.get(
                 service_interval_ms,
@@ -427,8 +423,7 @@ class PersistentStateService:
             return
         delay = max(
             0.0,
-            (deadline_ns - int(self._monotonic() * 1_000_000_000))
-            / 1_000_000_000,
+            (deadline_ns - int(self._monotonic() * 1_000_000_000)) / 1_000_000_000,
         )
         self._admission_timer = asyncio.get_running_loop().call_later(
             delay,
@@ -502,9 +497,7 @@ class PersistentStateService:
             )
         elif disposition.outcome == "unavailable":
             future.set_exception(
-                PersistentStateServiceUnavailable(
-                    "persistent-state admission authority is unavailable"
-                )
+                PersistentStateServiceUnavailable("persistent-state admission authority is unavailable")
             )
         else:
             future.cancel()
@@ -539,9 +532,7 @@ class PersistentStateService:
             self._admission_drain_task = None
             self._arm_admission_timer()
             if launched:
-                asyncio.get_running_loop().call_soon(
-                    self._schedule_admission_drain
-                )
+                asyncio.get_running_loop().call_soon(self._schedule_admission_drain)
 
     async def _submit_admission(self, dispatch: Any) -> None:
         controller = self._admission_controller
@@ -572,9 +563,7 @@ class PersistentStateService:
             try:
                 result = await asyncio.shield(shared)
                 if not isinstance(result, StateReserveResult):
-                    raise PersistentStateServiceUnavailable(
-                        "reconciled admission returned an invalid result"
-                    )
+                    raise PersistentStateServiceUnavailable("reconciled admission returned an invalid result")
                 lease = result.lease
             except Exception as error:
                 controller.complete_no_lease(dispatch.handle)
@@ -591,10 +580,7 @@ class PersistentStateService:
             self._schedule_admission_drain()
             return
 
-        attached = (
-            self._admission_attached[dispatch.handle.slot]
-            and not future.cancelled()
-        )
+        attached = self._admission_attached[dispatch.handle.slot] and not future.cancelled()
 
         def handoff(_attempt: Any, committed: object) -> None:
             if attached and not future.done():
@@ -608,8 +594,7 @@ class PersistentStateService:
         )
         wait_s = max(
             0.0,
-            self._monotonic()
-            - self._admission_enqueued_at[dispatch.handle.slot],
+            self._monotonic() - self._admission_enqueued_at[dispatch.handle.slot],
         )
         self._clear_admission_slot(dispatch.handle)
         self._observe_metrics(
@@ -691,13 +676,11 @@ class PersistentStateService:
             except Exception as error:
                 if (
                     self._failed_releases
-                    and loop.time() - started_at
-                    >= self._admission_config.release_convergence_timeout_s
+                    and loop.time() - started_at >= self._admission_config.release_convergence_timeout_s
                 ):
                     self._report_host_fatal(
                         PersistentStateServiceUnavailable(
-                            "persistent-state release recovery did not converge: "
-                            f"{error}"
+                            f"persistent-state release recovery did not converge: {error}"
                         )
                     )
                     return
@@ -711,11 +694,7 @@ class PersistentStateService:
         """Forget only completed operations whose retry horizon expired."""
 
         now = self._monotonic()
-        expired = [
-            operation_id
-            for operation_id, expires_at in self._operation_expires_at.items()
-            if expires_at <= now
-        ]
+        expired = [operation_id for operation_id, expires_at in self._operation_expires_at.items() if expires_at <= now]
         for operation_id in expired:
             future = self._operations.get(operation_id)
             if future is not None and future.done():
@@ -733,10 +712,7 @@ class PersistentStateService:
         # release tombstone eventually. Existing resident leases each retain
         # one cleanup slot. This invariant lets release remain available even
         # when new admission is closed by the operation horizon.
-        self._tombstone_admission_blocked = (
-            len(self._operation_expires_at) + resident_count + 2
-            > self._max_tombstones
-        )
+        self._tombstone_admission_blocked = len(self._operation_expires_at) + resident_count + 2 > self._max_tombstones
 
     def _track_operation(
         self,
@@ -750,20 +726,12 @@ class PersistentStateService:
         self._operations[operation_id] = future
 
         def completed(_future: asyncio.Future[Any]) -> None:
-            if (
-                _future.cancelled()
-                or (
-                    not retain_error
-                    and _future.exception() is not None
-                )
-            ):
+            if _future.cancelled() or (not retain_error and _future.exception() is not None):
                 if self._operations.get(operation_id) is _future:
                     self._operations.pop(operation_id, None)
                     self._operation_expires_at.pop(operation_id, None)
                 return
-            self._operation_expires_at[operation_id] = (
-                self._monotonic() + self._tombstone_ttl_s
-            )
+            self._operation_expires_at[operation_id] = self._monotonic() + self._tombstone_ttl_s
             self._refresh_tombstone_admission()
 
         future.add_done_callback(completed)
@@ -787,9 +755,7 @@ class PersistentStateService:
         try:
             getattr(sink, method_name)(*args, **kwargs)
         except Exception:
-            logger.exception(
-                "persistent-state metric observation failed; serving is unaffected"
-            )
+            logger.exception("persistent-state metric observation failed; serving is unaffected")
 
     def _project_inventory(self) -> None:
         inventory = self._inventory
@@ -813,12 +779,12 @@ class PersistentStateService:
         if inventory is None:
             return
         capacity = max(1, int(inventory.get("effective_capacity", 1)))
-        charged_count = len(self._pending_service_intervals) + len(
-            self._service_intervals
-        )
+        charged_count = len(self._pending_service_intervals) + len(self._service_intervals)
         inventory["execution_claims"] = charged_count
-        inventory["charged_demand"] = float(Fraction(charged_count, capacity))
         profile = self._compiled_service_profile
+        authority = self._startup_authority
+        if profile is not None or authority is None:
+            inventory["charged_demand"] = float(Fraction(charged_count, capacity))
         if profile is not None:
             receipt = getattr(profile, "receipt", profile)
             receipt_hash = getattr(receipt, "receipt_sha256", None)
@@ -828,34 +794,47 @@ class PersistentStateService:
         if admission_config is not None:
             inventory["admission_policy"] = admission_config.admission_policy
         controller = self._admission_controller
-        if (
-            controller is not None
-            and profile is not None
-            and admission_config is not None
-        ):
+        if controller is not None and admission_config is not None:
             from vllm_omni.engine.persistent_state_capacity import (
+                FixedDispatchCapacity,
                 project_fixed_dispatch_capacity,
             )
 
-            projection = project_fixed_dispatch_capacity(
-                profile=profile,
-                inventory=inventory,
-                resident_counts_by_interval=self._resident_interval_counts,
-                submitted_counts_by_interval=self._submitted_interval_counts,
-                authority_open=self.ready,
-                admission_policy=admission_config.admission_policy,
-            )
+            if authority is not None:
+                projection = project_fixed_dispatch_capacity(
+                    startup_authority=authority,
+                    state_resident=int(inventory["resident_count"]),
+                    state_submitted=sum(self._submitted_interval_counts.values()),
+                    execution_committed=len(self._service_intervals),
+                    execution_submitted=len(self._pending_service_intervals),
+                    authority_open=self.ready,
+                )
+            elif profile is not None:
+                projection = project_fixed_dispatch_capacity(
+                    profile=profile,
+                    inventory=inventory,
+                    resident_counts_by_interval=self._resident_interval_counts,
+                    submitted_counts_by_interval=self._submitted_interval_counts,
+                    authority_open=self.ready,
+                    admission_policy=admission_config.admission_policy,
+                )
+            else:
+                raise PersistentStateServiceUnavailable("persistent-state startup authority is absent")
             inventory["execution_claims"] = projection.execution_claims
-            inventory["charged_demand"] = (
-                projection.charged_units / projection.service_budget_units
-            )
+            if profile is not None:
+                if not isinstance(projection, FixedDispatchCapacity):
+                    raise RuntimeError("profile authority produced hard-cap projection")
+                inventory["charged_demand"] = projection.charged_units / projection.service_budget_units
+                nominal_headroom = projection.nominal_dispatchable_by_interval
+            else:
+                inventory.pop("charged_demand", None)
+                inventory["service_profile_identity"] = None
+                nominal_headroom = None
             pending = controller.pending_counts
             pending_by_cadence = {
                 str(interval): {
                     **pending[interval],
-                    "committed_cleanup": self._failed_release_interval_counts[
-                        interval
-                    ],
+                    "committed_cleanup": self._failed_release_interval_counts[interval],
                 }
                 for interval in self._resident_interval_counts
             }
@@ -863,19 +842,26 @@ class PersistentStateService:
                 "observe_persistent_state_capacity",
                 str(inventory["stage"]),
                 str(inventory["replica"]),
-                service_source=str(
-                    getattr(receipt, "service_budget_source", "measured_fallback")
+                admission_policy=admission_config.admission_policy,
+                service_source=(
+                    str(
+                        getattr(
+                            receipt,
+                            "service_budget_source",
+                            "measured_fallback",
+                        )
+                    )
+                    if profile is not None
+                    else None
                 ),
-                service_budget=float(profile.derating_factor),
-                charged_demand=float(inventory["charged_demand"]),
+                service_budget=(float(profile.derating_factor) if profile is not None else None),
+                charged_demand=(float(inventory["charged_demand"]) if profile is not None else None),
                 execution_claims=projection.execution_claims,
                 max_num_seqs=projection.max_num_seqs,
                 headroom_by_cadence={
                     str(interval): {
                         "hard": projection.hard_headroom,
-                        "nominal": projection.nominal_dispatchable_by_interval[
-                            interval
-                        ],
+                        **({"nominal": nominal_headroom[interval]} if nominal_headroom is not None else {}),
                     }
                     for interval in self._resident_interval_counts
                 },
@@ -891,16 +877,12 @@ class PersistentStateService:
         existing = self._pending_service_intervals.get(operation_id)
         if existing is not None:
             if existing != service_interval_ms:
-                raise PersistentStateServiceUnavailable(
-                    "one reserve operation changed service interval"
-                )
+                raise PersistentStateServiceUnavailable("one reserve operation changed service interval")
             return
         if service_interval_ms not in self._submitted_interval_counts:
             raise PersistentStateUnsupportedServiceInterval(
                 requested_interval_ms=service_interval_ms,
-                resolved_envelope=str(
-                    (self._inventory or {}).get("profile_id", "installed profile")
-                ),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
             )
         self._pending_service_intervals[operation_id] = service_interval_ms
         self._submitted_interval_counts[service_interval_ms] += 1
@@ -955,9 +937,7 @@ class PersistentStateService:
         if interval is not None:
             self._failed_release_interval_counts[interval] -= 1
             if self._failed_release_interval_counts[interval] < 0:
-                raise RuntimeError(
-                    "persistent-state failed-release cadence underflow"
-                )
+                raise RuntimeError("persistent-state failed-release cadence underflow")
 
     def _observe_admission_rejection(self, reason: str) -> None:
         self._observe_metrics("inc_admission_rejection", reason)
@@ -991,11 +971,7 @@ class PersistentStateService:
             drain.cancel()
         for slot, future in enumerate(self._admission_futures):
             if future is not None and not future.done():
-                future.set_exception(
-                    PersistentStateServiceUnavailable(
-                        "persistent-state service is stopping"
-                    )
-                )
+                future.set_exception(PersistentStateServiceUnavailable("persistent-state service is stopping"))
             resource_task = self._admission_resource_tasks[slot]
             if resource_task is not None and not resource_task.done():
                 resource_task.cancel()
@@ -1016,9 +992,7 @@ class PersistentStateService:
                 self._complete_admission_disposition(disposition)
         self._engine_epoch = engine_epoch
 
-    async def _reconcile_orphan_bindings(
-        self, snapshot: dict[str, Any]
-    ) -> None:
+    async def _reconcile_orphan_bindings(self, snapshot: dict[str, Any]) -> None:
         """Release engine bindings no live lease owns (PORT-STATE-023).
 
         Runs inside the handshake, before admission opens. An orphan is a
@@ -1031,9 +1005,7 @@ class PersistentStateService:
         """
         inventory = self._inventory
         if inventory is None:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state inventory is unavailable during orphan recovery"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state inventory is unavailable during orphan recovery")
         for binding in snapshot.get("bindings", ()):
             token = str(binding["binding_token"])
             if token in self._live_leases:
@@ -1081,19 +1053,13 @@ class PersistentStateService:
 
         inventory = self._inventory
         if inventory is None:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state inventory is unavailable during release recovery"
-            )
-        bindings = {
-            str(binding["binding_token"]): binding
-            for binding in snapshot.get("bindings", ())
-        }
+            raise PersistentStateServiceUnavailable("persistent-state inventory is unavailable during release recovery")
+        bindings = {str(binding["binding_token"]): binding for binding in snapshot.get("bindings", ())}
         for token, command in tuple(self._failed_releases.items()):
             binding = bindings.get(token)
             if binding is not None and not bool(binding.get("terminal", False)):
                 raise PersistentStateServiceUnavailable(
-                    "persistent-state failed release is not terminally "
-                    f"reconcilable for binding {token}"
+                    f"persistent-state failed release is not terminally reconcilable for binding {token}"
                 )
             try:
                 raw = await self._stage_client.call_utility_async(
@@ -1121,27 +1087,20 @@ class PersistentStateService:
             self._live_leases.pop(token, None)
             self._release_resident_interval(token)
             snapshot["bindings"] = [
-                candidate
-                for candidate in snapshot.get("bindings", ())
-                if str(candidate["binding_token"]) != token
+                candidate for candidate in snapshot.get("bindings", ()) if str(candidate["binding_token"]) != token
             ]
+
     def _ensure_dispatcher(self) -> None:
         if self._dispatcher_task is None or self._dispatcher_task.done():
-            self._dispatcher_task = asyncio.create_task(
-                self._dispatch(), name="persistent-state-dispatch"
-            )
+            self._dispatcher_task = asyncio.create_task(self._dispatch(), name="persistent-state-dispatch")
 
     async def _perform_handshake(self, *, open_admission: bool) -> None:
         """Reconcile one authoritative snapshot and optionally open serving."""
 
-        snapshot = await self._stage_client.call_utility_async(
-            "persistent_state_snapshot"
-        )
+        snapshot = await self._stage_client.call_utility_async("persistent_state_snapshot")
         capabilities = set(snapshot.get("capabilities", ()))
         if "resident" not in capabilities:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state capability inventory lacks resident state"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state capability inventory lacks resident state")
         required_inventory = {
             "manager_revision",
             "resident_count",
@@ -1149,6 +1108,8 @@ class PersistentStateService:
             "safety_reserve",
             "configured_limit",
             "effective_capacity",
+            "slot_bytes",
+            "execution_claim_ceiling",
             "stage",
             "replica",
             "schema_id",
@@ -1157,61 +1118,100 @@ class PersistentStateService:
         missing_inventory = required_inventory.difference(snapshot)
         if missing_inventory:
             raise PersistentStateServiceUnavailable(
-                "persistent-state capability inventory is incomplete: "
-                f"missing {sorted(missing_inventory)}"
+                f"persistent-state capability inventory is incomplete: missing {sorted(missing_inventory)}"
             )
         engine_epoch = str(snapshot["engine_epoch"])
         if self._engine_epoch is not None and engine_epoch != self._engine_epoch:
             self.engine_epoch_changed(engine_epoch)
-            raise PersistentStateServiceUnavailable(
-                "persistent-state engine epoch changed during snapshot"
+            raise PersistentStateServiceUnavailable("persistent-state engine epoch changed during snapshot")
+        authority = self._startup_authority
+        if authority is not None:
+            from vllm_omni.engine.persistent_state_startup import (
+                derive_hard_cap_authority,
             )
+
+            required_static = {
+                "profile_id",
+                "execution_environment_key",
+                "precision_policy",
+                "schema_id",
+                "slot_bytes",
+                "physical_capacity",
+                "safety_reserve",
+                "configured_limit",
+                "effective_capacity",
+                "execution_claim_ceiling",
+                "stage",
+                "replica",
+            }
+            missing_static = sorted(required_static.difference(snapshot))
+            recovered = (
+                None
+                if missing_static
+                else derive_hard_cap_authority(
+                    served_intervals_ms=authority.served_intervals_ms,
+                    model_profile_id=str(snapshot["profile_id"]),
+                    execution_environment_key=str(snapshot["execution_environment_key"]),
+                    precision_policy=str(snapshot["precision_policy"]),
+                    schema_id=str(snapshot["schema_id"]),
+                    slot_bytes=int(snapshot["slot_bytes"]),
+                    stage=int(snapshot["stage"]),
+                    replica=int(snapshot["replica"]),
+                    physical_capacity=int(snapshot["physical_capacity"]),
+                    configured_limit=int(snapshot["configured_limit"]),
+                    effective_capacity=int(snapshot["effective_capacity"]),
+                    max_num_seqs=int(snapshot["execution_claim_ceiling"]),
+                    safety_reserve=int(snapshot["safety_reserve"]),
+                    controller_identity=authority.controller_identity,
+                )
+            )
+            if recovered is None or (recovered.hard_cap_envelope_sha256 != authority.hard_cap_envelope_sha256):
+                error = PersistentStateServiceUnavailable(
+                    f"persistent-state hard-cap authority mismatch: missing={missing_static}"
+                )
+                self._report_host_fatal(error)
+                raise error
         self._engine_epoch = engine_epoch
         self._inventory = dict(snapshot)
         self._sync_service_projection()
         if self._max_tombstones < 2 * int(snapshot["effective_capacity"]):
             raise PersistentStateServiceUnavailable(
-                "persistent-state tombstone count cannot reserve cleanup "
-                "headroom for effective capacity"
+                "persistent-state tombstone count cannot reserve cleanup headroom for effective capacity"
             )
         advertised_ttl = snapshot.get("persistent_state_tombstone_ttl_s")
         advertised_max = snapshot.get("persistent_state_max_tombstones")
-        if (
-            advertised_ttl is not None
-            and float(advertised_ttl) != self._tombstone_ttl_s
-        ):
-            raise PersistentStateServiceUnavailable(
-                "persistent-state tombstone TTL disagrees across processes"
-            )
-        if advertised_max is not None and int(advertised_max) != self._max_tombstones:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state tombstone count disagrees across processes"
-            )
+        if advertised_ttl is not None and float(advertised_ttl) != self._tombstone_ttl_s:
+            raise PersistentStateServiceUnavailable("persistent-state tombstone TTL disagrees across processes")
         runtime = self._runtime_config
+        if (
+            runtime is not None
+            and runtime.admission_policy == "hard_cap"
+            and not self._startup_profile_sealed
+            and advertised_max is not None
+        ):
+            self._max_tombstones = int(advertised_max)
+        if advertised_max is not None and int(advertised_max) != self._max_tombstones:
+            raise PersistentStateServiceUnavailable("persistent-state tombstone count disagrees across processes")
         if runtime is not None:
+            hard_capacity = min(
+                int(snapshot["effective_capacity"]),
+                int(snapshot["configured_limit"]),
+                int(snapshot["execution_claim_ceiling"]),
+            )
             expected = {
-                "persistent_state_priming_budget_sha256": str(
-                    runtime.priming_budget_sha256
+                "persistent_state_priming_budget_sha256": (runtime.priming_budget_sha256),
+                "persistent_state_bootstrap_operation_budget": int(runtime.bootstrap_operation_budget),
+                "persistent_state_runtime_tombstone_allowance": (
+                    max(32, 4 * hard_capacity)
+                    if runtime.admission_policy == "hard_cap"
+                    else int(runtime.runtime_tombstone_allowance)
                 ),
-                "persistent_state_bootstrap_operation_budget": int(
-                    runtime.bootstrap_operation_budget
-                ),
-                "persistent_state_runtime_tombstone_allowance": int(
-                    runtime.runtime_tombstone_allowance
-                ),
-                "persistent_state_admission_policy": (
-                    runtime.admission_policy
-                ),
+                "persistent_state_admission_policy": (runtime.admission_policy),
             }
-            mismatched = [
-                name
-                for name, value in expected.items()
-                if snapshot.get(name) != value
-            ]
+            mismatched = [name for name, value in expected.items() if snapshot.get(name) != value]
             if mismatched:
                 raise PersistentStateServiceUnavailable(
-                    "persistent-state runtime envelope disagrees across "
-                    f"processes: {mismatched}"
+                    f"persistent-state runtime envelope disagrees across processes: {mismatched}"
                 )
         await self._reconcile_failed_releases(snapshot)
         await self._reconcile_orphan_bindings(snapshot)
@@ -1266,17 +1266,13 @@ class PersistentStateService:
         """Install the model-owned interval subset before priming reserves."""
 
         if not self._bootstrap_complete or self._startup_profile_sealed:
-            raise RuntimeError(
-                "persistent-state bootstrap intervals require an open bootstrap"
-            )
+            raise RuntimeError("persistent-state bootstrap intervals require an open bootstrap")
         if (
             not 1 <= len(intervals_ms) <= 5
             or len(set(intervals_ms)) != len(intervals_ms)
             or any(interval <= 0 for interval in intervals_ms)
         ):
-            raise ValueError(
-                "bootstrap intervals must contain one to five unique values"
-            )
+            raise ValueError("bootstrap intervals must contain one to five unique values")
         if (
             self._pending_service_intervals
             or self._service_intervals
@@ -1285,9 +1281,7 @@ class PersistentStateService:
             or any(self._submitted_interval_counts.values())
             or any(self._failed_release_interval_counts.values())
         ):
-            raise RuntimeError(
-                "persistent-state bootstrap interval authority is not empty"
-            )
+            raise RuntimeError("persistent-state bootstrap interval authority is not empty")
         self._resident_interval_counts = dict.fromkeys(intervals_ms, 0)
         self._submitted_interval_counts = dict.fromkeys(intervals_ms, 0)
         self._failed_release_interval_counts = dict.fromkeys(intervals_ms, 0)
@@ -1303,26 +1297,16 @@ class PersistentStateService:
         if self._startup_profile_sealed:
             raise RuntimeError("persistent-state startup profile is already sealed")
         if not self._bootstrap_complete or self._inventory is None:
-            raise RuntimeError(
-                "persistent-state bootstrap handshake must complete before seal"
-            )
+            raise RuntimeError("persistent-state bootstrap handshake must complete before seal")
         resolved_admission = admission_config or self._admission_config
         if resolved_admission is None:
-            raise RuntimeError(
-                "persistent-state admission configuration is required at seal"
-            )
-        profile_intervals = tuple(
-            compiled_service_profile.compiled_demand.intervals_ms
-        )
+            raise RuntimeError("persistent-state admission configuration is required at seal")
+        profile_intervals = tuple(compiled_service_profile.compiled_demand.intervals_ms)
         admission_intervals = tuple(resolved_admission.supported_intervals_ms)
         if profile_intervals != admission_intervals:
-            raise ValueError(
-                "compiled profile and admission controller intervals disagree"
-            )
+            raise ValueError("compiled profile and admission controller intervals disagree")
         if tuple(self._resident_interval_counts) != profile_intervals:
-            raise ValueError(
-                "bootstrap and compiled profile intervals disagree"
-            )
+            raise ValueError("bootstrap and compiled profile intervals disagree")
         if (
             self._pending_service_intervals
             or self._service_intervals
@@ -1331,9 +1315,7 @@ class PersistentStateService:
             or any(self._submitted_interval_counts.values())
             or any(self._failed_release_interval_counts.values())
         ):
-            raise RuntimeError(
-                "persistent-state priming authority is not empty at seal"
-            )
+            raise RuntimeError("persistent-state priming authority is not empty at seal")
         self._admission_config = resolved_admission
         self._compiled_service_profile = compiled_service_profile
         self._resident_interval_counts = dict.fromkeys(profile_intervals, 0)
@@ -1350,13 +1332,84 @@ class PersistentStateService:
         if self._admission_controller is None:
             self._ready = False
             self._admission_open = False
-            raise RuntimeError(
-                "persistent-state startup profile could not install admission"
-            )
+            raise RuntimeError("persistent-state startup profile could not install admission")
         assert self._engine_epoch is not None
-        self._admission_controller.authority_recovered(
-            engine_epoch=self._engine_epoch
+        self._admission_controller.authority_recovered(engine_epoch=self._engine_epoch)
+        self._sync_service_projection()
+        self._refresh_tombstone_admission()
+        self._project_inventory()
+        self._schedule_admission_drain()
+
+    def seal_startup_authority(
+        self,
+        *,
+        authority: Any,
+        admission_config: Any | None = None,
+    ) -> None:
+        """Seal a profile-free hard-cap authority after one handshake."""
+
+        from vllm_omni.engine.persistent_state_capacity import HardCapAuthority
+
+        if not isinstance(authority, HardCapAuthority):
+            raise TypeError("hard-cap startup requires HardCapAuthority")
+        if self._startup_profile_sealed:
+            raise RuntimeError("persistent-state startup authority is already sealed")
+        if not self._bootstrap_complete or self._inventory is None:
+            raise RuntimeError("persistent-state bootstrap handshake must complete before seal")
+        resolved_admission = admission_config or self._admission_config
+        if resolved_admission is None:
+            raise RuntimeError("persistent-state admission configuration is required at seal")
+        intervals = tuple(authority.served_intervals_ms)
+        if tuple(resolved_admission.supported_intervals_ms) != intervals:
+            raise ValueError("hard-cap authority and admission controller intervals disagree")
+        if tuple(self._resident_interval_counts) != intervals:
+            raise ValueError("bootstrap and hard-cap intervals disagree")
+        inventory_static = {
+            "model_profile_id": str(self._inventory["profile_id"]),
+            "execution_environment_key": str(self._inventory["execution_environment_key"]),
+            "precision_policy": str(self._inventory["precision_policy"]),
+            "schema_id": str(self._inventory["schema_id"]),
+            "slot_bytes": int(self._inventory["slot_bytes"]),
+            "stage": int(self._inventory["stage"]),
+            "replica": int(self._inventory["replica"]),
+            "physical_capacity": int(self._inventory["physical_capacity"]),
+            "configured_resident_limit": int(self._inventory["configured_limit"]),
+            "effective_state_slots": int(self._inventory["effective_capacity"]),
+            "max_num_seqs": int(self._inventory["execution_claim_ceiling"]),
+            "safety_reserve": int(self._inventory["safety_reserve"]),
+        }
+        mismatched = [name for name, value in inventory_static.items() if getattr(authority, name) != value]
+        if mismatched:
+            raise ValueError(f"hard-cap authority and startup inventory mismatch: {mismatched}")
+        if (
+            self._pending_service_intervals
+            or self._service_intervals
+            or self._failed_releases
+            or any(self._resident_interval_counts.values())
+            or any(self._submitted_interval_counts.values())
+            or any(self._failed_release_interval_counts.values())
+        ):
+            raise RuntimeError("persistent-state bootstrap authority is not empty at seal")
+        self._admission_config = resolved_admission
+        self._startup_authority = authority
+        hard_capacity = min(
+            authority.effective_state_slots,
+            authority.configured_resident_limit,
+            authority.max_num_seqs,
         )
+        self.reserve_queue = asyncio.Queue(maxsize=hard_capacity)
+        self.cleanup_queue = asyncio.Queue(maxsize=hard_capacity)
+        self._reset_admission_storage(int(resolved_admission.waiter_capacity))
+        self._startup_profile_sealed = True
+        self._ready = True
+        self._admission_open = True
+        self._install_admission_controller()
+        if self._admission_controller is None:
+            self._ready = False
+            self._admission_open = False
+            raise RuntimeError("persistent-state hard-cap authority could not install admission")
+        assert self._engine_epoch is not None
+        self._admission_controller.authority_recovered(engine_epoch=self._engine_epoch)
         self._sync_service_projection()
         self._refresh_tombstone_admission()
         self._project_inventory()
@@ -1374,9 +1427,7 @@ class PersistentStateService:
         """Reserve only within the closed bootstrap/priming interval."""
 
         if not self._bootstrap_complete or self._startup_profile_sealed:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state priming is unavailable outside bootstrap"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state priming is unavailable outside bootstrap")
         return await self._reserve_direct(
             operation_id=operation_id,
             session_key=session_key,
@@ -1393,9 +1444,7 @@ class PersistentStateService:
             if self._fatal_error is not None:
                 raise PersistentStateServiceUnavailable(str(self._fatal_error))
             if self._bootstrap_active and not self._startup_profile_sealed:
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state startup profile is not sealed"
-                )
+                raise PersistentStateServiceUnavailable("persistent-state startup profile is not sealed")
             if not self._ready:
                 await self._perform_handshake(open_admission=True)
             self._ensure_dispatcher()
@@ -1403,14 +1452,8 @@ class PersistentStateService:
     async def check_health(self) -> None:
         """Require a completed inventory handshake and open admission."""
         recovery = self._recovery_task
-        if (
-            recovery is not None
-            and not recovery.done()
-            and recovery is not asyncio.current_task()
-        ):
-            raise PersistentStateServiceUnavailable(
-                "persistent-state authority recovery is in progress"
-            )
+        if recovery is not None and not recovery.done() and recovery is not asyncio.current_task():
+            raise PersistentStateServiceUnavailable("persistent-state authority recovery is in progress")
         else:
             try:
                 await self._ensure_started()
@@ -1419,9 +1462,7 @@ class PersistentStateService:
                 raise
         self._refresh_tombstone_admission()
         if not self.ready:
-            raise PersistentStateServiceUnavailable(
-                "persistent-state admission is closed"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state admission is closed")
 
     async def check_admission(self) -> None:
         """Check health for one admission attempt and classify its denial."""
@@ -1431,9 +1472,7 @@ class PersistentStateService:
             self._observe_admission_rejection("unavailable")
             raise
 
-    def _coalesced_future(
-        self, operation_id: str
-    ) -> asyncio.Future[Any] | None:
+    def _coalesced_future(self, operation_id: str) -> asyncio.Future[Any] | None:
         self._prune_operation_tombstones()
         return self._operations.get(operation_id)
 
@@ -1454,9 +1493,7 @@ class PersistentStateService:
 
         if self._admission_config is not None and not self._startup_profile_sealed:
             self._observe_admission_rejection("unavailable")
-            raise PersistentStateServiceUnavailable(
-                "persistent-state startup profile is not sealed"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state startup profile is not sealed")
         try:
             await self._ensure_started()
         except PersistentStateServiceUnavailable:
@@ -1475,9 +1512,7 @@ class PersistentStateService:
             self._observe_admission_rejection("unsupported")
             raise PersistentStateUnsupportedServiceInterval(
                 requested_interval_ms=service_interval_ms,
-                resolved_envelope=str(
-                    (self._inventory or {}).get("profile_id", "installed profile")
-                ),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
             )
         from vllm_omni.engine.persistent_state_admission import (
             AdmissionAttempt,
@@ -1486,9 +1521,7 @@ class PersistentStateService:
         now_ns = int(self._monotonic() * 1_000_000_000)
         config = self._admission_config
         assert config is not None
-        wait_deadline = admission_deadline_ns or (
-            now_ns + int(config.admission_wait_timeout_s * 1_000_000_000)
-        )
+        wait_deadline = admission_deadline_ns or (now_ns + int(config.admission_wait_timeout_s * 1_000_000_000))
         attempt = AdmissionAttempt(
             attempt_id=operation_id,
             connection_id=connection_id or session_key,
@@ -1496,9 +1529,7 @@ class PersistentStateService:
             operation_id=operation_id,
             service_interval_ms=service_interval_ms,
             admission_deadline_ns=wait_deadline,
-            unadmitted_deadline_ns=(
-                unadmitted_deadline_ns or wait_deadline
-            ),
+            unadmitted_deadline_ns=(unadmitted_deadline_ns or wait_deadline),
             resource_key=session_key,
             schema_id=schema_id,
             profile_id=profile_id,
@@ -1507,9 +1538,7 @@ class PersistentStateService:
         existing = self._admission_future_for(handle)
         if existing is not None:
             return await asyncio.shield(existing)
-        future: asyncio.Future[StateLease] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[StateLease] = asyncio.get_running_loop().create_future()
         slot = handle.slot
         self._admission_generations[slot] = handle.generation
         self._admission_futures[slot] = future
@@ -1555,18 +1584,12 @@ class PersistentStateService:
                     cause="tombstone_horizon",
                 )
             if not self.ready and not (
-                allow_bootstrap
-                and self._bootstrap_complete
-                and not self._startup_profile_sealed
+                allow_bootstrap and self._bootstrap_complete and not self._startup_profile_sealed
             ):
                 self._observe_admission_rejection("unavailable")
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state admission is closed"
-                )
+                raise PersistentStateServiceUnavailable("persistent-state admission is closed")
             self._charge_pending_interval(operation_id, service_interval_ms)
-            future: asyncio.Future[StateReserveResult] = (
-                asyncio.get_running_loop().create_future()
-            )
+            future: asyncio.Future[StateReserveResult] = asyncio.get_running_loop().create_future()
             self._track_operation(
                 operation_id,
                 future,
@@ -1596,9 +1619,7 @@ class PersistentStateService:
             self._queue_event.set()
             shared = future
         try:
-            result = await asyncio.wait_for(
-                asyncio.shield(shared), timeout=self._operation_timeout_s
-            )
+            result = await asyncio.wait_for(asyncio.shield(shared), timeout=self._operation_timeout_s)
         except asyncio.TimeoutError:
             # Submission may already be committed.  Close admission and
             # reconcile this same operation id; never mint a parallel attempt.
@@ -1618,9 +1639,7 @@ class PersistentStateService:
             if controller is not None and self._engine_epoch is not None:
                 controller.authority_recovered(engine_epoch=self._engine_epoch)
         if not isinstance(result, StateReserveResult):
-            raise PersistentStateServiceUnavailable(
-                "persistent-state reserve returned an invalid result"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state reserve returned an invalid result")
         self._update_projection(
             manager_revision=result.manager_revision,
             resident_count=result.resident_count,
@@ -1635,46 +1654,34 @@ class PersistentStateService:
         reason: str,
     ) -> StateReleaseResult:
         """Return a lease once through the cleanup-priority lane."""
-        if not (
-            self._bootstrap_complete and not self._startup_profile_sealed
-        ):
+        if not (self._bootstrap_complete and not self._startup_profile_sealed):
             await self._ensure_started()
         shared = self._coalesced_future(operation_id)
         if shared is None:
-            future: asyncio.Future[StateReleaseResult] = (
-                asyncio.get_running_loop().create_future()
-            )
+            future: asyncio.Future[StateReleaseResult] = asyncio.get_running_loop().create_future()
             self._track_operation(
                 operation_id,
                 future,
                 retain_error=False,
             )
             try:
-                self.cleanup_queue.put_nowait(
-                    _ReleaseCommand(operation_id, lease, reason, future)
-                )
+                self.cleanup_queue.put_nowait(_ReleaseCommand(operation_id, lease, reason, future))
             except asyncio.QueueFull as error:
                 self._operations.pop(operation_id, None)
                 self._operation_expires_at.pop(operation_id, None)
                 self._demote()
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state cleanup queue is full"
-                ) from error
+                raise PersistentStateServiceUnavailable("persistent-state cleanup queue is full") from error
             self._queue_event.set()
             shared = future
         try:
-            result = await asyncio.wait_for(
-                asyncio.shield(shared), timeout=self._reconciliation_timeout_s
-            )
+            result = await asyncio.wait_for(asyncio.shield(shared), timeout=self._reconciliation_timeout_s)
         except asyncio.TimeoutError as error:
             self._demote()
             raise PersistentStateIndeterminate(
                 "persistent-state release reconciliation remained indeterminate"
             ) from error
         if not isinstance(result, StateReleaseResult):
-            raise PersistentStateServiceUnavailable(
-                "persistent-state release returned an invalid result"
-            )
+            raise PersistentStateServiceUnavailable("persistent-state release returned an invalid result")
         self._update_projection(
             manager_revision=result.manager_revision,
             resident_count=result.resident_count,
@@ -1688,9 +1695,7 @@ class PersistentStateService:
         binding_token = lease.binding_token
         shared = self._pending_cleanup_claims.get(binding_token)
         if shared is None:
-            future: asyncio.Future[bool] = (
-                asyncio.get_running_loop().create_future()
-            )
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             self._pending_cleanup_claims[binding_token] = future
 
             def completed(done: asyncio.Future[bool]) -> None:
@@ -1699,15 +1704,11 @@ class PersistentStateService:
 
             future.add_done_callback(completed)
             try:
-                self.cleanup_queue.put_nowait(
-                    _BeginCleanupCommand(lease, future)
-                )
+                self.cleanup_queue.put_nowait(_BeginCleanupCommand(lease, future))
             except asyncio.QueueFull as error:
                 self._pending_cleanup_claims.pop(binding_token, None)
                 self._demote()
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state cleanup queue is full"
-                ) from error
+                raise PersistentStateServiceUnavailable("persistent-state cleanup queue is full") from error
             self._queue_event.set()
             shared = future
         try:
@@ -1727,12 +1728,7 @@ class PersistentStateService:
             await self._queue_event.wait()
             self._queue_event.clear()
             while True:
-                command: (
-                    _ReserveCommand
-                    | _ReleaseCommand
-                    | _BeginCleanupCommand
-                    | None
-                ) = None
+                command: _ReserveCommand | _ReleaseCommand | _BeginCleanupCommand | None = None
                 try:
                     command = self.cleanup_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -1764,9 +1760,7 @@ class PersistentStateService:
             result = self._decode_reserve(raw)
             if result.lease.engine_epoch != self._engine_epoch:
                 self.engine_epoch_changed(result.lease.engine_epoch)
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state reserve crossed an engine epoch"
-                )
+                raise PersistentStateServiceUnavailable("persistent-state reserve crossed an engine epoch")
         except Exception as error:
             self._pop_pending_interval(command.operation_id)
             self._sync_service_projection()
@@ -1812,9 +1806,7 @@ class PersistentStateService:
             result = self._decode_release(raw)
             if result.location_event.engine_epoch != self._engine_epoch:
                 self.engine_epoch_changed(result.location_event.engine_epoch)
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state release crossed an engine epoch"
-                )
+                raise PersistentStateServiceUnavailable("persistent-state release crossed an engine epoch")
         except Exception as error:
             mapped = self._map_error(error)
             self._mark_failed_release_interval(command.lease.binding_token)
@@ -1845,9 +1837,7 @@ class PersistentStateService:
                 self._lease_payload(command.lease),
             )
             if not isinstance(won, bool):
-                raise PersistentStateServiceUnavailable(
-                    "persistent-state pending cleanup returned an invalid result"
-                )
+                raise PersistentStateServiceUnavailable("persistent-state pending cleanup returned an invalid result")
         except Exception as error:
             mapped = self._map_error(error)
             if not command.future.done():
@@ -1867,12 +1857,8 @@ class PersistentStateService:
         message = str(error)
         if "persistent_state_unsupported_service_interval" in message:
             return PersistentStateUnsupportedServiceInterval(
-                requested_interval_ms=(
-                    0 if service_interval_ms is None else service_interval_ms
-                ),
-                resolved_envelope=str(
-                    (self._inventory or {}).get("profile_id", "installed profile")
-                ),
+                requested_interval_ms=(0 if service_interval_ms is None else service_interval_ms),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
             )
         if "persistent_state_horizon_exhausted" in message:
             return PersistentStateBackpressure(

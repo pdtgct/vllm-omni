@@ -344,6 +344,8 @@ class StageConfigFactory:
             deploy_path = Path(deploy_config_path)
 
         if not deploy_path.exists():
+            if deploy_config_path is None and model_type in {"nemotron_asr", "nemotron3_5_asr"}:
+                raise FileNotFoundError(f"Nemotron ASR requires packaged deploy config: {deploy_path}")
             logger.warning(
                 "Deploy config not found: %s — using pipeline defaults only",
                 deploy_path,
@@ -375,6 +377,14 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            additional_override = stage.runtime_overrides.pop("additional_config", None)
+            if additional_override is not None:
+                from vllm_omni.config.stage_config import merge_persistent_state_additional_config
+
+                stage.yaml_engine_args["additional_config"] = merge_persistent_state_additional_config(
+                    stage.yaml_engine_args.get("additional_config"),
+                    additional_override,
+                )
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)
