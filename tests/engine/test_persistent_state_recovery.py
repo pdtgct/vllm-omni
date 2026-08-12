@@ -28,6 +28,7 @@ from vllm_omni.engine.persistent_state_service import (
     PersistentStateIndeterminate,
     PersistentStateService,
     PersistentStateServiceUnavailable,
+    PersistentStateUnsupportedServiceInterval,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -77,6 +78,7 @@ class _RecoveryStage:
         self.snapshot_calls = 0
         self.engine_epoch = "epoch-a"
         self.snapshot_gate: asyncio.Event | None = None
+        self.snapshot_overrides: dict[str, Any] = {}
 
     def _snapshot(self) -> dict[str, Any]:
         snapshot = dict(_SNAPSHOT_BASE)
@@ -84,6 +86,7 @@ class _RecoveryStage:
         snapshot["manager_revision"] = self.revision
         snapshot["resident_count"] = self.resident
         snapshot["bindings"] = [dict(b) for b in self.bindings]
+        snapshot.update(self.snapshot_overrides)
         return snapshot
 
     async def call_utility_async(self, name: str, *args: Any) -> dict[str, Any]:
@@ -387,55 +390,275 @@ def test_service_projection_exports_the_exact_installed_derating() -> None:
     asyncio.run(scenario())
 
 
-def test_hard_cap_service_keeps_controller_and_advisory_zero_headroom() -> None:
-    """@spec PORT-STATE-026/027 / PORT-OBS-012: no reserve bypass."""
+def test_hard_cap_service_seals_static_authority_without_profile() -> None:
+    """@spec PORT-STATE-026/027 / PORT-OBS-012: no profile or bypass."""
 
     async def scenario() -> None:
+        from vllm_omni.engine import persistent_state_startup as startup
         from vllm_omni.engine.persistent_state_admission import (
             AdmissionControllerConfig,
         )
 
         stage = _RecoveryStage()
-        profile = _compiled_admission_profile(
-            derating_factor=Fraction(1, 100),
-            maximum_population=1,
+        derive = getattr(startup, "derive_hard_cap_authority", None)
+        if not callable(derive):
+            pytest.fail(
+                "PORT-STATE-027 missing static hard-cap authority derivation",
+                pytrace=False,
+            )
+        admission_config = AdmissionControllerConfig(
+            waiter_capacity=4,
+            max_inflight_reserves=2,
+            dispatch_budget=1,
+            aging_threshold_ns=1_000_000,
+            admission_wait_timeout_s=0.1,
+            retry_floor_ms=10,
+            retry_jitter_ms=0,
+            recovery_backoff_s=(0.001,),
+            release_convergence_timeout_s=0.1,
+            supported_intervals_ms=(80, 320, 560, 1120),
+            admission_policy="hard_cap",
         )
         service = _service(
             stage,
             _Clock(),
-            admission_config=AdmissionControllerConfig(
-                waiter_capacity=2,
-                max_inflight_reserves=1,
-                dispatch_budget=1,
-                aging_threshold_ns=1_000_000,
-                admission_wait_timeout_s=0.1,
-                retry_floor_ms=10,
-                retry_jitter_ms=0,
-                recovery_backoff_s=(0.001,),
-                release_convergence_timeout_s=0.1,
-                supported_intervals_ms=(80, 160, 320, 560, 1120),
-                admission_policy="hard_cap",
-            ),
-            compiled_service_profile=profile,
         )
-        await _open_service(service)
+        inventory = await service.bootstrap_handshake()
+        service.configure_bootstrap_intervals((80, 320, 560, 1120))
+        authority = derive(
+            served_intervals_ms=(80, 320, 560, 1120),
+            model_profile_id=inventory["profile_id"],
+            schema_id=inventory["schema_id"],
+            slot_bytes=6_314_936,
+            stage=0,
+            replica=0,
+            physical_capacity=4,
+            configured_limit=4,
+            effective_capacity=4,
+            max_num_seqs=2,
+            safety_reserve=0,
+            controller_identity="controller-a",
+        )
+        service.seal_startup_authority(
+            admission_config=admission_config,
+            authority=authority,
+        )
+
+        with pytest.raises(PersistentStateUnsupportedServiceInterval):
+            await service.reserve(
+                **_lease_kwargs(70),
+                service_interval_ms=160,
+                connection_id="connection-unsupported",
+            )
+        assert stage.reserve_calls == 0
 
         lease = await service.reserve(
             **_lease_kwargs(71),
             service_interval_ms=1120,
             connection_id="connection-hard-cap",
         )
+        second = await service.reserve(
+            **_lease_kwargs(72),
+            service_interval_ms=1120,
+            connection_id="connection-hard-cap-2",
+        )
+        third_task = asyncio.create_task(
+            service.reserve(
+                **_lease_kwargs(73),
+                service_interval_ms=1120,
+                connection_id="connection-hard-cap-3",
+            )
+        )
+        await _wait_until(
+            lambda: service.admission_snapshot is not None
+            and service.admission_snapshot.waiter_count == 1
+        )
 
-        assert stage.reserve_calls == 1
+        assert stage.reserve_calls == 2
+        assert not third_task.done()
         assert service.admission_snapshot is not None
         assert service.admission_snapshot.submitted_count == 0
         assert service.inventory is not None
         assert service.inventory["admission_policy"] == "hard_cap"
+        assert service.inventory["service_profile_identity"] is None
         await service.release(
             operation_id="release-hard-cap",
             lease=lease,
             reason="test",
         )
+        third = await asyncio.wait_for(third_task, timeout=0.25)
+        assert stage.reserve_calls == 3
+        for operation_id, active in (
+            ("release-hard-cap-2", second),
+            ("release-hard-cap-3", third),
+        ):
+            await service.release(
+                operation_id=operation_id,
+                lease=active,
+                reason="test",
+            )
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_selected_service_without_sealed_controller_never_reserves_directly() -> None:
+    """@spec PORT-STATE-004/027: selected serving has no direct-reserve mode."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _service(stage, _Clock())
+
+        with pytest.raises(
+            PersistentStateServiceUnavailable,
+            match="authority|controller|not sealed|unavailable",
+        ):
+            await service.reserve(
+                **_lease_kwargs(72),
+                service_interval_ms=1_120,
+                connection_id="connection-missing-authority",
+            )
+
+        assert stage.reserve_calls == 0
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_hard_cap_digest_structurally_excludes_dynamic_state_and_rejects_static_drift() -> None:
+    """@spec PORT-STATE-009/022/027 / PORT-INT-005."""
+    from vllm_omni.engine import persistent_state_startup as startup
+
+    derive = getattr(startup, "derive_hard_cap_authority", None)
+    if not callable(derive):
+        pytest.fail(
+            "PORT-STATE-027 missing static hard-cap authority derivation",
+            pytrace=False,
+        )
+    common = dict(
+        served_intervals_ms=(80, 320, 560, 1_120),
+        model_profile_id="profile-a",
+        schema_id="schema-a",
+        slot_bytes=6_314_936,
+        stage=0,
+        replica=0,
+        physical_capacity=9,
+        configured_limit=8,
+        effective_capacity=8,
+        max_num_seqs=8,
+        safety_reserve=0,
+        controller_identity="controller-a",
+    )
+    authority = derive(**common)
+    changed_schema = derive(
+        **{**common, "schema_id": "schema-b"},
+    )
+    clamped = derive(
+        **{**common, "effective_capacity": 3},
+    )
+
+    for dynamic_name in (
+        "engine_epoch",
+        "manager_revision",
+        "resident_count",
+        "execution_claims",
+    ):
+        assert not hasattr(authority, dynamic_name)
+    assert authority.hard_cap_envelope_sha256 != changed_schema.hard_cap_envelope_sha256
+    assert authority.hard_cap_envelope_sha256 != clamped.hard_cap_envelope_sha256
+    assert authority.service_profile_identity is None
+    assert authority.model_profile_id == "profile-a"
+    assert clamped.configured_resident_limit == 8
+    assert clamped.effective_state_slots == 3
+
+
+@pytest.mark.parametrize(
+    ("drift_field", "drift_value"),
+    (("schema_id", "schema-b"), ("configured_limit", 1)),
+)
+def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
+    drift_field: str,
+    drift_value: Any,
+) -> None:
+    """@spec PORT-STATE-009/014/022/027: recovery consults the seal."""
+
+    async def scenario() -> None:
+        from vllm_omni.engine import persistent_state_startup as startup
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionControllerConfig,
+        )
+
+        derive = getattr(startup, "derive_hard_cap_authority", None)
+        if not callable(derive):
+            pytest.fail(
+                "PORT-STATE-027 missing static hard-cap authority derivation",
+                pytrace=False,
+            )
+        stage = _RecoveryStage()
+        fatal: list[BaseException] = []
+        service = _service(
+            stage,
+            _Clock(),
+            host_fatal_callback=fatal.append,
+        )
+        inventory = await service.bootstrap_handshake()
+        intervals = (80, 320, 560, 1120)
+        service.configure_bootstrap_intervals(intervals)
+        config = AdmissionControllerConfig(
+            waiter_capacity=4,
+            max_inflight_reserves=2,
+            dispatch_budget=1,
+            aging_threshold_ns=1_000_000,
+            admission_wait_timeout_s=0.1,
+            retry_floor_ms=10,
+            retry_jitter_ms=0,
+            recovery_backoff_s=(0.001,),
+            release_convergence_timeout_s=0.01,
+            supported_intervals_ms=intervals,
+            admission_policy="hard_cap",
+        )
+        authority = derive(
+            served_intervals_ms=intervals,
+            model_profile_id=inventory["profile_id"],
+            schema_id=inventory["schema_id"],
+            slot_bytes=6_314_936,
+            stage=0,
+            replica=0,
+            physical_capacity=4,
+            configured_limit=2,
+            effective_capacity=2,
+            max_num_seqs=2,
+            safety_reserve=0,
+            controller_identity="controller-a",
+        )
+        service.seal_startup_authority(
+            admission_config=config,
+            authority=authority,
+        )
+
+        lease = await service.reserve(
+            **_lease_kwargs(74),
+            service_interval_ms=1120,
+        )
+        # The live lease changes revision and occupancy. Recovery must rebuild
+        # dynamic counters while retaining the immutable hard-cap authority.
+        service._demote()
+        await service.check_health()
+        assert service.ready
+        assert fatal == []
+        await service.release(
+            operation_id="release-dynamic-recovery",
+            lease=lease,
+            reason="test",
+        )
+
+        stage.snapshot_overrides[drift_field] = drift_value
+        service._demote()
+        with pytest.raises(PersistentStateServiceUnavailable):
+            await service.check_health()
+        await _wait_until(lambda: bool(fatal), timeout_s=0.1)
+        assert not service.ready
+        assert "mismatch" in str(fatal[0]).lower()
         service.shutdown()
 
     asyncio.run(scenario())

@@ -444,60 +444,47 @@ def test_table_proven_mix_is_not_rejected_by_the_old_additive_ratio() -> None:
     assert projection.nominal_dispatchable_by_interval[1_120] == 1
 
 
-def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None:
-    """@spec PORT-STATE-026 / PORT-OBS-012: characterize, do not lie."""
-    profile = _compile(
-        intervals_ms=(320,),
-        tables_ms=((200,),),
-        derating_factor=Fraction(1, 2),
+def test_hard_cap_dispatches_from_disjoint_hard_counters_without_profile() -> None:
+    """@spec PORT-STATE-026/027 / PORT-OBS-012: O(1), profile-free."""
+    authority = _symbol("HardCapAuthority")(
+        served_intervals_ms=(80, 320, 560, 1_120),
+        effective_state_slots=6,
+        configured_resident_limit=5,
+        max_num_seqs=8,
+        model_profile_id="profile-a",
+        service_profile_identity=None,
     )
-    empty = {320: 0}
-    inventory = {
-        "resident_count": 0,
-        "effective_capacity": 4,
-        "configured_limit": 4,
+    projection = _symbol("project_fixed_dispatch_capacity")(
+        startup_authority=authority,
+        state_resident=2,
+        state_submitted=1,
+        execution_committed=3,
+        execution_submitted=2,
+        authority_open=True,
+    )
+
+    # min(6-2-1, 5-2-1, 8-3-2) == 2. State and execution
+    # submissions are disjoint authorities and are each subtracted once.
+    assert projection.hard_headroom == 2
+    assert projection.candidate_supported_by_interval == {
+        80: True,
+        320: True,
+        560: True,
+        1_120: True,
     }
-    project = _symbol("project_fixed_dispatch_capacity")
-
-    guarded = project(
-        profile=profile,
-        inventory=inventory,
-        resident_counts_by_interval=empty,
-        submitted_counts_by_interval=empty,
-        authority_open=True,
-        admission_policy="profile",
-    )
-    characterization = project(
-        profile=profile,
-        inventory=inventory,
-        resident_counts_by_interval=empty,
-        submitted_counts_by_interval=empty,
-        authority_open=True,
-        admission_policy="hard_cap",
-    )
-
-    assert guarded.candidate_supported_by_interval == {320: False}
-    assert guarded.dispatchable_by_interval == {320: 0}
-    assert characterization.candidate_supported_by_interval == {320: True}
-    assert characterization.dispatchable_by_interval == {320: 1}
-    assert characterization.nominal_dispatchable_by_interval == {320: 0}
-    assert characterization.hard_headroom == 1
-    assert characterization.admission_policy == "hard_cap"
-
-    at_search_ceiling = project(
-        profile=profile,
-        inventory={**inventory, "resident_count": 1},
-        resident_counts_by_interval={320: 1},
-        submitted_counts_by_interval=empty,
-        authority_open=True,
-        admission_policy="hard_cap",
-    )
-    assert at_search_ceiling.hard_headroom == 0
-    assert at_search_ceiling.dispatchable_by_interval == {320: 0}
+    assert projection.dispatchable_by_interval == {
+        80: 2,
+        320: 2,
+        560: 2,
+        1_120: 2,
+    }
+    assert not hasattr(projection, "nominal_dispatchable_by_interval")
+    assert authority.service_profile_identity is None
+    assert authority.model_profile_id == "profile-a"
 
 
-def test_hard_cap_compiler_retains_zero_frontier_as_advisory() -> None:
-    """@spec PORT-STATE-026: characterization can boot past nominal zero."""
+def test_service_profile_compiler_rejects_hard_cap_instead_of_minting_advice() -> None:
+    """@spec PORT-STATE-026 / PORT-PERF-006: hard_cap never compiles."""
 
     with pytest.raises(ValueError, match="cannot support one session"):
         _compile(
@@ -506,15 +493,12 @@ def test_hard_cap_compiler_retains_zero_frontier_as_advisory() -> None:
             admission_policy="profile",
         )
 
-    characterization = _compile(
-        intervals_ms=(1_120,),
-        tables_ms=((1_130,),),
-        admission_policy="hard_cap",
-    )
-
-    assert characterization.measured_capacity == 0
-    assert characterization.homogeneous_capacity_by_interval == {1_120: 0}
-    assert characterization.receipt.admission_policy == "hard_cap"
+    with pytest.raises(ValueError, match="profile.*only|hard_cap.*compile"):
+        _compile(
+            intervals_ms=(1_120,),
+            tables_ms=((1_130,),),
+            admission_policy="hard_cap",
+        )
 
     with pytest.raises(ValueError, match="admission policy"):
         _compile(

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, NoReturn
 
 import pytest
@@ -40,9 +41,13 @@ def _observe(metrics: OmniStreamingMetrics) -> None:
     method = getattr(metrics, "observe_persistent_state_capacity", None)
     if not callable(method):
         _fail("PORT-OBS-012 missing observe_persistent_state_capacity")
+    parameters = inspect.signature(method).parameters
+    if "admission_policy" not in parameters:
+        _fail("PORT-OBS-012 missing policy-specific capacity projection")
     method(
         "0",
         "0",
+        admission_policy="profile",
         service_source="qualified_profile",
         service_budget=1.0,
         charged_demand=0.25,
@@ -238,3 +243,51 @@ def test_admission_reason_enum_adds_unsupported_without_renaming() -> None:
         "unavailable",
         "unsupported",
     ), "PORT-OBS-001 missing the approved three-class rejection taxonomy"
+
+
+def test_hard_cap_projection_omits_every_profile_only_series() -> None:
+    """@spec PORT-OBS-001/012: absence is not a fabricated zero profile."""
+
+    model = "capacity-metrics-hard-cap"
+    metrics = OmniStreamingMetrics(model_name=model, log_stats=True)
+    method = getattr(metrics, "observe_persistent_state_capacity", None)
+    if not callable(method):
+        _fail("PORT-OBS-012 missing observe_persistent_state_capacity")
+    parameters = inspect.signature(method).parameters
+    if "admission_policy" not in parameters:
+        _fail("PORT-OBS-012 missing policy-specific capacity projection")
+    method(
+        "0",
+        "0",
+        admission_policy="hard_cap",
+        service_source=None,
+        service_budget=None,
+        charged_demand=None,
+        execution_claims=2,
+        max_num_seqs=8,
+        headroom_by_cadence={
+            "80": {"hard": 1},
+            "320": {"hard": 2},
+            "560": {"hard": 2},
+            "1120": {"hard": 2},
+        },
+        pending_by_cadence={},
+    )
+
+    output = generate_latest(REGISTRY).decode()
+    demand = _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO")
+    headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
+    assert not any(
+        line.startswith(demand) and f'model_name="{model}"' in line
+        for line in output.splitlines()
+    )
+    assert not any(
+        line.startswith(headroom)
+        and f'model_name="{model}"' in line
+        and 'kind="nominal"' in line
+        for line in output.splitlines()
+    )
+    assert _sample(
+        f'{headroom}{{cadence_ms="1120",kind="hard",model_name="{model}",'
+        'replica="0",stage="0"}'
+    ) == 2.0
