@@ -121,8 +121,22 @@ def test_oversized_logical_count_clamps_without_sizing_up() -> None:
 
     assert resolution.allocated_total_blocks == 20
     assert resolution.allocated_real_slots == 17
+    if not hasattr(resolution, "requested_count_limit"):
+        _fail("PORT-STATE-004 missing requested/resolved clamp receipt")
+    assert resolution.requested_count_limit == 100
     assert resolution.resolved_count_limit == 17
     assert resolution.count_was_clamped is True
+
+
+def test_impossible_minimum_pool_fails_before_manager_startup() -> None:
+    """@spec PORT-STATE-004: null, safety, and one real slot are mandatory."""
+
+    with pytest.raises(ValueError, match="null block.*one real slot"):
+        _resolution(
+            profiled_block_bound=2,
+            safety_reserve_slots=1,
+            max_resident_sessions=8,
+        )
 
 
 def test_explicit_override_above_the_preoverride_bound_fails() -> None:

@@ -458,9 +458,144 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
         engine_client=engine,
     )
     callback(RuntimeError("release recovery exhausted"))
-
     assert events == ["report", "terminate"]
 
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec ENV-MIG-012 / PORT-PERF-005/006 / PORT-INT-013."""
+    module = _startup_module()
+    prepare = _startup_symbol("prepare_persistent_state_service")
+    events: list[str] = []
+    forbidden_profile_fields = frozenset(
+        {
+            "service_profile_trailing_rounds",
+            "startup_priming_timeout_s",
+            "service_profile_derating_factor",
+            "priming_budget_descriptor",
+            "priming_budget_sha256",
+            "priming_configured_population_ceiling",
+        }
+    )
+
+    class _HardCapRuntime(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            if name in forbidden_profile_fields:
+                _fail(f"PORT-PERF-006 hard_cap read profile-only field {name}")
+            raise AttributeError(name)
+
+    common = vars(_runtime()).copy()
+    for name in forbidden_profile_fields:
+        common.pop(name, None)
+    runtime = _HardCapRuntime(**common)
+    runtime.admission_policy = "hard_cap"
+    runtime.bootstrap_operation_budget = 0
+    runtime.service_profile_identity = None
+    runtime.profile_status = "not_measured"
+
+    class _HardCapProvider:
+        def served_intervals_ms(self, *, model_config: Any) -> tuple[int, ...]:
+            assert model_config is engine.model_config
+            events.append("intervals")
+            return (80, 320, 560, 1_120)
+
+        def build_priming_plan(self, **kwargs: Any) -> NoReturn:
+            del kwargs
+            _fail("PORT-PERF-005 hard_cap constructed a priming plan")
+
+    class _Service:
+        def __init__(self, stage_client: Any, **kwargs: Any) -> None:
+            assert stage_client == "stage"
+            assert kwargs["runtime_config"] is runtime
+            events.append("construct")
+            self.ready = False
+
+        async def bootstrap_handshake(self) -> dict[str, Any]:
+            events.append("handshake")
+            return _startup_inventory()
+
+        def configure_bootstrap_intervals(self, intervals_ms: tuple[int, ...]) -> None:
+            assert intervals_ms == (80, 320, 560, 1_120)
+            events.append("configure")
+
+        def seal_startup_authority(
+            self,
+            *,
+            admission_config: Any,
+            authority: Any,
+        ) -> None:
+            assert admission_config == "hard-controller"
+            assert authority.policy == "hard_cap"
+            assert authority.service_profile_identity is None
+            assert authority.model_profile_id == "profile-a"
+            assert authority.served_intervals_ms == (80, 320, 560, 1_120)
+            events.append("seal-hard")
+            self.ready = True
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    def forbidden(*args: Any, **kwargs: Any) -> NoReturn:
+        del args, kwargs
+        _fail("PORT-PERF-006 hard_cap invoked the service-profile compiler")
+
+    engine = SimpleNamespace(model_config=object())
+    monkeypatch.setattr(module, "PersistentStateService", _Service)
+    monkeypatch.setattr(module, "run_service_priming_round", forbidden)
+    monkeypatch.setattr(module, "compile_provisional_service_profile", forbidden)
+    monkeypatch.setattr(
+        module,
+        "derive_admission_controller_config",
+        lambda value, **kwargs: (
+            "hard-controller"
+            if value is runtime and kwargs["supported_intervals_ms"] == (80, 320, 560, 1_120)
+            else _fail("PORT-STATE-027 hard-cap controller authority mismatch")
+        ),
+    )
+
+    service = await prepare(
+        engine_client=engine,
+        stage_client="stage",
+        runtime_config=runtime,
+        startup_provider=_HardCapProvider(),
+        host_fatal_callback=lambda error: None,
+    )
+
+    assert service.ready
+    assert events == [
+        "construct",
+        "handshake",
+        "intervals",
+        "configure",
+        "seal-hard",
+    ]
+
+
+def test_nemotron_provider_resolves_hard_cap_intervals_without_a_priming_plan() -> None:
+    """@spec PORT-PERF-005 / PORT-STATE-026: model facts, no synthetic work."""
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    resolver = getattr(
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+        "served_intervals_ms",
+        None,
+    )
+    if not callable(resolver):
+        _fail("PORT-PERF-005 missing dependency-light served-interval resolver")
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            supported_num_lookahead_tokens=[3, 0, 6, 13]
+        )
+    )
+
+    intervals = resolver(model_config=model_config)
+
+    assert intervals == (80, 320, 560, 1_120)
+    assert 160 not in intervals
 
 def test_async_omni_fatal_state_is_visible_to_launcher_supervision() -> None:
     """@spec PORT-STATE-014: the callback changes real engine properties."""

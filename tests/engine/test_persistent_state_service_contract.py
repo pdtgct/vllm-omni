@@ -747,18 +747,15 @@ def test_runtime_config_reports_every_missing_a36_field_together() -> None:
     assert all(name in message for name in missing)
 
 
-@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
-def test_runtime_config_requires_and_fingerprints_admission_policy(
-    policy: str,
-) -> None:
-    """@spec ENV-MIG-011 / PORT-STATE-026: policy is explicit."""
+def test_runtime_config_requires_and_fingerprints_profile_policy() -> None:
+    """@spec ENV-MIG-011 / PORT-STATE-026: profile policy is explicit."""
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
 
     values = {
         **_EXPLICIT_A36_ENVELOPE,
-        "persistent_state_admission_policy": policy,
+        "persistent_state_admission_policy": "profile",
     }
     api_runtime = PersistentStateRuntimeConfig.from_vllm_config(
         SimpleNamespace(additional_config=values)
@@ -767,8 +764,93 @@ def test_runtime_config_requires_and_fingerprints_admission_policy(
         SimpleNamespace(additional_config=values)
     )
 
-    assert api_runtime.admission_policy == policy
-    assert core_runtime.admission_policy == policy
+    assert api_runtime.admission_policy == "profile"
+    assert core_runtime.admission_policy == "profile"
+
+
+def test_hard_cap_rejects_profile_only_runtime_fields() -> None:
+    """@spec ENV-MIG-011: hard-cap has no empty or retained profile arm."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    values = {
+        **_EXPLICIT_A36_ENVELOPE,
+        "persistent_state_admission_policy": "hard_cap",
+    }
+    with pytest.raises(ValueError, match="hard_cap|profile-only|profile"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=values)
+        )
+
+
+def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
+    """@spec ENV-MIG-009/011: canonical values, not keystrokes, fingerprint."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    profile_only = {
+        "persistent_state_service_profile_trailing_rounds",
+        "persistent_state_startup_priming_timeout_s",
+        "persistent_state_service_profile_derating_factor",
+    }
+    explicit_values = {
+        key: value
+        for key, value in _EXPLICIT_A36_ENVELOPE.items()
+        if key not in profile_only
+    }
+    explicit_values["persistent_state_admission_policy"] = "hard_cap"
+    common = dict(
+        model_config=SimpleNamespace(architectures=("Nemotron3_5AsrForRNNT",)),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+
+    defaults = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            additional_config={
+                "persistent_state_admission_policy": "hard_cap"
+            },
+            **common,
+        ),
+        startup_provider=object(),
+    )
+    explicit = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config=explicit_values, **common),
+        startup_provider=object(),
+    )
+
+    assert defaults == explicit
+    assert defaults.admission_policy == "hard_cap"
+    assert defaults.service_profile_trailing_rounds is None
+    assert defaults.startup_priming_timeout_s is None
+    assert defaults.service_profile_derating_factor is None
+    assert defaults.priming_budget_descriptor is None
+    assert defaults.priming_budget_sha256 is None
+    assert defaults.bootstrap_operation_budget == 0
+
+
+def test_explicit_profile_still_requires_every_profile_authority() -> None:
+    """@spec ENV-MIG-011/012: quick start never weakens profile startup."""
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    with pytest.raises(ValueError) as info:
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(
+                additional_config={
+                    "persistent_state_admission_policy": "profile"
+                },
+                scheduler_config=SimpleNamespace(max_num_seqs=8),
+            ),
+            startup_provider=object(),
+        )
+
+    message = str(info.value)
+    assert "persistent_state_service_profile_trailing_rounds" in message
+    assert "persistent_state_startup_priming_timeout_s" in message
+    assert "persistent_state_service_profile_derating_factor" in message
 
 
 @pytest.mark.parametrize("policy", (None, "", "benchmark", 1, ["profile"]))
