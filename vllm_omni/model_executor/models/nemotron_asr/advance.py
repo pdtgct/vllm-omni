@@ -1179,32 +1179,33 @@ def advance_session(
     out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
 
     caches = _GatheredCaches(state)
-    with torch.no_grad(), phase("port.encode"):
-        enc = stream_step(
-            # _GatheredCaches is StreamingCaches' structural twin over
-            # the gathered batch; stream_step reads only the shared
-            # .channel/.time/.valid surface (the now-deleted
-            # forward_step.py precedent, migration-proven bit-for-bit).
-            core.encoder,
-            mel,
-            caches,  # type: ignore[arg-type]
-            out_offsets=drop,
-            out_lengths=enc_lengths,
-            out_width=out_width,
-        )
-        # Row-wise language conditioning in ONE call: the
-        # conditioner takes the (B,) prompt tensor directly (no
-        # per-prompt fragmentation or host set construction).
-        conditioned = core.lid(enc, prompt_index=batch.prompt_index)
-        # Padded-position zeroing for the conditioned stream (the
-        # conditioner may bias padded rows away from zero; decode
-        # masks by length, but captures and determinism want zeros).
-        fcol = torch.arange(out_width, device=device).view(1, -1, 1)
-        conditioned = torch.where(
-            fcol < enc_lengths.view(-1, 1, 1),
-            conditioned,
-            conditioned.new_zeros(()),
-        )
+    with torch.no_grad():
+        with phase("port.encode"):
+            enc = stream_step(
+                # _GatheredCaches is StreamingCaches' structural twin over
+                # the gathered batch; stream_step reads only the shared
+                # .channel/.time/.valid surface (the now-deleted
+                # forward_step.py precedent, migration-proven bit-for-bit).
+                core.encoder,
+                mel,
+                caches,  # type: ignore[arg-type]
+                out_offsets=drop,
+                out_lengths=enc_lengths,
+                out_width=out_width,
+            )
+            # Row-wise language conditioning in ONE call: the
+            # conditioner takes the (B,) prompt tensor directly (no
+            # per-prompt fragmentation or host set construction).
+            conditioned = core.lid(enc, prompt_index=batch.prompt_index)
+            # Padded-position zeroing for the conditioned stream (the
+            # conditioner may bias padded rows away from zero; decode
+            # masks by length, but captures and determinism want zeros).
+            fcol = torch.arange(out_width, device=device).view(1, -1, 1)
+            conditioned = torch.where(
+                fcol < enc_lengths.view(-1, 1, 1),
+                conditioned,
+                conditioned.new_zeros(()),
+            )
         decode_in = DecodeState(
             h=state.h.transpose(0, 1).contiguous(),
             c=state.c.transpose(0, 1).contiguous(),

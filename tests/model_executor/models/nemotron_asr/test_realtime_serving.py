@@ -50,6 +50,7 @@ def _load_chain() -> dict[str, Any]:
         "rnnt_cell",
         "rnnt",
         "configuration_nemotron_asr",
+        "profiling",
         "session",
         "streaming",
     ):
@@ -149,6 +150,40 @@ def test_one_yield_per_chunk_at_the_admitted_config() -> None:
     assert tail[5] == 3
     assert yields[-1]["prompt_token_ids"] != [PLACEHOLDER_ID]
     assert "multi_modal_data" not in yields[-1]
+
+
+# @spec PORT-PERF-007
+def test_park_profile_range_wraps_each_completed_audio_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    class RecordingPhase:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self) -> None:
+            events.append(("enter", self.name))
+
+        def __exit__(self, *exc_info: object) -> None:
+            del exc_info
+            events.append(("exit", self.name))
+
+    monkeypatch.setattr(
+        _MODULES["streaming"],
+        "_PARK_PHASE",
+        RecordingPhase("port.park"),
+    )
+
+    # One ordinary unit and its explicit zero-sample final tail each park.
+    _run(_collect_yields([8960]))
+
+    assert events == [
+        ("enter", "port.park"),
+        ("exit", "port.park"),
+        ("enter", "port.park"),
+        ("exit", "port.park"),
+    ]
 
 
 def test_ragged_appends_rechunk_to_the_admitted_size() -> None:

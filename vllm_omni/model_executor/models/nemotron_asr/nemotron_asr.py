@@ -75,6 +75,7 @@ from vllm_omni.model_executor.models.nemotron_asr.processor import (
     NemotronASRMultiModalProcessor,
     NemotronASRProcessingInfo,
 )
+from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
     Joint,
@@ -99,6 +100,12 @@ _MAX_FRAMES_PER_CHUNK = 14
 _N_MELS = 128
 _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
+#: Prebind the new high-frequency ranges once. When profiling is disabled
+#: these all reference the module's shared null range; serving does no lookup
+#: or per-call context-manager allocation.
+_CARRIER_PACK_PHASE = phase("port.carrier_pack")
+_CARRIER_H2D_PHASE = phase("port.carrier_h2d")
+_MULTIMODAL_MERGE_PHASE = phase("port.multimodal_merge")
 
 
 class NemotronASRCore(nn.Module):
@@ -676,18 +683,24 @@ class NemotronASRForRNNT(nn.Module):
         hidden = int(self.config.hidden_size)
         rows = []
         for chunk in audios:
-            envelope = (
-                (chunk if isinstance(chunk, torch.Tensor) else torch.as_tensor(getattr(chunk, "audio_arrays", chunk)))
-                .reshape(-1)
-                .to(dtype=torch.float32)
-            )
-            if envelope.shape[0] < ENVELOPE_HEADER_SLOTS:
-                raise ValueError("audio envelope is smaller than its header")
-            if envelope.shape[0] > hidden:
-                raise ValueError("audio envelope exceeds carrier width")
-            row = torch.zeros(hidden, dtype=torch.float32)
-            row[: envelope.shape[0]] = envelope
-            rows.append(row.to(device).unsqueeze(0))
+            with _CARRIER_PACK_PHASE:
+                envelope = (
+                    (
+                        chunk
+                        if isinstance(chunk, torch.Tensor)
+                        else torch.as_tensor(getattr(chunk, "audio_arrays", chunk))
+                    )
+                    .reshape(-1)
+                    .to(dtype=torch.float32)
+                )
+                if envelope.shape[0] < ENVELOPE_HEADER_SLOTS:
+                    raise ValueError("audio envelope is smaller than its header")
+                if envelope.shape[0] > hidden:
+                    raise ValueError("audio envelope exceeds carrier width")
+                row = torch.zeros(hidden, dtype=torch.float32)
+                row[: envelope.shape[0]] = envelope
+            with _CARRIER_H2D_PHASE:
+                rows.append(row.to(device).unsqueeze(0))
         return rows
 
     def embed_input_ids(
@@ -709,12 +722,13 @@ class NemotronASRForRNNT(nn.Module):
                 dtype=torch.float32,
                 device=input_ids.device,
             )
-        return merge_mm_embeddings(
-            input_ids,
-            multimodal_embeddings,
-            is_multimodal,
-            hidden_size=hidden,
-        )
+        with _MULTIMODAL_MERGE_PHASE:
+            return merge_mm_embeddings(
+                input_ids,
+                multimodal_embeddings,
+                is_multimodal,
+                hidden_size=hidden,
+            )
 
     def forward(
         self,

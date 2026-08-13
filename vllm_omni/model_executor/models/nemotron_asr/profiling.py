@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from types import TracebackType
+from typing import Literal
 
 import torch
 
@@ -31,6 +32,9 @@ _ENABLED = os.getenv(_ENV_FLAG, "0").strip().lower() in {"1", "true", "yes", "on
 #: The closed set of transaction phases. Ordered as the transaction runs.
 PHASES: tuple[str, ...] = (
     "port.ingest",
+    "port.carrier_pack",
+    "port.carrier_h2d",
+    "port.multimodal_merge",
     "port.featurize",
     "port.encode",
     "port.decode",
@@ -52,7 +56,7 @@ class _NullPhase:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         return False
 
 
@@ -78,7 +82,7 @@ class _NvtxPhase:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         torch.cuda.nvtx.range_pop()
         return False
 

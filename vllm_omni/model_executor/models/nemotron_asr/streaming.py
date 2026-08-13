@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     ENVELOPE_HEADER_FIELDS,
     FRONTEND_CONSTANTS,
 )
+from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 from vllm_omni.model_executor.models.nemotron_asr.session import (
     ACCEPTED_AUDIO_BUDGET_DEFAULT_S,
     NemotronRealtimeSession,
@@ -32,6 +33,7 @@ from vllm_omni.model_executor.models.nemotron_asr.session import (
 
 _ENVELOPE_VERSION = 2.0
 _HEADER_SLOTS = len(ENVELOPE_HEADER_FIELDS)
+_PARK_PHASE = phase("port.park")
 
 
 def mint_envelope(
@@ -203,13 +205,14 @@ async def buffer_stream(
             )
             yield rendered
             await hold_until_park()
-            authority.park(
-                request_id=authority.request_id,
-                engine_epoch=authority.engine_epoch,
-                lease_generation=authority.lease_generation,
-                logical_sequence=unit.logical_sequence,
-                carrier_sequence=unit.carrier_sequence,
-            )
+            with _PARK_PHASE:
+                authority.park(
+                    request_id=authority.request_id,
+                    engine_epoch=authority.engine_epoch,
+                    lease_generation=authority.lease_generation,
+                    logical_sequence=unit.logical_sequence,
+                    carrier_sequence=unit.carrier_sequence,
+                )
 
     # Acceptance and ready-stamping are synchronous under the session's
     # single authority. Every cadence completed by one caller piece is

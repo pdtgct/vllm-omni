@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from contextlib import AbstractContextManager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -206,6 +207,39 @@ def _advance(core: Any, batch: Any, state: Any, **kw: Any) -> Any:
     # mixed-phase differential runs both candidates.
     kw.setdefault("decode_fn", rnnt.decode_compact_active)
     return advance.advance_session(core, batch, state, geometry=GEOMETRY_1120, **kw)
+
+
+def test_encoder_and_decoder_profile_ranges_are_siblings(monkeypatch) -> None:
+    """The phase digest must not double-count decode as encoder time."""
+    # @spec PORT-OBS-001
+    events: list[tuple[str, str]] = []
+
+    class RecordingPhase(AbstractContextManager[None]):
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self) -> None:
+            events.append(("enter", self.name))
+
+        def __exit__(self, *exc_info: object) -> None:
+            del exc_info
+            events.append(("exit", self.name))
+
+    monkeypatch.setattr(advance, "phase", RecordingPhase)
+    core = _core()
+    state = _fresh_state(1)
+    samples = torch.zeros(1, CHUNK)
+
+    _advance(core, _chunk(samples, seq=0), state)
+
+    assert events[:6] == [
+        ("enter", "port.featurize"),
+        ("exit", "port.featurize"),
+        ("enter", "port.encode"),
+        ("exit", "port.encode"),
+        ("enter", "port.decode"),
+        ("exit", "port.decode"),
+    ]
 
 
 def test_session_first_chunk_advances_and_captures() -> None:
