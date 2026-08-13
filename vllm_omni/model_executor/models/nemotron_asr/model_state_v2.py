@@ -204,6 +204,17 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if (
+            self.supports_mm_inputs
+            and self.encoder_runner.inputs_embeds.dtype != torch.float32
+        ):
+            # Nemotron's merged rows are structural envelopes, not model
+            # activations. Keep the reusable vLLM workspace FP32 while the
+            # encoder and decoder execute in the configured model dtype.
+            self.encoder_runner.inputs_embeds = torch.zeros_like(
+                self.encoder_runner.inputs_embeds,
+                dtype=torch.float32,
+            )
         self._projection = ProjectionJoin()
         self._projection_epoch: int | None = None
         self._scheduler_output: object | None = None

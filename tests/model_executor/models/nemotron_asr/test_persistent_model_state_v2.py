@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 import torch
+from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
@@ -88,6 +89,56 @@ def test_mrv2_profile_uses_the_encoder_runners_ephemeral_embedding_buffer() -> N
     assert dummy.shape == (7, 4)
     assert dummy.data_ptr() == backing.data_ptr()
     assert torch.equal(dummy, backing[:7])
+
+
+def test_fp16_engine_preserves_fp32_structural_envelopes_through_encoder_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-INT-004 / PORT-MIG-004
+    class EnvelopeModel(torch.nn.Module):
+        def embed_input_ids(
+            self,
+            input_ids: torch.Tensor,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            del kwargs
+            values = (0.1, 1.0001, 16_385.0, -0.3333)
+            row = torch.tensor(values, dtype=torch.float32)
+            return row.repeat(input_ids.shape[0], 1)
+
+    model = EnvelopeModel()
+    expected = model.embed_input_ids(torch.tensor([1, 2], dtype=torch.long))
+
+    def install_fp16_encoder_runner(
+        state: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        state.supports_mm_inputs = True
+        state.encoder_runner = EncoderRunner(
+            model=model,
+            max_num_tokens=8,
+            hidden_size=4,
+            encoder_cache=cast(Any, object()),
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+
+    monkeypatch.setattr(ModelState, "__init__", install_fp16_encoder_runner)
+    state = _module().NemotronASRModelState()
+
+    actual = state.encoder_runner.get_inputs_embeds(
+        torch.tensor([1, 2], dtype=torch.long),
+        [],
+        torch.zeros(2, dtype=torch.bool),
+    )[:2]
+
+    assert state.encoder_runner.dtype == torch.float16
+    assert state.encoder_runner.inputs_embeds.dtype == torch.float32
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    assert state.dummy_inputs_embeds(2).data_ptr() == actual.data_ptr()
 
 
 def test_core_task_policy_is_generate_plus_realtime_only() -> None:
