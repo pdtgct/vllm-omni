@@ -69,6 +69,7 @@ from vllm_omni.model_executor.models.nemotron_asr.plan import (
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+    policy_for_engine_dtype,
 )
 from vllm_omni.model_executor.models.nemotron_asr.processor import (
     NemotronASRDummyInputsBuilder,
@@ -189,14 +190,14 @@ class NemotronASRCore(nn.Module):
 def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
     """Cast compute modules to the policy's weight dtype (PORT-PREC-001).
 
-    Encoder, LID, predictor, and joint move to ``dtype_for("weights")``;
-    activations follow at the module entry seams, so this realization
-    requires the two classes to agree. The mel front-end stays fp32 —
+    Encoder, LID, and joint move to ``dtype_for("weights")``; the predictor
+    moves once to ``dtype_for("recurrent_weights")`` so its manual LSTM does
+    not allocate state-dtype weight copies per symbol. Activations follow at
+    the module entry seams. The mel front-end stays fp32 —
     it sits upstream of the activations seam and is the golden input
     boundary. Recurrent/cache state dtypes are independent axes read at
-    their own construction sites (PORT-PREC-005), and the manual LSTM
-    cell up-casts its weights to the state dtype per step, keeping
-    ``(h, c)`` accumulation at fp32 under sub-fp32 weights.
+    their own construction sites (PORT-PREC-005). The selected FP16 policy
+    keeps recurrent weights and ``(h, c)`` accumulation at fp32.
     """
     weights = core.policy.dtype_for("weights")
     activations = core.policy.dtype_for("activations")
@@ -206,8 +207,15 @@ def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
             f"dtype at the entry seams; policy {core.policy.identifier} "
             f"declares weights={weights} activations={activations}"
         )
-    for module in (core.encoder, core.lid, core.predictor, core.joint):
+    for module in (core.encoder, core.lid, core.joint):
         module.to(weights)
+    try:
+        recurrent_weights = core.policy.dtype_for("recurrent_weights")
+    except KeyError:
+        # Existing policies predate the independently selectable recurrent
+        # weight axis and retain their prior weights-dtype behavior.
+        recurrent_weights = weights
+    core.predictor.to(recurrent_weights)
     return core
 
 
@@ -325,26 +333,20 @@ class NemotronASRForRNNT(nn.Module):
         # PORT-STATE-009: precision is part of the qualified profile.
         # An unqualified --dtype fails loudly, never warn-and-ignore.
         engine_dtype = getattr(vllm_config.model_config, "dtype", None)
-        if engine_dtype is not None and engine_dtype != torch.float32:
+        if engine_dtype is None:
             raise ValueError(
-                f"--dtype {engine_dtype} is not the qualified profile "
-                "for this model (float32); a precision change requires "
-                "requalification (PORT-STATE-009). If no --dtype was "
-                "given, vLLM's auto policy downcasts float32 checkpoints "
-                "on SM80+ GPUs and the pipeline's deploy profile "
-                "(vllm_omni/deploy/nemotron_asr.yaml) normally pins "
-                "float32 - a 'Deploy config not found' warning earlier "
-                "in this log means the installation is missing its "
-                "deploy data. Pass --dtype float32 or repair the "
-                "installation."
+                "Nemotron requires an explicit resolved engine dtype; "
+                "the packaged deploy profile normally selects float16 "
+                "(PORT-STATE-009)"
             )
+        policy = policy_for_engine_dtype(engine_dtype)
+        policy.assert_engine_dtype(engine_dtype)
         # Pool sizing is resolved after vLLM's real memory profile in the
         # common worker. The model constructor deliberately does not invent
         # physical capacity or mutate ``num_gpu_blocks_override``.
         reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
-        policy = FP32_BRINGUP
         self.core = NemotronASRCore(
             vocab_size=hf_config.num_asr_labels,
             att_context=(
@@ -361,6 +363,9 @@ class NemotronASRForRNNT(nn.Module):
             window=torch.zeros(_WIN_LENGTH),
             policy=policy,
         )
+        apply_policy_dtypes(self.core)
+        self.precision_policy_id = policy.identifier
+        self.precision_policy_hash = policy.content_hash
         state_prefix = f"{prefix}.persistent_state" if prefix else "persistent_state"
         self._persistent_state_layer = PersistentStateLayerBase(
             build_nemotron_persistent_state_spec(hf_config),

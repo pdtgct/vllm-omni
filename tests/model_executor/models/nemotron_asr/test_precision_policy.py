@@ -10,11 +10,14 @@ independent axis, defaults fp32, never silently reduced).
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
+    FP16_COMPUTE,
     FP32_BRINGUP,
     PrecisionPolicy,
     RecurrentStatePrecisionError,
+    policy_for_engine_dtype,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,8 +31,92 @@ def test_bringup_policy_is_fp32_everywhere():
         "conv_state",
         "lstm_state",
         "queue_state",
+        "recurrent_weights",
     ):
         assert FP32_BRINGUP.dtype_for(tensor_class) == torch.float32
+
+
+def test_fp16_compute_keeps_recurrent_weights_and_state_fp32():
+    assert FP16_COMPUTE.identifier == "pp-82807083c34e"
+    assert FP16_COMPUTE.content_hash == (
+        "sha256:82807083c34e8e54de24c214990462ff"
+        "9c95ef2ebc0a43c0f0039ca2fb1cc60c"
+    )
+    assert FP16_COMPUTE.dtype_for("weights") == torch.float16
+    assert FP16_COMPUTE.dtype_for("activations") == torch.float16
+    assert FP16_COMPUTE.dtype_for("recurrent_weights") == torch.float32
+    for tensor_class in (
+        "attention_cache",
+        "conv_state",
+        "lstm_state",
+        "queue_state",
+        "frontend_state",
+    ):
+        assert FP16_COMPUTE.dtype_for(tensor_class) == torch.float32
+    assert policy_for_engine_dtype(torch.float16) is FP16_COMPUTE
+    assert policy_for_engine_dtype(torch.float32) is FP32_BRINGUP
+    with pytest.raises(ValueError, match="no qualified"):
+        policy_for_engine_dtype(torch.bfloat16)
+
+
+def test_fp16_policy_survives_real_component_checkpoint_loading():
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
+        FastConformerEncoder,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.lid import (
+        PromptConditioner,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRForRNNT,
+        apply_policy_dtypes,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        Joint,
+        Predictor,
+    )
+
+    class Core(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy = FP16_COMPUTE
+            self.encoder = FastConformerEncoder(
+                feat_in=8,
+                d_model=8,
+                d_ff=16,
+                n_layers=1,
+                n_heads=2,
+                subsampling_channels=4,
+            )
+            self.lid = PromptConditioner(enc_hidden=8, num_prompts=2)
+            self.predictor = Predictor(
+                vocab_size=4,
+                pred_hidden=4,
+                pred_rnn_layers=1,
+            )
+            self.joint = Joint(
+                enc_hidden=8,
+                pred_hidden=4,
+                joint_hidden=4,
+                vocab_size=4,
+            )
+
+    core = Core()
+    apply_policy_dtypes(core)  # type: ignore[arg-type]
+    checkpoint = [
+        (name, value.detach().to(torch.float32).clone())
+        for name, value in core.state_dict().items()
+    ]
+    model = object.__new__(NemotronASRForRNNT)
+    nn.Module.__init__(model)
+    model.core = core
+    assert model.load_weights(checkpoint) == {
+        f"core.{name}" for name in core.state_dict()
+    }
+
+    assert next(core.encoder.parameters()).dtype == torch.float16
+    assert next(core.lid.parameters()).dtype == torch.float16
+    assert next(core.joint.parameters()).dtype == torch.float16
+    assert next(core.predictor.parameters()).dtype == torch.float32
 
 
 def test_identifier_matches_harness_scheme():

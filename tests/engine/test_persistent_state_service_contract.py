@@ -209,6 +209,7 @@ def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
     manager, _, _ = make_manager(require_persistent_state_module(), num_gpu_blocks=3)
     manager.resident_state_scatter_warmup_complete = True
     core = object.__new__(StageEngineCoreProc)
+    core._persistent_state_precision_policy_id = "pp-test"
     core.vllm_config = SimpleNamespace(additional_config=dict(_EXPLICIT_A36_ENVELOPE))
     core.scheduler = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
@@ -220,6 +221,7 @@ def test_engine_snapshot_attests_completed_resident_scatter_warmup() -> None:
         "ENV-MIG-012 engine inventory omitted scatter-warmup attestation"
     )
     assert snapshot["persistent_state_admission_policy"] == "profile"
+    assert snapshot["precision_policy"] == "pp-test"
 
 
 def _publish_warmup_attestation(core: Any) -> None:
@@ -253,6 +255,8 @@ def test_engine_core_publishes_all_worker_warmup_attestations(
         collective_rpc=lambda method: (
             worker_attestations
             if method == "persistent_state_warmup_attestation"
+            else ["pp-test"]
+            if method == "persistent_state_precision_policy_attestation"
             else pytest.fail(f"unexpected worker RPC: {method}")
         )
     )
@@ -263,6 +267,7 @@ def test_engine_core_publishes_all_worker_warmup_attestations(
     _publish_warmup_attestation(core)
 
     assert manager.resident_state_scatter_warmup_complete is True
+    assert core._persistent_state_precision_policy_id == "pp-test"
 
 
 @pytest.mark.parametrize("worker_attestations", ([], [False], [True, False]))
@@ -322,7 +327,14 @@ def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
     def fake_base_init(core: Any, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         events.append("base-init")
-        core.model_executor = SimpleNamespace(collective_rpc=lambda method: events.append(method) or [True])
+        core.model_executor = SimpleNamespace(
+            collective_rpc=lambda method: events.append(method)
+            or (
+                [True]
+                if method == "persistent_state_warmup_attestation"
+                else ["pp-test"]
+            )
+        )
         core.scheduler = SimpleNamespace(
             kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(manager,)))
         )
@@ -334,6 +346,7 @@ def test_engine_core_init_automatically_publishes_worker_warmup_attestation(
     assert events == [
         "base-init",
         "persistent_state_warmup_attestation",
+        "persistent_state_precision_policy_attestation",
     ]
     assert manager.resident_state_scatter_warmup_complete is True
 

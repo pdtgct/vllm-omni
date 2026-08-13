@@ -4,10 +4,9 @@
 
 A wheel built without ``vllm_omni/deploy/*.yaml`` silently drops the
 pipeline's qualified profile: the loader logs "Deploy config not found"
-and proceeds with defaults, vLLM's auto policy then downcasts the
-float32 checkpoint to bfloat16 on SM80+, and serving dies at the
-model's precision gate. Editable installs never see this, which is
-exactly why it must be pinned by test.
+and proceeds with defaults, so vLLM's auto policy can select a dtype that
+does not name the qualified acceleration fingerprint. Editable installs
+never see this, which is exactly why it must be pinned by test.
 """
 
 import sys
@@ -30,7 +29,7 @@ def test_the_qualified_deploy_profile_exists_where_the_loader_looks() -> None:
     profile = _DEPLOY_DIR / "nemotron_asr.yaml"
     assert profile.is_file(), (
         "the qualified deploy profile is missing from this installation - "
-        "a built distribution without deploy data loses the float32 pin"
+        "a built distribution without deploy data loses the precision pin"
     )
 
 
@@ -39,7 +38,7 @@ def test_the_profile_pins_what_the_model_gates() -> None:
     """The profile's load-bearing values match the model-side gates, so a
     missing profile fails loudly at those gates instead of drifting."""
     profile = yaml.safe_load((_DEPLOY_DIR / "nemotron_asr.yaml").read_text())
-    assert profile["dtype"] == "float32"
+    assert profile["dtype"] == "float16"
     assert profile["enable_prefix_caching"] is False
     assert all(stage.get("enforce_eager") is True for stage in profile["stages"])
 

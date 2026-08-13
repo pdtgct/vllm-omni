@@ -112,7 +112,7 @@ def test_nemotron_stage_config_pins_supported_bringup_lane() -> None:
         "NemotronASRScheduler"
     )
     assert stage.engine_args.async_scheduling is False
-    assert stage.engine_args.dtype == "float32"
+    assert stage.engine_args.dtype == "float16"
     assert stage.engine_args.enforce_eager is True
     assert stage.engine_args.enable_prefix_caching is False
     assert "speculative_config" not in stage.engine_args

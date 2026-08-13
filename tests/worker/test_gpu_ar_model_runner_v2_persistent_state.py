@@ -658,6 +658,18 @@ def test_persistent_only_worker_logs_actual_execution_fingerprint(
     ]
 
 
+def test_worker_attests_loaded_precision_policy_identity() -> None:
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+    worker = _worker(persistent=True, ordinary_groups=0)
+    worker.model_runner.model.precision_policy_id = "pp-fp16-test"
+
+    assert (
+        GPUARWorker.persistent_state_precision_policy_attestation(worker)
+        == "pp-fp16-test"
+    )
+
+
 def test_nonpersistent_worker_preserves_core_warmup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -25,6 +25,7 @@ import torch
 TENSOR_CLASSES: Final = (
     "weights",
     "activations",
+    "recurrent_weights",
     "attention_cache",
     "conv_state",
     "lstm_state",
@@ -149,3 +150,34 @@ bf16, every state class fp32 — the vLLM mamba mixed-precision idiom
 (compute dtype below the recurrent/cache dtype, never the reverse).
 Transcript parity vs the fp32-locked oracle stays BLOCKING; tensor
 deltas are advisory under this identifier (EVAL-PAR-006)."""
+
+
+FP16_COMPUTE: Final = PrecisionPolicy(
+    {
+        "weights": "fp16",
+        "activations": "fp16",
+        "recurrent_weights": "fp32",
+        "attention_cache": "fp32",
+        "conv_state": "fp32",
+        "lstm_state": "fp32",
+        "queue_state": "fp32",
+        "frontend_state": "fp32",
+    }
+)
+"""FP16 encoder/LID/joint compute with FP32 recurrent weights and state.
+
+Keeping predictor weights at the recurrent-state dtype prevents the manual
+LSTM cell from materializing FP32 weight copies on every emitted symbol.
+"""
+
+
+def policy_for_engine_dtype(engine_dtype: torch.dtype) -> PrecisionPolicy:
+    """Resolve the reviewed policy selected by vLLM's engine dtype."""
+    if engine_dtype == torch.float32:
+        return FP32_BRINGUP
+    if engine_dtype == torch.float16:
+        return FP16_COMPUTE
+    raise ValueError(
+        f"engine dtype {engine_dtype} has no qualified Nemotron "
+        "PrecisionPolicy; expected float32 or float16"
+    )

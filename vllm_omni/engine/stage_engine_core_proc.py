@@ -91,6 +91,19 @@ class StageEngineCoreProc(EngineCoreProc):
         attestations = self.model_executor.collective_rpc("persistent_state_warmup_attestation")
         if not attestations or not all(result is True for result in attestations):
             raise RuntimeError("persistent-state worker warmup attestation is incomplete")
+        policy_ids = self.model_executor.collective_rpc(
+            "persistent_state_precision_policy_attestation"
+        )
+        if (
+            not policy_ids
+            or any(not isinstance(policy_id, str) for policy_id in policy_ids)
+            or len(set(policy_ids)) != 1
+        ):
+            raise RuntimeError(
+                "persistent-state worker precision-policy attestation "
+                "is incomplete or inconsistent"
+            )
+        self._persistent_state_precision_policy_id = policy_ids[0]
         matches[0].resident_state_scatter_warmup_complete = True
 
     def preprocess_add_request(
@@ -214,7 +227,6 @@ class StageEngineCoreProc(EngineCoreProc):
         control = self._persistent_state_control()
         self._prune_persistent_state_operations(control)
         scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
-        model_config = getattr(self.vllm_config, "model_config", None)
         compute_hash = getattr(self.vllm_config, "compute_hash", None)
         return {
             "engine_epoch": control["engine_epoch"],
@@ -233,7 +245,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 )
             ),
             "execution_environment_key": (compute_hash() if callable(compute_hash) else "test-unavailable"),
-            "precision_policy": str(getattr(model_config, "dtype", "unknown")),
+            "precision_policy": self._persistent_state_precision_policy_id,
             "stage": manager.stage,
             "replica": manager.replica,
             "capabilities": ["resident"],

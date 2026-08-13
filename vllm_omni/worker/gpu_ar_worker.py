@@ -63,6 +63,20 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         return bool(getattr(self, "_persistent_state_warmup_complete", False))
 
+    def persistent_state_precision_policy_attestation(self) -> str:
+        """Return the loaded model's resolved compute-policy identity."""
+
+        policy_id = getattr(
+            self.model_runner.model,
+            "precision_policy_id",
+            None,
+        )
+        if not isinstance(policy_id, str) or not policy_id:
+            raise RuntimeError(
+                "persistent-state model has no precision-policy identity"
+            )
+        return policy_id
+
     @instrument(span_name="Warmup persistent-only model (GPU)")
     def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
         """Finish eager worker warmup without inventing token-cache requests.
