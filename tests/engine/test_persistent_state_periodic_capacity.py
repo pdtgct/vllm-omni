@@ -440,7 +440,7 @@ def test_table_proven_mix_is_not_rejected_by_the_old_additive_ratio() -> None:
     assert projection.nominal_dispatchable_by_interval[1_120] == 1
 
 
-def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None:
+def test_hard_cap_dispatches_to_hard_ceiling_without_timing_profile() -> None:
     """@spec PORT-STATE-026 / PORT-OBS-012: characterize, do not lie."""
     profile = _compile(
         intervals_ms=(320,),
@@ -463,8 +463,25 @@ def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None
         authority_open=True,
         admission_policy="profile",
     )
+    authority = _symbol(
+        "build_unmeasured_hard_cap_authority",
+        "PORT-STATE-027",
+    )(
+        served_intervals_ms=(320,),
+        inventory={
+            "physical_capacity": 4,
+            "effective_capacity": 4,
+            "configured_limit": 4,
+            "execution_claim_ceiling": 1,
+            "slot_bytes": 6_314_936,
+            "execution_environment_key": "test",
+            "precision_policy": "fp32",
+            "profile_id": "test-profile",
+        },
+        maximum_charged_population=1,
+    )
     characterization = project(
-        profile=profile,
+        profile=authority,
         inventory=inventory,
         resident_counts_by_interval=empty,
         submitted_counts_by_interval=empty,
@@ -476,12 +493,12 @@ def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None
     assert guarded.dispatchable_by_interval == {320: 0}
     assert characterization.candidate_supported_by_interval == {320: True}
     assert characterization.dispatchable_by_interval == {320: 1}
-    assert characterization.nominal_dispatchable_by_interval == {320: 0}
+    assert characterization.nominal_dispatchable_by_interval == {320: None}
     assert characterization.hard_headroom == 1
     assert characterization.admission_policy == "hard_cap"
 
     at_search_ceiling = project(
-        profile=profile,
+        profile=authority,
         inventory={**inventory, "resident_count": 1},
         resident_counts_by_interval={320: 1},
         submitted_counts_by_interval=empty,
@@ -490,6 +507,59 @@ def test_hard_cap_dispatches_to_hard_ceiling_without_rewriting_profile() -> None
     )
     assert at_search_ceiling.hard_headroom == 0
     assert at_search_ceiling.dispatchable_by_interval == {320: 0}
+
+
+def test_unmeasured_hard_cap_uses_only_sealed_hard_authorities() -> None:
+    """@spec PORT-STATE-026: no timing profile is invented for hard cap."""
+    authority = _symbol(
+        "build_unmeasured_hard_cap_authority",
+        "PORT-STATE-027",
+    )(
+        served_intervals_ms=(80, 320, 1_120),
+        inventory={
+            "physical_capacity": 9,
+            "effective_capacity": 7,
+            "configured_limit": 6,
+            "execution_claim_ceiling": 5,
+            "slot_bytes": 6_314_936,
+            "execution_environment_key": "a100-fp32",
+            "precision_policy": "fp32",
+            "profile_id": "nemotron-asr-fp32-v1",
+        },
+        maximum_charged_population=4,
+    )
+    project = _symbol("project_fixed_dispatch_capacity")
+    empty = dict.fromkeys(authority.served_intervals_ms, 0)
+    projection = project(
+        profile=authority,
+        inventory={
+            "resident_count": 0,
+            "effective_capacity": 7,
+            "configured_limit": 6,
+        },
+        resident_counts_by_interval=empty,
+        submitted_counts_by_interval=empty,
+        authority_open=True,
+        admission_policy="hard_cap",
+    )
+
+    assert authority.evidence_class == "unmeasured"
+    assert authority.receipt.measurement_state == "unmeasured"
+    assert authority.receipt.maximum_charged_population == 4
+    assert len(authority.receipt.receipt_sha256) == 64
+    assert projection.hard_headroom == 4
+    assert projection.dispatchable_by_interval == {
+        80: 4,
+        320: 4,
+        1_120: 4,
+    }
+    assert projection.nominal_dispatchable_by_interval == {
+        80: None,
+        320: None,
+        1_120: None,
+    }
+    assert projection.charged_units is None
+    assert projection.service_budget_units is None
 
 
 def test_dispatch_projection_rejects_unknown_admission_policy() -> None:

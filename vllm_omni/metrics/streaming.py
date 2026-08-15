@@ -267,12 +267,12 @@ class OmniStreamingMetrics:
         stage: str,
         replica: str,
         *,
-        service_source: str,
-        service_budget: float,
-        charged_demand: float,
+        service_source: str | None,
+        service_budget: float | None,
+        charged_demand: float | None,
         execution_claims: int,
         max_num_seqs: int,
-        headroom_by_cadence: dict[str, dict[str, int]],
+        headroom_by_cadence: dict[str, dict[str, int | None]],
         pending_by_cadence: dict[str, dict[str, int]],
     ) -> None:
         """Replace one consistent fixed-cardinality capacity projection."""
@@ -280,19 +280,27 @@ class OmniStreamingMetrics:
             return
         if not stage or not replica:
             return
-        if service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES:
-            return
-        for kind, value in (
-            ("budget", service_budget),
-            ("charged_demand", charged_demand),
+        if (
+            service_source is not None
+            and service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES
         ):
-            _persistent_state_service_demand_family.labels(
-                model_name=self._model_name,
-                stage=stage,
-                replica=replica,
-                kind=kind,
-                source=service_source,
-            ).set(value)
+            return
+        if (
+            service_source in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES
+            and service_budget is not None
+            and charged_demand is not None
+        ):
+            for kind, value in (
+                ("budget", service_budget),
+                ("charged_demand", charged_demand),
+            ):
+                _persistent_state_service_demand_family.labels(
+                    model_name=self._model_name,
+                    stage=stage,
+                    replica=replica,
+                    kind=kind,
+                    source=service_source,
+                ).set(value)
         for kind, value in (
             ("claims", execution_claims),
             ("max_num_seqs", max_num_seqs),
@@ -311,6 +319,8 @@ class OmniStreamingMetrics:
             ):
                 continue
             for kind, value in headroom.items():
+                if value is None:
+                    continue
                 _persistent_state_admission_headroom_family.labels(
                     model_name=self._model_name,
                     stage=stage,

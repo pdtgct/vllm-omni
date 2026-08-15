@@ -129,6 +129,25 @@ async def prepare_persistent_state_service(
         missing_inventory = sorted(_REQUIRED_STARTUP_INVENTORY - inventory.keys())
         if missing_inventory:
             raise RuntimeError("persistent-state startup inventory is incomplete: " + ", ".join(missing_inventory))
+        if runtime_config.admission_policy == "hard_cap":
+            authority = startup_provider.build_hard_cap_authority(
+                runtime_config=runtime_config,
+                inventory=inventory,
+                model_config=engine_client.model_config,
+            )
+            service.configure_bootstrap_intervals(
+                authority.served_intervals_ms
+            )
+            admission_config = derive_admission_controller_config(
+                runtime_config,
+                supported_intervals_ms=authority.served_intervals_ms,
+            )
+            service.seal_startup_authority(
+                admission_config=admission_config,
+                startup_authority=authority,
+            )
+            return service
+
         plan = startup_provider.build_priming_plan(
             runtime_config=runtime_config,
             inventory=inventory,

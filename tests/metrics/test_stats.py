@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.metrics import OrchestratorAggregator
@@ -89,6 +91,42 @@ def test_build_and_log_summary_e2e_only() -> None:
     assert e2e_entry["e2e_total_tokens"] == 5
     stage_entry = _get_request_entry(summary["stage_table"], "r")
     assert stage_entry["stages"] == []
+
+
+def test_info_level_cleanup_keeps_metrics_without_building_request_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detailed request tables are DEBUG-only and cost nothing at INFO."""
+    from vllm_omni.entrypoints import omni_base
+
+    calls: list[str] = []
+    metrics = SimpleNamespace(
+        e2e_done={"req"},
+        build_and_log_summary=lambda: calls.append("summary"),
+    )
+    prom = SimpleNamespace(
+        request_failed=lambda: calls.append("failed"),
+        set_running=lambda value: calls.append(f"running={value}"),
+        set_waiting=lambda value: calls.append(f"waiting={value}"),
+    )
+    engine = SimpleNamespace(_running_counter=SimpleNamespace(value=0))
+    instance = object.__new__(omni_base.OmniBase)
+    instance.log_stats = True
+    instance.prom_metrics = prom
+    instance.engine = engine
+    instance.request_states = {"req": SimpleNamespace(metrics=metrics)}
+    instance._consumed_metric_messages = {}
+    monkeypatch.setattr(
+        omni_base.logger,
+        "isEnabledFor",
+        lambda level: False,
+    )
+
+    instance._log_summary_and_cleanup("req")
+
+    assert "summary" not in calls
+    assert calls == ["running=0", "waiting=0"]
+    assert instance.request_states == {}
 
 
 def test_build_and_log_summary_multiple_requests() -> None:

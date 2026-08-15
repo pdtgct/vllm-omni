@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 import weakref
@@ -305,9 +306,10 @@ class OmniBase(PDDisaggregationMixin):
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
                 self.prom_metrics.request_failed()
-            if self.log_stats:
+            if self.log_stats and logger.isEnabledFor(logging.DEBUG):
                 # Emit per-request orchestrator timing (including e2e_total_ms)
-                # before dropping request state.
+                # before dropping request state. Aggregate/Prometheus metrics
+                # remain enabled at normal INFO verbosity.
                 req_state.metrics.build_and_log_summary()
         except Exception:
             logger.exception(

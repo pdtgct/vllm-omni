@@ -749,7 +749,7 @@ class OrchestratorAggregator:
             if v not in (0, 0.0, 0.000, None, ""):
                 overall_fields.append(k)
         if overall_fields:
-            logger.info(
+            logger.debug(
                 "\n%s",
                 _format_table("Overall Summary", overall_summary, overall_fields),
             )
@@ -775,7 +775,7 @@ class OrchestratorAggregator:
                 value_fields_e2e = sorted(nonzero_e2e_fields)
 
                 if value_fields_e2e:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"RequestE2EStats [request_id={rid}]",
@@ -816,7 +816,7 @@ class OrchestratorAggregator:
                     parts.append(f"transfers=[{','.join(transfer_parts)}]")
                 if "ar2diffusion_ms" in pt:
                     parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
-                logger.info("[OmniTiming] %s", " ".join(parts))
+                logger.debug("[OmniTiming] %s", " ".join(parts))
 
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
@@ -858,7 +858,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"StageRequestStats [request_id={rid}]",
@@ -898,7 +898,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"TransferEdgeStats [request_id={rid}]",

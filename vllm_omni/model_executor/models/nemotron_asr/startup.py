@@ -12,8 +12,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from vllm_omni.engine.persistent_state_capacity import (
+    HardCapAdmissionAuthority,
     ServiceExecutionTier,
     ServiceProfileContext,
+    build_unmeasured_hard_cap_authority,
 )
 from vllm_omni.engine.persistent_state_priming import (
     ServicePrimingBudgetCell,
@@ -95,6 +97,55 @@ class NemotronPersistentStateStartupProvider:
             declared_bootstrap_operation_budget=declared_operations,
         )
 
+    @staticmethod
+    def _admitted_geometries(model_config: Any) -> tuple[tuple[int, str], ...]:
+        hf_config = getattr(model_config, "hf_config", model_config)
+        declared_lookaheads = getattr(
+            hf_config,
+            "supported_num_lookahead_tokens",
+            None,
+        )
+        supported = (
+            None
+            if declared_lookaheads is None
+            else {int(value) for value in declared_lookaheads}
+        )
+        geometries = tuple(
+            (geometry_id, cadence)
+            for geometry_id, (cadence, (_, lookahead)) in enumerate(
+                CADENCES.items()
+            )
+            if supported is None or lookahead in supported
+        )
+        if not geometries:
+            raise ValueError(
+                "served configuration declares no supported manifest geometry"
+            )
+        return geometries
+
+    def build_hard_cap_authority(
+        self,
+        *,
+        runtime_config: Any,
+        inventory: dict[str, Any],
+        model_config: Any,
+    ) -> HardCapAdmissionAuthority:
+        """Seal hard authorities without executing a service microbenchmark."""
+
+        del runtime_config
+        admitted = self._admitted_geometries(model_config)
+        maximum_population = min(
+            int(inventory["effective_capacity"]),
+            int(inventory["execution_claim_ceiling"]),
+        )
+        return build_unmeasured_hard_cap_authority(
+            served_intervals_ms=tuple(
+                int(cadence.removesuffix("ms")) for _, cadence in admitted
+            ),
+            inventory=inventory,
+            maximum_charged_population=maximum_population,
+        )
+
     def build_priming_plan(
         self,
         *,
@@ -124,20 +175,7 @@ class NemotronPersistentStateStartupProvider:
                     max_active_population=maximum_population,
                 )
             )
-        hf_config = getattr(model_config, "hf_config", model_config)
-        declared_lookaheads = getattr(
-            hf_config,
-            "supported_num_lookahead_tokens",
-            None,
-        )
-        supported = None if declared_lookaheads is None else {int(value) for value in declared_lookaheads}
-        admitted_geometries = tuple(
-            (geometry_id, cadence)
-            for geometry_id, (cadence, (_, lookahead)) in enumerate(CADENCES.items())
-            if supported is None or lookahead in supported
-        )
-        if not admitted_geometries:
-            raise ValueError("served configuration declares no supported manifest geometry")
+        admitted_geometries = self._admitted_geometries(model_config)
 
         rounds: list[ServicePrimingRound] = []
         for geometry_id, cadence in admitted_geometries:

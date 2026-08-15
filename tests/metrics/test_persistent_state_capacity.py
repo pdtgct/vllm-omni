@@ -197,6 +197,44 @@ def test_capacity_projection_is_one_consistent_snapshot() -> None:
     ) == 4.0
 
 
+def test_unmeasured_hard_cap_omits_demand_but_keeps_capacity_metrics() -> None:
+    """@spec PORT-OBS-012: absence of measurement is never published as zero."""
+    model = "unmeasured-hard-cap-contract"
+    metrics = OmniStreamingMetrics(model_name=model, log_stats=True)
+    metrics.observe_persistent_state_capacity(
+        "0",
+        "0",
+        service_source=None,
+        service_budget=None,
+        charged_demand=None,
+        execution_claims=2,
+        max_num_seqs=8,
+        headroom_by_cadence={"160": {"hard": 6, "nominal": None}},
+        pending_by_cadence={
+            "160": {
+                "waiting": 1,
+                "submitted": 0,
+                "reconciling": 0,
+                "committed_cleanup": 0,
+            }
+        },
+    )
+
+    demand = _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO")
+    assert _sample(f'{demand}{{kind="budget",model_name="{model}"') is None
+    execution = _required(defs, "PERSISTENT_STATE_EXECUTION_CLAIMS")
+    assert _sample(
+        f'{execution}{{kind="claims",model_name="{model}",replica="0",stage="0"}}'
+    ) == 2.0
+    headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
+    assert _sample(
+        f'{headroom}{{cadence_ms="160",kind="hard",model_name="{model}",replica="0",stage="0"}}'
+    ) == 6.0
+    assert _sample(
+        f'{headroom}{{cadence_ms="160",kind="nominal",model_name="{model}"'
+    ) is None
+
+
 def test_admission_wait_observation_uses_bounded_outcome_and_seconds() -> None:
     """@spec PORT-OBS-012: queue wait is distinct from TTFS."""
 

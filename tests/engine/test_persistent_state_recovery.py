@@ -395,9 +395,20 @@ def test_hard_cap_service_keeps_controller_and_advisory_zero_headroom() -> None:
         )
 
         stage = _RecoveryStage()
-        profile = _compiled_admission_profile(
-            derating_factor=Fraction(1, 100),
-            maximum_population=1,
+        from vllm_omni.engine.persistent_state_capacity import (
+            build_unmeasured_hard_cap_authority,
+        )
+
+        profile = build_unmeasured_hard_cap_authority(
+            served_intervals_ms=(80, 160, 320, 560, 1120),
+            inventory={
+                **_SNAPSHOT_BASE,
+                "execution_claim_ceiling": 1,
+                "slot_bytes": 6_314_936,
+                "execution_environment_key": "test",
+                "precision_policy": "fp32",
+            },
+            maximum_charged_population=1,
         )
         service = _service(
             stage,

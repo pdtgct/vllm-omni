@@ -334,10 +334,14 @@ class PersistentStateService:
         if config is None or profile is None or epoch is None:
             return
         from vllm_omni.engine.persistent_state_capacity import (
+            HardCapAdmissionAuthority,
             StartupServiceProfile,
         )
 
-        if not isinstance(profile, StartupServiceProfile):
+        if not isinstance(
+            profile,
+            (StartupServiceProfile, HardCapAdmissionAuthority),
+        ):
             return
         from vllm_omni.engine.persistent_state_admission import (
             BoundedAdmissionController,
@@ -846,9 +850,21 @@ class PersistentStateService:
                 admission_policy=admission_config.admission_policy,
             )
             inventory["execution_claims"] = projection.execution_claims
-            inventory["charged_demand"] = (
-                projection.charged_units / projection.service_budget_units
+            has_measured_demand = (
+                projection.charged_units is not None
+                and projection.service_budget_units is not None
             )
+            if has_measured_demand:
+                charged_units = projection.charged_units
+                service_budget_units = projection.service_budget_units
+                if charged_units is None or service_budget_units is None:
+                    raise RuntimeError(
+                        "measured service projection lacks demand authorities"
+                    )
+                inventory["charged_demand"] = charged_units / service_budget_units
+            else:
+                inventory.pop("charged_demand", None)
+                inventory["service_profile_measurement_state"] = "unmeasured"
             pending = controller.pending_counts
             pending_by_cadence = {
                 str(interval): {
@@ -863,19 +879,37 @@ class PersistentStateService:
                 "observe_persistent_state_capacity",
                 str(inventory["stage"]),
                 str(inventory["replica"]),
-                service_source=str(
-                    getattr(receipt, "service_budget_source", "measured_fallback")
+                service_source=(
+                    str(
+                        getattr(
+                            receipt,
+                            "service_budget_source",
+                            "measured_fallback",
+                        )
+                    )
+                    if has_measured_demand
+                    else None
                 ),
-                service_budget=float(profile.derating_factor),
-                charged_demand=float(inventory["charged_demand"]),
+                service_budget=(
+                    float(profile.derating_factor)
+                    if has_measured_demand
+                    else None
+                ),
+                charged_demand=(
+                    float(inventory["charged_demand"])
+                    if has_measured_demand
+                    else None
+                ),
                 execution_claims=projection.execution_claims,
                 max_num_seqs=projection.max_num_seqs,
                 headroom_by_cadence={
                     str(interval): {
                         "hard": projection.hard_headroom,
-                        "nominal": projection.nominal_dispatchable_by_interval[
-                            interval
-                        ],
+                        "nominal": (
+                            projection.nominal_dispatchable_by_interval[
+                                interval
+                            ]
+                        ),
                     }
                     for interval in self._resident_interval_counts
                 },
@@ -1292,10 +1326,10 @@ class PersistentStateService:
         self._submitted_interval_counts = dict.fromkeys(intervals_ms, 0)
         self._failed_release_interval_counts = dict.fromkeys(intervals_ms, 0)
 
-    def seal_startup_profile(
+    def seal_startup_authority(
         self,
         *,
-        compiled_service_profile: Any,
+        startup_authority: Any,
         admission_config: Any | None = None,
     ) -> None:
         """Atomically install the immutable startup authority exactly once."""
@@ -1311,9 +1345,11 @@ class PersistentStateService:
             raise RuntimeError(
                 "persistent-state admission configuration is required at seal"
             )
-        profile_intervals = tuple(
-            compiled_service_profile.compiled_demand.intervals_ms
+        from vllm_omni.engine.persistent_state_capacity import (
+            startup_authority_intervals,
         )
+
+        profile_intervals = startup_authority_intervals(startup_authority)
         admission_intervals = tuple(resolved_admission.supported_intervals_ms)
         if profile_intervals != admission_intervals:
             raise ValueError(
@@ -1335,7 +1371,7 @@ class PersistentStateService:
                 "persistent-state priming authority is not empty at seal"
             )
         self._admission_config = resolved_admission
-        self._compiled_service_profile = compiled_service_profile
+        self._compiled_service_profile = startup_authority
         self._resident_interval_counts = dict.fromkeys(profile_intervals, 0)
         self._submitted_interval_counts = dict.fromkeys(profile_intervals, 0)
         self._failed_release_interval_counts = dict.fromkeys(
@@ -1361,6 +1397,19 @@ class PersistentStateService:
         self._refresh_tombstone_admission()
         self._project_inventory()
         self._schedule_admission_drain()
+
+    def seal_startup_profile(
+        self,
+        *,
+        compiled_service_profile: Any,
+        admission_config: Any | None = None,
+    ) -> None:
+        """Compatibility entry point for the measured profile policy."""
+
+        self.seal_startup_authority(
+            startup_authority=compiled_service_profile,
+            admission_config=admission_config,
+        )
 
     async def reserve_for_priming(
         self,

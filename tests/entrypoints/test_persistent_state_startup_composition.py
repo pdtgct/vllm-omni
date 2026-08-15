@@ -233,6 +233,96 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_hard_cap_skips_service_priming_and_seals_unmeasured_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec PORT-PERF-005/006 / PORT-STATE-027: hard cap boots fast."""
+    module = _startup_module()
+    prepare = _startup_symbol("prepare_persistent_state_service")
+    events: list[str] = []
+    runtime = _runtime()
+    runtime.admission_policy = "hard_cap"
+    authority = SimpleNamespace(
+        served_intervals_ms=(80, 320, 1_120),
+        evidence_class="unmeasured",
+    )
+
+    class _ProviderWithoutProfiler:
+        def build_hard_cap_authority(self, **kwargs: Any) -> Any:
+            assert kwargs["runtime_config"] is runtime
+            assert kwargs["inventory"] == _startup_inventory()
+            events.append("authority")
+            return authority
+
+        def build_priming_plan(self, **kwargs: Any) -> NoReturn:
+            del kwargs
+            _fail("PORT-PERF-005 hard_cap invoked service priming")
+
+    class _Service:
+        def __init__(self, stage_client: Any, **kwargs: Any) -> None:
+            del stage_client, kwargs
+            events.append("construct")
+            self.ready = False
+
+        async def bootstrap_handshake(self) -> dict[str, Any]:
+            events.append("handshake")
+            return _startup_inventory()
+
+        def configure_bootstrap_intervals(
+            self,
+            intervals_ms: tuple[int, ...],
+        ) -> None:
+            assert intervals_ms == authority.served_intervals_ms
+            events.append("configure")
+
+        def seal_startup_authority(self, **kwargs: Any) -> None:
+            assert kwargs["startup_authority"] is authority
+            assert kwargs["admission_config"] == "controller-config"
+            events.append("seal")
+            self.ready = True
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    monkeypatch.setattr(module, "PersistentStateService", _Service)
+    monkeypatch.setattr(
+        module,
+        "derive_admission_controller_config",
+        lambda value, *, supported_intervals_ms: (
+            events.append("validate") or "controller-config"
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_service_priming_round",
+        lambda **kwargs: _fail("PORT-PERF-005 hard_cap ran a priming round"),
+    )
+    monkeypatch.setattr(
+        module,
+        "compile_provisional_service_profile",
+        lambda *args, **kwargs: _fail("PORT-PERF-006 hard_cap compiled timing evidence"),
+    )
+
+    service = await prepare(
+        engine_client=SimpleNamespace(model_config=object()),
+        stage_client="stage",
+        runtime_config=runtime,
+        startup_provider=_ProviderWithoutProfiler(),
+        host_fatal_callback=lambda error: None,
+    )
+
+    assert service.ready
+    assert events == [
+        "construct",
+        "handshake",
+        "authority",
+        "configure",
+        "validate",
+        "seal",
+    ]
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_preparation_rolls_back_when_warmup_attestation_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -542,6 +632,38 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
     assert plan.served_intervals_ms == (80, 320, 560, 1120)
     assert plan.compile_kwargs.get("control_upper_ns_by_window_and_population") is None
     assert plan.compile_kwargs.get("control_dominance_sha256") is None
+
+
+def test_nemotron_hard_cap_provider_builds_no_executable_rounds() -> None:
+    """@spec PORT-PERF-005/006: hard cap derives only static authority."""
+    from vllm_omni.model_executor.models.nemotron_asr.startup import (
+        NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+
+    inventory = {
+        "physical_capacity": 5,
+        "effective_capacity": 4,
+        "configured_limit": 3,
+        "execution_claim_ceiling": 8,
+        "slot_bytes": 6_314_936,
+        "execution_environment_key": "env-a",
+        "precision_policy": "torch.float32",
+        "profile_id": "profile-a",
+    }
+    authority = NEMOTRON_PERSISTENT_STATE_STARTUP.build_hard_cap_authority(
+        runtime_config=SimpleNamespace(admission_policy="hard_cap"),
+        inventory=inventory,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                supported_num_lookahead_tokens=[3, 0, 6, 13]
+            )
+        ),
+    )
+
+    assert authority.served_intervals_ms == (80, 320, 560, 1_120)
+    assert authority.receipt.maximum_charged_population == 4
+    assert authority.receipt.count_cap == 3
+    assert authority.receipt.measurement_state == "unmeasured"
 
 
 def test_nemotron_provider_keeps_all_manifest_geometries_without_declaration() -> None:

@@ -343,6 +343,122 @@ class StartupServiceProfile:
 
 
 @dataclass(frozen=True)
+class HardCapAdmissionReceipt:
+    """Measurement-free receipt for an intentionally unmeasured hard cap."""
+
+    admission_policy: Literal["hard_cap"]
+    measurement_state: Literal["unmeasured"]
+    served_intervals_ms: tuple[int, ...]
+    maximum_charged_population: int
+    pre_override_physical_bound: int
+    allocated_pool: int
+    effective_capacity: int
+    count_cap: int
+    execution_claim_ceiling: int
+    slot_bytes: int
+    execution_environment_key: str
+    precision_policy: str
+    state_profile: str
+    receipt_sha256: str
+
+
+@dataclass(frozen=True)
+class HardCapAdmissionAuthority:
+    """Startup-sealed hard authorities without fabricated timing evidence."""
+
+    served_intervals_ms: tuple[int, ...]
+    receipt: HardCapAdmissionReceipt
+    evidence_class: Literal["unmeasured"] = "unmeasured"
+
+
+def build_unmeasured_hard_cap_authority(
+    *,
+    served_intervals_ms: Sequence[int],
+    inventory: Mapping[str, object],
+    maximum_charged_population: int,
+) -> HardCapAdmissionAuthority:
+    """Build an immutable hard-cap receipt without running service work."""
+
+    intervals = tuple(int(value) for value in served_intervals_ms)
+    if (
+        not 1 <= len(intervals) <= len(_SERVICE_INTERVALS_MS)
+        or len(set(intervals)) != len(intervals)
+        or any(value not in _SERVICE_INTERVALS_MS for value in intervals)
+    ):
+        raise ValueError("hard-cap authority requires one to five served intervals")
+    if maximum_charged_population <= 0:
+        raise ValueError("hard-cap maximum charged population must be positive")
+
+    def inventory_int(name: str) -> int:
+        value = inventory.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"hard-cap inventory {name} must be a positive integer")
+        return value
+
+    def inventory_str(name: str) -> str:
+        value = inventory.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"hard-cap inventory {name} must be nonempty text")
+        return value
+
+    physical_capacity = inventory_int("physical_capacity")
+    effective_capacity = inventory_int("effective_capacity")
+    configured_limit = inventory_int("configured_limit")
+    execution_claim_ceiling = inventory_int("execution_claim_ceiling")
+    slot_bytes = inventory_int("slot_bytes")
+    execution_environment_key = inventory_str("execution_environment_key")
+    precision_policy = inventory_str("precision_policy")
+    state_profile = inventory_str("profile_id")
+    payload = {
+        "admission_policy": "hard_cap",
+        "measurement_state": "unmeasured",
+        "served_intervals_ms": intervals,
+        "maximum_charged_population": maximum_charged_population,
+        "pre_override_physical_bound": physical_capacity,
+        "allocated_pool": physical_capacity,
+        "effective_capacity": effective_capacity,
+        "count_cap": configured_limit,
+        "execution_claim_ceiling": execution_claim_ceiling,
+        "slot_bytes": slot_bytes,
+        "execution_environment_key": execution_environment_key,
+        "precision_policy": precision_policy,
+        "state_profile": state_profile,
+    }
+    receipt = HardCapAdmissionReceipt(
+        admission_policy="hard_cap",
+        measurement_state="unmeasured",
+        served_intervals_ms=intervals,
+        maximum_charged_population=maximum_charged_population,
+        pre_override_physical_bound=physical_capacity,
+        allocated_pool=physical_capacity,
+        effective_capacity=effective_capacity,
+        count_cap=configured_limit,
+        execution_claim_ceiling=execution_claim_ceiling,
+        slot_bytes=slot_bytes,
+        execution_environment_key=execution_environment_key,
+        precision_policy=precision_policy,
+        state_profile=state_profile,
+        receipt_sha256=_hash_json(payload),
+    )
+    return HardCapAdmissionAuthority(
+        served_intervals_ms=intervals,
+        receipt=receipt,
+    )
+
+
+def startup_authority_intervals(
+    authority: StartupServiceProfile | HardCapAdmissionAuthority,
+) -> tuple[int, ...]:
+    """Return the sealed served interval set for either admission policy."""
+
+    if isinstance(authority, StartupServiceProfile):
+        return authority.compiled_demand.intervals_ms
+    if isinstance(authority, HardCapAdmissionAuthority):
+        return authority.served_intervals_ms
+    raise TypeError("unknown persistent-state startup admission authority")
+
+
+@dataclass(frozen=True)
 class PeriodicSchedulability:
     """Exact result for one fixed-cardinality periodic population."""
 
@@ -370,11 +486,11 @@ class FixedDispatchCapacity:
 
     hard_headroom: int
     candidate_supported_by_interval: Mapping[int, bool]
-    nominal_dispatchable_by_interval: Mapping[int, int]
+    nominal_dispatchable_by_interval: Mapping[int, int | None]
     dispatchable_by_interval: Mapping[int, int]
     admission_policy: AdmissionPolicy
-    charged_units: int
-    service_budget_units: int
+    charged_units: int | None
+    service_budget_units: int | None
     execution_claims: int
     max_num_seqs: int
 
@@ -1197,7 +1313,7 @@ def fallback_transaction_duration_ns(
 # @spec PORT-STATE-004, PORT-STATE-026, PORT-STATE-027, PORT-PERF-008
 def project_fixed_dispatch_capacity(
     *,
-    profile: StartupServiceProfile,
+    profile: StartupServiceProfile | HardCapAdmissionAuthority,
     inventory: Mapping[str, object],
     resident_counts_by_interval: Mapping[int, int],
     submitted_counts_by_interval: Mapping[int, int],
@@ -1216,20 +1332,27 @@ def project_fixed_dispatch_capacity(
 
     if admission_policy not in {"profile", "hard_cap"}:
         raise ValueError("unknown persistent-state admission policy")
-    intervals = profile.compiled_demand.intervals_ms
+    if admission_policy == "hard_cap":
+        if not isinstance(profile, HardCapAdmissionAuthority):
+            raise ValueError("hard-cap admission requires an unmeasured hard-cap authority")
+    elif not isinstance(profile, StartupServiceProfile):
+        raise ValueError("profile admission requires a compiled service profile")
+
+    intervals = startup_authority_intervals(profile)
     if (
         not 1 <= len(intervals) <= len(_SERVICE_INTERVALS_MS)
         or len(set(intervals)) != len(intervals)
         or any(interval <= 0 for interval in intervals)
     ):
-        raise ValueError("compiled service profile must cover one to five unique intervals")
-    interval_to_geometry: dict[int, int] = {}
-    for geometry_id, interval in profile.service_interval_ms_by_geometry.items():
-        if interval in interval_to_geometry:
-            raise ValueError("service interval must identify exactly one profiled geometry")
-        interval_to_geometry[interval] = geometry_id
-    if set(interval_to_geometry) != set(intervals):
-        raise ValueError("service profile lacks an admitted interval geometry")
+        raise ValueError("startup authority must cover one to five unique intervals")
+    if isinstance(profile, StartupServiceProfile):
+        interval_to_geometry: dict[int, int] = {}
+        for geometry_id, interval in profile.service_interval_ms_by_geometry.items():
+            if interval in interval_to_geometry:
+                raise ValueError("service interval must identify exactly one profiled geometry")
+            interval_to_geometry[interval] = geometry_id
+        if set(interval_to_geometry) != set(intervals):
+            raise ValueError("service profile lacks an admitted interval geometry")
 
     if set(resident_counts_by_interval) != set(intervals) or set(submitted_counts_by_interval) != set(intervals):
         raise ValueError("capacity counters must cover each admitted interval")
@@ -1266,6 +1389,23 @@ def project_fixed_dispatch_capacity(
             profile.receipt.maximum_charged_population - execution_claims,
         ),
     )
+    if admission_policy == "hard_cap":
+        return FixedDispatchCapacity(
+            hard_headroom=hard if authority_open else 0,
+            candidate_supported_by_interval=dict.fromkeys(intervals, True),
+            nominal_dispatchable_by_interval=dict.fromkeys(intervals),
+            dispatchable_by_interval=dict.fromkeys(
+                intervals,
+                hard if authority_open else 0,
+            ),
+            admission_policy=admission_policy,
+            charged_units=None,
+            service_budget_units=None,
+            execution_claims=execution_claims,
+            max_num_seqs=max_num_seqs,
+        )
+
+    assert isinstance(profile, StartupServiceProfile)
     current = evaluate_periodic_schedulability(
         profile=profile,
         population_by_interval=counts,
@@ -1303,19 +1443,11 @@ def project_fixed_dispatch_capacity(
             if authority_open and candidate_supported
             else 0
         )
-    if admission_policy == "profile":
-        dispatchable = nominal_dispatchable
-    else:
-        supported = dict.fromkeys(intervals, True)
-        dispatchable = dict.fromkeys(
-            intervals,
-            hard if authority_open else 0,
-        )
     return FixedDispatchCapacity(
         hard_headroom=hard if authority_open else 0,
         candidate_supported_by_interval=supported,
         nominal_dispatchable_by_interval=nominal_dispatchable,
-        dispatchable_by_interval=dispatchable,
+        dispatchable_by_interval=nominal_dispatchable,
         admission_policy=admission_policy,
         charged_units=charged,
         service_budget_units=budget,
