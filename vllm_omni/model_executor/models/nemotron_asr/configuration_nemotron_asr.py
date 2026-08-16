@@ -106,6 +106,7 @@ class NemotronASRConfig(PretrainedConfig):
         eou_token_id: int | None = None,
         flush_token_id: int | None = None,
         endpoint_history_capacity_frames: int = 12,
+        encoder_execution_arm: str | None = None,
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
@@ -155,6 +156,10 @@ class NemotronASRConfig(PretrainedConfig):
                 raise ValueError("vocab_size must cover every control token id")
         if endpoint_history_capacity_frames <= 0:
             raise ValueError("endpoint history capacity must be positive")
+        # The encoder execution gate is an analysis-only startup choice.
+        # Absence retains the compatibility eager baseline; an experiment
+        # stamps the resolved value into its evidence fingerprint.
+        self.encoder_execution_arm = encoder_execution_arm
         # Startup decode policy is part of the served artifact, not a
         # process-local default. Preserve all three fields through HF
         # serialization so build_decode_resolver sees the declaration
@@ -231,8 +236,7 @@ def translate_card_config(card: dict) -> dict:
     supported = encoder.get("supported_num_lookahead_tokens")
     if supported is not None and _PINNED_LOOKAHEAD not in supported:
         raise ValueError(
-            f"the pinned lookahead arm ({_PINNED_LOOKAHEAD}) is not in the "
-            f"card's supported set {supported}"
+            f"the pinned lookahead arm ({_PINNED_LOOKAHEAD}) is not in the card's supported set {supported}"
         )
     if supported is not None:
         # Retained verbatim: session admission validates each requested
@@ -263,6 +267,7 @@ def translate_card_config(card: dict) -> dict:
         # same value the offline publisher stamps into the served
         # artifact.
         "decode_dispatch_arm": "dense-eager",
+        "encoder_execution_arm": "eager",
         "d_model": d_model,
         "n_layers": int(encoder["num_hidden_layers"]),
         "conv_kernel": int(encoder["conv_kernel_size"]),
