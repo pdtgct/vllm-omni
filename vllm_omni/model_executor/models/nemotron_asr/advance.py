@@ -351,15 +351,9 @@ class RowPlan:
     request_ids: tuple[str, ...]
     execution_tier: int
     bindings: tuple[PreparedRowBinding, ...]
-    endpoint_mode: torch.Tensor = field(
-        default_factory=lambda: torch.zeros(0, dtype=torch.int64)
-    )
-    endpoint_threshold_frames: torch.Tensor = field(
-        default_factory=lambda: torch.zeros(0, dtype=torch.int64)
-    )
-    endpoint_residue_frames: torch.Tensor = field(
-        default_factory=lambda: torch.zeros(0, dtype=torch.int64)
-    )
+    endpoint_mode: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.int64))
+    endpoint_threshold_frames: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.int64))
+    endpoint_residue_frames: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.int64))
 
 
 @dataclass
@@ -1179,46 +1173,47 @@ def advance_session(
     out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
 
     caches = _GatheredCaches(state)
-    with torch.no_grad(), phase("port.encode"):
-        enc = stream_step(
-            # _GatheredCaches is StreamingCaches' structural twin over
-            # the gathered batch; stream_step reads only the shared
-            # .channel/.time/.valid surface (the now-deleted
-            # forward_step.py precedent, migration-proven bit-for-bit).
-            core.encoder,
-            mel,
-            caches,  # type: ignore[arg-type]
-            out_offsets=drop,
-            out_lengths=enc_lengths,
-            out_width=out_width,
-        )
-        # Row-wise language conditioning in ONE call: the
-        # conditioner takes the (B,) prompt tensor directly (no
-        # per-prompt fragmentation or host set construction).
-        conditioned = core.lid(enc, prompt_index=batch.prompt_index)
-        # Padded-position zeroing for the conditioned stream (the
-        # conditioner may bias padded rows away from zero; decode
-        # masks by length, but captures and determinism want zeros).
-        fcol = torch.arange(out_width, device=device).view(1, -1, 1)
-        conditioned = torch.where(
-            fcol < enc_lengths.view(-1, 1, 1),
-            conditioned,
-            conditioned.new_zeros(()),
-        )
-        decode_in = DecodeState(
-            h=state.h.transpose(0, 1).contiguous(),
-            c=state.c.transpose(0, 1).contiguous(),
-            last_label=state.last_label.clone(),
-        )
-        # Extension callables receive writable tensors. Preserve an
-        # independent oracle before handing them over so an in-place decoder
-        # cannot rewrite the baseline used for no-emission/state checks.
-        decode_baseline = DecodeState(
-            h=decode_in.h.clone(),
-            c=decode_in.c.clone(),
-            last_label=decode_in.last_label.clone(),
-        )
+    with torch.no_grad():
+        with phase("port.encode"):
+            enc = stream_step(
+                # _GatheredCaches is StreamingCaches' structural twin over
+                # the gathered batch; stream_step reads only the shared
+                # .channel/.time/.valid surface (the now-deleted
+                # forward_step.py precedent, migration-proven bit-for-bit).
+                core.encoder,
+                mel,
+                caches,  # type: ignore[arg-type]
+                out_offsets=drop,
+                out_lengths=enc_lengths,
+                out_width=out_width,
+            )
+            # Row-wise language conditioning in ONE call: the
+            # conditioner takes the (B,) prompt tensor directly (no
+            # per-prompt fragmentation or host set construction).
+            conditioned = core.lid(enc, prompt_index=batch.prompt_index)
+            # Padded-position zeroing for the conditioned stream (the
+            # conditioner may bias padded rows away from zero; decode
+            # masks by length, but captures and determinism want zeros).
+            fcol = torch.arange(out_width, device=device).view(1, -1, 1)
+            conditioned = torch.where(
+                fcol < enc_lengths.view(-1, 1, 1),
+                conditioned,
+                conditioned.new_zeros(()),
+            )
         with phase("port.decode"):
+            decode_in = DecodeState(
+                h=state.h.transpose(0, 1).contiguous(),
+                c=state.c.transpose(0, 1).contiguous(),
+                last_label=state.last_label.clone(),
+            )
+            # Extension callables receive writable tensors. Preserve an
+            # independent oracle before handing them over so an in-place decoder
+            # cannot rewrite the baseline used for no-emission/state checks.
+            decode_baseline = DecodeState(
+                h=decode_in.h.clone(),
+                c=decode_in.c.clone(),
+                last_label=decode_in.last_label.clone(),
+            )
             decoded = decode_fn(
                 conditioned,
                 enc_lengths,
@@ -1603,14 +1598,9 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
         ("endpoint_residue_frames", plan.endpoint_residue_frames),
     ):
         if tensor.numel() and (
-            tensor.device.type != "cpu"
-            or tensor.dtype != torch.int64
-            or tensor.dim() != 1
-            or tensor.shape[0] != n_real
+            tensor.device.type != "cpu" or tensor.dtype != torch.int64 or tensor.dim() != 1 or tensor.shape[0] != n_real
         ):
-            raise ValueError(
-                f"plan.{name} must be empty or CPU int64 shaped ({n_real},)"
-            )
+            raise ValueError(f"plan.{name} must be empty or CPU int64 shaped ({n_real},)")
     live = plan.live_block_ids
     if live.device.type != "cpu" or live.dtype != torch.int64 or live.dim() != 1:
         raise ValueError("plan.live_block_ids must be rank-one CPU int64")
@@ -2276,11 +2266,7 @@ def advance_model_rows(
             eou_token_id,
         )
     )
-    if endpoint_enabled and (
-        endpoint_history_pool is None
-        or endpoint_book_pool is None
-        or eou_token_id is None
-    ):
+    if endpoint_enabled and (endpoint_history_pool is None or endpoint_book_pool is None or eou_token_id is None):
         raise ValueError("endpoint execution requires history, book, and EOU id")
     if endpoint_enabled and (
         endpoint_history_pool.dtype != torch.int32
@@ -2367,10 +2353,7 @@ def advance_model_rows(
     # downstream consumer (metrics, orchestrator) stays model-agnostic.
     cadence_labels = list(CADENCES)
     _stage_batch_stats(
-        [
-            (cadence_labels[geometry].removesuffix("ms"), int(positions.numel()))
-            for geometry, positions, _ in bucket_pos
-        ]
+        [(cadence_labels[geometry].removesuffix("ms"), int(positions.numel())) for geometry, positions, _ in bucket_pos]
     )
 
     # ---- small continuing-row gather + metadata-only fresh init ----
@@ -2391,29 +2374,17 @@ def advance_model_rows(
     queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
     counters_small = _gather_initialized_rows(frontend_counter_pool, didx, fresh_mask_cpu)
     endpoint_history = (
-        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
+        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu) if endpoint_enabled else None
     )
-    endpoint_book = (
-        _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
-    )
-    endpoint_mode_cpu = (
-        plan.endpoint_mode
-        if plan.endpoint_mode.numel()
-        else torch.zeros(n_real, dtype=torch.int64)
-    )
+    endpoint_book = _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu) if endpoint_enabled else None
+    endpoint_mode_cpu = plan.endpoint_mode if plan.endpoint_mode.numel() else torch.zeros(n_real, dtype=torch.int64)
     endpoint_threshold_cpu = (
         plan.endpoint_threshold_frames
         if plan.endpoint_threshold_frames.numel()
         else torch.zeros(n_real, dtype=torch.int64)
     )
     endpoint_residue_cpu = (
-        plan.endpoint_residue_frames
-        if plan.endpoint_residue_frames.numel()
-        else torch.zeros(n_real, dtype=torch.int64)
+        plan.endpoint_residue_frames if plan.endpoint_residue_frames.numel() else torch.zeros(n_real, dtype=torch.int64)
     )
     if (
         bool(((endpoint_mode_cpu != 0) & (endpoint_mode_cpu != 1)).any())
@@ -2455,9 +2426,7 @@ def advance_model_rows(
     if endpoint_enabled:
         assert eou_token_id is not None
         queued_value_valid |= queue == int(eou_token_id)
-    queued_bad = ((~queued_value_valid) & (slot < len_all.unsqueeze(1))).any(
-        dim=1
-    )
+    queued_bad = ((~queued_value_valid) & (slot < len_all.unsqueeze(1))).any(dim=1)
     prior_emitted = (
         queue.gather(
             1,
@@ -2532,20 +2501,10 @@ def advance_model_rows(
     forced_eou = torch.zeros_like(park_echo)
     if endpoint_enabled:
         assert eou_token_id is not None
-        forced_eou = (
-            (~is_chunk_dev)
-            & (~pending)
-            & (remaining == 0)
-            & (~finalized)
-            & (ids_dev == int(eou_token_id))
-        )
-    status |= (
-        (~is_chunk_dev)
-        & (~pending)
-        & ((remaining > 0) | (~finalized))
-        & (~park_echo)
-        & (~forced_eou)
-    ).to(torch.int32) * ROW_STATUS_SESSION_PROTOCOL
+        forced_eou = (~is_chunk_dev) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == int(eou_token_id))
+    status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized)) & (~park_echo) & (~forced_eou)).to(
+        torch.int32
+    ) * ROW_STATUS_SESSION_PROTOCOL
     status |= (book[:, BOOK_GEOMETRY].long() != plan_geom_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
     status |= (book[:, QUEUE_PROMPT].long() != prior_prompt_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
     status |= (book_bad | counter_bad).to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
@@ -2705,13 +2664,8 @@ def advance_model_rows(
                 observe_chunk_tensors,
             )
 
-            if (
-                result.frame_emission_counts is None
-                or result.frame_valid_lengths is None
-            ):
-                raise ValueError(
-                    "selected decode arm does not expose frame-aligned endpoint symbols"
-                )
+            if result.frame_emission_counts is None or result.frame_valid_lengths is None:
+                raise ValueError("selected decode arm does not expose frame-aligned endpoint symbols")
             assert endpoint_history is not None
             assert endpoint_book is not None
             endpoint_transition = observe_chunk_tensors(
@@ -2722,22 +2676,15 @@ def advance_model_rows(
                 token_ids=result.token_ids,
                 token_lengths=result.token_lengths,
                 final_tail=batch.final_tail.to(device),
-                mode=_h2d(
-                    endpoint_mode_cpu.index_select(0, pos_t), device
-                ),
-                threshold_frames=_h2d(
-                    endpoint_threshold_cpu.index_select(0, pos_t), device
-                ),
-                residue_frames=_h2d(
-                    endpoint_residue_cpu.index_select(0, pos_t), device
-                ),
+                mode=_h2d(endpoint_mode_cpu.index_select(0, pos_t), device),
+                threshold_frames=_h2d(endpoint_threshold_cpu.index_select(0, pos_t), device),
+                residue_frames=_h2d(endpoint_residue_cpu.index_select(0, pos_t), device),
                 eou_token_id=int(eou_token_id),
                 row_clean=result.row_status == 0,
             )
             assert result.row_status is not None
             endpoint_status = result.row_status | (
-                endpoint_transition.overflow.to(torch.int32)
-                * ROW_STATUS_DECODE_INVARIANT
+                endpoint_transition.overflow.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
             )
             result = AdvanceResult(
                 token_ids=endpoint_transition.token_ids,
@@ -2982,15 +2929,11 @@ def advance_model_rows(
     pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
     plast = pbook[:, QUEUE_LAST_LABEL].long()
     premaining = plen - phead
-    proposed_queue_value_valid = (projection.queue >= 0) & (
-        projection.queue < blank
-    )
+    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
     if endpoint_enabled:
         assert eou_token_id is not None
         proposed_queue_value_valid |= projection.queue == int(eou_token_id)
-    proposed_queued_bad = (
-        (~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))
-    ).any(dim=1)
+    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
     proposed_prior_emitted = (
         projection.queue.gather(
             1,
@@ -3011,9 +2954,7 @@ def advance_model_rows(
     proposed_expected_is_eou = torch.zeros_like(ppend)
     if endpoint_enabled:
         assert eou_token_id is not None
-        proposed_tail_is_eou = (plen > 0) & (
-            proposed_queue_last == int(eou_token_id)
-        )
+        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
         proposed_expected_is_eou = pexpected == int(eou_token_id)
     proposed_bad = (
         (phead < 0)
@@ -3028,11 +2969,7 @@ def advance_model_rows(
         | proposed_queued_bad
         | (ppend & (phead < 1))
         | (ppend & (pexpected != proposed_prior_emitted))
-        | (
-            (plen > 0)
-            & (~proposed_tail_is_eou)
-            & (plast != proposed_queue_last)
-        )
+        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
         | ((premaining > 0) & (~ppend))
         | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
         | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
@@ -3184,21 +3121,19 @@ def advance_model_rows(
             raise ValueError("commit sink returned a reservation without stage()")
         stage_reservation = stage_candidate
 
-    # ---- commit: prevalidated, allocation-free scatters only ----
+    # ---- commit: prevalidated, allocation-free scatters + no-fail stage ----
     # Every descriptor was already validated above (the complete-plan
     # pass); the commit window calls the private prevalidated
     # executor directly so no descriptor is re-validated here.
-    try:
-        with phase("port.scatter"):
+    with phase("port.scatter"):
+        try:
             for op in scatter_ops:
-                _execute_masked_page_scatter_(
-                    op.pool, op.scratch, op.blocks, op.row_status
-                )
-    except BaseException:
-        if cancel_reservation is not None:
-            cancel_reservation()
-        raise
-    # ---- ONE no-fail combined stage through the reserved ticket ----
-    if stage_reservation is not None:
-        stage_reservation(status)
+                _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+        except BaseException:
+            if cancel_reservation is not None:
+                cancel_reservation()
+            raise
+        # ---- ONE no-fail combined stage through the reserved ticket ----
+        if stage_reservation is not None:
+            stage_reservation(status)
     return projection_rows
