@@ -64,6 +64,11 @@ def _no_state_model() -> Any:
     object.__setattr__(model, "_emission_adapter", object())
     object.__setattr__(model, "_decode_resolver", object())
     object.__setattr__(model, "_decode_graph_binding", None)
+    object.__setattr__(
+        model,
+        "_encoder_execution",
+        SimpleNamespace(transition=object()),
+    )
     return model
 
 
@@ -188,6 +193,7 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     assert advance_kwargs["memory_profile"] is True
     assert advance_kwargs["commit_sink"] is None
     assert advance_kwargs["decode_resolver"] is model._decode_resolver
+    assert advance_kwargs["encoder_transition"] is model._encoder_execution.transition
 
 
 def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
@@ -265,8 +271,6 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     assert resolved.decode_fn is decode_dense_masked_frames
     assert resolved.override_reason == "pre-capture-memory-profile"
     assert captured["memory_profile"] is True
-
-
 def test_profile_execution_drains_stats_when_the_transition_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

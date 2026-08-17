@@ -56,6 +56,9 @@ from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        EncoderTransition,
+    )
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRCore,
     )
@@ -1033,6 +1036,7 @@ def advance_session(
     *,
     geometry: int,
     decode_fn: RnntDecodeFn,
+    encoder_transition: EncoderTransition | None = None,
     capture: bool = False,
     row_status: torch.Tensor | None = None,
 ) -> AdvanceResult:
@@ -1080,6 +1084,9 @@ def advance_session(
             profile; startup then builds a dispatch table keyed by
             geometry, padded batch tier, and execution/precision
             profile, and passes the selected callable per bucket.
+        encoder_transition: optional startup-bound execution mechanism for
+            the exact encoder+conditioning transition. ``None`` executes
+            the eager reference directly (unit probes and compatibility).
         capture: the explicit capture policy (PORT-HOOK-001). OFF by
             default: performance runs return ``captures=None`` with no
             capture-only allocations and no extended lifetime for the
@@ -1103,8 +1110,8 @@ def advance_session(
         ValueError: if ``geometry`` is not an admitted geometry id
             (a host configuration error, not a row condition).
     """
-    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
-        stream_step,
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        execute_encoder_transition,
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
         CTR_COMMITTED_MEL_FRAMES,
@@ -1220,31 +1227,25 @@ def advance_session(
     caches = _GatheredCaches(state)
     with torch.no_grad():
         with phase("port.encode"):
-            enc = stream_step(
-                # _GatheredCaches is StreamingCaches' structural twin over
-                # the gathered batch; stream_step reads only the shared
-                # .channel/.time/.valid surface (the now-deleted
-                # forward_step.py precedent, migration-proven bit-for-bit).
-                core.encoder,
-                mel,
-                caches,  # type: ignore[arg-type]
-                out_offsets=drop,
-                out_lengths=enc_lengths,
-                out_width=out_width,
-            )
-            # Row-wise language conditioning in ONE call: the
-            # conditioner takes the (B,) prompt tensor directly (no
-            # per-prompt fragmentation or host set construction).
-            conditioned = core.lid(enc, prompt_index=batch.prompt_index)
-            # Padded-position zeroing for the conditioned stream (the
-            # conditioner may bias padded rows away from zero; decode
-            # masks by length, but captures and determinism want zeros).
-            fcol = torch.arange(out_width, device=device).view(1, -1, 1)
-            conditioned = torch.where(
-                fcol < enc_lengths.view(-1, 1, 1),
-                conditioned,
-                conditioned.new_zeros(()),
-            )
+            if encoder_transition is None:
+                enc, conditioned = execute_encoder_transition(
+                    core,
+                    mel,
+                    caches,
+                    drop,
+                    enc_lengths,
+                    out_width,
+                    batch.prompt_index,
+                )
+            else:
+                enc, conditioned = encoder_transition(
+                    mel,
+                    caches,
+                    drop,
+                    enc_lengths,
+                    out_width,
+                    batch.prompt_index,
+                )
         with phase("port.decode"):
             decode_in = DecodeState(
                 h=state.h.transpose(0, 1).contiguous(),
@@ -2168,6 +2169,7 @@ def advance_model_rows(
     eou_token_id: int | None = None,
     adapter: EmissionAdapter,
     decode_resolver: DecodeResolver,
+    encoder_transition: EncoderTransition | None = None,
     placeholder_id: int,
     park_id: int,
     commit_sink: CommitSink | None = None,
@@ -2668,6 +2670,7 @@ def advance_model_rows(
             state,
             geometry=g,
             decode_fn=resolved.decode_fn,
+            encoder_transition=encoder_transition,
             capture=capture_on,
             row_status=incoming,
         )
