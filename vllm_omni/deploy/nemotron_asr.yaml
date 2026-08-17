@@ -12,3 +12,4 @@ stages:
     persistent_state:
       persistent_state_admission_policy: hard_cap
       persistent_state_admission_retry_floor_ms: 100
+      persistent_state_max_tombstones: 256

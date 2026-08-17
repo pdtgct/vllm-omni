@@ -321,6 +321,7 @@ class PersistentStateDeployConfig:
 
     persistent_state_admission_policy: str
     persistent_state_admission_retry_floor_ms: int | None = None
+    persistent_state_max_tombstones: int | None = None
     persistent_state_service_profile_trailing_rounds: int | None = None
     persistent_state_startup_priming_round_timeout_s: float | None = None
     persistent_state_startup_priming_timeout_s: float | None = None
@@ -352,6 +353,13 @@ class PersistentStateDeployConfig:
             or self.persistent_state_admission_retry_floor_ms <= 0
         ):
             raise ValueError("persistent_state_admission_retry_floor_ms must be a positive integer")
+        if self.persistent_state_max_tombstones is not None and (
+            not isinstance(self.persistent_state_max_tombstones, int)
+            or self.persistent_state_max_tombstones <= 0
+        ):
+            raise ValueError(
+                "persistent_state_max_tombstones must be a positive integer"
+            )
 
         profile_values = {key: getattr(self, key) for key in _PERSISTENT_STATE_PROFILE_KEYS}
         if self.persistent_state_admission_policy == "hard_cap":
