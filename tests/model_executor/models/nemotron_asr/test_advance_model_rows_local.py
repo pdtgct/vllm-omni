@@ -46,6 +46,7 @@ def _load_chain() -> dict[str, Any]:
         "masks",
         "featurizer",
         "encoder",
+        "encoder_execution",
         "lid",
         "manifests",
         "frontend",

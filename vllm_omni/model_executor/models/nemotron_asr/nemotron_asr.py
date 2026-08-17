@@ -48,6 +48,9 @@ from vllm_omni.model_executor.models.nemotron_asr.decode_dispatch import (
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     FastConformerEncoder,
 )
+from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+    build_encoder_execution,
+)
 from vllm_omni.model_executor.models.nemotron_asr.featurizer import (
     MelFeaturizer,
 )
@@ -370,6 +373,7 @@ class NemotronASRForRNNT(nn.Module):
             blank_id=self.core.blank_id,
         )
         self._decode_resolver = build_decode_resolver(hf_config)
+        self._encoder_execution = build_encoder_execution(self.core, hf_config)
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
@@ -789,6 +793,7 @@ class NemotronASRForRNNT(nn.Module):
             eou_token_id=int(self.config.eou_token_id),
             adapter=self._emission_adapter,
             decode_resolver=self._decode_resolver,
+            encoder_transition=self._encoder_execution.transition,
             placeholder_id=int(self.config.audio_chunk_token_id),
             park_id=int(self.config.eos_token_id),
             commit_sink=self._ensure_commit_sink(inputs_embeds.device),

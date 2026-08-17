@@ -42,6 +42,7 @@ def _load_chain() -> dict[str, Any]:
         "masks",
         "featurizer",
         "encoder",
+        "encoder_execution",
         "lid",
         "manifests",
         "frontend",
@@ -231,6 +232,71 @@ def test_encode_phase_exits_before_decode_phase_enters(
     _advance(core, _chunk(torch.randn(1, CHUNK) * 0.1, seq=0), state)
 
     assert events.index("port.encode:exit") < events.index("port.decode:enter")
+
+
+def test_static_fullgraph_encoder_transition_matches_eager_exactly() -> None:
+    # @spec PORT-PERF-009
+    # The production candidate uses Inductor, but this contract is
+    # backend-independent: Dynamo must capture the real cache-mutating
+    # transition as one full static graph, and that graph must preserve every
+    # observable tensor and resident-state write exactly. ``backend="eager"``
+    # keeps this CPU gate independent of a platform compiler toolchain.
+    core = _core()
+    torch.manual_seed(20)
+    batch = _chunk(torch.randn(1, CHUNK) * 0.1, seq=0)
+    eager_state = _fresh_state(1)
+    graph_state = _fresh_state(1)
+
+    eager = _advance(core, batch, eager_state, capture=True)
+    encoder_execution = mods["encoder_execution"]
+
+    def transition(*args: Any) -> Any:
+        return encoder_execution.execute_encoder_transition(core, *args)
+
+    fullgraph = torch.compile(
+        transition,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    graphed = _advance(
+        core,
+        batch,
+        graph_state,
+        encoder_transition=fullgraph,
+        capture=True,
+    )
+
+    for field in (
+        "token_ids",
+        "token_lengths",
+        "row_valid",
+        "row_status",
+        "frame_emission_counts",
+        "frame_final_labels",
+        "frame_valid_lengths",
+    ):
+        torch.testing.assert_close(
+            getattr(graphed, field),
+            getattr(eager, field),
+            rtol=0,
+            atol=0,
+        )
+    assert eager.captures is not None and graphed.captures is not None
+    for field in (
+        "frontend_mel",
+        "mel_lengths",
+        "encoder_raw",
+        "encoder_conditioned",
+        "encoder_lengths",
+    ):
+        torch.testing.assert_close(
+            getattr(graphed.captures, field),
+            getattr(eager.captures, field),
+            rtol=0,
+            atol=0,
+        )
+    _assert_row_unchanged(graph_state, 0, _row_clone(eager_state, 0))
 
 
 def test_session_first_chunk_advances_and_captures() -> None:
