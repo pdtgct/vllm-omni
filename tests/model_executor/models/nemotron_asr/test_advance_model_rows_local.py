@@ -2742,6 +2742,46 @@ def test_commit_loop_never_revalidates_a_prevalidated_descriptor(
     assert counts["n"] == expected_descriptors
 
 
+def test_reservation_stage_occurs_before_scatter_phase_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-003, PORT-HOOK-001, PORT-PERF-007
+    events: list[str] = []
+
+    class _RecordedPhase:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def __enter__(self) -> None:
+            events.append(f"{self._name}:enter")
+
+        def __exit__(self, *_args: Any) -> None:
+            events.append(f"{self._name}:exit")
+
+    monkeypatch.setattr(advance, "phase", _RecordedPhase)
+    core = _tiny_core()
+    pools = _fresh_pools()
+    sink = _CommitRecorder()
+    sink.on_stage = lambda: events.append("reservation:stage")
+    torch.manual_seed(5)
+    carrier = _envelope(
+        torch.randn(REG_SAMPLES) * 0.01,
+        final=False,
+        seq=0,
+    ).unsqueeze(0)
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1]),
+        commit_sink=sink,
+    )
+
+    assert events.index("port.scatter:enter") < events.index("reservation:stage")
+    assert events.index("reservation:stage") < events.index("port.scatter:exit")
+
+
 def test_burst_overflow_is_rejected_not_truncated() -> None:
     # A decode returning more labels than the queue holds is a port
     # defect: the row masks with BURST_OVERFLOW and nothing scatters —

@@ -208,6 +208,31 @@ def _advance(core: Any, batch: Any, state: Any, **kw: Any) -> Any:
     return advance.advance_session(core, batch, state, geometry=GEOMETRY_1120, **kw)
 
 
+def test_encode_phase_exits_before_decode_phase_enters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-ADV-001, PORT-PERF-007
+    events: list[str] = []
+
+    class _RecordedPhase:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def __enter__(self) -> None:
+            events.append(f"{self._name}:enter")
+
+        def __exit__(self, *_args: Any) -> None:
+            events.append(f"{self._name}:exit")
+
+    monkeypatch.setattr(advance, "phase", _RecordedPhase)
+    core = _core()
+    state = _fresh_state(1)
+    torch.manual_seed(20)
+    _advance(core, _chunk(torch.randn(1, CHUNK) * 0.1, seq=0), state)
+
+    assert events.index("port.encode:exit") < events.index("port.decode:enter")
+
+
 def test_session_first_chunk_advances_and_captures() -> None:
     # @spec PORT-ADV-001
     # The canonical transition, exercised: session-first 1120 ms chunk
