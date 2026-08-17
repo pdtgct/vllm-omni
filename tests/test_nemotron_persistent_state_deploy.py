@@ -189,10 +189,12 @@ class TestNemotronPersistentStateDeploy:
         (
             "      null",
             "      persistent_state_unknown_key: 1",
+            "      persistent_state_admission_policy: hard_cap\n"
+            "      persistent_state_max_tombstones: 0",
             "      persistent_state_admission_policy: profile\n"
             "      persistent_state_service_profile_trailing_rounds: 3",
         ),
-        ids=("null", "unknown", "partial"),
+        ids=("null", "unknown", "tombstones", "partial"),
     )
     def test_invalid_persistent_state_profile_fails_closed(
         self,
@@ -222,6 +224,7 @@ class TestNemotronPersistentStateDeploy:
 
         assert stage.yaml_engine_args["max_num_seqs"] == 8
         assert additional["persistent_state_admission_policy"] == "hard_cap"
+        assert additional["persistent_state_max_tombstones"] == 256
         assert not _PROFILE_ONLY_KEYS & additional.keys()
 
     def test_missing_packaged_nemotron_deploy_has_no_generic_fallback(
