@@ -63,6 +63,7 @@ def _no_state_model() -> Any:
     object.__setattr__(model, "core", object())
     object.__setattr__(model, "_emission_adapter", object())
     object.__setattr__(model, "_decode_resolver", object())
+    object.__setattr__(model, "_profile_decode_resolver", object())
     return model
 
 
@@ -185,6 +186,7 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     )
     assert advance_kwargs["capture"] is False
     assert advance_kwargs["commit_sink"] is None
+    assert advance_kwargs["decode_resolver"] is model._profile_decode_resolver
 
 
 def test_profile_execution_drains_stats_when_the_transition_fails(

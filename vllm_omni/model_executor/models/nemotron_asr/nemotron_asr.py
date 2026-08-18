@@ -407,6 +407,7 @@ class NemotronASRForRNNT(nn.Module):
             hf_config,
             graph_binding=self._decode_graph_binding,
         )
+        self._profile_decode_resolver = build_profile_decode_resolver(hf_config)
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
 
@@ -968,5 +969,35 @@ def build_decode_resolver(
                 override_reason="multi-bucket-serialization-guard",
             )
         return ResolvedDecode(arm=arm, decode_fn=arms[arm])
+
+    return resolve
+
+
+# @spec PORT-PERF-004
+def build_profile_decode_resolver(hf_config: Any) -> DecodeResolver:
+    """Resolve the disposable memory profile before regional capture."""
+
+    arm = getattr(hf_config, "decode_dispatch_arm", None)
+    if arm != "dense-graphed":
+        return build_decode_resolver(hf_config)
+    if getattr(hf_config, "decode_dispatch_table", None):
+        raise ValueError(
+            "declare decode_dispatch_arm OR decode_dispatch_table, not both"
+        )
+
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    def resolve(request: DecodeRequest) -> ResolvedDecode:
+        if request.graph_covers_decode:
+            raise ValueError(
+                "pre-capture memory profile cannot claim graph coverage"
+            )
+        return ResolvedDecode(
+            arm="dense-eager",
+            decode_fn=decode_dense_masked_frames,
+            override_reason="pre-capture-memory-profile",
+        )
 
     return resolve

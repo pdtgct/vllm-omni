@@ -231,7 +231,7 @@ def run_persistent_state_profile(
             endpoint_book_pool=pools.endpoint_book,
             eou_token_id=_required_control(model.config, "eou_token_id"),
             adapter=model._emission_adapter,
-            decode_resolver=model._decode_resolver,
+            decode_resolver=model._profile_decode_resolver,
             placeholder_id=_required_control(
                 model.config,
                 "audio_chunk_token_id",
