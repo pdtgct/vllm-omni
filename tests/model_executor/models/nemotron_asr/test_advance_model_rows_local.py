@@ -665,8 +665,8 @@ def test_fresh_binding_cannot_authorize_prompt_transition() -> None:
     _assert_pools_equal(pools, before)
 
 
-# @spec PORT-DEC-008, PORT-STATE-007
-def test_graph_covered_call_rejects_before_resolver_or_resident_read(
+# @spec PORT-ADV-003, PORT-DEC-008, PORT-PERF-004, PORT-STATE-007
+def test_regional_graph_resolves_before_resident_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     core = _tiny_core()
@@ -674,18 +674,27 @@ def test_graph_covered_call_rejects_before_resolver_or_resident_read(
     before = _clone_pools(pools)
     events: list[str] = []
     original = torch.Tensor.index_select
+    resident_tensors = {
+        id(tensor)
+        for value in pools.values()
+        for tensor in (value if isinstance(value, list) else [value])
+        if isinstance(tensor, torch.Tensor)
+    }
 
     def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
-        events.append("read")
+        if id(tensor) in resident_tensors:
+            events.append("read")
         return original(tensor, dim, index)
 
     monkeypatch.setattr(torch.Tensor, "index_select", observed)
 
-    def resolver(_request: Any) -> Any:
+    def resolver(request: Any) -> Any:
         events.append("resolve")
-        return advance.ResolvedDecode("dense-graphed", rnnt.decode_dense_masked)
+        assert request.graph_covers_decode is True
+        assert request.execution_batch_size == 1
+        raise RuntimeError("graph resolved")
 
-    with pytest.raises(ValueError, match="graph-covered"):
+    with pytest.raises(RuntimeError, match="graph resolved"):
         _call(
             core,
             pools,
@@ -696,7 +705,7 @@ def test_graph_covered_call_rejects_before_resolver_or_resident_read(
             resolver=resolver,
             graph_covers_decode=True,
         )
-    assert events == []
+    assert events == ["resolve"]
     _assert_pools_equal(pools, before)
 
 
@@ -3158,17 +3167,18 @@ def test_table_resolver_bracket_disagreement_takes_sync_free() -> None:
     assert got.arm == "dense-eager"
 
 
-def test_table_resolver_graph_coverage_fails_closed() -> None:
+def test_table_resolver_graph_coverage_structurally_selects_dense_graph() -> None:
     resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
-    with pytest.raises(ValueError, match="exact padded runner"):
-        resolver(
-            advance.DecodeRequest(
-                geometry=0,
-                execution_batch_size=512,
-                graph_covers_decode=True,
-                ready_decode_buckets=1,
-            )
+    resolved = resolver(
+        advance.DecodeRequest(
+            geometry=0,
+            execution_batch_size=512,
+            graph_covers_decode=True,
+            ready_decode_buckets=1,
         )
+    )
+    assert resolved.arm == "dense-graphed"
+    assert resolved.decode_fn is _arms()["dense-graphed"]
 
 
 def test_table_resolver_multi_bucket_forces_sync_free() -> None:

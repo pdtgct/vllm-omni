@@ -74,9 +74,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         sampler. Preserve core's model-neutral kernel warmup and operational
         postamble while omitting only that incompatible synthetic-request pass.
 
-        This specialization is intentionally limited to the already-enforced
-        eager, non-compiled lane. A future execution-mode expansion must first
-        qualify the corresponding core warmup/capture behavior.
+        This specialization keeps the outer runner eager and non-compiled.
+        A model-owned warmup hook may capture a qualified fixed-shape
+        subregion (for example, the Nemotron dense decoder) before this worker
+        attests readiness; that does not change the outer execution contract.
         """
 
         # @spec PORT-ADV-003, ENV-MIG-012

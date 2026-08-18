@@ -317,9 +317,10 @@ class RowPlan:
     the scheduler's absolute ready deadline for each selected CHUNK;
     non-CHUNK rows carry zero. Buckets execute by their earliest
     selected-row deadline, never enum/geometry order.
-    ``execution_tier``: the engine's padded decode execution tier
-    under a graph-covered profile; 0 for eager profiles, where the
-    live bucket size IS the execution size (PORT-DEC-008 as amended).
+    ``execution_tier``: the engine's padded decode execution-tier
+    ceiling under a graph-covered profile; 0 for eager profiles, where
+    the live bucket size IS the execution size (PORT-DEC-008 as
+    amended).
     ``bindings``: one immutable :class:`PreparedRowBinding` per real
     row, minted atomically by the provider from registry + scheduler
     authority. Preflight requires the composed block and every parallel
@@ -461,22 +462,26 @@ class DecodeRequest:
     transaction seams).
 
     ``geometry``: the bucket's admitted geometry id.
-    ``execution_batch_size``: the size decode actually EXECUTES at —
-    the live bucket size under eager profiles (eager buckets are
-    unpadded, so live equals execution) and the engine's padded tier
-    under graph coverage (PORT-DEC-008 as amended).
+    ``execution_batch_size``: the live size of this geometry bucket.
+    Eager profiles execute it directly; a regional graph resolver maps
+    it to the smallest captured tier not smaller than the live size.
     ``graph_covers_decode``: invocation-specific graph coverage; a
     covering graph structurally forces the capture-eligible arm.
     ``ready_decode_buckets``: decode buckets ready in this engine
     iteration — the multi-bucket compact-override input (the dispatch
     record's step-4 obligation: compact's occupancy-1.000 host lock is
     priced for single buckets only).
+    ``execution_tier_limit``: the RowPlan's graph-tier authority for
+    this invocation. The binding selects the smallest captured tier
+    for the bucket and must not exceed this ceiling. Eager requests
+    carry zero.
     """
 
     geometry: int
     execution_batch_size: int
     graph_covers_decode: bool
     ready_decode_buckets: int
+    execution_tier_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -516,8 +521,8 @@ def make_table_resolver(
     into a dense lookup, with one aggregate log line per geometry
     instead of per-lookup warnings. The returned resolver then:
 
-    - fails closed whenever the outer invocation's engine graph covers
-      decode, until the runner provides exact padded row authority;
+    - structurally selects the capture-eligible arm whenever the
+      invocation's regional graph covers decode;
     - forces the sync-free eager arm whenever more than one decode
       bucket is ready in the iteration (the multi-bucket override),
       recording ``override_reason`` for telemetry;
@@ -595,8 +600,10 @@ def make_table_resolver(
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
-            raise ValueError(
-                "graph-covered decode requires exact padded runner authority; the Phase 6c resolver is eager-only"
+            return ResolvedDecode(
+                arm="dense-graphed",
+                decode_fn=arms["dense-graphed"],
+                override_reason="regional-graph-coverage",
             )
         batch = min(max(request.execution_batch_size, 1), max_batch)
         arm = compiled_t[request.geometry][batch]
@@ -2206,12 +2213,12 @@ def advance_model_rows(
     hidden = int(inputs_embeds.shape[1])
     device = inputs_embeds.device
     idx_cpu = _structural_preflight(plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0]))
-    if graph_covers_decode:
+    has_chunk = bool(plan.is_chunk.any())
+    if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
         raise ValueError(
-            "graph-covered outer decode is rejected until exact runner "
-            "padding is implemented and pod-qualified (PORT-DEC-008)"
+            "regional graph decode requires a positive RowPlan execution tier"
         )
-    if plan.execution_tier != 0:
+    if not graph_covers_decode and plan.execution_tier != 0:
         raise ValueError("eager execution requires plan.execution_tier == 0")
     if capture and commit_sink is None:
         raise ValueError("capture requires a composite commit sink")
@@ -2335,8 +2342,9 @@ def advance_model_rows(
             DecodeRequest(
                 geometry=geometry,
                 execution_batch_size=live,
-                graph_covers_decode=False,
+                graph_covers_decode=graph_covers_decode,
                 ready_decode_buckets=ready,
+                execution_tier_limit=plan.execution_tier,
             )
         )
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
