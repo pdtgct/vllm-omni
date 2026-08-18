@@ -242,6 +242,47 @@ def test_served_dense_graph_arm_requires_binding_and_resolves_exact_key() -> Non
 
 
 # @spec PORT-PERF-004
+def test_dense_graph_memory_profile_uses_canonical_dense_eager_resolver() -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.advance import (
+        DecodeRequest,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        build_decode_resolver,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    config = SimpleNamespace(
+        decode_dispatch_arm="dense-graphed",
+        decode_dispatch_table=None,
+    )
+
+    class Binding:
+        def execution_tier(self, live_rows: int) -> int:
+            raise AssertionError("profile must not consult captured tiers")
+
+        def decode_fn(self, *, geometry: int, tier: int):
+            raise AssertionError("profile must not bind a graph key")
+
+    resolver = build_decode_resolver(config, graph_binding=Binding())
+    resolved = resolver(
+        DecodeRequest(
+            geometry=4,
+            execution_batch_size=4,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
+            execution_tier_limit=0,
+            memory_profile=True,
+        )
+    )
+
+    assert resolved.arm == "dense-eager"
+    assert resolved.decode_fn is decode_dense_masked_frames
+    assert resolved.override_reason == "pre-capture-memory-profile"
+
+
+# @spec PORT-PERF-004
 def test_served_dense_graph_arm_selects_smallest_tier_within_plan_ceiling() -> None:
     from vllm_omni.model_executor.models.nemotron_asr.advance import (
         DecodeRequest,

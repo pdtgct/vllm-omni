@@ -378,6 +378,7 @@ def _call(
     commit_sink: Any = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    memory_profile: bool = False,
     staging: Any = None,
 ) -> torch.Tensor:
     if adapter is None:
@@ -398,6 +399,7 @@ def _call(
         commit_sink=commit_sink,
         capture=capture,
         graph_covers_decode=graph_covers_decode,
+        memory_profile=memory_profile,
         staging=staging,
         **pools,
     )
@@ -704,6 +706,73 @@ def test_regional_graph_resolves_before_resident_read(
             _refuse_adapter,
             resolver=resolver,
             graph_covers_decode=True,
+        )
+    assert events == ["resolve"]
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-PERF-004
+def test_memory_profile_purpose_reaches_resolver_before_resident_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    events: list[str] = []
+    original = torch.Tensor.index_select
+    resident_tensors = {
+        id(tensor)
+        for value in pools.values()
+        for tensor in (value if isinstance(value, list) else [value])
+        if isinstance(tensor, torch.Tensor)
+    }
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        if id(tensor) in resident_tensors:
+            events.append("read")
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        build_decode_resolver,
+    )
+
+    class Binding:
+        def execution_tier(self, live_rows: int) -> int:
+            raise AssertionError("profile must not consult captured tiers")
+
+        def decode_fn(self, *, geometry: int, tier: int):
+            raise AssertionError("profile must not bind a graph key")
+
+    canonical = build_decode_resolver(
+        SimpleNamespace(
+            decode_dispatch_arm="dense-graphed",
+            decode_dispatch_table=None,
+        ),
+        graph_binding=Binding(),
+    )
+
+    def resolver(request: Any) -> Any:
+        events.append("resolve")
+        assert request.memory_profile is True
+        assert request.graph_covers_decode is False
+        assert request.execution_tier_limit == 0
+        resolved = canonical(request)
+        assert resolved.arm == "dense-eager"
+        assert resolved.override_reason == "pre-capture-memory-profile"
+        raise RuntimeError("profile resolved")
+
+    with pytest.raises(RuntimeError, match="profile resolved"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            _plan(prefills=[1]),
+            _refuse_adapter,
+            resolver=resolver,
+            memory_profile=True,
         )
     assert events == ["resolve"]
     _assert_pools_equal(pools, before)

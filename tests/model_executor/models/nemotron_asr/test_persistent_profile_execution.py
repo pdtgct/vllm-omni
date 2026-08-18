@@ -185,6 +185,7 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
         invocation.plan,
     )
     assert advance_kwargs["capture"] is False
+    assert advance_kwargs["memory_profile"] is True
     assert advance_kwargs["commit_sink"] is None
     assert advance_kwargs["decode_resolver"] is model._decode_resolver
 
@@ -194,8 +195,6 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
 ) -> None:
     # @spec PORT-PERF-004
     profile = _profile_module()
-    advance = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.advance")
-    rnnt = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.rnnt")
     invocation = SimpleNamespace(
         input_ids=torch.zeros(1, dtype=torch.long),
         inputs_embeds=torch.zeros(1, 7),
@@ -228,7 +227,8 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     )
     monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
     model = _no_state_model()
-    object.__setattr__(model, "_decode_graph_binding", object())
+    canonical_resolver = object()
+    object.__setattr__(model, "_decode_resolver", canonical_resolver)
 
     profile.run_persistent_state_profile(
         model,
@@ -236,18 +236,8 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
         device=torch.device("cpu"),
     )
 
-    resolved = captured["decode_resolver"](
-        advance.DecodeRequest(
-            geometry=4,
-            execution_batch_size=1,
-            graph_covers_decode=False,
-            ready_decode_buckets=1,
-            execution_tier_limit=0,
-        )
-    )
-    assert resolved.arm == "dense-eager"
-    assert resolved.decode_fn is rnnt.decode_dense_masked_frames
-    assert resolved.override_reason == "pre-capture-memory-profile"
+    assert captured["decode_resolver"] is canonical_resolver
+    assert captured["memory_profile"] is True
 
 
 def test_profile_execution_drains_stats_when_the_transition_fails(

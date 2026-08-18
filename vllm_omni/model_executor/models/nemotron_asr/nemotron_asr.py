@@ -874,6 +874,7 @@ class NemotronASRForRNNT(nn.Module):
         return NemotronASRModelState
 
 
+# @spec PORT-DEC-008, PORT-PERF-004
 def build_decode_resolver(
     hf_config: Any,
     *,
@@ -935,6 +936,16 @@ def build_decode_resolver(
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if arm == "dense-graphed":
+            if request.memory_profile:
+                if request.graph_covers_decode:
+                    raise ValueError(
+                        "pre-capture memory profile cannot claim graph coverage"
+                    )
+                return ResolvedDecode(
+                    arm="dense-eager",
+                    decode_fn=arms["dense-eager"],
+                    override_reason="pre-capture-memory-profile",
+                )
             if not request.graph_covers_decode:
                 raise ValueError(
                     "dense-graphed dispatch requires regional graph coverage"

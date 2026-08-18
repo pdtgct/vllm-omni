@@ -475,6 +475,9 @@ class DecodeRequest:
     this invocation. The binding selects the smallest captured tier
     for the bucket and must not exceed this ceiling. Eager requests
     carry zero.
+    ``memory_profile``: this bucket belongs to the disposable
+    pre-capture activation-memory profile. The served resolver uses
+    the same dense decoder eagerly without claiming graph coverage.
     """
 
     geometry: int
@@ -482,6 +485,7 @@ class DecodeRequest:
     graph_covers_decode: bool
     ready_decode_buckets: int
     execution_tier_limit: int = 0
+    memory_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -2083,7 +2087,7 @@ def consume_batch_stats() -> list[tuple[str, int]] | None:
 
 
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
-# @spec PORT-PERF-001, PORT-STATE-007, PORT-STATE-008
+# @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(
     core: NemotronASRCore,
     input_ids: torch.Tensor,
@@ -2110,6 +2114,7 @@ def advance_model_rows(
     commit_sink: CommitSink | None = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    memory_profile: bool = False,
     staging: HostStaging | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
@@ -2220,6 +2225,10 @@ def advance_model_rows(
         )
     if not graph_covers_decode and plan.execution_tier != 0:
         raise ValueError("eager execution requires plan.execution_tier == 0")
+    if memory_profile and graph_covers_decode:
+        raise ValueError("memory profile cannot claim graph coverage")
+    if memory_profile and capture:
+        raise ValueError("memory profile cannot publish capture records")
     if capture and commit_sink is None:
         raise ValueError("capture requires a composite commit sink")
     lookaheads = [right for (_, right) in CADENCES.values()]
@@ -2345,6 +2354,7 @@ def advance_model_rows(
                 graph_covers_decode=graph_covers_decode,
                 ready_decode_buckets=ready,
                 execution_tier_limit=plan.execution_tier,
+                memory_profile=memory_profile,
             )
         )
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):

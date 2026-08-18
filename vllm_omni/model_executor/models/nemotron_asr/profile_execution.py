@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -19,10 +19,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ENV_VALID_SAMPLES,
     ENV_VERSION,
     ENVELOPE_VERSION,
-    DecodeRequest,
-    DecodeResolver,
     PreparedRowBinding,
-    ResolvedDecode,
     RowPlan,
     advance_model_rows,
     consume_batch_stats,
@@ -73,29 +70,6 @@ def _required_control(config: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"profile execution requires integer {name}")
     return value
-
-
-# @spec PORT-PERF-004
-def _profile_decode_resolver(model: Any) -> DecodeResolver:
-    """Resolve profiling from current graph-binding state, not served dispatch."""
-
-    if getattr(model, "_decode_graph_binding", None) is None:
-        return cast(DecodeResolver, model._decode_resolver)
-
-    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
-        decode_dense_masked_frames,
-    )
-
-    def resolve(request: DecodeRequest) -> ResolvedDecode:
-        if request.graph_covers_decode:
-            raise ValueError("pre-capture memory profile cannot claim graph coverage")
-        return ResolvedDecode(
-            arm="dense-eager",
-            decode_fn=decode_dense_masked_frames,
-            override_reason="pre-capture-memory-profile",
-        )
-
-    return resolve
 
 
 # @spec PORT-MIG-005, PORT-STATE-003, PORT-STATE-007
@@ -203,7 +177,7 @@ def build_profile_invocation(
     )
 
 
-# @spec PORT-ADV-001, PORT-MIG-003, PORT-MIG-005
+# @spec PORT-ADV-001, PORT-MIG-003, PORT-MIG-005, PORT-PERF-004
 def run_persistent_state_profile(
     model: Any,
     *,
@@ -257,7 +231,7 @@ def run_persistent_state_profile(
             endpoint_book_pool=pools.endpoint_book,
             eou_token_id=_required_control(model.config, "eou_token_id"),
             adapter=model._emission_adapter,
-            decode_resolver=_profile_decode_resolver(model),
+            decode_resolver=model._decode_resolver,
             placeholder_id=_required_control(
                 model.config,
                 "audio_chunk_token_id",
@@ -265,6 +239,7 @@ def run_persistent_state_profile(
             park_id=_required_control(model.config, "eos_token_id"),
             commit_sink=None,
             capture=False,
+            memory_profile=True,
             staging=None,
         )
     finally:
