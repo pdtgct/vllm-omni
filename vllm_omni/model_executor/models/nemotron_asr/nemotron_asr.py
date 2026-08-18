@@ -378,12 +378,25 @@ class NemotronASRForRNNT(nn.Module):
                 execution_tiers,
             )
 
+            supported = getattr(
+                hf_config,
+                "supported_num_lookahead_tokens",
+                None,
+            )
+            served_lookaheads = (
+                {right for _, right in CADENCES.values()}
+                if supported is None
+                else {int(value) for value in supported}
+            )
             self._decode_graph_binding = DenseGraphBinding(
                 decode_fn=decode_dense_masked_frames,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
                 vllm_config=vllm_config,
-                frame_widths=tuple(right + 1 for _, right in CADENCES.values()),
+                frame_widths=tuple(
+                    right + 1 if right in served_lookaheads else None
+                    for _, right in CADENCES.values()
+                ),
                 tiers=execution_tiers(self._max_num_seqs),
                 encoder_hidden=int(hf_config.d_model),
                 predictor_layers=int(hf_config.pred_rnn_layers),

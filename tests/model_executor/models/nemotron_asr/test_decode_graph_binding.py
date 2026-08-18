@@ -115,6 +115,30 @@ def test_warmup_captures_every_geometry_tier_and_runtime_rejects_unknown_key() -
         binding.decode_fn(geometry=2, tier=4)
 
 
+# @spec PORT-PERF-004
+def test_warmup_captures_only_served_geometries_with_stable_ids() -> None:
+    _, decode = _decode_calls()
+    binding = DenseGraphBinding(
+        decode_fn=decode,
+        predictor=object(),
+        joint=object(),
+        vllm_config=object(),
+        frame_widths=(1, None, 4),
+        tiers=(1, 2),
+        encoder_hidden=3,
+        predictor_layers=2,
+        predictor_hidden=5,
+        blank_id=7,
+        runtime=_runtime(),
+    )
+
+    binding.warmup(torch.device("cpu"), torch.float32)
+
+    assert binding.captured_keys == ((0, 1), (0, 2), (2, 1), (2, 2))
+    with pytest.raises(ValueError, match="uncaptured dense graph"):
+        binding.decode_fn(geometry=1, tier=1)
+
+
 # @spec PORT-ADV-003, PORT-PERF-004
 def test_runtime_pads_with_zero_lengths_and_returns_only_live_rows() -> None:
     calls, decode = _decode_calls()

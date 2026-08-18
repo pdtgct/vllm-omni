@@ -123,7 +123,7 @@ class DenseGraphBinding:
         predictor: Any,
         joint: Any,
         vllm_config: Any,
-        frame_widths: tuple[int, ...],
+        frame_widths: tuple[int | None, ...],
         tiers: tuple[int, ...],
         encoder_hidden: int,
         predictor_layers: int,
@@ -131,8 +131,12 @@ class DenseGraphBinding:
         blank_id: int,
         runtime: GraphRuntime | None = None,
     ) -> None:
-        if not frame_widths or any(value <= 0 for value in frame_widths):
-            raise ValueError("decode graph frame widths must be positive")
+        if (
+            not frame_widths
+            or not any(value is not None for value in frame_widths)
+            or any(value is not None and value <= 0 for value in frame_widths)
+        ):
+            raise ValueError("decode graph requires at least one positive frame width")
         if not tiers or tuple(sorted(set(tiers))) != tiers or tiers[0] <= 0:
             raise ValueError("decode graph tiers must be positive and increasing")
         self._decode_fn = decode_fn
@@ -169,6 +173,8 @@ class DenseGraphBinding:
         runtime: GraphRuntime,
     ) -> _GraphEntry:
         frames = self._frame_widths[geometry]
+        if frames is None:
+            raise ValueError(f"decode graph geometry {geometry} is not served")
         enc_frames = torch.zeros(
             tier,
             frames,
@@ -306,7 +312,8 @@ class DenseGraphBinding:
                 dtype=dtype,
                 runtime=runtime,
             )
-            for geometry in range(len(self._frame_widths))
+            for geometry, frames in enumerate(self._frame_widths)
+            if frames is not None
             for tier in self._tiers
         }
         runtime.set_capture_enabled(True)
