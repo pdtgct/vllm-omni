@@ -63,7 +63,7 @@ def _no_state_model() -> Any:
     object.__setattr__(model, "core", object())
     object.__setattr__(model, "_emission_adapter", object())
     object.__setattr__(model, "_decode_resolver", object())
-    object.__setattr__(model, "_profile_decode_resolver", object())
+    object.__setattr__(model, "_decode_graph_binding", None)
     return model
 
 
@@ -186,7 +186,68 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     )
     assert advance_kwargs["capture"] is False
     assert advance_kwargs["commit_sink"] is None
-    assert advance_kwargs["decode_resolver"] is model._profile_decode_resolver
+    assert advance_kwargs["decode_resolver"] is model._decode_resolver
+
+
+def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-004
+    profile = _profile_module()
+    advance = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.advance")
+    rnnt = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.rnnt")
+    invocation = SimpleNamespace(
+        input_ids=torch.zeros(1, dtype=torch.long),
+        inputs_embeds=torch.zeros(1, 7),
+        plan=object(),
+        pools=SimpleNamespace(
+            channel=(),
+            convolution=(),
+            valid_length=(),
+            predictor_h=object(),
+            predictor_c=object(),
+            replay_queue=object(),
+            replay_book=object(),
+            frontend_raw=object(),
+            frontend_mel=object(),
+            frontend_counters=object(),
+            endpoint_history=object(),
+            endpoint_book=object(),
+        ),
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        profile,
+        "build_profile_invocation",
+        lambda *args, **kwargs: invocation,
+    )
+    monkeypatch.setattr(
+        profile,
+        "advance_model_rows",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
+    model = _no_state_model()
+    object.__setattr__(model, "_decode_graph_binding", object())
+
+    profile.run_persistent_state_profile(
+        model,
+        num_rows=1,
+        device=torch.device("cpu"),
+    )
+
+    resolved = captured["decode_resolver"](
+        advance.DecodeRequest(
+            geometry=4,
+            execution_batch_size=1,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
+            execution_tier_limit=0,
+        )
+    )
+    assert resolved.arm == "dense-eager"
+    assert resolved.decode_fn is rnnt.decode_dense_masked_frames
+    assert resolved.override_reason == "pre-capture-memory-profile"
 
 
 def test_profile_execution_drains_stats_when_the_transition_fails(
