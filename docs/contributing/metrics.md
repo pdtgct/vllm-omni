@@ -9,10 +9,19 @@ You can use these metrics in production to monitor the health and performance of
 
 ## How to Enable and View Metrics
 
-### Start the Service with Metrics Logging
+### Start the Service with Metrics Collection
 
 ```bash
 vllm serve /workspace/models/Qwen3-Omni-30B-A3B-Instruct --omni --port 8014 --log-stats
+```
+
+`--log-stats` enables statistics collection and Prometheus export without
+printing per-request tables at the normal `INFO` log level. To inspect the
+human-readable diagnostic tables, opt in to debug logging:
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG vllm serve /workspace/models/Qwen3-Omni-30B-A3B-Instruct \
+  --omni --port 8014 --log-stats
 ```
 
 ### Send a Request
@@ -23,7 +32,7 @@ python openai_chat_completion_client_for_multimodal_generation.py --query-type u
 
 ### What You Will See
 
-With `--log-stats` enabled, the server will output detailed metrics logs after each request. Example output:
+With debug logging enabled, the server will output detailed metrics logs after each request. Example output:
 
 
 #### Overall Summary

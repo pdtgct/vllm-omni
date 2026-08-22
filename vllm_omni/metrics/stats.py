@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -705,6 +706,7 @@ class OrchestratorAggregator:
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
             return {}
+        debug_logging = logger.isEnabledFor(logging.DEBUG)
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
         e2e_avg_req = (wall_time_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
@@ -741,18 +743,20 @@ class OrchestratorAggregator:
         for idx, wall_time in enumerate(stage_wall_time_ms):
             overall_summary[f"e2e_stage_{idx}_wall_time_ms"] = wall_time
 
-        # Print overall summary
-        # filter out all-zero fields for logging
-        overall_fields = []
-        for k in OVERALL_FIELDS or list(overall_summary.keys()):
-            v = overall_summary.get(k, None)
-            if v not in (0, 0.0, 0.000, None, ""):
-                overall_fields.append(k)
-        if overall_fields:
-            logger.info(
-                "\n%s",
-                _format_table("Overall Summary", overall_summary, overall_fields),
-            )
+        # Human-readable tables are diagnostic output. Keep statistics
+        # collection enabled independently of the process log level, and do
+        # not pay formatting cost unless DEBUG logging is requested.
+        if debug_logging:
+            overall_fields = []
+            for k in OVERALL_FIELDS or list(overall_summary.keys()):
+                v = overall_summary.get(k, None)
+                if v not in (0, 0.0, 0.000, None, ""):
+                    overall_fields.append(k)
+            if overall_fields:
+                logger.debug(
+                    "\n%s",
+                    _format_table("Overall Summary", overall_summary, overall_fields),
+                )
 
         all_request_ids = sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events})
 
@@ -767,32 +771,26 @@ class OrchestratorAggregator:
                 e2e_data = _build_row(e2e_evt, E2E_FIELDS)
                 result_e2e_table.append({"request_id": rid, **e2e_data})
 
-                # filter out all-zero fields for logging
-                nonzero_e2e_fields = set()
-                for k, v in e2e_data.items():
-                    if v not in (0, 0.000, None, ""):
-                        nonzero_e2e_fields.add(k)
-                value_fields_e2e = sorted(nonzero_e2e_fields)
-
-                if value_fields_e2e:
-                    logger.info(
-                        "\n%s",
-                        _format_table(
-                            f"RequestE2EStats [request_id={rid}]",
-                            e2e_data,
-                            value_fields=value_fields_e2e,
-                        ),
-                    )
+                if debug_logging:
+                    nonzero_e2e_fields = {k for k, v in e2e_data.items() if v not in (0, 0.000, None, "")}
+                    value_fields_e2e = sorted(nonzero_e2e_fields)
+                    if value_fields_e2e:
+                        logger.debug(
+                            "\n%s",
+                            _format_table(
+                                f"RequestE2EStats [request_id={rid}]",
+                                e2e_data,
+                                value_fields=value_fields_e2e,
+                            ),
+                        )
 
             # === [OmniTiming] concise per-request summary ===
             stage_evts = sorted(
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
-            pt = {}
-            if stage_evts:
-                pt = stage_evts[-1].pipeline_timings or {}
-            if pt or e2e_evt:
+            if debug_logging and (stage_evts or e2e_evt):
+                pt = (stage_evts[-1].pipeline_timings or {}) if stage_evts else {}
                 parts = [f"req={rid}"]
                 if e2e_evt:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
@@ -816,7 +814,7 @@ class OrchestratorAggregator:
                     parts.append(f"transfers=[{','.join(transfer_parts)}]")
                 if "ar2diffusion_ms" in pt:
                     parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
-                logger.info("[OmniTiming] %s", " ".join(parts))
+                logger.debug("[OmniTiming] %s", " ".join(parts))
 
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
@@ -839,7 +837,7 @@ class OrchestratorAggregator:
 
             result_stage_table.append({"request_id": rid, "stages": stage_rows})
 
-            if stage_rows:
+            if debug_logging and stage_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in stage_rows:
@@ -858,7 +856,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"StageRequestStats [request_id={rid}]",
@@ -879,7 +877,7 @@ class OrchestratorAggregator:
             ]
             result_trans_table.append({"request_id": rid, "transfers": transfer_rows})
 
-            if transfer_rows:
+            if debug_logging and transfer_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in transfer_rows:
@@ -898,7 +896,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"TransferEdgeStats [request_id={rid}]",

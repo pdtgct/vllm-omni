@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+from unittest.mock import Mock
+
 import pytest
 
 from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.metrics import stats as stats_module
 from vllm_omni.metrics.stats import RequestE2EStats, StageRequestStats, StageStats
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -155,3 +159,38 @@ def test_build_and_log_summary_multiple_requests() -> None:
     r2_stage_entry = next(e for e in summary["stage_table"] if e["request_id"] == "r2")
     assert len(r1_stage_entry["stages"]) == 2
     assert len(r2_stage_entry["stages"]) == 1
+
+
+def test_summary_text_is_debug_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collect stats without formatting request tables at the default level."""
+    fake_logger = Mock()
+    fake_logger.isEnabledFor.return_value = False
+    format_table = Mock(side_effect=AssertionError("formatted stats at INFO level"))
+    monkeypatch.setattr(stats_module, "logger", fake_logger)
+    monkeypatch.setattr(stats_module, "_format_table", format_table)
+
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    agg.on_stage_metrics(
+        0,
+        "r1",
+        StageRequestStats(
+            batch_id=1,
+            batch_size=1,
+            num_tokens_in=1,
+            num_tokens_out=1,
+            stage_gen_time_ms=1.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(),
+        ),
+    )
+    agg.on_finalize_request(0, "r1", req_start_ts=0.0)
+
+    summary = agg.build_and_log_summary()
+
+    assert summary["overall_summary"]["e2e_requests"] == 1
+    fake_logger.isEnabledFor.assert_called_once_with(logging.DEBUG)
+    fake_logger.info.assert_not_called()
+    fake_logger.debug.assert_not_called()
+    format_table.assert_not_called()
