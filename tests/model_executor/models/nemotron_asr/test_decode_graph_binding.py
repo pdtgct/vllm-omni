@@ -174,6 +174,14 @@ def test_runtime_pads_with_zero_lengths_and_returns_only_live_rows() -> None:
     assert calls[-1].tolist() == [2, 1, 2, 0]
     assert result.token_ids.shape[0] == 3
     assert result.state.h.shape == (2, 3, 5)
+    # The graph owns fixed tier-four storage. Selecting three live rows keeps
+    # each predictor layer densely packed while retaining one padded row
+    # between layers; materializing a contiguous copy here would add an
+    # uncaptured D2D repack to every non-tier-exact replay.
+    assert result.state.h.stride() == (20, 5, 1)
+    assert result.state.c.stride() == (20, 5, 1)
+    assert not result.state.h.is_contiguous()
+    assert not result.state.c.is_contiguous()
     assert result.state.last_label.tolist() == [7, 8, 9]
 
 

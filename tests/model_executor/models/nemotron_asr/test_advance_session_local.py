@@ -293,6 +293,89 @@ def test_decode_receives_only_geometry_valid_encoder_frames(
     assert result.captures.encoder_conditioned.shape[1] == valid_width + 2
 
 
+# @spec PORT-ADV-004, PORT-PERF-004
+def test_decode_accepts_exact_live_state_with_only_outer_tier_padding() -> None:
+    core = _core()
+    state = _fresh_state(3)
+    samples = torch.zeros(3, CHUNK)
+
+    def tier_padded_decode(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        del enc_frames, enc_lengths
+        layers, live, hidden = decode_state.h.shape
+        tier = 4
+        assert live == 3
+        h_storage = torch.zeros(layers, tier, hidden)
+        c_storage = torch.zeros_like(h_storage)
+        h_storage[:, :live].copy_(decode_state.h + 1)
+        c_storage[:, :live].copy_(decode_state.c + 2)
+        next_h = h_storage[:, :live]
+        next_c = c_storage[:, :live]
+        assert next_h.stride() == (tier * hidden, hidden, 1)
+        assert not next_h.is_contiguous()
+        return (
+            torch.ones(live, 1, dtype=torch.int32),
+            torch.ones(live, dtype=torch.int32),
+            rnnt.DecodeState(
+                h=next_h,
+                c=next_c,
+                last_label=torch.ones(live, dtype=torch.long),
+            ),
+        )
+
+    _advance(
+        core,
+        _chunk(samples, seq=0),
+        state,
+        decode_fn=tier_padded_decode,
+    )
+
+    torch.testing.assert_close(state.h, torch.ones_like(state.h))
+    torch.testing.assert_close(state.c, torch.full_like(state.c, 2))
+    assert state.last_label.tolist() == [1, 1, 1]
+
+
+# @spec PORT-ADV-004
+def test_decode_rejects_noncanonical_inner_state_layout() -> None:
+    core = _core()
+    state = _fresh_state(1)
+
+    def inner_strided_decode(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        del enc_frames, enc_lengths
+        layers, live, hidden = decode_state.h.shape
+        h = torch.zeros(layers, live, hidden * 2)[:, :, ::2]
+        assert h.shape == decode_state.h.shape
+        assert h.stride(-1) == 2
+        return (
+            torch.zeros(live, 1, dtype=torch.int32),
+            torch.zeros(live, dtype=torch.int32),
+            rnnt.DecodeState(
+                h=h,
+                c=decode_state.c,
+                last_label=decode_state.last_label,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="next-state h"):
+        _advance(
+            core,
+            _chunk(torch.zeros(1, CHUNK), seq=0),
+            state,
+            decode_fn=inner_strided_decode,
+        )
+
+
 def test_session_first_chunk_advances_and_captures() -> None:
     # @spec PORT-ADV-001
     # The canonical transition, exercised: session-first 1120 ms chunk

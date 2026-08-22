@@ -75,6 +75,38 @@ RnntDecodeFn = Callable[
     "tuple[torch.Tensor, torch.Tensor, DecodeState] | FrameAlignedDecode",
 ]
 
+
+def _has_packed_decode_state_interior(tensor: torch.Tensor) -> bool:
+    """Whether ``(batch, hidden)`` is packed with optional layer padding.
+
+    A tiered graph owns ``(layers, P, hidden)`` output storage and returns the
+    exact-live ``[:, :B]`` prefix.  For ``B < P`` that prefix is not globally
+    contiguous: the unused tier rows remain between predictor layers.  It is
+    nevertheless non-overlapping and dense within every live layer when
+
+    ``stride = (sL, hidden, 1)`` and ``sL >= B * hidden``.
+
+    That is the complete layout needed by the read-only validation and
+    batch-major resident-state commit below.  Requiring global contiguity
+    would force an uncaptured D2D repack after every non-tier-exact replay;
+    accepting anything weaker would admit transposed, stepped, or broadcast
+    state interiors.
+    """
+
+    if tensor.dim() != 3:
+        return False
+    # Preserve the canonical eager contract exactly. PyTorch may assign
+    # arbitrary strides to size-one dimensions while still correctly
+    # classifying the tensor as contiguous (for example ``(H, 2H, 1)`` for
+    # shape ``(L, 1, H)``), so the fixed-stride proof below is only the
+    # additional graph-prefix case.
+    if tensor.is_contiguous():
+        return True
+    _layers, batch, hidden = tensor.shape
+    layer_stride, batch_stride, hidden_stride = tensor.stride()
+    return hidden_stride == 1 and batch_stride == hidden and layer_stride >= batch * hidden
+
+
 #: Chunk-envelope header layout (design §Chunk envelope): the versioned
 #: FP32 carrier row is ``[version, valid_samples, geometry_id,
 #: final_tail, prompt_index, chunk_sequence, admission_ms_mod,
@@ -1273,16 +1305,31 @@ def advance_session(
     decode_type = type(decode_out)
     if decode_type.__module__ != DecodeState.__module__ or decode_type.__qualname__ != DecodeState.__qualname__:
         raise ValueError("decode_fn must return DecodeState")
-    for name, actual, expected in (
-        ("h", decode_out.h, decode_baseline.h),
-        ("c", decode_out.c, decode_baseline.c),
-        ("last_label", decode_out.last_label, decode_baseline.last_label),
+    for name, actual, expected, layout_valid in (
+        (
+            "h",
+            decode_out.h,
+            decode_baseline.h,
+            _has_packed_decode_state_interior(decode_out.h),
+        ),
+        (
+            "c",
+            decode_out.c,
+            decode_baseline.c,
+            _has_packed_decode_state_interior(decode_out.c),
+        ),
+        (
+            "last_label",
+            decode_out.last_label,
+            decode_baseline.last_label,
+            decode_out.last_label.is_contiguous(),
+        ),
     ):
         if (
             tuple(actual.shape) != tuple(expected.shape)
             or actual.dtype != expected.dtype
             or actual.device != expected.device
-            or not actual.is_contiguous()
+            or not layout_valid
         ):
             raise ValueError(f"decode_fn next-state {name} changed shape/dtype/device/layout")
     lengths = token_lengths.long()
@@ -2232,9 +2279,7 @@ def advance_model_rows(
     idx_cpu = _structural_preflight(plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0]))
     has_chunk = bool(plan.is_chunk.any())
     if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
-        raise ValueError(
-            "regional graph decode requires a positive RowPlan execution tier"
-        )
+        raise ValueError("regional graph decode requires a positive RowPlan execution tier")
     if not graph_covers_decode and plan.execution_tier != 0:
         raise ValueError("eager execution requires plan.execution_tier == 0")
     if memory_profile and graph_covers_decode:

@@ -39,7 +39,9 @@ DECODE_ALGO_REVISION = "decode-algo-v1"
 class DecodeState:
     """Per-session decode state carried across chunks (page-backed).
 
-    ``h``/``c``: predictor LSTM state ``(layers, batch, hidden)``.
+    ``h``/``c``: predictor LSTM state ``(layers, batch, hidden)`` with packed
+    ``(batch, hidden)`` interiors. The outer layer stride may retain padding
+    from a fixed-tier graph buffer.
     ``last_label``: ``(batch,)`` int64; blank at session start (SOS).
     """
 
@@ -288,12 +290,8 @@ def decode_compact_active_frames(
     last_label = state.last_label.clone()
     token_ids = torch.zeros(batch, t_pad * max_symbols, dtype=torch.int32, device=device)
     token_lengths = torch.zeros(batch, dtype=torch.long, device=device)
-    frame_emission_counts = torch.zeros(
-        batch, t_pad, dtype=torch.int32, device=device
-    )
-    frame_final_labels = torch.full(
-        (batch, t_pad), blank, dtype=torch.int32, device=device
-    )
+    frame_emission_counts = torch.zeros(batch, t_pad, dtype=torch.int32, device=device)
+    frame_final_labels = torch.full((batch, t_pad), blank, dtype=torch.int32, device=device)
     pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
     for t in range(t_pad):
         frame = enc_frames[:, t]
