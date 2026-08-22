@@ -1020,8 +1020,10 @@ def advance_session(
     zero-frame rows. Every shape is host-derived from the bucket
     geometry (padded frontend width ``C``, matching the reference's
     largest single regular/final cadence shift, and encoder
-    width from the subsampling formula); validity is per-row length
-    tensors. Every per-row failure — wrong chunk sequence, audio
+    width from the subsampling formula); decode receives only the
+    geometry manifest's maximum-valid encoder prefix, while named
+    captures retain the full padded encoder width. Validity is per-row
+    length tensors. Every per-row failure — wrong chunk sequence, audio
     after finalization, an envelope geometry different from the
     bucket's, an oversized final residual, or a frontend design
     invariant — is a masked no-op reported as a bit in
@@ -1225,8 +1227,18 @@ def advance_session(
                 c=decode_in.c.clone(),
                 last_label=decode_in.last_label.clone(),
             )
+            # The padded encoder grid includes PRE_ENCODE_DROP trailing
+            # outputs produced from its nine-frame overlap prefix. They are
+            # zeroed above and excluded by enc_lengths, but are not part of
+            # the geometry's valid decode domain or dense graph key. Keep the
+            # full tensor for named captures and pass a zero-copy prefix view
+            # to both eager and graphed decoders.
+            max_valid_frames = lookahead + 1
+            if out_width != max_valid_frames + PRE_ENCODE_DROP:
+                raise ValueError("padded encoder width disagrees with the geometry-valid decode prefix")
+            decode_frames = conditioned[:, :max_valid_frames]
             decoded = decode_fn(
-                conditioned,
+                decode_frames,
                 enc_lengths,
                 core.predictor,
                 core.joint,

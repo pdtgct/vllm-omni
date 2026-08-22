@@ -63,6 +63,7 @@ mods = _load_chain()
 advance = mods["advance"]
 frontend = mods["frontend"]
 rnnt = mods["rnnt"]
+manifests = mods["manifests"]
 
 FEAT = 16
 D_MODEL = 32
@@ -231,6 +232,65 @@ def test_encode_phase_exits_before_decode_phase_enters(
     _advance(core, _chunk(torch.randn(1, CHUNK) * 0.1, seq=0), state)
 
     assert events.index("port.encode:exit") < events.index("port.decode:enter")
+
+
+@pytest.mark.parametrize(
+    ("geometry", "label", "lookahead"),
+    [(geometry, label, right) for geometry, (label, (_, right)) in enumerate(manifests.CADENCES.items())],
+)
+def test_decode_receives_only_geometry_valid_encoder_frames(
+    geometry: int,
+    label: str,
+    lookahead: int,
+) -> None:
+    # @spec PORT-ADV-004, PORT-PERF-004
+    # The encoder retains its fixed padded width for capture, while decode's
+    # fixed-trip width is the geometry manifest's maximum valid prefix. The
+    # pre-encode cache produces two trailing padded outputs which must not
+    # become part of the dense graph key or its repeated label loop.
+    core = _core()
+    state = _fresh_state(1)
+    valid_width = lookahead + 1
+    raw_width = manifests.RAW_SAMPLES_PER_CHUNK[label]
+    batch = advance.ChunkBatch(
+        samples=torch.zeros(1, raw_width),
+        valid_samples=torch.tensor([raw_width]),
+        geometry_id=torch.tensor([geometry]),
+        final_tail=torch.tensor([False]),
+        prompt_index=torch.tensor([0]),
+        chunk_sequence=torch.tensor([0]),
+    )
+
+    def decode_probe(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        assert enc_frames.shape[1] == valid_width
+        assert enc_lengths.tolist() == [valid_width]
+        return (
+            torch.zeros(
+                1,
+                valid_width * rnnt.MAX_SYMBOLS_PER_STEP,
+                dtype=torch.int32,
+            ),
+            torch.zeros(1, dtype=torch.int32),
+            decode_state,
+        )
+
+    result = advance.advance_session(
+        core,
+        batch,
+        state,
+        geometry=geometry,
+        decode_fn=decode_probe,
+        capture=True,
+    )
+
+    assert result.captures is not None
+    assert result.captures.encoder_conditioned.shape[1] == valid_width + 2
 
 
 def test_session_first_chunk_advances_and_captures() -> None:
