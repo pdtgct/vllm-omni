@@ -32,7 +32,7 @@ def _model_class() -> type[Any]:
     return cast(type[Any], _model_module().NemotronASRForRNNT)
 
 
-def _config() -> Any:
+def _config(*, decode_dispatch_arm: str = "dense-eager") -> Any:
     config_module = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr")
     return config_module.NemotronASRConfig(
         vocab_size=13_092,
@@ -42,7 +42,7 @@ def _config() -> Any:
         eou_token_id=13_090,
         flush_token_id=13_091,
         prompt_dictionary={"en-US": 0},
-        decode_dispatch_arm="dense-eager",
+        decode_dispatch_arm=decode_dispatch_arm,
     )
 
 
@@ -227,8 +227,17 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     )
     monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
     model = _no_state_model()
-    canonical_resolver = object()
-    object.__setattr__(model, "_decode_resolver", canonical_resolver)
+    object.__setattr__(
+        model,
+        "config",
+        _config(decode_dispatch_arm="dense-graphed"),
+    )
+
+    def served_resolver(request: Any) -> Any:
+        raise ValueError("dense-graphed dispatch requires regional graph coverage")
+
+    object.__setattr__(model, "_decode_resolver", served_resolver)
+    object.__setattr__(model, "_decode_graph_binding", object())
 
     profile.run_persistent_state_profile(
         model,
@@ -236,7 +245,25 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
         device=torch.device("cpu"),
     )
 
-    assert captured["decode_resolver"] is canonical_resolver
+    from vllm_omni.model_executor.models.nemotron_asr.advance import (
+        DecodeRequest,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    resolved = captured["decode_resolver"](
+        DecodeRequest(
+            geometry=4,
+            execution_batch_size=1,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
+            memory_profile=True,
+        )
+    )
+    assert resolved.arm == "dense-eager"
+    assert resolved.decode_fn is decode_dense_masked_frames
+    assert resolved.override_reason == "pre-capture-memory-profile"
     assert captured["memory_profile"] is True
 
 

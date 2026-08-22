@@ -19,7 +19,10 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ENV_VALID_SAMPLES,
     ENV_VERSION,
     ENVELOPE_VERSION,
+    DecodeRequest,
+    DecodeResolver,
     PreparedRowBinding,
+    ResolvedDecode,
     RowPlan,
     advance_model_rows,
     consume_batch_stats,
@@ -70,6 +73,31 @@ def _required_control(config: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"profile execution requires integer {name}")
     return value
+
+
+# @spec PORT-PERF-004
+def _profile_decode_resolver(model: Any) -> DecodeResolver:
+    """Bind pre-capture dense-graph profiling to dense eager."""
+
+    if getattr(model.config, "decode_dispatch_arm", None) != "dense-graphed":
+        return model._decode_resolver
+
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    def resolve(request: DecodeRequest) -> ResolvedDecode:
+        if request.graph_covers_decode:
+            raise ValueError(
+                "pre-capture memory profile cannot claim graph coverage"
+            )
+        return ResolvedDecode(
+            arm="dense-eager",
+            decode_fn=decode_dense_masked_frames,
+            override_reason="pre-capture-memory-profile",
+        )
+
+    return resolve
 
 
 # @spec PORT-MIG-005, PORT-STATE-003, PORT-STATE-007
@@ -231,7 +259,7 @@ def run_persistent_state_profile(
             endpoint_book_pool=pools.endpoint_book,
             eou_token_id=_required_control(model.config, "eou_token_id"),
             adapter=model._emission_adapter,
-            decode_resolver=model._decode_resolver,
+            decode_resolver=_profile_decode_resolver(model),
             placeholder_id=_required_control(
                 model.config,
                 "audio_chunk_token_id",
