@@ -78,13 +78,17 @@ def build_profile_invocation(
     *,
     num_rows: int,
     device: torch.device,
+    geometry_id: int | None = None,
 ) -> PersistentStateProfileInvocation:
     """Build the maximum live eager transaction without a manager slot."""
 
     rows = _positive_row_count(num_rows)
     placeholder_id = _required_control(config, "audio_chunk_token_id")
-    geometry_label = next(reversed(CADENCES))
-    geometry_id = len(CADENCES) - 1
+    if geometry_id is None:
+        geometry_id = len(CADENCES) - 1
+    if isinstance(geometry_id, bool) or not isinstance(geometry_id, int) or not 0 <= geometry_id < len(CADENCES):
+        raise ValueError("profile geometry id is outside the manifest")
+    geometry_label = tuple(CADENCES)[geometry_id]
     valid_samples = RAW_SAMPLES_PER_CHUNK[geometry_label]
     hidden_size = int(config.hidden_size)
     if hidden_size < len(ENVELOPE_HEADER_FIELDS) + valid_samples:
@@ -183,6 +187,7 @@ def run_persistent_state_profile(
     *,
     num_rows: int,
     device: torch.device,
+    geometry_id: int | None = None,
 ) -> torch.Tensor:
     """Execute the canonical transition and discard all profile effects."""
 
@@ -191,10 +196,14 @@ def run_persistent_state_profile(
         num_rows,
     )
     try:
+        invocation_kwargs: dict[str, Any] = {}
+        if geometry_id is not None:
+            invocation_kwargs["geometry_id"] = geometry_id
         invocation = build_profile_invocation(
             model.config,
             num_rows=num_rows,
             device=device,
+            **invocation_kwargs,
         )
         pools = invocation.pools
         if device.type == "cuda":
@@ -246,8 +255,47 @@ def run_persistent_state_profile(
         consume_batch_stats()
 
 
+# @spec PORT-PERF-009
+def warmup_static_encoder_execution(
+    model: Any,
+    *,
+    device: torch.device,
+) -> None:
+    """Compile and attest every served geometry/population cell."""
+    execution = model._encoder_execution
+    if execution.arm != "compiled-static":
+        return
+    if execution.ready:
+        return
+    declared = getattr(
+        model.config,
+        "supported_num_lookahead_tokens",
+        None,
+    )
+    served = None if declared is None else {int(value) for value in declared}
+    geometry_ids = tuple(
+        index for index, (_label, (_left, right)) in enumerate(CADENCES.items()) if served is None or right in served
+    )
+    if not geometry_ids:
+        raise ValueError("compiled-static encoder warmup has no served geometries")
+    cells = tuple((geometry, population) for geometry in geometry_ids for population in execution.warmup_populations)
+    for geometry, population in cells:
+        execution.warmup_cell(
+            geometry=geometry,
+            population=population,
+            invoke=lambda geometry=geometry, population=population: run_persistent_state_profile(
+                model,
+                num_rows=population,
+                device=device,
+                geometry_id=geometry,
+            ),
+        )
+    execution.seal(expected_cells=cells)
+
+
 __all__ = [
     "PersistentStateProfileInvocation",
     "build_profile_invocation",
     "run_persistent_state_profile",
+    "warmup_static_encoder_execution",
 ]

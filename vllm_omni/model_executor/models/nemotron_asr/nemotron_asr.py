@@ -372,9 +372,13 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
-        self._decode_resolver = build_decode_resolver(hf_config)
-        self._encoder_execution = build_encoder_execution(self.core, hf_config)
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        self._decode_resolver = build_decode_resolver(hf_config)
+        self._encoder_execution = build_encoder_execution(
+            self.core,
+            hf_config,
+            maximum_population=self._max_num_seqs,
+        )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
 
@@ -623,29 +627,33 @@ class NemotronASRForRNNT(nn.Module):
         )
 
     def warmup_resident_state(self) -> None:
-        """Warm every fixed-shape scatter specialization before admission."""
+        """Warm every fixed-shape specialization before admission."""
 
         from vllm_omni.model_executor.models.nemotron_asr.advance import (
             warmup_advance_model_rows_scatter,
         )
+        from vllm_omni.model_executor.models.nemotron_asr.profile_execution import (
+            warmup_static_encoder_execution,
+        )
 
         pools = self._state_pools()
-        if pools.channel[0].device.type != "cuda":
-            return
-        warmup_advance_model_rows_scatter(
-            channel_pools=list(pools.channel),
-            time_pools=list(pools.convolution),
-            len_pools=list(pools.valid_length),
-            h_pool=pools.predictor_h,
-            c_pool=pools.predictor_c,
-            queue_pool=pools.replay_queue,
-            book_pool=pools.replay_book,
-            frontend_raw_pool=pools.frontend_raw,
-            frontend_mel_pool=pools.frontend_mel,
-            frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history,
-            endpoint_book_pool=pools.endpoint_book,
-        )
+        device = pools.predictor_h.device
+        if device.type == "cuda":
+            warmup_advance_model_rows_scatter(
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+            )
+        warmup_static_encoder_execution(self, device=device)
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
