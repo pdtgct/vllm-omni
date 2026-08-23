@@ -19,11 +19,13 @@ declaratively per update by ``pipeline.py sampling_constraints`` and
 actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
@@ -94,6 +96,8 @@ from vllm_omni.model_executor.models.nemotron_asr.state_profile import (
     project_nemotron_state_pools,
 )
 from vllm_omni.model_executor.persistent_state import PersistentStateLayerBase
+
+logger = init_logger(__name__)
 
 #: The largest published chunk (1120 ms) emits 14 encoder frames — the
 #: replay queue page's per-chunk worst case.
@@ -373,8 +377,12 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
-        self._encoder_execution = build_encoder_execution(self.core, hf_config)
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        self._encoder_execution = build_encoder_execution(
+            self.core,
+            hf_config,
+            maximum_population=self._max_num_seqs,
+        )
         self._decode_graph_binding = None
         if getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed":
             from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
@@ -388,19 +396,14 @@ class NemotronASRForRNNT(nn.Module):
                 None,
             )
             served_lookaheads = (
-                {right for _, right in CADENCES.values()}
-                if supported is None
-                else {int(value) for value in supported}
+                {right for _, right in CADENCES.values()} if supported is None else {int(value) for value in supported}
             )
             self._decode_graph_binding = DenseGraphBinding(
                 decode_fn=decode_dense_masked_frames,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
                 vllm_config=vllm_config,
-                frame_widths=tuple(
-                    right + 1 if right in served_lookaheads else None
-                    for _, right in CADENCES.values()
-                ),
+                frame_widths=tuple(right + 1 if right in served_lookaheads else None for _, right in CADENCES.values()),
                 tiers=execution_tiers(self._max_num_seqs),
                 encoder_hidden=int(hf_config.d_model),
                 predictor_layers=int(hf_config.pred_rnn_layers),
@@ -664,6 +667,9 @@ class NemotronASRForRNNT(nn.Module):
         from vllm_omni.model_executor.models.nemotron_asr.advance import (
             warmup_advance_model_rows_scatter,
         )
+        from vllm_omni.model_executor.models.nemotron_asr.profile_execution import (
+            warmup_static_encoder_execution,
+        )
 
         pools = self._state_pools()
         device = pools.predictor_h.device
@@ -682,11 +688,35 @@ class NemotronASRForRNNT(nn.Module):
                 endpoint_history_pool=pools.endpoint_history,
                 endpoint_book_pool=pools.endpoint_book,
             )
+        warmup_static_encoder_execution(self, device=device)
         if self._decode_graph_binding is not None:
             self._decode_graph_binding.warmup(
                 device,
                 next(self.core.encoder.parameters()).dtype,
             )
+        logger.info(
+            "Nemotron execution profile ready %s",
+            json.dumps(
+                self.execution_profile_receipt(),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def execution_profile_receipt(self) -> dict[str, Any]:
+        """Report the resolved execution arms and startup coverage."""
+        binding = self._decode_graph_binding
+        keys = () if binding is None else binding.captured_keys
+        decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        return {
+            "schema": "nemotron-execution-profile/1",
+            "decode": {
+                "arm": decode_arm,
+                "captured_keys": [list(key) for key in keys],
+                "ready": binding is None or bool(keys),
+            },
+            "encoder": self._encoder_execution.ready_receipt(),
+        }
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
@@ -930,41 +960,26 @@ def build_decode_resolver(
         "compact-eager": decode_compact_active_frames,
     }
     if arm == "dense-graphed" and graph_binding is None:
-        raise ValueError(
-            "decode_dispatch_arm='dense-graphed' requires a captured graph binding"
-        )
+        raise ValueError("decode_dispatch_arm='dense-graphed' requires a captured graph binding")
     known_arms = {*arms, "dense-graphed"}
     if arm not in known_arms:
-        raise ValueError(
-            f"unknown decode_dispatch_arm {arm!r} (known: {sorted(known_arms)})"
-        )
+        raise ValueError(f"unknown decode_dispatch_arm {arm!r} (known: {sorted(known_arms)})")
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if arm == "dense-graphed":
             if request.memory_profile:
                 if request.graph_covers_decode:
-                    raise ValueError(
-                        "pre-capture memory profile cannot claim graph coverage"
-                    )
+                    raise ValueError("pre-capture memory profile cannot claim graph coverage")
                 return ResolvedDecode(
                     arm="dense-eager",
                     decode_fn=arms["dense-eager"],
                     override_reason="pre-capture-memory-profile",
                 )
             if not request.graph_covers_decode:
-                raise ValueError(
-                    "dense-graphed dispatch requires regional graph coverage"
-                )
-            tier = graph_binding.execution_tier(
-                request.execution_batch_size
-            )
-            if (
-                request.execution_tier_limit > 0
-                and tier > request.execution_tier_limit
-            ):
-                raise ValueError(
-                    "decode bucket tier exceeds RowPlan execution authority"
-                )
+                raise ValueError("dense-graphed dispatch requires regional graph coverage")
+            tier = graph_binding.execution_tier(request.execution_batch_size)
+            if request.execution_tier_limit > 0 and tier > request.execution_tier_limit:
+                raise ValueError("decode bucket tier exceeds RowPlan execution authority")
             return ResolvedDecode(
                 arm="dense-graphed",
                 decode_fn=graph_binding.decode_fn(
@@ -974,9 +989,7 @@ def build_decode_resolver(
                 override_reason="regional-graph-coverage",
             )
         if request.graph_covers_decode:
-            raise ValueError(
-                "graph-covered decode requires the dense-graphed served arm"
-            )
+            raise ValueError("graph-covered decode requires the dense-graphed served arm")
         if request.ready_decode_buckets > 1 and arm not in SYNC_FREE_ARMS:
             return ResolvedDecode(
                 arm="dense-eager",

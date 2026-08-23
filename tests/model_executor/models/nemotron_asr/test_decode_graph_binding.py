@@ -336,3 +336,49 @@ def test_served_dense_graph_arm_selects_smallest_tier_within_plan_ceiling() -> N
                 execution_tier_limit=2,
             )
         )
+
+
+def test_execution_profile_receipt_reports_resolved_arms_and_ready_keys() -> None:
+    # @spec PORT-PERF-004, PORT-PERF-009
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        NemotronASRForRNNT,
+    )
+
+    model = object.__new__(NemotronASRForRNNT)
+    object.__setattr__(
+        model,
+        "config",
+        SimpleNamespace(decode_dispatch_arm="dense-graphed"),
+    )
+    object.__setattr__(
+        model,
+        "_encoder_execution",
+        SimpleNamespace(
+            ready_receipt=lambda: {
+                "arm": "compiled-static",
+                "ready": True,
+                "warmup_cells": [[0, 1], [0, 2]],
+                "warmup_populations": [1, 2],
+            }
+        ),
+    )
+    object.__setattr__(
+        model,
+        "_decode_graph_binding",
+        SimpleNamespace(captured_keys=((0, 1), (0, 2))),
+    )
+
+    assert model.execution_profile_receipt() == {
+        "schema": "nemotron-execution-profile/1",
+        "decode": {
+            "arm": "dense-graphed",
+            "captured_keys": [[0, 1], [0, 2]],
+            "ready": True,
+        },
+        "encoder": {
+            "arm": "compiled-static",
+            "ready": True,
+            "warmup_cells": [[0, 1], [0, 2]],
+            "warmup_populations": [1, 2],
+        },
+    }

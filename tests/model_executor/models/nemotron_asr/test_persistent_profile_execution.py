@@ -118,6 +118,25 @@ def test_profile_invocation_uses_ephemeral_manifest_storage_and_valid_carriers()
     assert invocation.inputs_embeds[:, geometry_index].tolist() == [4.0] * 2
 
 
+def test_profile_invocation_accepts_one_exact_geometry() -> None:
+    # @spec PORT-PERF-009
+    profile = _profile_module()
+    config = _config()
+
+    invocation = profile.build_profile_invocation(
+        config,
+        num_rows=2,
+        device=torch.device("cpu"),
+        geometry_id=1,
+    )
+
+    assert invocation.geometry_label == "160ms"
+    assert invocation.geometry_id == 1
+    assert invocation.plan.geometry_id.tolist() == [1, 1]
+    valid_index = profile.ENVELOPE_HEADER_FIELDS.index("valid_samples")
+    assert invocation.inputs_embeds[:, valid_index].tolist() == [2_560.0, 2_560.0]
+
+
 def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -271,6 +290,8 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     assert resolved.decode_fn is decode_dense_masked_frames
     assert resolved.override_reason == "pre-capture-memory-profile"
     assert captured["memory_profile"] is True
+
+
 def test_profile_execution_drains_stats_when_the_transition_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,6 +363,62 @@ def test_profile_execution_drains_stats_on_empty_dispatch(
         )
 
     assert drained == [True]
+
+
+def test_static_encoder_warmup_is_product_owned_cartesian_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-009
+    profile = _profile_module()
+    invoked: list[tuple[int, int]] = []
+    warmed: list[tuple[int, int]] = []
+    sealed: list[tuple[tuple[int, int], ...]] = []
+
+    class Execution:
+        arm = "compiled-static"
+        warmup_populations = (1, 3)
+
+        def warmup_cell(self, *, geometry: int, population: int, invoke: Any) -> None:
+            warmed.append((geometry, population))
+            invoke()
+
+        def seal(self, *, expected_cells: tuple[tuple[int, int], ...]) -> None:
+            sealed.append(expected_cells)
+
+    model = _no_state_model()
+    object.__setattr__(
+        model,
+        "config",
+        _config(),
+    )
+    object.__setattr__(
+        model.config,
+        "supported_num_lookahead_tokens",
+        [0, 3, 13],
+    )
+    object.__setattr__(model, "_encoder_execution", Execution())
+    monkeypatch.setattr(
+        profile,
+        "run_persistent_state_profile",
+        lambda _model, *, num_rows, device, geometry_id=None: invoked.append((int(geometry_id), num_rows)),
+    )
+
+    profile.warmup_static_encoder_execution(
+        model,
+        device=torch.device("cpu"),
+    )
+
+    expected = (
+        (0, 1),
+        (0, 3),
+        (2, 1),
+        (2, 3),
+        (4, 1),
+        (4, 3),
+    )
+    assert invoked == list(expected)
+    assert warmed == list(expected)
+    assert sealed == [expected]
 
 
 @pytest.mark.parametrize("is_profile", [True, False])
