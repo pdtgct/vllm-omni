@@ -292,6 +292,54 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     assert captured["memory_profile"] is True
 
 
+def test_compiled_profile_uses_largest_admitted_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-009
+    profile = _profile_module()
+    captured: dict[str, Any] = {}
+
+    def stop_after_build(
+        _config: Any,
+        *,
+        num_rows: int,
+        device: torch.device,
+        geometry_id: int,
+    ) -> Any:
+        captured.update(
+            num_rows=num_rows,
+            device=device,
+            geometry_id=geometry_id,
+        )
+        raise RuntimeError("stop after profile geometry selection")
+
+    monkeypatch.setattr(profile, "build_profile_invocation", stop_after_build)
+    monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
+    model = _no_state_model()
+    object.__setattr__(
+        model,
+        "_encoder_execution",
+        SimpleNamespace(
+            arm="compiled-static",
+            transition=object(),
+            warmup_geometries=(2, 0),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after profile geometry selection"):
+        profile.run_persistent_state_profile(
+            model,
+            num_rows=4,
+            device=torch.device("cpu"),
+        )
+
+    assert captured == {
+        "num_rows": 4,
+        "device": torch.device("cpu"),
+        "geometry_id": 2,
+    }
+
+
 def test_profile_execution_drains_stats_when_the_transition_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -376,13 +424,13 @@ def test_static_encoder_warmup_is_product_owned_cartesian_execution(
 
     class Execution:
         arm = "compiled-static"
+        warmup_geometries = (0, 2, 4)
         warmup_populations = (1, 3)
 
-        def warmup_cell(self, *, geometry: int, population: int, invoke: Any) -> None:
-            warmed.append((geometry, population))
-            invoke()
-
-        def seal(self, *, expected_cells: tuple[tuple[int, int], ...]) -> None:
+        def warmup_domain(self, *, expected_cells: tuple[tuple[int, int], ...], invoke: Any) -> None:
+            for geometry, population in expected_cells:
+                warmed.append((geometry, population))
+                invoke(geometry, population)
             sealed.append(expected_cells)
 
     model = _no_state_model()

@@ -222,6 +222,9 @@ def run_persistent_state_profile(
         num_rows,
     )
     try:
+        execution = model._encoder_execution
+        if geometry_id is None and getattr(execution, "arm", None) == "compiled-static":
+            geometry_id = max(execution.warmup_geometries)
         invocation_kwargs: dict[str, Any] = {}
         if geometry_id is not None:
             invocation_kwargs["geometry_id"] = geometry_id
@@ -247,37 +250,48 @@ def run_persistent_state_profile(
                 endpoint_history_pool=pools.endpoint_history,
                 endpoint_book_pool=pools.endpoint_book,
             )
-        return advance_model_rows(
-            model.core,
-            invocation.input_ids,
-            invocation.inputs_embeds,
-            invocation.plan,
-            channel_pools=list(pools.channel),
-            time_pools=list(pools.convolution),
-            len_pools=list(pools.valid_length),
-            h_pool=pools.predictor_h,
-            c_pool=pools.predictor_c,
-            queue_pool=pools.replay_queue,
-            book_pool=pools.replay_book,
-            frontend_raw_pool=pools.frontend_raw,
-            frontend_mel_pool=pools.frontend_mel,
-            frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history,
-            endpoint_book_pool=pools.endpoint_book,
-            eou_token_id=_required_control(model.config, "eou_token_id"),
-            adapter=model._emission_adapter,
-            decode_resolver=_profile_decode_resolver(model),
-            encoder_transition=model._encoder_execution.transition,
-            placeholder_id=_required_control(
-                model.config,
-                "audio_chunk_token_id",
-            ),
-            park_id=_required_control(model.config, "eos_token_id"),
-            commit_sink=None,
-            capture=False,
-            memory_profile=True,
-            staging=None,
-        )
+        def invoke() -> torch.Tensor:
+            return advance_model_rows(
+                model.core,
+                invocation.input_ids,
+                invocation.inputs_embeds,
+                invocation.plan,
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+                eou_token_id=_required_control(model.config, "eou_token_id"),
+                adapter=model._emission_adapter,
+                decode_resolver=_profile_decode_resolver(model),
+                encoder_transition=model._encoder_execution.transition,
+                placeholder_id=_required_control(
+                    model.config,
+                    "audio_chunk_token_id",
+                ),
+                park_id=_required_control(model.config, "eos_token_id"),
+                commit_sink=None,
+                capture=False,
+                memory_profile=True,
+                staging=None,
+            )
+
+        if getattr(execution, "arm", None) == "compiled-static" and not execution.cell_active:
+            if geometry_id is None:
+                raise ValueError("compiled-static encoder profile geometry is missing")
+            return execution.profile_cell(
+                geometry=geometry_id,
+                population=num_rows,
+                invoke=invoke,
+            )
+        return invoke()
     finally:
         consume_batch_stats()
 
@@ -294,30 +308,20 @@ def warmup_static_encoder_execution(
         return
     if getattr(execution, "ready", False):
         return
-    declared = getattr(
-        model.config,
-        "supported_num_lookahead_tokens",
-        None,
+    cells = tuple(
+        (geometry, population)
+        for geometry in execution.warmup_geometries
+        for population in execution.warmup_populations
     )
-    served = None if declared is None else {int(value) for value in declared}
-    geometry_ids = tuple(
-        index for index, (_label, (_left, right)) in enumerate(CADENCES.items()) if served is None or right in served
+    execution.warmup_domain(
+        expected_cells=cells,
+        invoke=lambda geometry, population: run_persistent_state_profile(
+            model,
+            num_rows=population,
+            device=device,
+            geometry_id=geometry,
+        ),
     )
-    if not geometry_ids:
-        raise ValueError("compiled-static encoder warmup has no served geometries")
-    cells = tuple((geometry, population) for geometry in geometry_ids for population in execution.warmup_populations)
-    for geometry, population in cells:
-        execution.warmup_cell(
-            geometry=geometry,
-            population=population,
-            invoke=lambda geometry=geometry, population=population: run_persistent_state_profile(
-                model,
-                num_rows=population,
-                device=device,
-                geometry_id=geometry,
-            ),
-        )
-    execution.seal(expected_cells=cells)
 
 
 __all__ = [

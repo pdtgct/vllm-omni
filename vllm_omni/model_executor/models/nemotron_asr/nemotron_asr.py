@@ -109,6 +109,23 @@ _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
 
 
+def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
+    declared = getattr(
+        hf_config,
+        "supported_num_lookahead_tokens",
+        None,
+    )
+    supported = None if declared is None else {int(value) for value in declared}
+    geometries = tuple(
+        index
+        for index, (_label, (_left, right)) in enumerate(CADENCES.items())
+        if supported is None or right in supported
+    )
+    if not geometries:
+        raise ValueError("served configuration declares no supported encoder geometry")
+    return geometries
+
+
 class NemotronASRCore(nn.Module):
     """The assembled cache-aware streaming pipeline.
 
@@ -378,10 +395,12 @@ class NemotronASRForRNNT(nn.Module):
             blank_id=self.core.blank_id,
         )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
             self.core,
             hf_config,
             maximum_population=self._max_num_seqs,
+            warmup_geometries=served_geometry_ids,
         )
         self._decode_graph_binding = None
         if getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed":
@@ -390,20 +409,16 @@ class NemotronASRForRNNT(nn.Module):
                 execution_tiers,
             )
 
-            supported = getattr(
-                hf_config,
-                "supported_num_lookahead_tokens",
-                None,
-            )
-            served_lookaheads = (
-                {right for _, right in CADENCES.values()} if supported is None else {int(value) for value in supported}
-            )
+            served_geometry_set = set(served_geometry_ids)
             self._decode_graph_binding = DenseGraphBinding(
                 decode_fn=decode_dense_masked_frames,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
                 vllm_config=vllm_config,
-                frame_widths=tuple(right + 1 if right in served_lookaheads else None for _, right in CADENCES.values()),
+                frame_widths=tuple(
+                    right + 1 if index in served_geometry_set else None
+                    for index, (_left, right) in enumerate(CADENCES.values())
+                ),
                 tiers=execution_tiers(self._max_num_seqs),
                 encoder_hidden=int(hf_config.d_model),
                 predictor_layers=int(hf_config.pred_rnn_layers),

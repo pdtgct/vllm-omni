@@ -358,6 +358,7 @@ def test_execution_profile_receipt_reports_resolved_arms_and_ready_keys() -> Non
                 "arm": "compiled-static",
                 "ready": True,
                 "warmup_cells": [[0, 1], [0, 2]],
+                "warmup_geometries": [0],
                 "warmup_populations": [1, 2],
             }
         ),
@@ -379,6 +380,7 @@ def test_execution_profile_receipt_reports_resolved_arms_and_ready_keys() -> Non
             "arm": "compiled-static",
             "ready": True,
             "warmup_cells": [[0, 1], [0, 2]],
+            "warmup_geometries": [0],
             "warmup_populations": [1, 2],
         },
     }
