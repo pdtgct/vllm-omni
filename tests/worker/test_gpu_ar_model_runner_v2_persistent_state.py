@@ -700,7 +700,7 @@ def test_mixed_persistent_and_token_cache_warmup_fails_closed(
 def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # @spec PORT-ADV-003 / PORT-MIG-005 / PORT-MIG-006
+    # @spec PORT-ADV-003 / PORT-MIG-005 / PORT-MIG-006 / PORT-PERF-009
     from vllm.config.compilation import CompilationMode
 
     module = importlib.import_module("vllm_omni.worker.gpu_ar_worker")
@@ -717,7 +717,7 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     )
     worker.model_runner.lora_config = None
     worker.model_runner.model.warmup_resident_state = lambda: events.append(
-        "resident-state"
+        f"resident-state:inference={torch.is_inference_mode_enabled()}"
     )
     worker.model_config = SimpleNamespace(enforce_eager=True, seed=17)
     worker.vllm_config = SimpleNamespace(
@@ -737,7 +737,9 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     monkeypatch.setattr(
         module,
         "kernel_warmup",
-        lambda value: events.append("kernel-warmup"),
+        lambda value: events.append(
+            f"kernel-warmup:inference={torch.is_inference_mode_enabled()}"
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -784,8 +786,8 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     assert warmup_attestation(worker) is True
     assert events == [
         "remove-loras",
-        "kernel-warmup",
-        "resident-state",
+        "kernel-warmup:inference=True",
+        "resident-state:inference=True",
         "seed:17",
         "jit-monitor",
         "freeze-gc",

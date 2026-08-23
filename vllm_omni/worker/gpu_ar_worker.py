@@ -64,6 +64,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         return bool(getattr(self, "_persistent_state_warmup_complete", False))
 
     @instrument(span_name="Warmup persistent-only model (GPU)")
+    @torch.inference_mode()
     def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
         """Finish eager worker warmup without inventing token-cache requests.
 
@@ -78,9 +79,14 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         A model-owned warmup hook may capture a qualified fixed-shape
         subregion (for example, the Nemotron dense decoder) before this worker
         attests readiness; that does not change the outer execution contract.
+
+        Run the complete warmup lifecycle under the same inference-mode
+        contract as activation profiling and served execution.  In
+        particular, a compiled model-owned subregion must see the same tensor
+        dispatch-key set during profiling, warmup, and serving.
         """
 
-        # @spec PORT-ADV-003, ENV-MIG-012
+        # @spec PORT-ADV-003, PORT-PERF-009, ENV-MIG-012
         self._persistent_state_warmup_complete = False
         if not self.model_config.enforce_eager:
             raise RuntimeError(
