@@ -254,22 +254,9 @@ def build_encoder_execution(
             prompt_index,
         )
 
-    populations = getattr(hf_config, "encoder_execution_populations", None)
     if arm == "eager":
-        if populations not in (None, []):
-            raise ValueError("encoder_execution_populations is compiled-static-only")
         return ResolvedEncoderExecution(arm=arm, transition=transition)
-    if (
-        not isinstance(populations, (list, tuple))
-        or not populations
-        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in populations)
-        or tuple(populations) != tuple(sorted(set(populations)))
-        or populations[-1] > maximum_population
-    ):
-        raise ValueError(
-            "encoder_execution_populations must be a strictly increasing "
-            f"positive list bounded by max_num_seqs={maximum_population}"
-        )
+    populations = tuple(range(1, maximum_population + 1))
     compiled = torch.compile(
         transition,
         fullgraph=True,
@@ -279,7 +266,7 @@ def build_encoder_execution(
     execution = ResolvedEncoderExecution(
         arm=arm,
         transition=transition,
-        warmup_populations=tuple(populations),
+        warmup_populations=populations,
     )
 
     def guarded_transition(

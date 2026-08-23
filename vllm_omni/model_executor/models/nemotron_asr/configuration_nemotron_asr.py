@@ -107,7 +107,6 @@ class NemotronASRConfig(PretrainedConfig):
         flush_token_id: int | None = None,
         endpoint_history_capacity_frames: int = 12,
         encoder_execution_arm: str | None = None,
-        encoder_execution_populations: list[int] | None = None,
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
@@ -161,9 +160,6 @@ class NemotronASRConfig(PretrainedConfig):
         # Absence retains the compatibility eager baseline; an experiment
         # stamps the resolved value into its evidence fingerprint.
         self.encoder_execution_arm = encoder_execution_arm
-        self.encoder_execution_populations = (
-            None if encoder_execution_populations is None else list(encoder_execution_populations)
-        )
         # Startup decode policy is part of the served artifact, not a
         # process-local default. Preserve all three fields through HF
         # serialization so build_decode_resolver sees the declaration

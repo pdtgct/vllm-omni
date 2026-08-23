@@ -66,10 +66,7 @@ def test_compiled_static_uses_one_fail_closed_fullgraph_authority(
     monkeypatch.setattr(torch, "compile", fake_compile)
     resolved = build_encoder_execution(
         SimpleNamespace(),
-        SimpleNamespace(
-            encoder_execution_arm="compiled-static",
-            encoder_execution_populations=[1, 2, 3, 4],
-        ),
+        SimpleNamespace(encoder_execution_arm="compiled-static"),
         maximum_population=4,
     )
     assert resolved.arm == "compiled-static"
@@ -94,10 +91,7 @@ def test_compiler_initialization_failure_is_not_hidden(
     with pytest.raises(RuntimeError, match="synthetic compiler failure"):
         build_encoder_execution(
             SimpleNamespace(),
-            SimpleNamespace(
-                encoder_execution_arm="compiled-static",
-                encoder_execution_populations=[1],
-            ),
+            SimpleNamespace(encoder_execution_arm="compiled-static"),
             maximum_population=1,
         )
 
@@ -112,36 +106,17 @@ def test_unknown_encoder_execution_arm_fails_closed() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "populations",
-    [None, [], [0], [2, 1], [1, 1], [1, 5]],
-)
-def test_compiled_static_requires_bounded_exact_population_authority(
-    populations: object,
+def test_compiled_static_derives_complete_population_authority_from_runner_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # @spec PORT-PERF-009
-    with pytest.raises(ValueError, match="encoder_execution_populations"):
-        build_encoder_execution(
-            SimpleNamespace(),
-            SimpleNamespace(
-                encoder_execution_arm="compiled-static",
-                encoder_execution_populations=populations,
-            ),
-            maximum_population=4,
-        )
-
-
-def test_eager_rejects_compiled_arm_population_settings() -> None:
-    # @spec PORT-PERF-009
-    with pytest.raises(ValueError, match="compiled-static"):
-        build_encoder_execution(
-            SimpleNamespace(),
-            SimpleNamespace(
-                encoder_execution_arm="eager",
-                encoder_execution_populations=[1],
-            ),
-            maximum_population=4,
-        )
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    resolved = build_encoder_execution(
+        SimpleNamespace(),
+        SimpleNamespace(encoder_execution_arm="compiled-static"),
+        maximum_population=4,
+    )
+    assert resolved.warmup_populations == (1, 2, 3, 4)
 
 
 def test_compiled_static_seals_observed_signatures_and_rejects_lazy_compile(
@@ -160,10 +135,7 @@ def test_compiled_static_seals_observed_signatures_and_rejects_lazy_compile(
     monkeypatch.setattr(torch, "compile", fake_compile)
     execution = build_encoder_execution(
         SimpleNamespace(),
-        SimpleNamespace(
-            encoder_execution_arm="compiled-static",
-            encoder_execution_populations=[1, 2],
-        ),
+        SimpleNamespace(encoder_execution_arm="compiled-static"),
         maximum_population=2,
     )
     caches = SimpleNamespace(
