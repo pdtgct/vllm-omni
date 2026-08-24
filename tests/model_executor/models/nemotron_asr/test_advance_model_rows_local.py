@@ -31,6 +31,13 @@ _PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/ne
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
+def _publish_module(name: str, module: types.ModuleType) -> None:
+    sys.modules[name] = module
+    parent_name, _, child_name = name.rpartition(".")
+    if parent_name:
+        setattr(sys.modules[parent_name], child_name, module)
+
+
 def _load_chain() -> dict[str, Any]:
     for name in (
         "vllm_omni",
@@ -38,8 +45,10 @@ def _load_chain() -> dict[str, Any]:
         "vllm_omni.model_executor.models",
         _BASE,
     ):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
+        module = sys.modules.get(name, types.ModuleType(name))
+        if name == _BASE and not hasattr(module, "__path__"):
+            module.__path__ = [str(_PKG)]
+        _publish_module(name, module)
     loaded: dict[str, Any] = {}
     for mod in (
         "precision",
@@ -50,16 +59,23 @@ def _load_chain() -> dict[str, Any]:
         "lid",
         "manifests",
         "frontend",
+        "profiling",
         "rnnt_cell",
         "rnnt",
         "decode_dispatch",
         "state_scatter",
         "advance",
     ):
-        spec = importlib.util.spec_from_file_location(f"{_BASE}.{mod}", _PKG / f"{mod}.py")
+        module_name = f"{_BASE}.{mod}"
+        if module_name in sys.modules:
+            module = sys.modules[module_name]
+            _publish_module(module_name, module)
+            loaded[mod] = module
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_BASE}.{mod}"] = module
+        _publish_module(module_name, module)
         spec.loader.exec_module(module)
         loaded[mod] = module
     return loaded
@@ -1471,6 +1487,57 @@ def test_capture_in_range_wrong_length_is_row_tier_without_sync(
     assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
     assert sink.published == [[]]
     _assert_pools_equal(pools, before)
+
+
+def test_capture_validation_reuses_geometry_shape_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-010
+    encoder_execution = mods["encoder_execution"]
+    geometry_shape = getattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        None,
+    )
+    assert callable(geometry_shape), "PORT-PERF-010 missing encoder_geometry_shape"
+    observed: list[tuple[int, int, int]] = []
+
+    def observe_shape(*args: Any, **kwargs: Any) -> Any:
+        result = geometry_shape(*args, **kwargs)
+        observed.append(
+            (
+                result.cadence_frames,
+                result.mel_width,
+                result.out_width,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        observe_shape,
+    )
+    core = _tiny_core()
+    pools = _fresh_pools()
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        commit_sink=_CommitRecorder(),
+        capture=True,
+    )
+
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
 
 
 def test_capture_records_publish_after_commit_with_identity() -> None:

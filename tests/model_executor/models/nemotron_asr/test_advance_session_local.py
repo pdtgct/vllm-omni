@@ -27,6 +27,13 @@ _PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/ne
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
+def _publish_module(name: str, module: types.ModuleType) -> None:
+    sys.modules[name] = module
+    parent_name, _, child_name = name.rpartition(".")
+    if parent_name:
+        setattr(sys.modules[parent_name], child_name, module)
+
+
 def _load_chain() -> dict[str, Any]:
     for name in (
         "vllm_omni",
@@ -34,8 +41,10 @@ def _load_chain() -> dict[str, Any]:
         "vllm_omni.model_executor.models",
         _BASE,
     ):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
+        module = sys.modules.get(name, types.ModuleType(name))
+        if name == _BASE and not hasattr(module, "__path__"):
+            module.__path__ = [str(_PKG)]
+        _publish_module(name, module)
     loaded: dict[str, Any] = {}
     for mod in (
         "precision",
@@ -46,15 +55,22 @@ def _load_chain() -> dict[str, Any]:
         "lid",
         "manifests",
         "frontend",
+        "profiling",
         "rnnt_cell",
         "rnnt",
         "state_scatter",
         "advance",
     ):
-        spec = importlib.util.spec_from_file_location(f"{_BASE}.{mod}", _PKG / f"{mod}.py")
+        module_name = f"{_BASE}.{mod}"
+        if module_name in sys.modules:
+            module = sys.modules[module_name]
+            _publish_module(module_name, module)
+            loaded[mod] = module
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_BASE}.{mod}"] = module
+        _publish_module(module_name, module)
         spec.loader.exec_module(module)
         loaded[mod] = module
     return loaded
@@ -375,6 +391,78 @@ def test_decode_rejects_noncanonical_inner_state_layout() -> None:
             state,
             decode_fn=inner_strided_decode,
         )
+
+
+def test_advance_session_reuses_geometry_and_transition_input_authorities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-010
+    advance = mods["advance"]
+    encoder_execution = mods["encoder_execution"]
+    geometry_shape = getattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        None,
+    )
+    prepare_inputs = getattr(
+        advance,
+        "prepare_encoder_transition_inputs",
+        None,
+    )
+    assert callable(geometry_shape), "PORT-PERF-010 missing encoder_geometry_shape"
+    assert callable(prepare_inputs), "PORT-PERF-010 missing prepare_encoder_transition_inputs"
+    geometry_results: list[Any] = []
+    prepared: list[tuple[Any, ...]] = []
+    received: list[tuple[Any, ...]] = []
+
+    def observe_shape(*args: Any, **kwargs: Any) -> Any:
+        result = geometry_shape(*args, **kwargs)
+        geometry_results.append(result)
+        return result
+
+    def observe_inputs(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        result = prepare_inputs(*args, **kwargs)
+        assert isinstance(result, tuple)
+        prepared.append(result)
+        return result
+
+    def observe_transition(*args: Any) -> Any:
+        received.append(args)
+        return encoder_execution.execute_encoder_transition(core, *args)
+
+    monkeypatch.setattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        observe_shape,
+    )
+    monkeypatch.setattr(
+        advance,
+        "prepare_encoder_transition_inputs",
+        observe_inputs,
+    )
+    core = _core()
+    _advance(
+        core,
+        _chunk(torch.zeros(1, CHUNK), seq=0),
+        _fresh_state(1),
+        encoder_transition=observe_transition,
+    )
+
+    assert len(geometry_results) == 1
+    assert len(prepared) == len(received) == 1
+    assert len(prepared[0]) == len(received[0])
+    assert all(
+        prepared_arg is received_arg
+        for prepared_arg, received_arg in zip(
+            prepared[0],
+            received[0],
+            strict=True,
+        )
+    )
+    assert geometry_results[0].mel_width == int(received[0][0].shape[2])
+    assert geometry_results[0].out_width == received[0][4]
+
+
 def test_static_fullgraph_encoder_transition_matches_eager_exactly() -> None:
     # @spec PORT-PERF-009
     # The production candidate uses Inductor, but this contract is
@@ -438,6 +526,8 @@ def test_static_fullgraph_encoder_transition_matches_eager_exactly() -> None:
             atol=0,
         )
     _assert_row_unchanged(graph_state, 0, _row_clone(eager_state, 0))
+
+
 def test_session_first_chunk_advances_and_captures() -> None:
     # @spec PORT-ADV-001
     # The canonical transition, exercised: session-first 1120 ms chunk

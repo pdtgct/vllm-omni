@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        EncoderCaches,
         EncoderTransition,
     )
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
@@ -77,6 +78,33 @@ RnntDecodeFn = Callable[
     ...,
     "tuple[torch.Tensor, torch.Tensor, DecodeState] | FrameAlignedDecode",
 ]
+
+
+# @spec PORT-PERF-010
+def prepare_encoder_transition_inputs(
+    mel: torch.Tensor,
+    caches: EncoderCaches,
+    out_offsets: torch.Tensor,
+    out_lengths: torch.Tensor,
+    out_width: int,
+    prompt_index: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    EncoderCaches,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    torch.Tensor,
+]:
+    """Build the one transition tuple shared by profile, warmup, and serve."""
+    return (
+        mel,
+        caches,
+        out_offsets,
+        out_lengths,
+        int(out_width),
+        prompt_index,
+    )
 
 
 def _has_packed_decode_state_interior(tensor: torch.Tensor) -> bool:
@@ -1111,6 +1139,7 @@ def advance_session(
             (a host configuration error, not a row condition).
     """
     from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
         execute_encoder_transition,
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
@@ -1136,12 +1165,13 @@ def advance_session(
     if not 0 <= geometry < len(lookaheads):
         raise ValueError(f"unknown bucket geometry id {geometry}")
     lookahead = lookaheads[geometry]
-    cadence = 8 * (lookahead + 1)
+    geometry_shape = encoder_geometry_shape(core, geometry)
+    cadence = geometry_shape.cadence_frames
     # The bucket's padded frontend width is one reference cadence
     # shift: first rows commit C-7, continuing rows C, and final rows
     # consume at most C before dropping the sub-eight boundary debt.
     pad_frames = cadence
-    mel_width = MEL_TAIL_FRAMES + pad_frames
+    mel_width = geometry_shape.mel_width
 
     counters = state.frontend_counters
     # Envelope-protocol status bits (PORT-ADV-004), all on device: the
@@ -1222,30 +1252,26 @@ def advance_session(
         ),
         torch.zeros_like(counts),
     )
-    out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
+    out_width = geometry_shape.out_width
 
     caches = _GatheredCaches(state)
+    transition_inputs = prepare_encoder_transition_inputs(
+        mel,
+        caches,
+        drop,
+        enc_lengths,
+        out_width,
+        batch.prompt_index,
+    )
     with torch.no_grad():
         with phase("port.encode"):
             if encoder_transition is None:
                 enc, conditioned = execute_encoder_transition(
                     core,
-                    mel,
-                    caches,
-                    drop,
-                    enc_lengths,
-                    out_width,
-                    batch.prompt_index,
+                    *transition_inputs,
                 )
             else:
-                enc, conditioned = encoder_transition(
-                    mel,
-                    caches,
-                    drop,
-                    enc_lengths,
-                    out_width,
-                    batch.prompt_index,
-                )
+                enc, conditioned = encoder_transition(*transition_inputs)
         with phase("port.decode"):
             decode_in = DecodeState(
                 h=state.h.transpose(0, 1).contiguous(),
@@ -2243,6 +2269,9 @@ def advance_model_rows(
             resolver, or a trusted-identity projection-shape defect —
             always before any resident mutation.
     """
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+    )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
         CTR_COMMITTED_MEL_FRAMES,
         CTR_EXPECTED_CHUNK_SEQUENCE,
@@ -2618,7 +2647,8 @@ def advance_model_rows(
         rows_dev = staging.stage_bucket(g, pos_t, device) if staging is not None else _h2d(pos_t, device)
         blocks_dev = didx.index_select(0, rows_dev)
         fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
-        cadence = 8 * (lookaheads[g] + 1)
+        capture_geometry = encoder_geometry_shape(core, g) if capture_on else None
+        cadence = capture_geometry.cadence_frames if capture_geometry is not None else 8 * (lookaheads[g] + 1)
         s_g = cadence * hop
         if ENVELOPE_HEADER_SLOTS + s_g > hidden:
             raise ValueError(f"carrier width {hidden} cannot hold geometry {g}'s {s_g}-sample cadence")
@@ -2714,20 +2744,16 @@ def advance_model_rows(
                 (
                     int(rows_dev.shape[0]),
                     int(state.mel_tail.shape[1]),
-                    int(state.mel_tail.shape[2]) + cadence,
+                    capture_geometry.mel_width,
                 ),
                 (
                     int(rows_dev.shape[0]),
-                    int(
-                        core.encoder.pre_encode.output_lengths(torch.tensor([int(state.mel_tail.shape[2]) + cadence]))[
-                            0
-                        ]
-                    ),
+                    capture_geometry.out_width,
                     int(state.channel[0].shape[2]),
                 ),
                 state.channel[0].dtype,
             )
-            if capture_on
+            if capture_geometry is not None
             else None,
             expected_capture_lengths=(
                 capture_mel_lengths,
