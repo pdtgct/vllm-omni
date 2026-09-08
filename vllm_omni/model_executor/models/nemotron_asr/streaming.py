@@ -155,6 +155,16 @@ async def buffer_stream(
                 return
 
     authority = session.accepted_audio
+    # Optional capability; custom/no-op observers need no additional API.
+    # Cache once, preserving disabled per-unit clocks and scheduling calls.
+    timing = None
+    try:
+        resolve_timing = getattr(active_observer, "service_timing", None)
+        if resolve_timing is not None:
+            timing = resolve_timing(session_key)
+    except Exception:
+        pass
+    authority.capture_service_timing = timing is not None
 
     def prompt(unit: Any) -> dict[str, Any]:
         # TokensPrompt shape: one placeholder token per chunk
@@ -197,10 +207,26 @@ async def buffer_stream(
             if active_observer is not None and handle is not None:
                 observe_safely(active_observer.unit_minted, handle)
             rendered = prompt(unit)
+            submitted_ns = time.monotonic_ns()
             authority.record_submission(
                 unit,
-                submitted_at_ns=time.monotonic_ns(),
+                submitted_at_ns=submitted_ns,
             )
+            if timing is not None:
+                try:
+                    timing.submitted(
+                        handle,
+                        unit.logical_sequence,
+                        unit.carrier_sequence,
+                        unit.kind,
+                        authority.observed_eligibility_ns,
+                        submitted_ns,
+                    )
+                except Exception:
+                    try:
+                        timing.valid = False
+                    except Exception:
+                        pass
             yield rendered
             await hold_until_park()
             authority.park(

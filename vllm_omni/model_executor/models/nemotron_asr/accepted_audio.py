@@ -107,6 +107,8 @@ class AcceptedAudioAuthority:
         self._ready: deque[ReadyAudioUnit] = deque()
         self._in_flight: ReadyAudioUnit | None = None
         self._in_flight_submitted = False
+        self.capture_service_timing = False
+        self.observed_eligibility_ns: int | None = None
         self._prior_ordinary_submission_ns: int | None = None
         self._next_logical_sequence = initial_logical_sequence
         self._accepted_samples = 0
@@ -307,6 +309,8 @@ class AcceptedAudioAuthority:
                 current_ns = time.monotonic_ns() if now_ns is None else now_ns
                 if current_ns < eligibility_ns:
                     return None
+            if self.capture_service_timing:
+                self.observed_eligibility_ns = eligibility_ns
             self._in_flight = self._ready.popleft()
             self._in_flight_submitted = False
             return self._in_flight

@@ -535,9 +535,7 @@ def test_session_construction_is_the_native_open_boundary() -> None:
     opened = [c for c in fake.calls if c[0] == "session_opened"]
     # Keyed since the A27 topology cascade: identity-fallback key here
     # (no minted correlation key was supplied to construction).
-    assert opened == [
-        ("session_opened", {"session_key": session.session_key, "cadence_ms": "560"})
-    ]
+    assert opened == [("session_opened", {"session_key": session.session_key, "cadence_ms": "560"})]
 
 
 # @spec PORT-OBS-006
@@ -750,3 +748,139 @@ def test_ledger_fallback_ready_uses_the_sessions_key_not_the_ledgers() -> None:
     readies = [c for c in observer.calls if c[0] == "unit_ready"]
     assert readies, "ledger mint must emit a ready event"
     assert all(r[1]["session_key"] == "leased-req-9" for r in readies)
+
+
+# @spec PORT-OBS-002, PORT-OBS-003, PORT-STATE-026, PORT-PERF-007
+@pytest.mark.parametrize("mode", ["absent", "disabled", "enabled", "broken", "broken_capability"])
+def test_service_timing_preserves_dispatch_samples_and_calls(monkeypatch: Any, mode: str) -> None:
+    """Exercise real dispatch with deterministic time and previous-ACTUAL pacing."""
+    mod = _MODULES["streaming"]
+    submissions = []
+    dispatch_times = []
+    timing_calls = []
+    sleeps = []
+    clock_reads = []
+    capability_calls = []
+    clock = [1_000_000_000]
+
+    def monotonic_ns() -> int:
+        sampled = clock[0]
+        clock_reads.append(sampled)
+        # Every sample differs: resampling s in the observer cannot accidentally
+        # equal the sample that record_submission actually received.
+        clock[0] += 10_000_000
+        return sampled
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += round(seconds * 1e9)
+
+    class Timing:
+        def submitted(self, handle: Any, logical: int, carrier: int, kind: str, e: int, s: int) -> None:
+            timing_calls.append((handle, logical, carrier, kind, e, s))
+            if mode == "broken":
+                raise RuntimeError("observation failed")
+
+    class Observer(_RecordingObserver):
+        def service_timing(self, key: str) -> Any:
+            capability_calls.append(key)
+            if mode == "broken_capability":
+                raise RuntimeError("capability failed")
+            return Timing() if mode in ("enabled", "broken") else None
+
+    observer = _RecordingObserver() if mode == "absent" else Observer()
+    session = _session(observer=observer)
+    authority = session.accepted_audio
+    authority.cadence_ns = 160_000_000
+    original_dispatch = authority.dispatch_next
+    original_submission = authority.record_submission
+
+    def dispatch(*, now_ns: int) -> Any:
+        dispatch_times.append(now_ns)
+        return original_dispatch(now_ns=now_ns)
+
+    def submit(unit: Any, *, submitted_at_ns: int) -> None:
+        submissions.append((unit.logical_sequence, submitted_at_ns))
+        original_submission(unit, submitted_at_ns=submitted_at_ns)
+
+    monkeypatch.setattr(mod.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(authority, "dispatch_next", dispatch)
+    monkeypatch.setattr(authority, "record_submission", submit)
+
+    async def scenario() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        async for _ in buffer_stream(_audio(8_960 * 2), queue, session, final_tail_ready_stamp_s=1.0):
+            queue.put_nowait([PARK_ID])
+
+    _run(scenario())
+    assert submissions == [(0, 1_020_000_000), (1, 1_200_000_000), (2, 1_380_000_000)]
+    assert dispatch_times == [1_010_000_000, 1_030_000_000, 1_190_000_000, 1_210_000_000, 1_370_000_000]
+    assert sleeps == [0.15, 0.15]
+    # One acceptance + five dispatch attempts + three actual submissions;
+    # this exact sequence is the same in every observer mode.
+    assert clock_reads == [
+        1_000_000_000,
+        1_010_000_000,
+        1_020_000_000,
+        1_030_000_000,
+        1_190_000_000,
+        1_200_000_000,
+        1_210_000_000,
+        1_370_000_000,
+        1_380_000_000,
+    ]
+    assert len(capability_calls) == (0 if mode == "absent" else 1)
+    if mode in ("enabled", "broken"):
+        assert [(c[1], c[4], c[5]) for c in timing_calls] == [
+            (0, 1_000_000_000, 1_020_000_000),
+            (1, 1_180_000_000, 1_200_000_000),
+            (2, 1_360_000_000, 1_380_000_000),
+        ]
+        assert all(call[4] < call[5] for call in timing_calls)
+        assert [(call[1], call[5]) for call in timing_calls] == submissions
+        assert timing_calls[-1][3] == "final_tail"
+        ready_handles = [c[1]["handle"] for c in observer.calls if c[0] == "unit_minted"]
+        assert all(call[0] is h for call, h in zip(timing_calls, ready_handles, strict=True))
+    else:
+        assert timing_calls == []
+        assert authority.observed_eligibility_ns is None
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+def test_submission_observer_mutates_then_raises_invalidates_trace() -> None:
+    from vllm_omni.metrics.streaming_transport import ServiceTimingTrace
+
+    class Trace(ServiceTimingTrace):
+        def submitted(self, *args: Any) -> None:
+            super().submitted(*args)
+            raise RuntimeError("after successful recording")
+
+    trace = Trace("test-fixture-key")
+
+    class Observer(_RecordingObserver):
+        def service_timing(self, key: str) -> Any:
+            return trace
+
+        def unit_ready(self, **kwargs: Any) -> Any:
+            handle = super().unit_ready(**kwargs)
+            trace.ready(handle)
+            return handle
+
+    observer = Observer()
+    session = _session(observer=observer)
+    session.accepted_audio.cadence_ns = 1
+
+    async def scenario() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        async for prompt in buffer_stream(_audio(1), queue, session):
+            if "multi_modal_data" in prompt:
+                handle = observer.complete_inflight(session.session_key)
+                assert handle is not None
+                trace.disposed(handle, _MODULES["streaming"].time.monotonic_ns() / 1e9, "parked")
+            queue.put_nowait([PARK_ID])
+
+    _run(scenario())
+    result = trace.finish("completed")
+    assert result["complete"]
+    assert not result["valid"]

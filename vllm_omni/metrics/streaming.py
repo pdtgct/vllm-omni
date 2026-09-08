@@ -21,6 +21,8 @@ non-authoritative and nonfatal by construction.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,7 +30,7 @@ from prometheus_client import Counter, Gauge, Histogram
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.streaming_transport import ChunkReadyHandle, StreamingObserver
+from vllm_omni.metrics.streaming_transport import ChunkReadyHandle, ServiceTimingTrace, StreamingObserver
 
 logger = init_logger(__name__)
 
@@ -46,6 +48,7 @@ class _SessionRecord:
     cadence_ms: str
     waiting: list[ChunkReadyHandle] = field(default_factory=list)
     inflight: ChunkReadyHandle | None = None
+    timing: ServiceTimingTrace | None = None
 
 
 _cadence_labels = list(defs.STREAMING_CADENCE_LABELS)
@@ -467,6 +470,7 @@ class PrometheusStreamingObserver(StreamingObserver):
 
     def __init__(self, metrics: OmniStreamingMetrics) -> None:
         self._metrics = metrics
+        self._service_timing_enabled = metrics._log_stats and os.environ.get("VLLM_OMNI_SERVICE_TIMING") == "1"
         # One bounded record per session key (PORT-OBS-003 as amended):
         # {cadence, waiting-ready handles, single in-flight handle},
         # created at first open (or first ready, for observation-only
@@ -497,12 +501,18 @@ class PrometheusStreamingObserver(StreamingObserver):
         try:
             fn(*args, **kwargs)
         except Exception:
-            logger.exception("streaming observer sink failed in %s; observation is nonfatal", fn)
+            try:
+                logger.exception("streaming observer sink failed in %s; observation is nonfatal", fn)
+            except Exception:
+                pass
 
     def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
         record = self._sessions.get(session_key)
         if record is None:
-            self._sessions[session_key] = _SessionRecord(cadence_ms=cadence_ms)
+            self._sessions[session_key] = _SessionRecord(
+                cadence_ms=cadence_ms,
+                timing=ServiceTimingTrace(session_key) if self._service_timing_enabled else None,
+            )
             self._safe(self._metrics.inc_sessions_active, cadence_ms)
             return
         # Duplicate open of an active session: idempotent no-op; a
@@ -526,7 +536,8 @@ class PrometheusStreamingObserver(StreamingObserver):
         # (review round 2026-07-28, F4).
         remaining = self.clear_all_outstanding(session_key, outcome="error")
         if remaining:
-            logger.warning(
+            self._safe(
+                logger.warning,
                 "session finished (caller reason=%s) with %d undisposed "
                 "unit(s) — lifecycle divergence, cleared as error and the "
                 "session finishes as error",
@@ -538,6 +549,18 @@ class PrometheusStreamingObserver(StreamingObserver):
         # decrements active and increments finished together.
         self._safe(self._metrics.observe_session_finished, record.cadence_ms, reason)
         del self._sessions[session_key]
+        if record.timing is not None:
+            # Cleanup owns completion; diagnostic export cannot retain a session
+            # or fail serving, even when the logger itself is broken.
+            try:
+                logger.info("Service timing trace %s", json.dumps(record.timing.finish(reason), separators=(",", ":")))
+            except Exception:
+                pass
+
+    def service_timing(self, session_key: str) -> ServiceTimingTrace | None:
+        """Optional capability: resolve once per stream, absent when disabled."""
+        record = self._sessions.get(session_key)
+        return None if record is None else record.timing
 
     def session_record_count(self) -> int:
         """The number of live per-session records (bounded-state check)."""
@@ -574,6 +597,11 @@ class PrometheusStreamingObserver(StreamingObserver):
             )
             return handle
         record.waiting.append(handle)
+        if record.timing is not None:
+            try:
+                record.timing.ready(handle)
+            except Exception:
+                record.timing.valid = False
         self._safe(self._metrics.inc_backlog, cadence_ms)
         return handle
 
@@ -593,12 +621,13 @@ class PrometheusStreamingObserver(StreamingObserver):
             return
         if record.inflight is handle:
             return
-        if handle not in record.waiting:
-            return
         if record.inflight is not None:
             return
-        record.waiting.remove(handle)
-        record.inflight = handle
+        for index, waiting in enumerate(record.waiting):
+            if waiting is handle:
+                del record.waiting[index]
+                record.inflight = handle
+                return
 
     def complete_inflight(self, session_key: str) -> ChunkReadyHandle | None:
         """Resolve (without disposing) the single in-flight unit.
@@ -615,6 +644,7 @@ class PrometheusStreamingObserver(StreamingObserver):
         return record.inflight
 
     def unit_parked(self, handle: ChunkReadyHandle, *, park_stamp_s: float) -> None:
+        self._timing_disposed(handle, park_stamp_s, "parked")
         if not self._dispose(handle):
             return
         latency_s = max(park_stamp_s - handle.ready_stamp_s, 0.0)
@@ -625,6 +655,7 @@ class PrometheusStreamingObserver(StreamingObserver):
         self._safe(self._metrics.observe_chunk_outcome, handle.cadence_ms, handle.chunk_type, "parked")
 
     def unit_cleared(self, handle: ChunkReadyHandle, *, outcome: str) -> None:
+        self._timing_disposed(handle, None, outcome)
         if not self._dispose(handle):
             return
         self._safe(self._metrics.observe_chunk_outcome, handle.cadence_ms, handle.chunk_type, outcome)
@@ -644,6 +675,14 @@ class PrometheusStreamingObserver(StreamingObserver):
             self.unit_cleared(handle, outcome=outcome)
         return len(handles)
 
+    def _timing_disposed(self, handle: ChunkReadyHandle, park_s: float | None, outcome: str) -> None:
+        record = self._sessions.get(handle.session_key)
+        if record is not None and record.timing is not None:
+            try:
+                record.timing.disposed(handle, park_s, outcome)
+            except Exception:
+                record.timing.valid = False
+
     def _dispose(self, handle: ChunkReadyHandle) -> bool:
         """Idempotent terminal disposition: decrements backlog exactly
         once per handle. Succeeds only while the handle is waiting or
@@ -653,11 +692,14 @@ class PrometheusStreamingObserver(StreamingObserver):
         record = self._sessions.get(handle.session_key)
         if record is None:
             return False
-        if handle in record.waiting:
-            record.waiting.remove(handle)
-        elif record.inflight is handle:
+        if record.inflight is handle:
             record.inflight = None
         else:
-            return False
+            for index, waiting in enumerate(record.waiting):
+                if waiting is handle:
+                    del record.waiting[index]
+                    break
+            else:
+                return False
         self._safe(self._metrics.dec_backlog, handle.cadence_ms)
         return True

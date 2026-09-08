@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The neutral, Prometheus-free streaming-observability transport module.
 
-Owns two things that must NOT live in the model package or the Prometheus
+Owns the contracts and observations that must NOT live in the model package or the Prometheus
 metrics package (decisions/... "Observer protocol home", "Park-correlation
 authority"; PORT-OBS-003):
 
@@ -44,9 +44,9 @@ class ChunkReadyHandle:
     """Opaque per-unit identity carried through ready -> minted ->
     parked/cleared (PORT-OBS-003/004/005).
 
-    Frozen (hence hashable) so callers may key sets/dicts by handle
-    identity — e.g. asserting "every ready handle received exactly one
-    disposition" over a ``set`` of handles.
+    Frozen values can compare equal for distinct accepted units. Lifecycle
+    collaborators must compare handles by object identity (``is``), never
+    by dataclass equality or readiness timestamps.
 
     Attributes:
         session_key: The owning session's identity (the native
@@ -190,6 +190,203 @@ class StreamingObserver(Protocol):
         ...
 
 
+@dataclass(slots=True)
+class _ServiceTimingSlot:
+    handle: ChunkReadyHandle | None = None
+    logical_sequence: int | None = None
+    carrier_sequence: int | None = None
+    kind: str = ""
+    r: float | None = None
+    e_ns: int | None = None
+    s_ns: int | None = None
+    p: float | None = None
+    disposition: str | None = None
+
+
+# @spec PORT-OBS-002, PORT-OBS-003, PORT-OBS-004, PORT-PERF-007
+class ServiceTimingTrace:
+    """Session-owned diagnostic, mutated on the existing serving event loop.
+
+    Slots are allocated at open. Handles are matched by object identity;
+    authoritative logical/carrier sequences arrive at submission. r/p retain
+    the observer's raw monotonic seconds; e/s retain existing monotonic ns
+    until terminal serialization. Controls have no inferred readiness/park.
+    This is observational state, never a dispatch or completion authority.
+    """
+
+    capacity = 256
+
+    def __init__(self, session_key: str) -> None:
+        self.session_key = session_key
+        self.slots = [_ServiceTimingSlot() for _ in range(self.capacity)]
+        self.count = 0
+        self.overflow = 0
+        self.valid = True
+        self.next_sequence = 0
+
+    def _reserve(self) -> _ServiceTimingSlot | None:
+        if self.count == self.capacity:
+            self.overflow += 1
+            self.valid = False
+            return None
+        slot = self.slots[self.count]
+        self.count += 1
+        return slot
+
+    def _find(self, handle: ChunkReadyHandle) -> _ServiceTimingSlot | None:
+        for index in range(self.count):
+            slot = self.slots[index]
+            if slot.handle is handle:
+                return slot
+        self.valid = False
+        return None
+
+    def ready(self, handle: ChunkReadyHandle) -> None:
+        slot = self._reserve()
+        if slot is not None:
+            slot.handle = handle
+            slot.kind = handle.chunk_type
+            slot.r = handle.ready_stamp_s
+
+    def submitted(
+        self,
+        handle: ChunkReadyHandle | None,
+        logical_sequence: int,
+        carrier_sequence: int | None,
+        kind: str,
+        eligible_ns: int | None,
+        submitted_ns: int,
+    ) -> None:
+        if logical_sequence != self.next_sequence:
+            self.valid = False
+        self.next_sequence = logical_sequence + 1
+        if kind == "forced_eou" and handle is None:
+            slot = self._reserve()
+        elif handle is not None:
+            slot = self._find(handle)
+        else:
+            self.valid = False
+            return
+        if slot is None:
+            return
+        if slot.s_ns is not None or (slot.kind and slot.kind != kind):
+            self.valid = False
+            return
+        slot.logical_sequence = logical_sequence
+        slot.carrier_sequence = carrier_sequence
+        slot.kind = kind
+        slot.e_ns = eligible_ns
+        slot.s_ns = submitted_ns
+
+    def disposed(self, handle: ChunkReadyHandle, park_s: float | None, outcome: str) -> None:
+        slot = self._find(handle)
+        if slot is None:
+            return
+        if slot.disposition is not None:
+            self.valid = False
+            return
+        slot.p = park_s
+        slot.disposition = outcome
+
+    def finish(self, reason: str) -> dict[str, Any]:
+        """Serialize only at terminal cleanup, outside measured unit intervals.
+
+        One caller-owned logger record includes count/capacity/overflow and
+        an end marker: consumers must reject missing/truncated records and
+        reconcile audio_count and sum(p-r) with independent histograms only
+        for valid complete traces. count includes every bounded record,
+        including controls; audio_count includes regular/final-tail only.
+        Completion covers ordinary audio only, not control timing.
+        """
+        rows = []
+        complete = reason == "completed" and self.overflow == 0
+        final_tails = 0
+        audio_count = 0
+        previous_s: float | None = None
+        previous_p: float | None = None
+        predecessor = "first"
+        for slot in sorted(
+            self.slots[: self.count], key=lambda x: -1 if x.logical_sequence is None else x.logical_sequence
+        ):
+            e = None if slot.e_ns is None else slot.e_ns / 1e9
+            s = None if slot.s_ns is None else slot.s_ns / 1e9
+            if slot.kind == "forced_eou":
+                # Accepted-audio controls have a logical identity but no audio
+                # carrier, ready/eligibility/park stamp, or unit disposition.
+                if (
+                    slot.logical_sequence is None
+                    or slot.logical_sequence < 0
+                    or slot.carrier_sequence is not None
+                    or slot.s_ns is None
+                    or slot.r is not None
+                    or slot.e_ns is not None
+                    or slot.p is not None
+                    or slot.disposition is not None
+                    or slot.handle is not None
+                ):
+                    self.valid = False
+            elif slot.kind in ("regular", "final_tail"):
+                audio_count += 1
+                if slot.logical_sequence is not None and slot.carrier_sequence != slot.logical_sequence % (2**24):
+                    self.valid = False
+                if previous_p is not None and s is not None and s < previous_p:
+                    self.valid = False
+                final_tails += slot.kind == "final_tail"
+                if (
+                    slot.r is None
+                    or e is None
+                    or s is None
+                    or slot.p is None
+                    or slot.logical_sequence is None
+                    or slot.carrier_sequence is None
+                    or slot.disposition != "parked"
+                ):
+                    complete = False
+                elif not slot.r <= e <= s <= slot.p:
+                    self.valid = False
+            else:
+                self.valid = False
+            if s is not None:
+                if previous_s is not None and s < previous_s:
+                    self.valid = False
+                previous_s = s
+            rows.append(
+                dict(
+                    logical_sequence=slot.logical_sequence,
+                    carrier_sequence=slot.carrier_sequence,
+                    kind=slot.kind,
+                    r=slot.r,
+                    e=e,
+                    s=s,
+                    p=slot.p,
+                    disposition=slot.disposition,
+                    predecessor_attribution=predecessor,
+                )
+            )
+            if slot.kind == "forced_eou":
+                previous_p = None
+                predecessor = "control_unobserved"
+            else:
+                previous_p = slot.p
+                predecessor = "ordinary"
+        complete = complete and final_tails == 1
+        return dict(
+            schema=1,
+            session=self.session_key,
+            units=rows,
+            time_unit="monotonic_seconds",
+            capacity=self.capacity,
+            count=self.count,
+            audio_count=audio_count,
+            overflow=self.overflow,
+            reason=reason,
+            completion_scope="ordinary_audio",
+            complete=complete,
+            valid=self.valid and complete,
+            end=True,
+        )
+
+
 def observe_safely(observer_method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Invoke one bound ``StreamingObserver`` method, swallowing failure.
 
@@ -270,6 +467,4 @@ def forward_batch_stats_to_engine_core_outputs(
     # no such attribute — an unconditional read raised AttributeError
     # inside the engine-core busy loop and killed the engine on the
     # first idle step after a generation (2026-07-28 GPU round).
-    engine_core_outputs.streaming_chunk_batch_stats = getattr(
-        runner_output, "streaming_chunk_batch_stats", None
-    )
+    engine_core_outputs.streaming_chunk_batch_stats = getattr(runner_output, "streaming_chunk_batch_stats", None)
