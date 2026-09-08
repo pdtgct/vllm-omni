@@ -14,6 +14,13 @@ import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     FastConformerEncoder,
+    RelPositionalEncoding,
+)
+from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+    MEL_TAIL_FRAMES,
+)
+from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+    CADENCES,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -46,6 +53,30 @@ def test_output_shapes_and_lengths():
     out, lens = enc(mel, torch.tensor([160]))
     assert out.shape[0] == 1 and out.shape[2] == 32
     assert out.shape[1] == int(lens[0]) == enc.pre_encode.output_lengths(torch.tensor([160]))
+
+
+def test_materialized_positional_capacity_serves_every_geometry_bit_exactly() -> None:
+    # @spec PORT-PERF-010
+    enc = _tiny(att_context=(56, 13))
+    history = enc.att_context[0]
+    attention_lengths = []
+    for _, right in CADENCES.values():
+        mel_width = MEL_TAIL_FRAMES + 8 * (right + 1)
+        out_width = int(enc.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
+        attention_lengths.append(out_width + history)
+    t_cap = max(attention_lengths)
+    capacity_ref = torch.zeros(1, t_cap, 32)
+    enc.pos_enc._extend(t_cap, capacity_ref)
+    positional_id = id(enc.pos_enc.pe)
+
+    for attention_length in attention_lengths:
+        ref = torch.zeros(1, attention_length, 32)
+        actual = enc.pos_enc(ref)
+        exact = RelPositionalEncoding(32)
+        exact._extend(attention_length, ref)
+        expected = exact(ref)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert id(enc.pos_enc.pe) == positional_id
 
 
 def test_strictly_causal_at_zero_lookahead():

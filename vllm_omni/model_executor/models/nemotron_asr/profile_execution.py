@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -19,7 +19,10 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ENV_VALID_SAMPLES,
     ENV_VERSION,
     ENVELOPE_VERSION,
+    DecodeRequest,
+    DecodeResolver,
     PreparedRowBinding,
+    ResolvedDecode,
     RowPlan,
     advance_model_rows,
     consume_batch_stats,
@@ -39,6 +42,9 @@ from vllm_omni.model_executor.persistent_state import (
     PersistentStateStorage,
     allocate_persistent_state_storage,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
 
 logger = init_logger(__name__)
 
@@ -72,19 +78,46 @@ def _required_control(config: Any, name: str) -> int:
     return value
 
 
+# @spec PORT-PERF-004
+def _profile_decode_resolver(model: NemotronASRForRNNT) -> DecodeResolver:
+    """Bind pre-capture dense-graph profiling to dense eager."""
+
+    if getattr(model.config, "decode_dispatch_arm", None) != "dense-graphed":
+        return model._decode_resolver
+
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    def resolve(request: DecodeRequest) -> ResolvedDecode:
+        if request.graph_covers_decode:
+            raise ValueError("pre-capture memory profile cannot claim graph coverage")
+        return ResolvedDecode(
+            arm="dense-eager",
+            decode_fn=decode_dense_masked_frames,
+            override_reason="pre-capture-memory-profile",
+        )
+
+    return resolve
+
+
 # @spec PORT-MIG-005, PORT-STATE-003, PORT-STATE-007
 def build_profile_invocation(
     config: Any,
     *,
     num_rows: int,
     device: torch.device,
+    geometry_id: int | None = None,
 ) -> PersistentStateProfileInvocation:
     """Build the maximum live eager transaction without a manager slot."""
 
     rows = _positive_row_count(num_rows)
     placeholder_id = _required_control(config, "audio_chunk_token_id")
-    geometry_label = next(reversed(CADENCES))
-    geometry_id = len(CADENCES) - 1
+    if geometry_id is None:
+        geometry_id = len(CADENCES) - 1
+    if isinstance(geometry_id, bool) or not isinstance(geometry_id, int) or not 0 <= geometry_id < len(CADENCES):
+        raise ValueError("profile geometry id is outside the manifest")
+    geometry_label = tuple(CADENCES)[geometry_id]
     valid_samples = RAW_SAMPLES_PER_CHUNK[geometry_label]
     hidden_size = int(config.hidden_size)
     if hidden_size < len(ENVELOPE_HEADER_FIELDS) + valid_samples:
@@ -177,12 +210,13 @@ def build_profile_invocation(
     )
 
 
-# @spec PORT-ADV-001, PORT-MIG-003, PORT-MIG-005
+# @spec PORT-ADV-001, PORT-MIG-003, PORT-MIG-005, PORT-PERF-004
 def run_persistent_state_profile(
-    model: Any,
+    model: NemotronASRForRNNT,
     *,
     num_rows: int,
     device: torch.device,
+    geometry_id: int | None = None,
 ) -> torch.Tensor:
     """Execute the canonical transition and discard all profile effects."""
 
@@ -191,10 +225,20 @@ def run_persistent_state_profile(
         num_rows,
     )
     try:
+        execution = model._encoder_execution
+        if geometry_id is None and getattr(execution, "arm", None) in {
+            "compiled-static",
+            "dense-graphed",
+        }:
+            geometry_id = max(execution.warmup_geometries)
+        invocation_kwargs: dict[str, Any] = {}
+        if geometry_id is not None:
+            invocation_kwargs["geometry_id"] = geometry_id
         invocation = build_profile_invocation(
             model.config,
             num_rows=num_rows,
             device=device,
+            **invocation_kwargs,
         )
         pools = invocation.pools
         if device.type == "cuda":
@@ -212,41 +256,91 @@ def run_persistent_state_profile(
                 endpoint_history_pool=pools.endpoint_history,
                 endpoint_book_pool=pools.endpoint_book,
             )
-        return advance_model_rows(
-            model.core,
-            invocation.input_ids,
-            invocation.inputs_embeds,
-            invocation.plan,
-            channel_pools=list(pools.channel),
-            time_pools=list(pools.convolution),
-            len_pools=list(pools.valid_length),
-            h_pool=pools.predictor_h,
-            c_pool=pools.predictor_c,
-            queue_pool=pools.replay_queue,
-            book_pool=pools.replay_book,
-            frontend_raw_pool=pools.frontend_raw,
-            frontend_mel_pool=pools.frontend_mel,
-            frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history,
-            endpoint_book_pool=pools.endpoint_book,
-            eou_token_id=_required_control(model.config, "eou_token_id"),
-            adapter=model._emission_adapter,
-            decode_resolver=model._decode_resolver,
-            placeholder_id=_required_control(
-                model.config,
-                "audio_chunk_token_id",
-            ),
-            park_id=_required_control(model.config, "eos_token_id"),
-            commit_sink=None,
-            capture=False,
-            staging=None,
-        )
+
+        def invoke() -> torch.Tensor:
+            return advance_model_rows(
+                model.core,
+                invocation.input_ids,
+                invocation.inputs_embeds,
+                invocation.plan,
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+                eou_token_id=_required_control(model.config, "eou_token_id"),
+                adapter=model._emission_adapter,
+                decode_resolver=_profile_decode_resolver(model),
+                encoder_transition=model._encoder_execution.transition,
+                placeholder_id=_required_control(
+                    model.config,
+                    "audio_chunk_token_id",
+                ),
+                park_id=_required_control(model.config, "eos_token_id"),
+                commit_sink=None,
+                capture=False,
+                memory_profile=True,
+                staging=None,
+            )
+
+        if (
+            getattr(execution, "arm", None)
+            in {
+                "compiled-static",
+                "dense-graphed",
+            }
+            and not execution.cell_active
+        ):
+            if geometry_id is None:
+                raise ValueError("compiled-static encoder profile geometry is missing")
+            return execution.profile_cell(
+                geometry=geometry_id,
+                population=num_rows,
+                invoke=invoke,
+            )
+        return invoke()
     finally:
         consume_batch_stats()
+
+
+# @spec PORT-PERF-009, PORT-PERF-011
+def warmup_static_encoder_execution(
+    model: NemotronASRForRNNT,
+    *,
+    device: torch.device,
+) -> None:
+    """Compile and attest every served geometry/population cell."""
+    execution = model._encoder_execution
+    if execution.arm not in {"compiled-static", "dense-graphed"}:
+        return
+    if getattr(execution, "ready", False):
+        return
+    cells = tuple(
+        (geometry, population)
+        for geometry in execution.warmup_geometries
+        for population in execution.warmup_populations
+    )
+    execution.warmup_domain(
+        expected_cells=cells,
+        invoke=lambda geometry, population: run_persistent_state_profile(
+            model,
+            num_rows=population,
+            device=device,
+            geometry_id=geometry,
+        ),
+    )
 
 
 __all__ = [
     "PersistentStateProfileInvocation",
     "build_profile_invocation",
     "run_persistent_state_profile",
+    "warmup_static_encoder_execution",
 ]

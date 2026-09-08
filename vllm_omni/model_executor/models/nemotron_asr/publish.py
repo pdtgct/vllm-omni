@@ -106,10 +106,12 @@ def publish(
     decode_dispatch_arm: str,
 ) -> dict:
     """Convert + author + write the served checkpoint. Returns the config."""
-    if decode_dispatch_arm not in {"dense-eager", "compact-eager"}:
-        raise ValueError(
-            "decode_dispatch_arm must name a currently executable eager arm; dense-graphed is not a graph binding"
-        )
+    if decode_dispatch_arm not in {
+        "dense-eager",
+        "dense-graphed",
+        "compact-eager",
+    }:
+        raise ValueError("decode_dispatch_arm must name a supported dense-eager, dense-graphed, or compact-eager arm")
     if not source_model.is_file():
         raise ValueError(f"source .nemo checkpoint does not exist: {source_model}")
     metadata_path = metadata_path or nemo_state.with_name("meta.json")
@@ -256,9 +258,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--decode-dispatch-arm",
-        choices=("dense-eager", "compact-eager"),
+        choices=("dense-eager", "dense-graphed", "compact-eager"),
         required=True,
-        help="explicit executable bring-up arm authored into config.json",
+        help="explicit served decode arm authored into config.json",
     )
     args = ap.parse_args()
     summary = publish(

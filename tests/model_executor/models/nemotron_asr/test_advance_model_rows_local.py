@@ -31,6 +31,13 @@ _PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/ne
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
+def _publish_module(name: str, module: types.ModuleType) -> None:
+    sys.modules[name] = module
+    parent_name, _, child_name = name.rpartition(".")
+    if parent_name:
+        setattr(sys.modules[parent_name], child_name, module)
+
+
 def _load_chain() -> dict[str, Any]:
     for name in (
         "vllm_omni",
@@ -38,27 +45,37 @@ def _load_chain() -> dict[str, Any]:
         "vllm_omni.model_executor.models",
         _BASE,
     ):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
+        module = sys.modules.get(name, types.ModuleType(name))
+        if name == _BASE and not hasattr(module, "__path__"):
+            module.__path__ = [str(_PKG)]
+        _publish_module(name, module)
     loaded: dict[str, Any] = {}
     for mod in (
         "precision",
         "masks",
         "featurizer",
         "encoder",
+        "encoder_execution",
         "lid",
         "manifests",
         "frontend",
+        "profiling",
         "rnnt_cell",
         "rnnt",
         "decode_dispatch",
         "state_scatter",
         "advance",
     ):
-        spec = importlib.util.spec_from_file_location(f"{_BASE}.{mod}", _PKG / f"{mod}.py")
+        module_name = f"{_BASE}.{mod}"
+        if module_name in sys.modules:
+            module = sys.modules[module_name]
+            _publish_module(module_name, module)
+            loaded[mod] = module
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_BASE}.{mod}"] = module
+        _publish_module(module_name, module)
         spec.loader.exec_module(module)
         loaded[mod] = module
     return loaded
@@ -378,6 +395,7 @@ def _call(
     commit_sink: Any = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    memory_profile: bool = False,
     staging: Any = None,
 ) -> torch.Tensor:
     if adapter is None:
@@ -398,6 +416,7 @@ def _call(
         commit_sink=commit_sink,
         capture=capture,
         graph_covers_decode=graph_covers_decode,
+        memory_profile=memory_profile,
         staging=staging,
         **pools,
     )
@@ -665,8 +684,8 @@ def test_fresh_binding_cannot_authorize_prompt_transition() -> None:
     _assert_pools_equal(pools, before)
 
 
-# @spec PORT-DEC-008, PORT-STATE-007
-def test_graph_covered_call_rejects_before_resolver_or_resident_read(
+# @spec PORT-ADV-003, PORT-DEC-008, PORT-PERF-004, PORT-STATE-007
+def test_regional_graph_resolves_before_resident_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     core = _tiny_core()
@@ -674,18 +693,27 @@ def test_graph_covered_call_rejects_before_resolver_or_resident_read(
     before = _clone_pools(pools)
     events: list[str] = []
     original = torch.Tensor.index_select
+    resident_tensors = {
+        id(tensor)
+        for value in pools.values()
+        for tensor in (value if isinstance(value, list) else [value])
+        if isinstance(tensor, torch.Tensor)
+    }
 
     def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
-        events.append("read")
+        if id(tensor) in resident_tensors:
+            events.append("read")
         return original(tensor, dim, index)
 
     monkeypatch.setattr(torch.Tensor, "index_select", observed)
 
-    def resolver(_request: Any) -> Any:
+    def resolver(request: Any) -> Any:
         events.append("resolve")
-        return advance.ResolvedDecode("dense-graphed", rnnt.decode_dense_masked)
+        assert request.graph_covers_decode is True
+        assert request.execution_batch_size == 1
+        raise RuntimeError("graph resolved")
 
-    with pytest.raises(ValueError, match="graph-covered"):
+    with pytest.raises(RuntimeError, match="graph resolved"):
         _call(
             core,
             pools,
@@ -696,7 +724,74 @@ def test_graph_covered_call_rejects_before_resolver_or_resident_read(
             resolver=resolver,
             graph_covers_decode=True,
         )
-    assert events == []
+    assert events == ["resolve"]
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-PERF-004
+def test_memory_profile_purpose_reaches_resolver_before_resident_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _tiny_core()
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    events: list[str] = []
+    original = torch.Tensor.index_select
+    resident_tensors = {
+        id(tensor)
+        for value in pools.values()
+        for tensor in (value if isinstance(value, list) else [value])
+        if isinstance(tensor, torch.Tensor)
+    }
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> Any:
+        if id(tensor) in resident_tensors:
+            events.append("read")
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
+        build_decode_resolver,
+    )
+
+    class Binding:
+        def execution_tier(self, live_rows: int) -> int:
+            raise AssertionError("profile must not consult captured tiers")
+
+        def decode_fn(self, *, geometry: int, tier: int) -> object:
+            raise AssertionError("profile must not bind a graph key")
+
+    canonical = build_decode_resolver(
+        SimpleNamespace(
+            decode_dispatch_arm="dense-graphed",
+            decode_dispatch_table=None,
+        ),
+        graph_binding=Binding(),
+    )
+
+    def resolver(request: Any) -> Any:
+        events.append("resolve")
+        assert request.memory_profile is True
+        assert request.graph_covers_decode is False
+        assert request.execution_tier_limit == 0
+        resolved = canonical(request)
+        assert resolved.arm == "dense-eager"
+        assert resolved.override_reason == "pre-capture-memory-profile"
+        raise RuntimeError("profile resolved")
+
+    with pytest.raises(RuntimeError, match="profile resolved"):
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            _plan(prefills=[1]),
+            _refuse_adapter,
+            resolver=resolver,
+            memory_profile=True,
+        )
+    assert events == ["resolve"]
     _assert_pools_equal(pools, before)
 
 
@@ -1392,6 +1487,57 @@ def test_capture_in_range_wrong_length_is_row_tier_without_sync(
     assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
     assert sink.published == [[]]
     _assert_pools_equal(pools, before)
+
+
+def test_capture_validation_reuses_geometry_shape_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-010
+    encoder_execution = mods["encoder_execution"]
+    geometry_shape = getattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        None,
+    )
+    assert callable(geometry_shape), "PORT-PERF-010 missing encoder_geometry_shape"
+    observed: list[tuple[int, int, int]] = []
+
+    def observe_shape(*args: Any, **kwargs: Any) -> Any:
+        result = geometry_shape(*args, **kwargs)
+        observed.append(
+            (
+                result.cadence_frames,
+                result.mel_width,
+                result.out_width,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        observe_shape,
+    )
+    core = _tiny_core()
+    pools = _fresh_pools()
+    carrier = _envelope(
+        torch.randn(FINAL_SAMPLES) * 0.01,
+        final=True,
+        seq=0,
+        geometry=GEOM_FINAL,
+    ).unsqueeze(0)
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], dtype=torch.long),
+        carrier,
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        commit_sink=_CommitRecorder(),
+        capture=True,
+    )
+
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
 
 
 def test_capture_records_publish_after_commit_with_identity() -> None:
@@ -3158,17 +3304,18 @@ def test_table_resolver_bracket_disagreement_takes_sync_free() -> None:
     assert got.arm == "dense-eager"
 
 
-def test_table_resolver_graph_coverage_fails_closed() -> None:
+def test_table_resolver_graph_coverage_structurally_selects_dense_graph() -> None:
     resolver = advance.make_table_resolver(_table(), lane="fp32", arms=_arms(), max_batch=1024)
-    with pytest.raises(ValueError, match="exact padded runner"):
-        resolver(
-            advance.DecodeRequest(
-                geometry=0,
-                execution_batch_size=512,
-                graph_covers_decode=True,
-                ready_decode_buckets=1,
-            )
+    resolved = resolver(
+        advance.DecodeRequest(
+            geometry=0,
+            execution_batch_size=512,
+            graph_covers_decode=True,
+            ready_decode_buckets=1,
         )
+    )
+    assert resolved.arm == "dense-graphed"
+    assert resolved.decode_fn is _arms()["dense-graphed"]
 
 
 def test_table_resolver_multi_bucket_forces_sync_free() -> None:

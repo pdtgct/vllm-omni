@@ -159,9 +159,7 @@ def test_persistent_only_block_tables_expose_empty_attention_views() -> None:
     runner.block_tables.append_block_ids(0, (), overwrite=True)
     assert runner.block_tables.gather_block_tables(object(), 4) == ()
     assert runner.block_tables.get_dummy_block_tables(4) == ()
-    slot_mappings = runner.block_tables.compute_slot_mappings(
-        object(), object(), object(), 7
-    )
+    slot_mappings = runner.block_tables.compute_slot_mappings(object(), object(), object(), 7)
     assert slot_mappings.shape == (0, 7)
     assert runner.block_tables.get_dummy_slot_mappings(5).shape == (0, 5)
     with pytest.raises(RuntimeError, match="ordinary block ids"):
@@ -317,11 +315,7 @@ def test_sample_boundary_consumes_and_forwards_model_transaction_status(
     runner = _runner()
     runner.model = StatusModel()
     model_runner_output = SimpleNamespace()
-    core_output = (
-        SimpleNamespace(model_runner_output=model_runner_output)
-        if async_wrapped
-        else model_runner_output
-    )
+    core_output = SimpleNamespace(model_runner_output=model_runner_output) if async_wrapped else model_runner_output
 
     def sample(self: Any, grammar_output: object) -> object:
         del self, grammar_output
@@ -364,9 +358,7 @@ def test_sample_boundary_consumes_clean_status_before_the_next_transaction(
     type(runner).sample_tokens(runner, grammar_output=None)
 
     assert not staged
-    assert model_runner_output.omni_connector_output.model_status == {
-        "request": 0
-    }
+    assert model_runner_output.omni_connector_output.model_status == {"request": 0}
 
 
 @pytest.mark.parametrize("async_wrapped", [False, True])
@@ -390,11 +382,7 @@ def test_sample_boundary_drains_streaming_batch_stats_under_mrv2(
     model = BatchStatsModel()
     runner.model = model
     model_runner_output = SimpleNamespace()
-    core_output = (
-        SimpleNamespace(model_runner_output=model_runner_output)
-        if async_wrapped
-        else model_runner_output
-    )
+    core_output = SimpleNamespace(model_runner_output=model_runner_output) if async_wrapped else model_runner_output
     monkeypatch.setattr(
         GPUModelRunner,
         "sample_tokens",
@@ -624,9 +612,7 @@ def test_persistent_only_worker_logs_actual_execution_fingerprint(
 
     worker.model_runner.model = LoadedModel()
     worker.model_runner.model_state = LoadedModelState()
-    worker.model_runner._persistent_state_storage = (
-        LoadedPersistentStateStorage()
-    )
+    worker.model_runner._persistent_state_storage = LoadedPersistentStateStorage()
     worker.model_config = SimpleNamespace(enforce_eager=True)
     marker = object()
     monkeypatch.setattr(
@@ -700,7 +686,7 @@ def test_mixed_persistent_and_token_cache_warmup_fails_closed(
 def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # @spec PORT-ADV-003 / PORT-MIG-005 / PORT-MIG-006
+    # @spec PORT-ADV-003 / PORT-MIG-005 / PORT-MIG-006 / PORT-PERF-009
     from vllm.config.compilation import CompilationMode
 
     module = importlib.import_module("vllm_omni.worker.gpu_ar_worker")
@@ -712,12 +698,10 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
         )
     worker = _worker(persistent=True, ordinary_groups=0)
     events: list[str] = []
-    worker.model_runner.maybe_remove_all_loras = (
-        lambda config: events.append("remove-loras")
-    )
+    worker.model_runner.maybe_remove_all_loras = lambda config: events.append("remove-loras")
     worker.model_runner.lora_config = None
     worker.model_runner.model.warmup_resident_state = lambda: events.append(
-        "resident-state"
+        f"resident-state:inference={torch.is_inference_mode_enabled()}"
     )
     worker.model_config = SimpleNamespace(enforce_eager=True, seed=17)
     worker.vllm_config = SimpleNamespace(
@@ -737,7 +721,7 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     monkeypatch.setattr(
         module,
         "kernel_warmup",
-        lambda value: events.append("kernel-warmup"),
+        lambda value: events.append(f"kernel-warmup:inference={torch.is_inference_mode_enabled()}"),
     )
     monkeypatch.setattr(
         module,
@@ -784,8 +768,8 @@ def test_persistent_only_warmup_preserves_the_core_operational_postamble(
     assert warmup_attestation(worker) is True
     assert events == [
         "remove-loras",
-        "kernel-warmup",
-        "resident-state",
+        "kernel-warmup:inference=True",
+        "resident-state:inference=True",
         "seed:17",
         "jit-monitor",
         "freeze-gc",

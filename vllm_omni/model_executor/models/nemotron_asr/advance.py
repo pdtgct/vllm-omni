@@ -56,6 +56,10 @@ from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        EncoderCaches,
+        EncoderTransition,
+    )
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
         NemotronASRCore,
     )
@@ -74,6 +78,65 @@ RnntDecodeFn = Callable[
     ...,
     "tuple[torch.Tensor, torch.Tensor, DecodeState] | FrameAlignedDecode",
 ]
+
+
+# @spec PORT-PERF-010
+def prepare_encoder_transition_inputs(
+    mel: torch.Tensor,
+    caches: EncoderCaches,
+    out_offsets: torch.Tensor,
+    out_lengths: torch.Tensor,
+    out_width: int,
+    prompt_index: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    EncoderCaches,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    torch.Tensor,
+]:
+    """Build the one transition tuple shared by profile, warmup, and serve."""
+    return (
+        mel,
+        caches,
+        out_offsets,
+        out_lengths,
+        int(out_width),
+        prompt_index,
+    )
+
+
+def _has_packed_decode_state_interior(tensor: torch.Tensor) -> bool:
+    """Whether ``(batch, hidden)`` is packed with optional layer padding.
+
+    A tiered graph owns ``(layers, P, hidden)`` output storage and returns the
+    exact-live ``[:, :B]`` prefix.  For ``B < P`` that prefix is not globally
+    contiguous: the unused tier rows remain between predictor layers.  It is
+    nevertheless non-overlapping and dense within every live layer when
+
+    ``stride = (sL, hidden, 1)`` and ``sL >= B * hidden``.
+
+    That is the complete layout needed by the read-only validation and
+    batch-major resident-state commit below.  Requiring global contiguity
+    would force an uncaptured D2D repack after every non-tier-exact replay;
+    accepting anything weaker would admit transposed, stepped, or broadcast
+    state interiors.
+    """
+
+    if tensor.dim() != 3:
+        return False
+    # Preserve the canonical eager contract exactly. PyTorch may assign
+    # arbitrary strides to size-one dimensions while still correctly
+    # classifying the tensor as contiguous (for example ``(H, 2H, 1)`` for
+    # shape ``(L, 1, H)``), so the fixed-stride proof below is only the
+    # additional graph-prefix case.
+    if tensor.is_contiguous():
+        return True
+    _layers, batch, hidden = tensor.shape
+    layer_stride, batch_stride, hidden_stride = tensor.stride()
+    return hidden_stride == 1 and batch_stride == hidden and layer_stride >= batch * hidden
+
 
 #: Chunk-envelope header layout (design §Chunk envelope): the versioned
 #: FP32 carrier row is ``[version, valid_samples, geometry_id,
@@ -317,9 +380,10 @@ class RowPlan:
     the scheduler's absolute ready deadline for each selected CHUNK;
     non-CHUNK rows carry zero. Buckets execute by their earliest
     selected-row deadline, never enum/geometry order.
-    ``execution_tier``: the engine's padded decode execution tier
-    under a graph-covered profile; 0 for eager profiles, where the
-    live bucket size IS the execution size (PORT-DEC-008 as amended).
+    ``execution_tier``: the engine's padded decode execution-tier
+    ceiling under a graph-covered profile; 0 for eager profiles, where
+    the live bucket size IS the execution size (PORT-DEC-008 as
+    amended).
     ``bindings``: one immutable :class:`PreparedRowBinding` per real
     row, minted atomically by the provider from registry + scheduler
     authority. Preflight requires the composed block and every parallel
@@ -461,22 +525,30 @@ class DecodeRequest:
     transaction seams).
 
     ``geometry``: the bucket's admitted geometry id.
-    ``execution_batch_size``: the size decode actually EXECUTES at —
-    the live bucket size under eager profiles (eager buckets are
-    unpadded, so live equals execution) and the engine's padded tier
-    under graph coverage (PORT-DEC-008 as amended).
+    ``execution_batch_size``: the live size of this geometry bucket.
+    Eager profiles execute it directly; a regional graph resolver maps
+    it to the smallest captured tier not smaller than the live size.
     ``graph_covers_decode``: invocation-specific graph coverage; a
     covering graph structurally forces the capture-eligible arm.
     ``ready_decode_buckets``: decode buckets ready in this engine
     iteration — the multi-bucket compact-override input (the dispatch
     record's step-4 obligation: compact's occupancy-1.000 host lock is
     priced for single buckets only).
+    ``execution_tier_limit``: the RowPlan's graph-tier authority for
+    this invocation. The binding selects the smallest captured tier
+    for the bucket and must not exceed this ceiling. Eager requests
+    carry zero.
+    ``memory_profile``: this bucket belongs to the disposable
+    pre-capture activation-memory profile. The served resolver uses
+    the same dense decoder eagerly without claiming graph coverage.
     """
 
     geometry: int
     execution_batch_size: int
     graph_covers_decode: bool
     ready_decode_buckets: int
+    execution_tier_limit: int = 0
+    memory_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -516,8 +588,8 @@ def make_table_resolver(
     into a dense lookup, with one aggregate log line per geometry
     instead of per-lookup warnings. The returned resolver then:
 
-    - fails closed whenever the outer invocation's engine graph covers
-      decode, until the runner provides exact padded row authority;
+    - structurally selects the capture-eligible arm whenever the
+      invocation's regional graph covers decode;
     - forces the sync-free eager arm whenever more than one decode
       bucket is ready in the iteration (the multi-bucket override),
       recording ``override_reason`` for telemetry;
@@ -595,8 +667,10 @@ def make_table_resolver(
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
         if request.graph_covers_decode:
-            raise ValueError(
-                "graph-covered decode requires exact padded runner authority; the Phase 6c resolver is eager-only"
+            return ResolvedDecode(
+                arm="dense-graphed",
+                decode_fn=arms["dense-graphed"],
+                override_reason="regional-graph-coverage",
             )
         batch = min(max(request.execution_batch_size, 1), max_batch)
         arm = compiled_t[request.geometry][batch]
@@ -990,6 +1064,7 @@ def advance_session(
     *,
     geometry: int,
     decode_fn: RnntDecodeFn,
+    encoder_transition: EncoderTransition | None = None,
     capture: bool = False,
     row_status: torch.Tensor | None = None,
 ) -> AdvanceResult:
@@ -1009,8 +1084,10 @@ def advance_session(
     zero-frame rows. Every shape is host-derived from the bucket
     geometry (padded frontend width ``C``, matching the reference's
     largest single regular/final cadence shift, and encoder
-    width from the subsampling formula); validity is per-row length
-    tensors. Every per-row failure — wrong chunk sequence, audio
+    width from the subsampling formula); decode receives only the
+    geometry manifest's maximum-valid encoder prefix, while named
+    captures retain the full padded encoder width. Validity is per-row
+    length tensors. Every per-row failure — wrong chunk sequence, audio
     after finalization, an envelope geometry different from the
     bucket's, an oversized final residual, or a frontend design
     invariant — is a masked no-op reported as a bit in
@@ -1035,6 +1112,9 @@ def advance_session(
             profile; startup then builds a dispatch table keyed by
             geometry, padded batch tier, and execution/precision
             profile, and passes the selected callable per bucket.
+        encoder_transition: optional startup-bound execution mechanism for
+            the exact encoder+conditioning transition. ``None`` executes
+            the eager reference directly (unit probes and compatibility).
         capture: the explicit capture policy (PORT-HOOK-001). OFF by
             default: performance runs return ``captures=None`` with no
             capture-only allocations and no extended lifetime for the
@@ -1058,8 +1138,9 @@ def advance_session(
         ValueError: if ``geometry`` is not an admitted geometry id
             (a host configuration error, not a row condition).
     """
-    from vllm_omni.model_executor.models.nemotron_asr.encoder import (
-        stream_step,
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+        execute_encoder_transition,
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
         CTR_COMMITTED_MEL_FRAMES,
@@ -1084,12 +1165,13 @@ def advance_session(
     if not 0 <= geometry < len(lookaheads):
         raise ValueError(f"unknown bucket geometry id {geometry}")
     lookahead = lookaheads[geometry]
-    cadence = 8 * (lookahead + 1)
+    geometry_shape = encoder_geometry_shape(core, geometry)
+    cadence = geometry_shape.cadence_frames
     # The bucket's padded frontend width is one reference cadence
     # shift: first rows commit C-7, continuing rows C, and final rows
     # consume at most C before dropping the sub-eight boundary debt.
     pad_frames = cadence
-    mel_width = MEL_TAIL_FRAMES + pad_frames
+    mel_width = geometry_shape.mel_width
 
     counters = state.frontend_counters
     # Envelope-protocol status bits (PORT-ADV-004), all on device: the
@@ -1170,36 +1252,26 @@ def advance_session(
         ),
         torch.zeros_like(counts),
     )
-    out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([mel_width]))[0])
+    out_width = geometry_shape.out_width
 
     caches = _GatheredCaches(state)
+    transition_inputs = prepare_encoder_transition_inputs(
+        mel,
+        caches,
+        drop,
+        enc_lengths,
+        out_width,
+        batch.prompt_index,
+    )
     with torch.no_grad():
         with phase("port.encode"):
-            enc = stream_step(
-                # _GatheredCaches is StreamingCaches' structural twin over
-                # the gathered batch; stream_step reads only the shared
-                # .channel/.time/.valid surface (the now-deleted
-                # forward_step.py precedent, migration-proven bit-for-bit).
-                core.encoder,
-                mel,
-                caches,  # type: ignore[arg-type]
-                out_offsets=drop,
-                out_lengths=enc_lengths,
-                out_width=out_width,
-            )
-            # Row-wise language conditioning in ONE call: the
-            # conditioner takes the (B,) prompt tensor directly (no
-            # per-prompt fragmentation or host set construction).
-            conditioned = core.lid(enc, prompt_index=batch.prompt_index)
-            # Padded-position zeroing for the conditioned stream (the
-            # conditioner may bias padded rows away from zero; decode
-            # masks by length, but captures and determinism want zeros).
-            fcol = torch.arange(out_width, device=device).view(1, -1, 1)
-            conditioned = torch.where(
-                fcol < enc_lengths.view(-1, 1, 1),
-                conditioned,
-                conditioned.new_zeros(()),
-            )
+            if encoder_transition is None:
+                enc, conditioned = execute_encoder_transition(
+                    core,
+                    *transition_inputs,
+                )
+            else:
+                enc, conditioned = encoder_transition(*transition_inputs)
         with phase("port.decode"):
             decode_in = DecodeState(
                 h=state.h.transpose(0, 1).contiguous(),
@@ -1214,8 +1286,18 @@ def advance_session(
                 c=decode_in.c.clone(),
                 last_label=decode_in.last_label.clone(),
             )
+            # The padded encoder grid includes PRE_ENCODE_DROP trailing
+            # outputs produced from its nine-frame overlap prefix. They are
+            # zeroed above and excluded by enc_lengths, but are not part of
+            # the geometry's valid decode domain or dense graph key. Keep the
+            # full tensor for named captures and pass a zero-copy prefix view
+            # to both eager and graphed decoders.
+            max_valid_frames = lookahead + 1
+            if out_width != max_valid_frames + PRE_ENCODE_DROP:
+                raise ValueError("padded encoder width disagrees with the geometry-valid decode prefix")
+            decode_frames = conditioned[:, :max_valid_frames]
             decoded = decode_fn(
-                conditioned,
+                decode_frames,
                 enc_lengths,
                 core.predictor,
                 core.joint,
@@ -1250,16 +1332,31 @@ def advance_session(
     decode_type = type(decode_out)
     if decode_type.__module__ != DecodeState.__module__ or decode_type.__qualname__ != DecodeState.__qualname__:
         raise ValueError("decode_fn must return DecodeState")
-    for name, actual, expected in (
-        ("h", decode_out.h, decode_baseline.h),
-        ("c", decode_out.c, decode_baseline.c),
-        ("last_label", decode_out.last_label, decode_baseline.last_label),
+    for name, actual, expected, layout_valid in (
+        (
+            "h",
+            decode_out.h,
+            decode_baseline.h,
+            _has_packed_decode_state_interior(decode_out.h),
+        ),
+        (
+            "c",
+            decode_out.c,
+            decode_baseline.c,
+            _has_packed_decode_state_interior(decode_out.c),
+        ),
+        (
+            "last_label",
+            decode_out.last_label,
+            decode_baseline.last_label,
+            decode_out.last_label.is_contiguous(),
+        ),
     ):
         if (
             tuple(actual.shape) != tuple(expected.shape)
             or actual.dtype != expected.dtype
             or actual.device != expected.device
-            or not actual.is_contiguous()
+            or not layout_valid
         ):
             raise ValueError(f"decode_fn next-state {name} changed shape/dtype/device/layout")
     lengths = token_lengths.long()
@@ -1368,6 +1465,11 @@ class _StackedRows:
     def shape(self) -> tuple[int, ...]:
         return (len(self._views), *self._views[0].shape)
 
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        """Expose the complete storage for graph-owned adapter cloning."""
+        return tuple(self._views)
+
 
 class _GatheredCaches:
     """``StreamingCaches``' surface over a gathered
@@ -1381,6 +1483,22 @@ class _GatheredCaches:
         self._window_valid = state.window_valid
         self.left_context = state.channel[0].shape[1]
 
+    @classmethod
+    def _from_tensors(
+        cls,
+        *,
+        channel: tuple[torch.Tensor, ...],
+        time: tuple[torch.Tensor, ...],
+        valid: tuple[torch.Tensor, ...],
+        left_context: int,
+    ) -> _GatheredCaches:
+        adapter = cls.__new__(cls)
+        adapter.channel = _StackedRows(list(channel))
+        adapter.time = _StackedRows(list(time))
+        adapter._window_valid = list(valid)
+        adapter.left_context = int(left_context)
+        return adapter
+
     @property
     def valid(self) -> torch.Tensor:
         return self._window_valid[0].reshape(-1).to(torch.long)
@@ -1389,6 +1507,28 @@ class _GatheredCaches:
     def valid(self, value: torch.Tensor) -> None:
         for slot in self._window_valid:
             slot.copy_(value.reshape(slot.shape).to(slot.dtype))
+
+    def graph_storage(self) -> Any:
+        """Return all cache tensors, including every valid-length slot."""
+        from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+            EncoderCacheStorage,
+        )
+
+        return EncoderCacheStorage(
+            channel=self.channel.tensors,
+            time=self.time.tensors,
+            valid=tuple(self._window_valid),
+        )
+
+    def empty_like(self) -> _GatheredCaches:
+        """Clone this adapter's exact Python layout over fresh storage."""
+        storage = self.graph_storage()
+        return type(self)._from_tensors(
+            channel=tuple(torch.empty_like(tensor) for tensor in storage.channel),
+            time=tuple(torch.empty_like(tensor) for tensor in storage.time),
+            valid=tuple(torch.empty_like(tensor) for tensor in storage.valid),
+            left_context=self.left_context,
+        )
 
 
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -2076,7 +2216,7 @@ def consume_batch_stats() -> list[tuple[str, int]] | None:
 
 
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
-# @spec PORT-PERF-001, PORT-STATE-007, PORT-STATE-008
+# @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(
     core: NemotronASRCore,
     input_ids: torch.Tensor,
@@ -2098,11 +2238,13 @@ def advance_model_rows(
     eou_token_id: int | None = None,
     adapter: EmissionAdapter,
     decode_resolver: DecodeResolver,
+    encoder_transition: EncoderTransition | None = None,
     placeholder_id: int,
     park_id: int,
     commit_sink: CommitSink | None = None,
     capture: bool = False,
     graph_covers_decode: bool = False,
+    memory_profile: bool = False,
     staging: HostStaging | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
@@ -2170,6 +2312,9 @@ def advance_model_rows(
             resolver, or a trusted-identity projection-shape defect —
             always before any resident mutation.
     """
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+    )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
         CTR_COMMITTED_MEL_FRAMES,
         CTR_EXPECTED_CHUNK_SEQUENCE,
@@ -2206,13 +2351,15 @@ def advance_model_rows(
     hidden = int(inputs_embeds.shape[1])
     device = inputs_embeds.device
     idx_cpu = _structural_preflight(plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0]))
-    if graph_covers_decode:
-        raise ValueError(
-            "graph-covered outer decode is rejected until exact runner "
-            "padding is implemented and pod-qualified (PORT-DEC-008)"
-        )
-    if plan.execution_tier != 0:
+    has_chunk = bool(plan.is_chunk.any())
+    if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
+        raise ValueError("regional graph decode requires a positive RowPlan execution tier")
+    if not graph_covers_decode and plan.execution_tier != 0:
         raise ValueError("eager execution requires plan.execution_tier == 0")
+    if memory_profile and graph_covers_decode:
+        raise ValueError("memory profile cannot claim graph coverage")
+    if memory_profile and capture:
+        raise ValueError("memory profile cannot publish capture records")
     if capture and commit_sink is None:
         raise ValueError("capture requires a composite commit sink")
     lookaheads = [right for (_, right) in CADENCES.values()]
@@ -2335,8 +2482,10 @@ def advance_model_rows(
             DecodeRequest(
                 geometry=geometry,
                 execution_batch_size=live,
-                graph_covers_decode=False,
+                graph_covers_decode=graph_covers_decode,
                 ready_decode_buckets=ready,
+                execution_tier_limit=plan.execution_tier,
+                memory_profile=memory_profile,
             )
         )
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
@@ -2541,7 +2690,8 @@ def advance_model_rows(
         rows_dev = staging.stage_bucket(g, pos_t, device) if staging is not None else _h2d(pos_t, device)
         blocks_dev = didx.index_select(0, rows_dev)
         fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
-        cadence = 8 * (lookaheads[g] + 1)
+        capture_geometry = encoder_geometry_shape(core, g) if capture_on else None
+        cadence = capture_geometry.cadence_frames if capture_geometry is not None else 8 * (lookaheads[g] + 1)
         s_g = cadence * hop
         if ENVELOPE_HEADER_SLOTS + s_g > hidden:
             raise ValueError(f"carrier width {hidden} cannot hold geometry {g}'s {s_g}-sample cadence")
@@ -2593,6 +2743,7 @@ def advance_model_rows(
             state,
             geometry=g,
             decode_fn=resolved.decode_fn,
+            encoder_transition=encoder_transition,
             capture=capture_on,
             row_status=incoming,
         )
@@ -2636,20 +2787,16 @@ def advance_model_rows(
                 (
                     int(rows_dev.shape[0]),
                     int(state.mel_tail.shape[1]),
-                    int(state.mel_tail.shape[2]) + cadence,
+                    capture_geometry.mel_width,
                 ),
                 (
                     int(rows_dev.shape[0]),
-                    int(
-                        core.encoder.pre_encode.output_lengths(torch.tensor([int(state.mel_tail.shape[2]) + cadence]))[
-                            0
-                        ]
-                    ),
+                    capture_geometry.out_width,
                     int(state.channel[0].shape[2]),
                 ),
                 state.channel[0].dtype,
             )
-            if capture_on
+            if capture_geometry is not None
             else None,
             expected_capture_lengths=(
                 capture_mel_lengths,
