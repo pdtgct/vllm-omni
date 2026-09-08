@@ -38,11 +38,8 @@ def _streaming_lines(out: str) -> list[str]:
     whenever CPU time ticks or a GC runs mid-test, which depends on what
     ran before. Scope the comparison to the families under test.
     """
-    return [
-        line
-        for line in out.splitlines()
-        if line.startswith(defs.METRIC_PREFIX + "streaming_")
-    ]
+    return [line for line in out.splitlines() if line.startswith(defs.METRIC_PREFIX + "streaming_")]
+
 
 _EXPECTED_FAMILIES: dict[str, tuple[str, tuple[str, ...]]] = {
     # exposition name -> (type, labelnames)
@@ -302,10 +299,7 @@ class TestLogStatsGating:
             call()  # must not raise once log_stats gating is implemented
 
         out = generate_latest(REGISTRY).decode()
-        assert (
-            f'{defs.PERSISTENT_STATE_SLOTS}{{kind="resident",'
-            f'model_name="{_MODEL}"' not in out
-        )
+        assert f'{defs.PERSISTENT_STATE_SLOTS}{{kind="resident",model_name="{_MODEL}"' not in out
 
 
 # ---------------------------------------------------------------------------
@@ -391,13 +385,8 @@ class TestEnabledPathScrapeDeltas:
 
     # @spec PORT-OBS-007
     def test_inc_admission_rejection_produces_exact_counter_delta(self) -> None:
-        metrics = OmniStreamingMetrics(
-            model_name="delta-model-admission", log_stats=True
-        )
-        prefix = (
-            f'{defs.STREAMING_ADMISSION_REJECTIONS}_total{{'
-            'model_name="delta-model-admission",reason="capacity"}'
-        )
+        metrics = OmniStreamingMetrics(model_name="delta-model-admission", log_stats=True)
+        prefix = f'{defs.STREAMING_ADMISSION_REJECTIONS}_total{{model_name="delta-model-admission",reason="capacity"}}'
         before = _count_value(generate_latest(REGISTRY).decode(), prefix) or 0.0
 
         metrics.inc_admission_rejection("capacity")
@@ -407,9 +396,7 @@ class TestEnabledPathScrapeDeltas:
 
     # @spec PORT-OBS-010
     def test_persistent_state_slots_replace_the_manager_projection(self) -> None:
-        metrics = OmniStreamingMetrics(
-            model_name="delta-model-state-slots", log_stats=True
-        )
+        metrics = OmniStreamingMetrics(model_name="delta-model-state-slots", log_stats=True)
         first = {
             "resident": 1,
             "safety_reserve": 2,
@@ -568,7 +555,9 @@ class TestStrictLatencyMissBoundary:
         before = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
 
         observer.session_opened(session_key="fixture-key", cadence_ms="560")
-        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        handle = observer.unit_ready(
+            session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
         observer.unit_parked(handle, park_stamp_s=0.56)  # exactly the 560ms cadence period
 
         # Lead-authorized fix (Phase-6 round 2, Q1a): coerce both sides
@@ -590,7 +579,9 @@ class TestStrictLatencyMissBoundary:
         before = _count_value(generate_latest(REGISTRY).decode(), miss_prefix) or 0.0
 
         observer.session_opened(session_key="fixture-key", cadence_ms="560")
-        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        handle = observer.unit_ready(
+            session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
         observer.unit_parked(handle, park_stamp_s=0.560001)  # strictly over
 
         after = _count_value(generate_latest(REGISTRY).decode(), miss_prefix)
@@ -623,7 +614,9 @@ class TestParkedVsCleared:
         outcome_before = _count_value(generate_latest(REGISTRY).decode(), outcome_prefix) or 0.0
 
         observer.session_opened(session_key="fixture-key", cadence_ms="560")
-        handle = observer.unit_ready(session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        handle = observer.unit_ready(
+            session_key="fixture-key", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
+        )
         observer.unit_cleared(handle, outcome="aborted")
 
         # Lead-authorized fix (Phase-6 round 2, Q1a): coerce identically
@@ -701,8 +694,7 @@ class TestKeyedSessionLifecycle:
         observer = _keyed_observer("keyed-lc-1")
         active = f'{defs.STREAMING_SESSIONS_ACTIVE}{{cadence_ms="560",model_name="keyed-lc-1"}}'
         finished = (
-            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
-            f'{{cadence_ms="560",model_name="keyed-lc-1",reason="completed"}}'
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total{{cadence_ms="560",model_name="keyed-lc-1",reason="completed"}}'
         )
         base_active, base_fin = _gauge(active), _gauge(finished)
 
@@ -767,18 +759,14 @@ class TestKeyedSessionLifecycle:
         observer = _keyed_observer("keyed-lc-6")
         backlog = f'{defs.STREAMING_BACKLOG_CHUNKS}{{cadence_ms="560",model_name="keyed-lc-6"}}'
         err = (
-            f'{defs.STREAMING_CHUNKS}_total'
+            f"{defs.STREAMING_CHUNKS}_total"
             f'{{cadence_ms="560",chunk_type="regular",model_name="keyed-lc-6",outcome="error"}}'
         )
         base_b, base_e = _gauge(backlog), _gauge(err)
 
         observer.session_opened(session_key="req-f", cadence_ms="560")
-        h1 = observer.unit_ready(
-            session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
-        observer.unit_ready(
-            session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
-        )
+        h1 = observer.unit_ready(session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        observer.unit_ready(session_key="req-f", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1)
         assert _gauge(backlog) == base_b + 2
 
         observer.session_finished(session_key="req-f", reason="error")
@@ -793,13 +781,9 @@ class TestKeyedSessionLifecycle:
     def test_clear_all_outstanding_returns_the_number_cleared(self) -> None:
         observer = _keyed_observer("keyed-lc-7")
         observer.session_opened(session_key="req-g", cadence_ms="560")
-        h = observer.unit_ready(
-            session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
+        h = observer.unit_ready(session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_minted(h)
-        observer.unit_ready(
-            session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
-        )
+        observer.unit_ready(session_key="req-g", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1)
         assert observer.clear_all_outstanding("req-g", outcome="aborted") == 2
         assert observer.clear_all_outstanding("req-g", outcome="aborted") == 0
 
@@ -810,9 +794,7 @@ class TestKeyedSessionLifecycle:
         process-lifetime disposed-set, no orphan waiting/in-flight maps."""
         observer = _keyed_observer("keyed-lc-8")
         observer.session_opened(session_key="req-h", cadence_ms="560")
-        h = observer.unit_ready(
-            session_key="req-h", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
+        h = observer.unit_ready(session_key="req-h", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_minted(h)
         observer.complete_inflight("req-h")
         observer.unit_parked(h, park_stamp_s=0.2)
@@ -836,12 +818,8 @@ class TestStrictLifecycleTransitions:
         base = _gauge(backlog)
 
         observer.session_opened(session_key="req-m1", cadence_ms="560")
-        h1 = observer.unit_ready(
-            session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
-        h2 = observer.unit_ready(
-            session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1
-        )
+        h1 = observer.unit_ready(session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+        h2 = observer.unit_ready(session_key="req-m1", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.1)
         observer.unit_minted(h1)
         observer.unit_minted(h2)  # illegal while h1 in flight: no-op
         assert observer.complete_inflight("req-m1") is h1
@@ -858,9 +836,7 @@ class TestStrictLifecycleTransitions:
     def test_duplicate_and_foreign_mints_are_no_ops(self) -> None:
         observer = _keyed_observer("strict-lc-2")
         observer.session_opened(session_key="req-m2", cadence_ms="560")
-        h = observer.unit_ready(
-            session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
+        h = observer.unit_ready(session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.unit_minted(h)
         observer.unit_minted(h)  # duplicate: idempotent
         assert observer.complete_inflight("req-m2") is h
@@ -869,9 +845,7 @@ class TestStrictLifecycleTransitions:
         # displace the in-flight unit.
         from vllm_omni.metrics.streaming_transport import ChunkReadyHandle
 
-        foreign = ChunkReadyHandle(
-            session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=9.9
-        )
+        foreign = ChunkReadyHandle(session_key="req-m2", cadence_ms="560", chunk_type="regular", ready_stamp_s=9.9)
         observer.unit_minted(foreign)
         assert observer.complete_inflight("req-m2") is h
         observer.unit_parked(h, park_stamp_s=0.2)
@@ -885,26 +859,20 @@ class TestStrictLifecycleTransitions:
         chunk outcomes."""
         observer = _keyed_observer("strict-lc-3")
         completed = (
-            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
-            f'{{cadence_ms="560",model_name="strict-lc-3",reason="completed"}}'
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total{{cadence_ms="560",model_name="strict-lc-3",reason="completed"}}'
         )
         errored = (
-            f'{defs.STREAMING_SESSIONS_FINISHED}_total'
-            f'{{cadence_ms="560",model_name="strict-lc-3",reason="error"}}'
+            f'{defs.STREAMING_SESSIONS_FINISHED}_total{{cadence_ms="560",model_name="strict-lc-3",reason="error"}}'
         )
         base_c, base_e = _gauge(completed), _gauge(errored)
         observer.session_opened(session_key="req-m3", cadence_ms="560")
-        observer.unit_ready(
-            session_key="req-m3", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0
-        )
+        observer.unit_ready(session_key="req-m3", cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
         observer.session_finished(session_key="req-m3", reason="completed")
         assert _gauge(completed) == base_c
         assert _gauge(errored) == base_e + 1
 
     # @spec PORT-OBS-003
-    def test_ready_before_open_is_ignored_loudly(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_ready_before_open_is_ignored_loudly(self, caplog: pytest.LogCaptureFixture) -> None:
         """Reviewer F6 / PR #106 wording: open-at-construction is
         authoritative; a ready without an open creates no record, moves
         no backlog, and warns — it never manufactures implicit session
@@ -932,3 +900,316 @@ class TestStrictLifecycleTransitions:
 
         param = inspect.signature(PrometheusStreamingObserver.unit_ready).parameters["session_key"]
         assert param.default is inspect.Parameter.empty
+
+
+# @spec PORT-OBS-002, PORT-OBS-003, PORT-OBS-004
+class TestServiceTiming:
+    def observer(self, monkeypatch: Any, *, enabled: bool = True, stats: bool = True) -> Any:
+        from vllm_omni.metrics.streaming import PrometheusStreamingObserver
+
+        monkeypatch.setenv("VLLM_OMNI_SERVICE_TIMING", "1" if enabled else "0")
+        return PrometheusStreamingObserver(OmniStreamingMetrics(model_name=_MODEL, log_stats=stats))
+
+    def ready(self, observer: Any, *, kind: str = "regular", stamp: float = 1.0) -> Any:
+        return observer.unit_ready(session_key="timing", cadence_ms="160", chunk_type=kind, ready_stamp_s=stamp)
+
+    def test_disabled_and_stats_disabled_have_no_trace(self, monkeypatch: Any) -> None:
+        for enabled, stats in ((False, True), (True, False)):
+            observer = self.observer(monkeypatch, enabled=enabled, stats=stats)
+            observer.session_opened(session_key="timing", cadence_ms="160")
+            assert observer.service_timing("timing") is None
+
+    def test_equal_handles_keep_identity_and_one_disposition(self, monkeypatch: Any) -> None:
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        a, b = self.ready(observer), self.ready(observer)
+        assert a == b and a is not b
+        observer.unit_minted(b)
+        observer.unit_parked(b, park_stamp_s=1.2)
+        assert observer.complete_inflight("timing") is None
+        assert len(observer._sessions["timing"].waiting) == 1
+        assert observer._sessions["timing"].waiting[0] is a
+        observer.unit_minted(a)
+        assert observer.complete_inflight("timing") is a
+        observer.unit_parked(a, park_stamp_s=1.3)
+        assert observer._sessions["timing"].waiting == []
+
+    def test_complete_raw_trace_export_once_and_decomposition(self, monkeypatch: Any) -> None:
+        import json
+
+        from vllm_omni.metrics import streaming as mod
+
+        records = []
+        monkeypatch.setattr(mod.logger, "info", lambda fmt, payload: records.append(json.loads(payload)))
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        for seq, kind, r, e, s, p in (
+            (0, "regular", 1.0, 1_000_000_000, 1_020_000_000, 1.3),
+            (1, "final_tail", 1.0, 1_180_000_000, 1_310_000_000, 1.4),
+        ):
+            handle = self.ready(observer, kind=kind, stamp=r)
+            observer.unit_minted(handle)
+            trace.submitted(handle, seq, seq, kind, e, s)
+            observer.unit_parked(handle, park_stamp_s=p)
+        assert records == []
+        observer.session_finished(session_key="timing", reason="completed")
+        observer.session_finished(session_key="timing", reason="completed")
+        assert len(records) == 1
+        record = records[0]
+        assert record["valid"] and record["complete"]
+        assert record["capacity"] == 256 and record["schema"] == 1
+        assert record["count"] == 2 and record["overflow"] == 0
+        a, b = record["units"]
+        assert a["r"] == b["r"] == 1.0
+        assert a["p"] == 1.3 and b["p"] == 1.4
+        assert b["e"] == 1.18 and b["s"] == 1.31
+        assert b["p"] - b["r"] == pytest.approx((b["e"] - b["r"]) + (b["s"] - b["e"]) + (b["p"] - b["s"]))
+        assert max(b["e"], a["p"]) - b["e"] == pytest.approx(0.12)
+        assert observer.session_record_count() == 0
+
+    @pytest.mark.parametrize("fault", ["gap", "duplicate", "ordering", "missing", "cleared"])
+    def test_invalid_trace_never_fails_serving(self, monkeypatch: Any, fault: str) -> None:
+        def run(mutation: str | None) -> dict[str, Any]:
+            observer = self.observer(monkeypatch)
+            observer.session_opened(session_key="timing", cadence_ms="160")
+            trace = observer.service_timing("timing")
+            for seq, kind, r, e, s, p in (
+                (0, "regular", 1.0, 1_000_000_000, 1_100_000_000, 1.2),
+                (1, "final_tail", 2.0, 2_000_000_000, 2_100_000_000, 2.2),
+            ):
+                handle = self.ready(observer, kind=kind, stamp=r)
+                observer.unit_minted(handle)
+                if not (mutation == "missing" and seq == 0):
+                    # Changing both authoritative coordinates creates exactly
+                    # one logical gap, without a second carrier-modulo fault.
+                    identity = 2 if mutation == "gap" and seq == 1 else seq
+                    trace.submitted(handle, identity, identity, kind, e, s)
+                if mutation == "cleared" and seq == 0:
+                    observer.unit_cleared(handle, outcome="error")
+                else:
+                    park = 1.05 if mutation == "ordering" and seq == 0 else p
+                    observer.unit_parked(handle, park_stamp_s=park)
+                if mutation == "duplicate" and seq == 0:
+                    assert trace.valid, "ordinary first disposition must be valid"
+                    observer.unit_parked(handle, park_stamp_s=p)
+                    assert not trace.valid, "duplicate disposition must invalidate at the event"
+            if mutation == "gap":
+                assert not trace.valid, "logical gap must invalidate at submission"
+            elif mutation not in ("duplicate", "missing"):
+                assert trace.valid, "this mutation must be detected by terminal validation"
+            result: dict[str, Any] = trace.finish("completed")
+            observer.session_finished(session_key="timing", reason="completed")
+            assert observer.session_record_count() == 0
+            return result
+
+        baseline = run(None)
+        assert baseline["valid"] and baseline["complete"]
+        assert baseline["count"] == baseline["audio_count"] == 2
+        assert [row["kind"] for row in baseline["units"]] == ["regular", "final_tail"]
+        result = run(fault)
+        assert not result["valid"], f"single {fault} mutation must invalidate a complete baseline"
+        assert result["count"] == result["audio_count"] == 2
+        assert result["reason"] == baseline["reason"] == "completed"
+        # Gap/duplicate/order fail validity while preserving audio completeness;
+        # missing/cleared fail specifically because required timing is absent.
+        assert result["complete"] is (fault not in ("missing", "cleared"))
+        if fault == "gap":
+            assert [row["logical_sequence"] for row in result["units"]] == [0, 2]
+            assert all(row["carrier_sequence"] == row["logical_sequence"] for row in result["units"])
+        elif fault == "duplicate":
+            assert result["units"] == baseline["units"], "duplicate must not overwrite any raw sample"
+        elif fault == "ordering":
+            assert result["units"][0]["p"] == 1.05  # no raw clamping
+            assert result["units"][0]["s"] == 1.1
+            assert result["units"][1] == baseline["units"][1]
+        elif fault == "missing":
+            assert result["units"][0]["s"] is None
+            assert result["units"][0]["disposition"] == "parked"
+        else:
+            assert result["units"][0]["p"] is None
+            assert result["units"][0]["disposition"] == "error"
+
+    def test_fixed_capacity_even_after_overflow(self, monkeypatch: Any) -> None:
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        slots = trace.slots
+        for seq in range(300):
+            h = self.ready(observer)
+            observer.unit_minted(h)
+            trace.submitted(h, seq, seq, "regular", 1_000_000_000, 1_100_000_000)
+            observer.unit_parked(h, park_stamp_s=1.2)
+        result = trace.finish("completed")
+        assert trace.slots is slots and len(slots) == 256
+        assert len(result["units"]) == 256
+        assert result["overflow"] == 44 and not result["valid"]
+
+    def test_controls_are_typed_partial_and_consume_capacity(self, monkeypatch: Any) -> None:
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        trace.submitted(None, 0, None, "forced_eou", None, 1_000_000_000)
+        h = self.ready(observer, kind="final_tail")
+        observer.unit_minted(h)
+        trace.submitted(h, 1, 1, "final_tail", 1_000_000_000, 1_100_000_000)
+        observer.unit_parked(h, park_stamp_s=1.2)
+        result = trace.finish("completed")
+        control = result["units"][0]
+        assert control["kind"] == "forced_eou"
+        assert control["r"] is control["e"] is control["p"] is None
+        assert result["complete"] and result["valid"]
+        assert result["completion_scope"] == "ordinary_audio"
+
+    def test_export_failure_cannot_prevent_cleanup(self, monkeypatch: Any) -> None:
+        from vllm_omni.metrics import streaming as mod
+
+        def broken(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("logger failed")
+
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        self.ready(observer)
+        monkeypatch.setattr(mod.logger, "info", broken)
+        monkeypatch.setattr(mod.logger, "exception", broken)
+        observer.session_finished(session_key="timing", reason="error")
+        assert observer.session_record_count() == 0
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+@pytest.mark.parametrize("stage", ["ready", "disposed", "finish"])
+def test_service_timing_observer_failure_preserves_cleanup(monkeypatch: Any, stage: str) -> None:
+    from vllm_omni.metrics.streaming import PrometheusStreamingObserver
+
+    monkeypatch.setenv("VLLM_OMNI_SERVICE_TIMING", "1")
+    observer = PrometheusStreamingObserver(OmniStreamingMetrics(model_name=_MODEL))
+    observer.session_opened(session_key="failure", cadence_ms="160")
+    trace = observer.service_timing("failure")
+    assert trace is not None
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("trace failed")
+
+    monkeypatch.setattr(trace, stage, broken)
+    handle = observer.unit_ready(session_key="failure", cadence_ms="160", chunk_type="final_tail", ready_stamp_s=1.0)
+    observer.unit_minted(handle)
+    observer.unit_parked(handle, park_stamp_s=1.2)
+    assert observer.complete_inflight("failure") is None
+    observer.session_finished(session_key="failure", reason="completed")
+    assert observer.session_record_count() == 0
+
+
+# @spec PORT-OBS-003, PORT-OBS-004, PORT-STATE-026
+@pytest.mark.parametrize("fault", ["overlap", "carrier"])
+def test_service_timing_rejects_cross_unit_identity_and_order(monkeypatch: Any, fault: str) -> None:
+    helper = TestServiceTiming()
+    observer = helper.observer(monkeypatch)
+    observer.session_opened(session_key="timing", cadence_ms="160")
+    trace = observer.service_timing("timing")
+    for seq, kind, s, p in ((0, "regular", 1_000_000_000, 1.5), (1, "final_tail", 1_400_000_000, 1.6)):
+        h = helper.ready(observer, kind=kind)
+        observer.unit_minted(h)
+        trace.submitted(h, seq, 9 if fault == "carrier" else seq, kind, 1_000_000_000, s)
+        observer.unit_parked(h, park_stamp_s=p if fault == "overlap" else s / 1e9 + 0.01)
+    result = trace.finish("completed")
+    assert result["complete"]
+    assert not result["valid"]
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+@pytest.mark.parametrize("count", [256, 257])
+def test_service_timing_exact_capacity_boundary(monkeypatch: Any, count: int) -> None:
+    helper = TestServiceTiming()
+    observer = helper.observer(monkeypatch)
+    observer.session_opened(session_key="timing", cadence_ms="160")
+    trace = observer.service_timing("timing")
+    slots = trace.slots
+    for seq in range(count):
+        kind = "final_tail" if seq == count - 1 else "regular"
+        handle = helper.ready(observer, kind=kind, stamp=float(seq + 1))
+        observer.unit_minted(handle)
+        trace.submitted(handle, seq, seq, kind, (seq + 1) * 10**9, (seq + 1) * 10**9)
+        observer.unit_parked(handle, park_stamp_s=seq + 1.1)
+    record = trace.finish("completed")
+    assert trace.slots is slots and len(slots) == 256
+    assert record["count"] == 256 and record["overflow"] == count - 256
+    assert record["complete"] is (count == 256)
+    assert record["valid"] is (count == 256)
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+def test_service_timing_all_log_methods_and_metric_failure_allow_cleanup(monkeypatch: Any) -> None:
+    from vllm_omni.metrics import streaming as mod
+
+    helper = TestServiceTiming()
+    observer = helper.observer(monkeypatch)
+    observer.session_opened(session_key="timing", cadence_ms="160")
+    helper.ready(observer)
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("sink failed")
+
+    for method in ("info", "warning", "exception"):
+        monkeypatch.setattr(mod.logger, method, broken)
+    monkeypatch.setattr(observer.metrics, "observe_session_finished", broken)
+    observer.session_finished(session_key="timing", reason="completed")
+    assert observer.session_record_count() == 0
+
+
+# @spec PORT-OBS-003, PORT-OBS-004
+def test_service_timing_total_and_audio_counts_exclude_controls(monkeypatch: Any) -> None:
+    helper = TestServiceTiming()
+    observer = helper.observer(monkeypatch)
+    observer.session_opened(session_key="timing", cadence_ms="160")
+    trace = observer.service_timing("timing")
+    for seq, kind in enumerate(("regular", "forced_eou", "final_tail")):
+        if kind == "forced_eou":
+            trace.submitted(None, seq, None, kind, None, (seq + 1) * 10**9)
+        else:
+            handle = helper.ready(observer, kind=kind, stamp=float(seq + 1))
+            observer.unit_minted(handle)
+            trace.submitted(handle, seq, seq, kind, (seq + 1) * 10**9, (seq + 1) * 10**9)
+            observer.unit_parked(handle, park_stamp_s=seq + 1.1)
+    record = trace.finish("completed")
+    assert record["valid"] and record["complete"]
+    assert record["count"] == len(record["units"]) == 3
+    assert record["audio_count"] == 2
+    assert record["audio_count"] == sum(row["kind"] in ("regular", "final_tail") for row in record["units"])
+    assert record["units"][2]["predecessor_attribution"] == "control_unobserved"
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("logical_sequence", None),
+        ("logical_sequence", -1),
+        ("carrier_sequence", 0),
+        ("s_ns", None),
+        ("r", 1.0),
+        ("e_ns", 1_000_000_000),
+        ("p", 1.1),
+        ("disposition", "parked"),
+        ("handle", object()),
+        ("kind", "unknown"),
+    ],
+)
+def test_service_timing_rejects_malformed_control_shape(monkeypatch: Any, field: str, value: Any) -> None:
+    helper = TestServiceTiming()
+    observer = helper.observer(monkeypatch)
+    observer.session_opened(session_key="timing", cadence_ms="160")
+    trace = observer.service_timing("timing")
+    trace.submitted(None, 0, None, "forced_eou", None, 1_000_000_000)
+    handle = helper.ready(observer, kind="final_tail", stamp=2.0)
+    observer.unit_minted(handle)
+    trace.submitted(handle, 1, 1, "final_tail", 2_000_000_000, 2_000_000_000)
+    observer.unit_parked(handle, park_stamp_s=2.1)
+    # A broken collaborator may corrupt a partially filled diagnostic record;
+    # terminal validation must reject it without touching serving lifecycle.
+    setattr(trace.slots[0], field, value)
+    record = trace.finish("completed")
+    assert not record["valid"]
+    assert record["count"] == 2
+    assert record["audio_count"] == 1
+    observer.session_finished(session_key="timing", reason="completed")
+    assert observer.session_record_count() == 0
