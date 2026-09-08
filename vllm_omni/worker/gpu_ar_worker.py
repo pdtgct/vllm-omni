@@ -64,6 +64,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         return bool(getattr(self, "_persistent_state_warmup_complete", False))
 
     @instrument(span_name="Warmup persistent-only model (GPU)")
+    @torch.inference_mode()
     def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
         """Finish eager worker warmup without inventing token-cache requests.
 
@@ -74,25 +75,25 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         sampler. Preserve core's model-neutral kernel warmup and operational
         postamble while omitting only that incompatible synthetic-request pass.
 
-        This specialization is intentionally limited to the already-enforced
-        eager, non-compiled lane. A future execution-mode expansion must first
-        qualify the corresponding core warmup/capture behavior.
+        This specialization keeps the outer runner eager and non-compiled.
+        A model-owned warmup hook may capture a qualified fixed-shape
+        subregion (for example, the Nemotron dense decoder) before this worker
+        attests readiness; that does not change the outer execution contract.
+
+        Run the complete warmup lifecycle under the same inference-mode
+        contract as activation profiling and served execution.  In
+        particular, a compiled model-owned subregion must see the same tensor
+        dispatch-key set during profiling, warmup, and serving.
         """
 
-        # @spec PORT-ADV-003, ENV-MIG-012
+        # @spec PORT-ADV-003, PORT-PERF-009, ENV-MIG-012
         self._persistent_state_warmup_complete = False
         if not self.model_config.enforce_eager:
-            raise RuntimeError(
-                "persistent-only warmup requires eager execution"
-            )
+            raise RuntimeError("persistent-only warmup requires eager execution")
         if self.compilation_config.mode != CompilationMode.NONE:
-            raise RuntimeError(
-                "persistent-only warmup does not support model compilation"
-            )
+            raise RuntimeError("persistent-only warmup does not support model compilation")
 
-        self.model_runner.maybe_remove_all_loras(
-            self.model_runner.lora_config
-        )
+        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
         kernel_warmup(self)
 
         warmup_resident_state = getattr(
@@ -101,9 +102,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             None,
         )
         if not callable(warmup_resident_state):
-            raise RuntimeError(
-                "persistent-only model does not expose resident-state warmup"
-            )
+            raise RuntimeError("persistent-only model does not expose resident-state warmup")
         warmup_resident_state()
         self._persistent_state_warmup_complete = True
 
@@ -147,9 +146,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             )
             return self._compile_or_warm_up_persistent_only_model()
         if self._has_persistent_cache():
-            raise RuntimeError(
-                "mixed persistent and token-cache warmup is not qualified"
-            )
+            raise RuntimeError("mixed persistent and token-cache warmup is not qualified")
         return super().compile_or_warm_up_model()
 
     @instrument(span_name="Init device")
@@ -236,11 +233,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
-        runner_cls = (
-            GPUARModelRunnerV2
-            if self.use_v2_model_runner
-            else GPUARModelRunner
-        )
+        runner_cls = GPUARModelRunnerV2 if self.use_v2_model_runner else GPUARModelRunner
         self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:

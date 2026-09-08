@@ -19,11 +19,13 @@ declaratively per update by ``pipeline.py sampling_constraints`` and
 actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
@@ -47,6 +49,9 @@ from vllm_omni.model_executor.models.nemotron_asr.decode_dispatch import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     FastConformerEncoder,
+)
+from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+    build_encoder_execution,
 )
 from vllm_omni.model_executor.models.nemotron_asr.featurizer import (
     MelFeaturizer,
@@ -79,6 +84,7 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
     Joint,
     Predictor,
+    decode_dense_masked_frames,
     greedy_decode_chunk,
 )
 from vllm_omni.model_executor.models.nemotron_asr.startup import (
@@ -91,6 +97,8 @@ from vllm_omni.model_executor.models.nemotron_asr.state_profile import (
 )
 from vllm_omni.model_executor.persistent_state import PersistentStateLayerBase
 
+logger = init_logger(__name__)
+
 #: The largest published chunk (1120 ms) emits 14 encoder frames — the
 #: replay queue page's per-chunk worst case.
 _MAX_FRAMES_PER_CHUNK = 14
@@ -99,6 +107,23 @@ _MAX_FRAMES_PER_CHUNK = 14
 _N_MELS = 128
 _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
+
+
+def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
+    declared = getattr(
+        hf_config,
+        "supported_num_lookahead_tokens",
+        None,
+    )
+    supported = None if declared is None else {int(value) for value in declared}
+    geometries = tuple(
+        index
+        for index, (_label, (_left, right)) in enumerate(CADENCES.items())
+        if supported is None or right in supported
+    )
+    if not geometries:
+        raise ValueError("served configuration declares no supported encoder geometry")
+    return geometries
 
 
 class NemotronASRCore(nn.Module):
@@ -369,8 +394,42 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
-        self._decode_resolver = build_decode_resolver(hf_config)
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        served_geometry_ids = _served_geometry_ids(hf_config)
+        self._encoder_execution = build_encoder_execution(
+            self.core,
+            hf_config,
+            maximum_population=self._max_num_seqs,
+            warmup_geometries=served_geometry_ids,
+            vllm_config=vllm_config,
+        )
+        self._decode_graph_binding = None
+        if getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed":
+            from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
+                DenseGraphBinding,
+                execution_tiers,
+            )
+
+            served_geometry_set = set(served_geometry_ids)
+            self._decode_graph_binding = DenseGraphBinding(
+                decode_fn=decode_dense_masked_frames,
+                predictor=self.core.predictor,
+                joint=self.core.joint,
+                vllm_config=vllm_config,
+                frame_widths=tuple(
+                    right + 1 if index in served_geometry_set else None
+                    for index, (_left, right) in enumerate(CADENCES.values())
+                ),
+                tiers=execution_tiers(self._max_num_seqs),
+                encoder_hidden=int(hf_config.d_model),
+                predictor_layers=int(hf_config.pred_rnn_layers),
+                predictor_hidden=int(hf_config.pred_hidden),
+                blank_id=int(self.core.blank_id),
+            )
+        self._decode_resolver = build_decode_resolver(
+            hf_config,
+            graph_binding=self._decode_graph_binding,
+        )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
 
@@ -619,29 +678,61 @@ class NemotronASRForRNNT(nn.Module):
         )
 
     def warmup_resident_state(self) -> None:
-        """Warm every fixed-shape scatter specialization before admission."""
+        """Warm every resident scatter and regional graph before admission."""
 
         from vllm_omni.model_executor.models.nemotron_asr.advance import (
             warmup_advance_model_rows_scatter,
         )
+        from vllm_omni.model_executor.models.nemotron_asr.profile_execution import (
+            warmup_static_encoder_execution,
+        )
 
         pools = self._state_pools()
-        if pools.channel[0].device.type != "cuda":
-            return
-        warmup_advance_model_rows_scatter(
-            channel_pools=list(pools.channel),
-            time_pools=list(pools.convolution),
-            len_pools=list(pools.valid_length),
-            h_pool=pools.predictor_h,
-            c_pool=pools.predictor_c,
-            queue_pool=pools.replay_queue,
-            book_pool=pools.replay_book,
-            frontend_raw_pool=pools.frontend_raw,
-            frontend_mel_pool=pools.frontend_mel,
-            frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history,
-            endpoint_book_pool=pools.endpoint_book,
+        device = pools.predictor_h.device
+        if device.type == "cuda":
+            warmup_advance_model_rows_scatter(
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+            )
+        warmup_static_encoder_execution(self, device=device)
+        if self._decode_graph_binding is not None:
+            self._decode_graph_binding.warmup(
+                device,
+                next(self.core.encoder.parameters()).dtype,
+            )
+        logger.info(
+            "Nemotron execution profile ready %s",
+            json.dumps(
+                self.execution_profile_receipt(),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
+
+    def execution_profile_receipt(self) -> dict[str, Any]:
+        """Report the resolved execution arms and startup coverage."""
+        binding = self._decode_graph_binding
+        keys = () if binding is None else binding.captured_keys
+        decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        return {
+            "schema": "nemotron-execution-profile/1",
+            "decode": {
+                "arm": decode_arm,
+                "captured_keys": [list(key) for key in keys],
+                "ready": binding is None or bool(keys),
+            },
+            "encoder": self._encoder_execution.ready_receipt(),
+        }
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
@@ -762,12 +853,19 @@ class NemotronASRForRNNT(nn.Module):
             num_decodes = int(context.has_prior_state.sum().item())
             num_prefills = len(context.request_ids) - num_decodes
         pools = self._state_pools()
+        graph_binding = self._decode_graph_binding
+        graph_covers_decode = graph_binding is not None
+        chunk_rows = int(context.is_chunk.sum().item())
+        execution_tier = 0
+        if graph_binding is not None and chunk_rows:
+            execution_tier = graph_binding.execution_tier(chunk_rows)
         plan = build_row_plan(
             context,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             null_block_id=int(NULL_BLOCK_ID),
             num_pool_blocks=int(pools.replay_queue.shape[0]),
+            execution_tier=execution_tier,
         )
         return advance_model_rows(
             self.core,
@@ -789,10 +887,12 @@ class NemotronASRForRNNT(nn.Module):
             eou_token_id=int(self.config.eou_token_id),
             adapter=self._emission_adapter,
             decode_resolver=self._decode_resolver,
+            encoder_transition=self._encoder_execution.transition,
             placeholder_id=int(self.config.audio_chunk_token_id),
             park_id=int(self.config.eos_token_id),
             commit_sink=self._ensure_commit_sink(inputs_embeds.device),
             staging=self._ensure_host_staging(),
+            graph_covers_decode=graph_covers_decode,
         )
 
     def consume_batch_stats(self) -> list[tuple[str, int]] | None:
@@ -825,7 +925,12 @@ class NemotronASRForRNNT(nn.Module):
         return NemotronASRModelState
 
 
-def build_decode_resolver(hf_config: Any) -> DecodeResolver:
+# @spec PORT-DEC-008, PORT-PERF-004
+def build_decode_resolver(
+    hf_config: Any,
+    *,
+    graph_binding: Any = None,
+) -> DecodeResolver:
     """Startup decode-dispatch resolution (PORT-DEC-008: no default).
 
     The SERVED config must declare exactly one of:
@@ -834,8 +939,8 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
       the bring-up/correctness lane. More than one ready decode bucket
       still forces the sync-free eager arm — a declared arm is a
       preference, never a license to serialize a busy engine. A
-      ``dense-graphed`` declaration is rejected until an actual graph
-      binding exists.
+      ``dense-graphed`` declaration requires a startup-captured regional
+      graph binding; the outer model runner remains eager.
     - ``decode_dispatch_table``: a measured, validated table artifact.
       Loading it requires the runtime-fingerprint tooling owned by the
       deferred A100 work packet; until that lands this path fails
@@ -870,12 +975,37 @@ def build_decode_resolver(hf_config: Any) -> DecodeResolver:
         "dense-eager": decode_dense_masked_frames,
         "compact-eager": decode_compact_active_frames,
     }
-    if arm not in arms:
-        raise ValueError(f"unknown decode_dispatch_arm {arm!r} (known: {sorted(arms)})")
+    if arm == "dense-graphed" and graph_binding is None:
+        raise ValueError("decode_dispatch_arm='dense-graphed' requires a captured graph binding")
+    known_arms = {*arms, "dense-graphed"}
+    if arm not in known_arms:
+        raise ValueError(f"unknown decode_dispatch_arm {arm!r} (known: {sorted(known_arms)})")
 
     def resolve(request: DecodeRequest) -> ResolvedDecode:
+        if arm == "dense-graphed":
+            if request.memory_profile:
+                if request.graph_covers_decode:
+                    raise ValueError("pre-capture memory profile cannot claim graph coverage")
+                return ResolvedDecode(
+                    arm="dense-eager",
+                    decode_fn=arms["dense-eager"],
+                    override_reason="pre-capture-memory-profile",
+                )
+            if not request.graph_covers_decode:
+                raise ValueError("dense-graphed dispatch requires regional graph coverage")
+            tier = graph_binding.execution_tier(request.execution_batch_size)
+            if request.execution_tier_limit > 0 and tier > request.execution_tier_limit:
+                raise ValueError("decode bucket tier exceeds RowPlan execution authority")
+            return ResolvedDecode(
+                arm="dense-graphed",
+                decode_fn=graph_binding.decode_fn(
+                    geometry=request.geometry,
+                    tier=tier,
+                ),
+                override_reason="regional-graph-coverage",
+            )
         if request.graph_covers_decode:
-            raise ValueError("graph-covered decode requires an exact padded runner binding; Phase 6c is eager-only")
+            raise ValueError("graph-covered decode requires the dense-graphed served arm")
         if request.ready_decode_buckets > 1 and arm not in SYNC_FREE_ARMS:
             return ResolvedDecode(
                 arm="dense-eager",

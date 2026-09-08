@@ -32,7 +32,7 @@ def _model_class() -> type[Any]:
     return cast(type[Any], _model_module().NemotronASRForRNNT)
 
 
-def _config() -> Any:
+def _config(*, decode_dispatch_arm: str = "dense-eager") -> Any:
     config_module = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr")
     return config_module.NemotronASRConfig(
         vocab_size=13_092,
@@ -42,7 +42,7 @@ def _config() -> Any:
         eou_token_id=13_090,
         flush_token_id=13_091,
         prompt_dictionary={"en-US": 0},
-        decode_dispatch_arm="dense-eager",
+        decode_dispatch_arm=decode_dispatch_arm,
     )
 
 
@@ -63,6 +63,12 @@ def _no_state_model() -> Any:
     object.__setattr__(model, "core", object())
     object.__setattr__(model, "_emission_adapter", object())
     object.__setattr__(model, "_decode_resolver", object())
+    object.__setattr__(model, "_decode_graph_binding", None)
+    object.__setattr__(
+        model,
+        "_encoder_execution",
+        SimpleNamespace(transition=object()),
+    )
     return model
 
 
@@ -110,6 +116,25 @@ def test_profile_invocation_uses_ephemeral_manifest_storage_and_valid_carriers()
     geometry_index = manifests.ENVELOPE_HEADER_FIELDS.index("geometry_id")
     assert invocation.inputs_embeds[:, valid_index].tolist() == [17_920.0] * 2
     assert invocation.inputs_embeds[:, geometry_index].tolist() == [4.0] * 2
+
+
+def test_profile_invocation_accepts_one_exact_geometry() -> None:
+    # @spec PORT-PERF-009
+    profile = _profile_module()
+    config = _config()
+
+    invocation = profile.build_profile_invocation(
+        config,
+        num_rows=2,
+        device=torch.device("cpu"),
+        geometry_id=1,
+    )
+
+    assert invocation.geometry_label == "160ms"
+    assert invocation.geometry_id == 1
+    assert invocation.plan.geometry_id.tolist() == [1, 1]
+    valid_index = profile.ENVELOPE_HEADER_FIELDS.index("valid_samples")
+    assert invocation.inputs_embeds[:, valid_index].tolist() == [2_560.0, 2_560.0]
 
 
 def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
@@ -176,7 +201,8 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     assert warmup_kwargs["channel_pools"] == []
     assert warmup_kwargs["h_pool"] is invocation.pools.predictor_h
     assert warmup_kwargs["endpoint_book_pool"] is invocation.pools.endpoint_book
-    advance_args, advance_kwargs = events[3][1]
+    # The patched transaction records its positional tuple and keyword dict.
+    advance_args, advance_kwargs = cast(tuple[tuple[object, ...], dict[str, object]], events[3][1])
     assert advance_args[:4] == (
         model.core,
         invocation.input_ids,
@@ -184,7 +210,137 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
         invocation.plan,
     )
     assert advance_kwargs["capture"] is False
+    assert advance_kwargs["memory_profile"] is True
     assert advance_kwargs["commit_sink"] is None
+    assert advance_kwargs["decode_resolver"] is model._decode_resolver
+    assert advance_kwargs["encoder_transition"] is model._encoder_execution.transition
+
+
+def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-004
+    profile = _profile_module()
+    invocation = SimpleNamespace(
+        input_ids=torch.zeros(1, dtype=torch.long),
+        inputs_embeds=torch.zeros(1, 7),
+        plan=object(),
+        pools=SimpleNamespace(
+            channel=(),
+            convolution=(),
+            valid_length=(),
+            predictor_h=object(),
+            predictor_c=object(),
+            replay_queue=object(),
+            replay_book=object(),
+            frontend_raw=object(),
+            frontend_mel=object(),
+            frontend_counters=object(),
+            endpoint_history=object(),
+            endpoint_book=object(),
+        ),
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        profile,
+        "build_profile_invocation",
+        lambda *args, **kwargs: invocation,
+    )
+    monkeypatch.setattr(
+        profile,
+        "advance_model_rows",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
+    model = _no_state_model()
+    object.__setattr__(
+        model,
+        "config",
+        _config(decode_dispatch_arm="dense-graphed"),
+    )
+
+    def served_resolver(request: Any) -> Any:
+        raise ValueError("dense-graphed dispatch requires regional graph coverage")
+
+    object.__setattr__(model, "_decode_resolver", served_resolver)
+    object.__setattr__(model, "_decode_graph_binding", object())
+
+    profile.run_persistent_state_profile(
+        model,
+        num_rows=1,
+        device=torch.device("cpu"),
+    )
+
+    from vllm_omni.model_executor.models.nemotron_asr.advance import (
+        DecodeRequest,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        decode_dense_masked_frames,
+    )
+
+    resolved = captured["decode_resolver"](
+        DecodeRequest(
+            geometry=4,
+            execution_batch_size=1,
+            graph_covers_decode=False,
+            ready_decode_buckets=1,
+            memory_profile=True,
+        )
+    )
+    assert resolved.arm == "dense-eager"
+    assert resolved.decode_fn is decode_dense_masked_frames
+    assert resolved.override_reason == "pre-capture-memory-profile"
+    assert captured["memory_profile"] is True
+
+
+@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed"])
+def test_compiled_profile_uses_largest_admitted_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_arm: str,
+) -> None:
+    # @spec PORT-PERF-009, PORT-PERF-011
+    profile = _profile_module()
+    captured: dict[str, Any] = {}
+
+    def stop_after_build(
+        _config: Any,
+        *,
+        num_rows: int,
+        device: torch.device,
+        geometry_id: int,
+    ) -> Any:
+        captured.update(
+            num_rows=num_rows,
+            device=device,
+            geometry_id=geometry_id,
+        )
+        raise RuntimeError("stop after profile geometry selection")
+
+    monkeypatch.setattr(profile, "build_profile_invocation", stop_after_build)
+    monkeypatch.setattr(profile, "consume_batch_stats", lambda: None)
+    model = _no_state_model()
+    object.__setattr__(
+        model,
+        "_encoder_execution",
+        SimpleNamespace(
+            arm=encoder_arm,
+            transition=object(),
+            warmup_geometries=(2, 0),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after profile geometry selection"):
+        profile.run_persistent_state_profile(
+            model,
+            num_rows=4,
+            device=torch.device("cpu"),
+        )
+
+    assert captured == {
+        "num_rows": 4,
+        "device": torch.device("cpu"),
+        "geometry_id": 2,
+    }
 
 
 def test_profile_execution_drains_stats_when_the_transition_fails(
@@ -258,6 +414,64 @@ def test_profile_execution_drains_stats_on_empty_dispatch(
         )
 
     assert drained == [True]
+
+
+@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed"])
+def test_static_encoder_warmup_is_product_owned_cartesian_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_arm: str,
+) -> None:
+    # @spec PORT-PERF-009, PORT-PERF-011
+    profile = _profile_module()
+    invoked: list[tuple[int, int]] = []
+    warmed: list[tuple[int, int]] = []
+    sealed: list[tuple[tuple[int, int], ...]] = []
+
+    class Execution:
+        arm = encoder_arm
+        warmup_geometries = (0, 2, 4)
+        warmup_populations = (1, 3)
+
+        def warmup_domain(self, *, expected_cells: tuple[tuple[int, int], ...], invoke: Any) -> None:
+            for geometry, population in expected_cells:
+                warmed.append((geometry, population))
+                invoke(geometry, population)
+            sealed.append(expected_cells)
+
+    model = _no_state_model()
+    object.__setattr__(
+        model,
+        "config",
+        _config(),
+    )
+    object.__setattr__(
+        model.config,
+        "supported_num_lookahead_tokens",
+        [0, 3, 13],
+    )
+    object.__setattr__(model, "_encoder_execution", Execution())
+    monkeypatch.setattr(
+        profile,
+        "run_persistent_state_profile",
+        lambda _model, *, num_rows, device, geometry_id=None: invoked.append((int(geometry_id), num_rows)),
+    )
+
+    profile.warmup_static_encoder_execution(
+        model,
+        device=torch.device("cpu"),
+    )
+
+    expected = (
+        (0, 1),
+        (0, 3),
+        (2, 1),
+        (2, 3),
+        (4, 1),
+        (4, 3),
+    )
+    assert invoked == list(expected)
+    assert warmed == list(expected)
+    assert sealed == [expected]
 
 
 @pytest.mark.parametrize("is_profile", [True, False])

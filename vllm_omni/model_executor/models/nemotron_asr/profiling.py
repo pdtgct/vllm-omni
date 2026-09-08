@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from types import TracebackType
+from typing import Literal
 
 import torch
 
@@ -39,6 +40,14 @@ PHASES: tuple[str, ...] = (
 )
 
 
+#: Nested attribution preserves the comparable transaction-level PHASES.
+ENCODER_SUBPHASES: tuple[str, ...] = (
+    "port.encode.stage_in",
+    "port.encode.replay",
+    "port.encode.stage_out",
+)
+
+
 class _NullPhase:
     """Shared no-op range; entering and leaving it allocates nothing."""
 
@@ -52,7 +61,7 @@ class _NullPhase:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         return False
 
 
@@ -78,14 +87,14 @@ class _NvtxPhase:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         torch.cuda.nvtx.range_pop()
         return False
 
 
 _NULL = _NullPhase()
 _RANGES: dict[str, _NullPhase | _NvtxPhase] = {
-    name: (_NvtxPhase(name) if _ENABLED else _NULL) for name in PHASES
+    name: (_NvtxPhase(name) if _ENABLED else _NULL) for name in (*PHASES, *ENCODER_SUBPHASES)
 }
 
 

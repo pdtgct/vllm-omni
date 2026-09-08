@@ -27,6 +27,13 @@ _PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/ne
 _BASE = "vllm_omni.model_executor.models.nemotron_asr"
 
 
+def _publish_module(name: str, module: types.ModuleType) -> None:
+    sys.modules[name] = module
+    parent_name, _, child_name = name.rpartition(".")
+    if parent_name:
+        setattr(sys.modules[parent_name], child_name, module)
+
+
 def _load_chain() -> dict[str, Any]:
     for name in (
         "vllm_omni",
@@ -34,26 +41,36 @@ def _load_chain() -> dict[str, Any]:
         "vllm_omni.model_executor.models",
         _BASE,
     ):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
+        module = sys.modules.get(name, types.ModuleType(name))
+        if name == _BASE and not hasattr(module, "__path__"):
+            module.__path__ = [str(_PKG)]
+        _publish_module(name, module)
     loaded: dict[str, Any] = {}
     for mod in (
         "precision",
         "masks",
         "featurizer",
         "encoder",
+        "encoder_execution",
         "lid",
         "manifests",
         "frontend",
+        "profiling",
         "rnnt_cell",
         "rnnt",
         "state_scatter",
         "advance",
     ):
-        spec = importlib.util.spec_from_file_location(f"{_BASE}.{mod}", _PKG / f"{mod}.py")
+        module_name = f"{_BASE}.{mod}"
+        if module_name in sys.modules:
+            module = sys.modules[module_name]
+            _publish_module(module_name, module)
+            loaded[mod] = module
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, _PKG / f"{mod}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_BASE}.{mod}"] = module
+        _publish_module(module_name, module)
         spec.loader.exec_module(module)
         loaded[mod] = module
     return loaded
@@ -63,6 +80,7 @@ mods = _load_chain()
 advance = mods["advance"]
 frontend = mods["frontend"]
 rnnt = mods["rnnt"]
+manifests = mods["manifests"]
 
 FEAT = 16
 D_MODEL = 32
@@ -231,6 +249,283 @@ def test_encode_phase_exits_before_decode_phase_enters(
     _advance(core, _chunk(torch.randn(1, CHUNK) * 0.1, seq=0), state)
 
     assert events.index("port.encode:exit") < events.index("port.decode:enter")
+
+
+@pytest.mark.parametrize(
+    ("geometry", "label", "lookahead"),
+    [(geometry, label, right) for geometry, (label, (_, right)) in enumerate(manifests.CADENCES.items())],
+)
+def test_decode_receives_only_geometry_valid_encoder_frames(
+    geometry: int,
+    label: str,
+    lookahead: int,
+) -> None:
+    # @spec PORT-ADV-004, PORT-PERF-004
+    # The encoder retains its fixed padded width for capture, while decode's
+    # fixed-trip width is the geometry manifest's maximum valid prefix. The
+    # pre-encode cache produces two trailing padded outputs which must not
+    # become part of the dense graph key or its repeated label loop.
+    core = _core()
+    state = _fresh_state(1)
+    valid_width = lookahead + 1
+    raw_width = manifests.RAW_SAMPLES_PER_CHUNK[label]
+    batch = advance.ChunkBatch(
+        samples=torch.zeros(1, raw_width),
+        valid_samples=torch.tensor([raw_width]),
+        geometry_id=torch.tensor([geometry]),
+        final_tail=torch.tensor([False]),
+        prompt_index=torch.tensor([0]),
+        chunk_sequence=torch.tensor([0]),
+    )
+
+    def decode_probe(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        assert enc_frames.shape[1] == valid_width
+        assert enc_lengths.tolist() == [valid_width]
+        return (
+            torch.zeros(
+                1,
+                valid_width * rnnt.MAX_SYMBOLS_PER_STEP,
+                dtype=torch.int32,
+            ),
+            torch.zeros(1, dtype=torch.int32),
+            decode_state,
+        )
+
+    result = advance.advance_session(
+        core,
+        batch,
+        state,
+        geometry=geometry,
+        decode_fn=decode_probe,
+        capture=True,
+    )
+
+    assert result.captures is not None
+    assert result.captures.encoder_conditioned.shape[1] == valid_width + 2
+
+
+# @spec PORT-ADV-004, PORT-PERF-004
+def test_decode_accepts_exact_live_state_with_only_outer_tier_padding() -> None:
+    core = _core()
+    state = _fresh_state(3)
+    samples = torch.zeros(3, CHUNK)
+
+    def tier_padded_decode(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        del enc_frames, enc_lengths
+        layers, live, hidden = decode_state.h.shape
+        tier = 4
+        assert live == 3
+        h_storage = torch.zeros(layers, tier, hidden)
+        c_storage = torch.zeros_like(h_storage)
+        h_storage[:, :live].copy_(decode_state.h + 1)
+        c_storage[:, :live].copy_(decode_state.c + 2)
+        next_h = h_storage[:, :live]
+        next_c = c_storage[:, :live]
+        assert next_h.stride() == (tier * hidden, hidden, 1)
+        assert not next_h.is_contiguous()
+        return (
+            torch.ones(live, 1, dtype=torch.int32),
+            torch.ones(live, dtype=torch.int32),
+            rnnt.DecodeState(
+                h=next_h,
+                c=next_c,
+                last_label=torch.ones(live, dtype=torch.long),
+            ),
+        )
+
+    _advance(
+        core,
+        _chunk(samples, seq=0),
+        state,
+        decode_fn=tier_padded_decode,
+    )
+
+    torch.testing.assert_close(state.h, torch.ones_like(state.h))
+    torch.testing.assert_close(state.c, torch.full_like(state.c, 2))
+    assert state.last_label.tolist() == [1, 1, 1]
+
+
+# @spec PORT-ADV-004
+def test_decode_rejects_noncanonical_inner_state_layout() -> None:
+    core = _core()
+    state = _fresh_state(1)
+
+    def inner_strided_decode(
+        enc_frames: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        _predictor: Any,
+        _joint: Any,
+        decode_state: Any,
+    ) -> Any:
+        del enc_frames, enc_lengths
+        layers, live, hidden = decode_state.h.shape
+        h = torch.zeros(layers, live, hidden * 2)[:, :, ::2]
+        assert h.shape == decode_state.h.shape
+        assert h.stride(-1) == 2
+        return (
+            torch.zeros(live, 1, dtype=torch.int32),
+            torch.zeros(live, dtype=torch.int32),
+            rnnt.DecodeState(
+                h=h,
+                c=decode_state.c,
+                last_label=decode_state.last_label,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="next-state h"):
+        _advance(
+            core,
+            _chunk(torch.zeros(1, CHUNK), seq=0),
+            state,
+            decode_fn=inner_strided_decode,
+        )
+
+
+def test_advance_session_reuses_geometry_and_transition_input_authorities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-PERF-010
+    advance = mods["advance"]
+    encoder_execution = mods["encoder_execution"]
+    geometry_shape = getattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        None,
+    )
+    prepare_inputs = getattr(
+        advance,
+        "prepare_encoder_transition_inputs",
+        None,
+    )
+    assert callable(geometry_shape), "PORT-PERF-010 missing encoder_geometry_shape"
+    assert callable(prepare_inputs), "PORT-PERF-010 missing prepare_encoder_transition_inputs"
+    geometry_results: list[Any] = []
+    prepared: list[tuple[Any, ...]] = []
+    received: list[tuple[Any, ...]] = []
+
+    def observe_shape(*args: Any, **kwargs: Any) -> Any:
+        result = geometry_shape(*args, **kwargs)
+        geometry_results.append(result)
+        return result
+
+    def observe_inputs(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        result = prepare_inputs(*args, **kwargs)
+        assert isinstance(result, tuple)
+        prepared.append(result)
+        return result
+
+    def observe_transition(*args: Any) -> Any:
+        received.append(args)
+        return encoder_execution.execute_encoder_transition(core, *args)
+
+    monkeypatch.setattr(
+        encoder_execution,
+        "encoder_geometry_shape",
+        observe_shape,
+    )
+    monkeypatch.setattr(
+        advance,
+        "prepare_encoder_transition_inputs",
+        observe_inputs,
+    )
+    core = _core()
+    _advance(
+        core,
+        _chunk(torch.zeros(1, CHUNK), seq=0),
+        _fresh_state(1),
+        encoder_transition=observe_transition,
+    )
+
+    assert len(geometry_results) == 1
+    assert len(prepared) == len(received) == 1
+    assert len(prepared[0]) == len(received[0])
+    assert all(
+        prepared_arg is received_arg
+        for prepared_arg, received_arg in zip(
+            prepared[0],
+            received[0],
+            strict=True,
+        )
+    )
+    assert geometry_results[0].mel_width == int(received[0][0].shape[2])
+    assert geometry_results[0].out_width == received[0][4]
+
+
+def test_static_fullgraph_encoder_transition_matches_eager_exactly() -> None:
+    # @spec PORT-PERF-009
+    # The production candidate uses Inductor, but this contract is
+    # backend-independent: Dynamo must capture the real cache-mutating
+    # transition as one full static graph, and that graph must preserve every
+    # observable tensor and resident-state write exactly. ``backend="eager"``
+    # keeps this CPU gate independent of a platform compiler toolchain.
+    core = _core()
+    torch.manual_seed(20)
+    batch = _chunk(torch.randn(1, CHUNK) * 0.1, seq=0)
+    eager_state = _fresh_state(1)
+    graph_state = _fresh_state(1)
+
+    eager = _advance(core, batch, eager_state, capture=True)
+    encoder_execution = mods["encoder_execution"]
+
+    def transition(*args: Any) -> Any:
+        return encoder_execution.execute_encoder_transition(core, *args)
+
+    fullgraph = torch.compile(
+        transition,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    graphed = _advance(
+        core,
+        batch,
+        graph_state,
+        encoder_transition=fullgraph,
+        capture=True,
+    )
+
+    for field in (
+        "token_ids",
+        "token_lengths",
+        "row_valid",
+        "row_status",
+        "frame_emission_counts",
+        "frame_final_labels",
+        "frame_valid_lengths",
+    ):
+        torch.testing.assert_close(
+            getattr(graphed, field),
+            getattr(eager, field),
+            rtol=0,
+            atol=0,
+        )
+    assert eager.captures is not None and graphed.captures is not None
+    for field in (
+        "frontend_mel",
+        "mel_lengths",
+        "encoder_raw",
+        "encoder_conditioned",
+        "encoder_lengths",
+    ):
+        torch.testing.assert_close(
+            getattr(graphed.captures, field),
+            getattr(eager.captures, field),
+            rtol=0,
+            atol=0,
+        )
+    _assert_row_unchanged(graph_state, 0, _row_clone(eager_state, 0))
 
 
 def test_session_first_chunk_advances_and_captures() -> None:
