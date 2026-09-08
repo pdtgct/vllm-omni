@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -42,9 +42,7 @@ def _additional_information(value: object) -> Mapping[str, Any] | None:
 
 
 def _binding_payload(request: Request) -> Mapping[str, Any] | None:
-    information = _additional_information(
-        getattr(request, "additional_information", None)
-    )
+    information = _additional_information(getattr(request, "additional_information", None))
     if information is None:
         return None
     binding = information.get("persistent_state_binding")
@@ -57,6 +55,7 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._claimed_state_bindings: dict[str, StateBinding] = {}
+        self._rejected_state_claims: set[str] = set()
         self._validate_streaming_model_len(self.max_model_len)
 
     @staticmethod
@@ -70,18 +69,24 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
     def _state_registry(self) -> _PersistentStateRegistry | None:
         return getattr(self, "persistent_state_registry", None)
 
+    def _reject_initial_claim(self, request: Request) -> bool:
+        """Retire a rejected ADD and retain its error through output delivery."""
+
+        finished = self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+        self._rejected_state_claims.update(request_id for request_id, _ in finished)
+        return False
+
     def _claim_initial_request(self, request: Request) -> bool:
         """Join an initial ADD to its already committed logical lease."""
 
         payload = _binding_payload(request)
         registry = self._state_registry()
         if payload is None or registry is None:
-            request.status = RequestStatus.FINISHED_ERROR
             logger.error(
                 "persistent-state lifecycle invariant failed for request %s",
                 request.request_id,
             )
-            return False
+            return self._reject_initial_claim(request)
         try:
             binding = registry.claim_pending_lease(
                 engine_epoch=payload["engine_epoch"],
@@ -89,21 +94,20 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
                 generation=payload["generation"],
                 schema_id=payload["schema_id"],
                 profile_id=payload["profile_id"],
-                binding_token=payload.get("binding_token"),
+                binding_token=payload["binding_token"],
             )
         except (KeyError, RuntimeError, ValueError):
-            request.status = RequestStatus.FINISHED_ERROR
             logger.exception(
                 "persistent-state lifecycle claim failed for request %s",
                 request.request_id,
             )
-            return False
+            # The core finish path removes queued requests before marking
+            # them finished. Pre-setting the status makes it skip cleanup,
+            # allowing a rejected lease to reach ordinary allocation.
+            return self._reject_initial_claim(request)
         if not isinstance(binding, StateBinding):
-            request.status = RequestStatus.FINISHED_ERROR
-            logger.error(
-                "persistent-state lifecycle claim returned an invalid binding"
-            )
-            return False
+            logger.error("persistent-state lifecycle claim returned an invalid binding")
+            return self._reject_initial_claim(request)
         self._claimed_state_bindings[request.request_id] = binding
         return True
 
@@ -117,44 +121,20 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
         if payload.get("generation") != binding.generation:
             raise RuntimeError("streaming re-add generation mismatch")
         current_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-        if binding.slot_id not in {
-            block_id
-            for group in current_blocks.get_block_ids()
-            for block_id in group
-        }:
+        if binding.slot_id not in {block_id for group in current_blocks.get_block_ids() for block_id in group}:
             raise RuntimeError("streaming re-add block binding mismatch")
         return binding
 
+    # @spec PORT-STATE-019
     def schedule(self, throttle_prefills: bool = False) -> OmniSchedulerOutput:
         """Claim logical state before the base scheduler admits initial work."""
 
         claim_pending_lease = self._claim_initial_request
         for request in tuple(self.waiting):
-            payload = _binding_payload(request)
-            if payload is None:
-                continue
-            # Keep the complete lease identity at this join point.  The helper
-            # performs the atomic check; this validation makes an incomplete
-            # API-side binding fail before base scheduling can allocate work.
-            for field in (
-                "engine_epoch",
-                "session_key",
-                "generation",
-                "schema_id",
-                "profile_id",
-                "binding_token",
-            ):
-                if field not in payload:
-                    request.status = RequestStatus.FINISHED_ERROR
-                    break
             if request.request_id in self._claimed_state_bindings:
                 self._verify_streaming_readd(request)
                 continue
-            if not claim_pending_lease(request):
-                self.finish_requests(
-                    request.request_id,
-                    RequestStatus.FINISHED_ERROR,
-                )
+            claim_pending_lease(request)
 
         output = super().schedule(throttle_prefills)
         output.persistent_state_bindings.update(
@@ -181,6 +161,14 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
         """Publish terminal identity without owning physical cleanup."""
 
         result = super().update_from_output(*args, **kwargs)
+        # Omni emits externally finished requests as ABORT after queue cleanup.
+        # Preserve lifecycle rejection as ERROR without changing that default
+        # for ordinary cancellation or releasing an API-owned lease here.
+        for outputs in result.values():
+            for output in outputs.outputs:
+                if output.request_id in self._rejected_state_claims:
+                    output.finish_reason = FinishReason.ERROR
+                    self._rejected_state_claims.remove(output.request_id)
         registry = self._state_registry()
         if registry is not None:
             for request_id in tuple(self.finished_req_ids):
@@ -222,10 +210,7 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
         for feature in update.mm_features or ():
             position = feature.mm_position
             if position.offset < 0 or position.offset >= max(1, len(prompt_token_ids)):
-                raise ValueError(
-                    "multimodal feature position is outside the current prompt "
-                    "for the replacement prompt"
-                )
+                raise ValueError("multimodal feature position is outside the current prompt for the replacement prompt")
 
         request_id = session.request_id
         self._new_prompt_len_snapshot[request_id] = len(prompt_token_ids)
@@ -236,11 +221,7 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
 
         original_information = getattr(session, "additional_information", None)
         original_mapping = _additional_information(original_information)
-        original_binding = (
-            original_mapping.get("persistent_state_binding")
-            if original_mapping is not None
-            else None
-        )
+        original_binding = original_mapping.get("persistent_state_binding") if original_mapping is not None else None
         replacement_information = getattr(update, "additional_information", None)
         replacement_mapping = _additional_information(replacement_information)
         if isinstance(original_information, dict):

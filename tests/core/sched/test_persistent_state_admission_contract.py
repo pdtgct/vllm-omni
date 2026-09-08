@@ -25,9 +25,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 
 def _module() -> Any:
     try:
-        return importlib.import_module(
-            "vllm_omni.model_executor.models.nemotron_asr.scheduler"
-        )
+        return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.scheduler")
     except ModuleNotFoundError:
         pytest.fail(
             "PORT-STATE-019 missing NemotronASRScheduler module",
@@ -54,9 +52,7 @@ def test_model_scheduler_is_selected_explicitly_by_stage_configuration() -> None
     )[0].to_omegaconf()
 
     assert issubclass(scheduler_cls, OmniARScheduler)
-    assert stage_config.engine_args.scheduler_cls.endswith(
-        ".scheduler.NemotronASRScheduler"
-    )
+    assert stage_config.engine_args.scheduler_cls.endswith(".scheduler.NemotronASRScheduler")
     assert stage_config.engine_args.async_scheduling is False
 
 
@@ -75,7 +71,7 @@ def test_initial_add_claims_exact_pending_binding_before_base_schedule() -> None
         "schema_id",
         "profile_id",
     ):
-        assert field in source[:schedule_offset]
+        assert field in inspect.getsource(scheduler_cls._claim_initial_request)
 
 
 def test_claim_failure_is_lifecycle_error_not_capacity_or_allocation() -> None:
@@ -83,7 +79,7 @@ def test_claim_failure_is_lifecycle_error_not_capacity_or_allocation() -> None:
     scheduler_cls = _module().NemotronASRScheduler
     claim_region = inspect.getsource(scheduler_cls._claim_initial_request)
 
-    assert "FINISHED_ERROR" in claim_region
+    assert "FINISHED_ERROR" in inspect.getsource(scheduler_cls._reject_initial_claim)
     assert "lifecycle" in claim_region.lower() or "invariant" in claim_region.lower()
     assert "capacity_exhausted" not in claim_region
     assert "allocate" not in claim_region
