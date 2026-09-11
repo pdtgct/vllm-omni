@@ -1830,8 +1830,11 @@ def _gather_initialized_rows(
 ) -> torch.Tensor:
     """Gather only continuing rows; fresh rows start as exact zero state."""
     rows = int(blocks.shape[0])
-    scratch = torch.zeros((rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
     continuing_cpu = (~fresh_cpu).nonzero(as_tuple=True)[0]
+    if rows and int(continuing_cpu.numel()) == rows:
+        # Keep the legacy zero-scratch layout contract explicit.
+        return pool.index_select(0, blocks).contiguous()
+    scratch = torch.zeros((rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
     if int(continuing_cpu.numel()):
         continuing = _h2d(continuing_cpu, pool.device)
         continuing_blocks = blocks.index_select(0, continuing)
