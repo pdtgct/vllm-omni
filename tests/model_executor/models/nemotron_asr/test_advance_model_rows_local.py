@@ -3508,3 +3508,65 @@ def test_host_staging_slot_reuse_across_calls_is_safe() -> None:
     )
     assert out2.shape == (1, CARRIER_HIDDEN)
     assert _decision(out2)[0] != PARK_ID  # a real chunk computed, unaffected by call 1
+
+
+# @spec PORT-STATE-003
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_gather_continuing_rows_preserves_order_layout_and_isolation(noncontiguous: bool) -> None:
+    pool = torch.arange(60, dtype=torch.float32).reshape(5, 3, 4)
+    if noncontiguous:
+        pool = pool.transpose(1, 2)
+        assert not pool.is_contiguous()
+    before = pool.clone()
+    blocks = torch.tensor([4, 1, 3])
+    gathered = advance._gather_initialized_rows(pool, blocks, torch.zeros(3, dtype=torch.bool))
+    torch.testing.assert_close(gathered, torch.stack([before[4], before[1], before[3]]))
+    assert gathered.is_contiguous()
+    assert gathered.dtype == pool.dtype
+    assert gathered.device == pool.device
+    assert gathered.data_ptr() != pool.data_ptr()
+    gathered.fill_(-1)
+    torch.testing.assert_close(pool, before)
+    pool.fill_(99)
+    assert torch.all(gathered == -1)
+
+
+# @spec PORT-STATE-003
+@pytest.mark.parametrize("all_fresh", [False, True])
+def test_gather_fresh_poison_is_never_read(all_fresh: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.full((5, 3, 4), float("nan"))
+    pool[1].fill_(7)
+    blocks = torch.tensor([4, 1, 3])
+    fresh = torch.tensor([True, all_fresh, True])
+    reads: list[int] = []
+    original = torch.Tensor.index_select
+
+    def observed(tensor: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
+        if tensor is pool:
+            assert dim == 0
+            reads.extend(index.tolist())
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", observed)
+    gathered = advance._gather_initialized_rows(pool, blocks, fresh)
+    expected = torch.zeros((3, 3, 4))
+    if not all_fresh:
+        expected[1].fill_(7)
+    torch.testing.assert_close(gathered, expected)
+    assert reads == ([] if all_fresh else [1])
+    assert gathered.is_contiguous()
+    gathered.fill_(-1)
+    assert torch.isnan(pool[4]).all()
+    assert torch.isnan(pool[3]).all()
+    assert torch.all(pool[1] == 7)
+
+
+def test_gather_zero_rows_preserves_empty_layout() -> None:
+    pool = torch.full((5, 3, 4), float("nan"), dtype=torch.float64).transpose(1, 2)
+    gathered = advance._gather_initialized_rows(
+        pool, torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.bool)
+    )
+    assert gathered.shape == (0, 4, 3)
+    assert gathered.dtype == pool.dtype
+    assert gathered.device == pool.device
+    assert gathered.is_contiguous()
