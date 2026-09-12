@@ -40,9 +40,13 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     def _select_model_runner_cls(self):
         """Require MRv2 for persistent models; retain upstream choices otherwise."""
-        from vllm_omni.worker.persistent_state import discover_persistent_state_specs
+        from vllm.model_executor.model_loader import get_model_cls
 
-        if discover_persistent_state_specs(self.vllm_config):
+        # Runner selection precedes model construction, so no state layers
+        # have been registered yet. Use the same class capability as the API
+        # service; discover the allocated state inventory after model load.
+        model_cls = get_model_cls(self.vllm_config.model_config)
+        if bool(getattr(model_cls, "supports_persistent_state", False)):
             if not self.use_v2_model_runner:
                 raise RuntimeError("persistent state requires Model Runner v2")
             return GPUARModelRunnerV2

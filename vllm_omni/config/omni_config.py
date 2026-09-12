@@ -136,6 +136,7 @@ def _enforce_keyword_only_init(cls: type[Any]) -> type[Any]:
 
 class _ModelEngineOverrides(TypedDict, total=False):
     model: str
+    served_model_name: str | list[str]
     model_arch: str
     model_subdir: str
     tokenizer_subdir: str
@@ -405,6 +406,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     """Per-stage model behavior and resolved model-engine inputs."""
 
     model: str | None = None
+    served_model_name: str | list[str] | None = None
     model_arch: str | None = None
     revision: str | None = None
     tokenizer_revision: str | None = None

@@ -108,18 +108,18 @@ class OmniSchedulerMixin:
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
-        # Every omni worker forces the v1 model runner (the v2 runner carries no
-        # omni hooks), so the scheduler has to agree or the two disagree about
-        # what the SchedulerOutput carries. vLLM 0.29 defaults this to v2 where
-        # 0.28 did not, so the scheduler took its v2 fast path -- the one that
-        # deliberately omits resumed-request token ids -- while the v1 runner
-        # still read them, and resuming a request raised ``KeyError: <req_id>``
-        # in ``_update_states``.
-        if getattr(self, "use_v2_model_runner", False):
-            logger.warning("OMNI scheduler forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-
+        # Ordinary Omni workers retain V1 hooks; persistent-state workers
+        # use MRv2. Match the worker's pre-construction class capability so
+        # core emits the corresponding prefill/resume request payloads.
         model_config = self.vllm_config.model_config
+        if getattr(self, "use_v2_model_runner", False):
+            from vllm.model_executor.model_loader import get_model_cls
+
+            model_cls = get_model_cls(model_config)
+            if not bool(getattr(model_cls, "supports_persistent_state", False)):
+                logger.warning("OMNI scheduler forces v1 model runner for omni hooks.")
+                self.use_v2_model_runner = False
+
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config) if getattr(model_config, "async_chunk", False) else None
         )

@@ -12,9 +12,9 @@ width). Modeled on the pin's realtime precedent (manual single
 placeholder, no placeholder tokens minted into text) and the ASR
 field-config precedent (``MultiModalFieldConfig.batched("audio")``).
 
-The exact ``apply``/``_call_hf_processor`` flow for a no-HF-processor
-realtime model is confirmed against the live engine (BU-c2 pod round);
-this is the first cut against the pinned base API.
+The native processor separates multimodal field processing from prompt
+updates. Raw audio bypasses HF processing; dummy inputs receive their
+carrier token during the prompt-update stage.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ class NemotronASRDummyInputsBuilder(BaseDummyInputsBuilder[NemotronASRProcessing
 class NemotronASRMultiModalProcessor(BaseMultiModalProcessor[NemotronASRProcessingInfo]):
     """Raw-audio passthrough + single carrier placeholder.
 
-    No HF processor: ``_call_hf_processor`` builds the field batch from
+    No HF processor: ``_apply_hf_processor_main`` builds the field batch from
     the raw chunk directly (the model's ``embed_multimodal`` owns the
     mel front-end). The realtime prompt carries exactly one placeholder
     token, so placeholder positions are built manually (one carrier row
@@ -100,20 +100,14 @@ class NemotronASRMultiModalProcessor(BaseMultiModalProcessor[NemotronASRProcessi
         # Realtime cannot use the content-hash cache (streams are unique).
         super().__init__(info, dummy_inputs, cache=None)
 
-    def _call_hf_processor(
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # No HF processor: pass the raw waveform through untouched as the
-        # ``audio`` field (the model featurizes it in ``embed_multimodal``;
-        # nothing here computes mel), and synthesise the token stream the
-        # base ``_apply_hf_processor_text_mm`` pops as ``input_ids``. The
-        # streaming prompt is one carrier placeholder per audio chunk;
-        # ``requires_raw_input_tokens`` supplies the real ids at serving,
-        # so this path only has to hold for the text/profiling render.
+        # v0.29 calls this field-only entry point for real and dummy inputs.
+        # No HF processor or featurization: the model owns the mel frontend.
+        mm_data, passthrough_data = self._get_hf_mm_data(mm_items)
         # AudioProcessorItems delivers the batch under the plural key
         # ``audios`` (get_processor_data -> f"{modality}s"); the OUTPUT
         # field stays ``audio`` (embed_multimodal + the field config key).
@@ -124,9 +118,7 @@ class NemotronASRMultiModalProcessor(BaseMultiModalProcessor[NemotronASRProcessi
         # via _encode_nested_tensors, which only handles torch tensors
         # (it recurses into an ndarray and chokes on the scalar leaves).
         arrays = [torch.as_tensor(np.asarray(a, dtype=np.float32)) for a in audios]
-        placeholder_id = self.info.get_hf_config().audio_chunk_token_id
-        input_ids = [placeholder_id] * len(arrays)
-        return BatchFeature({"input_ids": [input_ids], "audio": arrays})
+        return BatchFeature({**passthrough_data, "audio": arrays})
 
     def _get_mm_fields_config(
         self,
@@ -154,16 +146,21 @@ class NemotronASRMultiModalProcessor(BaseMultiModalProcessor[NemotronASRProcessi
         prompt_ids: list[int],
         mm_kwargs: MultiModalKwargsOptionalItems,
         mm_prompt_updates: MultiModalPromptUpdates,
-        is_update_applied: bool,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         # One carrier row per chunk: the whole prompt is the single
         # placeholder token, so the placeholder spans one position at
         # index 0. ``tokens`` is only used for length accounting.
+        if mm_items.get_all_counts().get("audio", 0) == 0:
+            return prompt_ids, {}
+        if not prompt_ids:
+            # The dummy builder supplies empty text: its minted carrier has
+            # no tokenizer text form. Serving already supplies the real ID.
+            prompt_ids = [self.info.get_hf_config().audio_chunk_token_id]
         features_info = PlaceholderFeaturesInfo(
             modality="audio",
             item_idx=0,
             start_idx=0,
-            tokens=[prompt_ids[0]] if prompt_ids else [0],
+            tokens=[prompt_ids[0]],
             is_embed=None,
         )
         return prompt_ids, {"audio": [features_info]}
