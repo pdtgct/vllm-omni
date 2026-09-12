@@ -23,9 +23,9 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
-    EngineCoreOutputs,
     FinishReason,
 )
+from vllm.v1.engine import EngineCoreOutputs as CoreEngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -45,6 +45,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
@@ -127,17 +128,6 @@ class OmniSchedulerMixin:
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
-        # Every omni worker forces the v1 model runner (the v2 runner carries no
-        # omni hooks), so the scheduler has to agree or the two disagree about
-        # what the SchedulerOutput carries. vLLM 0.29 defaults this to v2 where
-        # 0.28 did not, so the scheduler took its v2 fast path -- the one that
-        # deliberately omits resumed-request token ids -- while the v1 runner
-        # still read them, and resuming a request raised ``KeyError: <req_id>``
-        # in ``_update_states``.
-        if getattr(self, "use_v2_model_runner", False):
-            logger.warning("OMNI scheduler forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-
         model_config = self.vllm_config.model_config
         self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
         self._native_data_plane = uses_native_mrv2_data_plane(
@@ -336,6 +326,20 @@ class OmniSchedulerMixin:
         self._latest_omni_connector_output = None
         if connector_output is not None:
             connector_outputs.append(connector_output)
+        for connector_output in connector_outputs:
+            failed_model_ids = (
+                set(getattr(connector_output, "model_failed_req_ids", set())) if connector_output else set()
+            )
+            requests = getattr(self, "requests", {})
+            present_failed_ids = {request_id for request_id in failed_model_ids if request_id in requests}
+            if present_failed_ids:
+                statuses = getattr(connector_output, "model_status", {})
+                logger.warning(
+                    "Finishing %d request(s) after model transaction status: %s",
+                    len(present_failed_ids),
+                    {request_id: statuses.get(request_id) for request_id in sorted(present_failed_ids)},
+                )
+                getattr(self, "finish_requests")(present_failed_ids, RequestStatus.FINISHED_ERROR)
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
@@ -697,7 +701,7 @@ class OmniSchedulerMixin:
 
     def _append_request_output(
         self,
-        outputs: dict[int, list[EngineCoreOutput]],
+        outputs: dict[int, list[OmniEngineCoreOutput]],
         request: Request,
         **output_fields: Any,
     ) -> None:
@@ -712,7 +716,7 @@ class OmniSchedulerMixin:
     def _handle_failed_kv_load_outputs(
         self,
         failed_request_ids: set[str] | None,
-        outputs: dict[int, list[EngineCoreOutput]],
+        outputs: dict[int, list[OmniEngineCoreOutput]],
     ) -> list[Request]:
         """Finish unrecoverable KV loads and emit their terminal outputs."""
         if not failed_request_ids or self.recompute_kv_load_failures:
@@ -731,7 +735,7 @@ class OmniSchedulerMixin:
 
     def _attach_finished_request_sets(
         self,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs],
         *,
         synthesize_abort_outputs: bool,
     ) -> None:
@@ -862,7 +866,7 @@ class OmniSchedulerMixin:
 
     def _attach_scheduler_stats(
         self,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs],
         spec_decoding_stats: SpecDecodingStats | None,
         kv_connector_stats: KVConnectorStats | None,
         cudagraph_stats: CUDAGraphStat | None,

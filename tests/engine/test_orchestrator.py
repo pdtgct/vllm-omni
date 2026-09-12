@@ -1716,6 +1716,7 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         target_logger.setLevel(prev_level)
 
     assert not stage0.abort_calls
+    assert pool.output_processor.abort_calls == [["missing-req"]]
     assert "abort: no live binding for req=missing-req in stage-0" in caplog.text
 
 
@@ -2097,3 +2098,65 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+# ---- PORT-OBS-008/009 orchestrator batch-stat sink (Phase-6 round 2, Q3) -----
+#
+# Drives the REAL ``Orchestrator._observe_batch_stats``/``set_streaming_metrics``
+# methods (the exact call site wired into ``_orchestration_loop``) with a
+# fake ``raw_outputs`` and a fake metrics recorder — never re-deriving the
+# geometry->cadence mapping here (that authority lives in advance.py; this
+# layer only ever sees already-resolved ``(cadence_ms, rows)`` entries).
+
+
+class _RecordingBatchStatsMetrics:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str, int]] = []
+
+    def observe_chunk_batch_size(self, stage: str, replica: str, cadence_ms: str, rows: int) -> None:
+        self.calls.append((stage, replica, cadence_ms, rows))
+
+
+def test_observe_batch_stats_dispatches_under_the_loop_stage_replica_identity() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    metrics = _RecordingBatchStatsMetrics()
+    orchestrator.set_streaming_metrics(metrics)
+
+    raw_outputs = SimpleNamespace(streaming_chunk_batch_stats=[("80", 4), ("320", 9)])
+    orchestrator._observe_batch_stats(raw_outputs, 0, 1)
+
+    assert metrics.calls == [("0", "1", "80", 4), ("0", "1", "320", 9)]
+
+
+def test_observe_batch_stats_is_a_noop_when_no_sink_installed() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    # Class-level default: _streaming_metrics is None without set_streaming_metrics.
+
+    raw_outputs = SimpleNamespace(streaming_chunk_batch_stats=[("80", 4)])
+    orchestrator._observe_batch_stats(raw_outputs, 0, 0)  # must not raise
+
+
+@pytest.mark.parametrize("payload", [None, []])
+def test_observe_batch_stats_skips_none_and_empty_payloads(payload: Any) -> None:
+    orchestrator = object.__new__(Orchestrator)
+    metrics = _RecordingBatchStatsMetrics()
+    orchestrator.set_streaming_metrics(metrics)
+
+    raw_outputs = SimpleNamespace(streaming_chunk_batch_stats=payload)
+    orchestrator._observe_batch_stats(raw_outputs, 0, 0)
+
+    assert metrics.calls == []
+
+
+def test_observe_batch_stats_defaults_to_none_when_raw_outputs_carries_no_field() -> None:
+    """A raw_outputs object with no ``streaming_chunk_batch_stats``
+    attribute at all (e.g. a non-omni ``EngineCoreOutputs``) must be
+    treated as "not collecting", never an AttributeError."""
+    orchestrator = object.__new__(Orchestrator)
+    metrics = _RecordingBatchStatsMetrics()
+    orchestrator.set_streaming_metrics(metrics)
+
+    raw_outputs = SimpleNamespace()
+    orchestrator._observe_batch_stats(raw_outputs, 0, 0)  # must not raise
+
+    assert metrics.calls == []

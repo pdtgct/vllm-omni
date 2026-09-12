@@ -1,0 +1,833 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CPU streaming-observer contracts against real package imports.
+
+PORT-OBS-003/004/005 cover ready, terminal, overflow, park correlation,
+latency, and backlog events. PORT-SESS-001 bounds queued accepted audio
+without capping lifetime cumulative audio.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+from collections import deque
+from collections.abc import AsyncIterator, Coroutine
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import pytest
+
+_PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/nemotron_asr"
+_METRICS_PKG = Path(__file__).resolve().parents[4] / "vllm_omni/metrics"
+_BASE = "vllm_omni.model_executor.models.nemotron_asr"
+
+_PARENT_STUBS = (
+    "vllm_omni",
+    "vllm_omni.model_executor",
+    "vllm_omni.model_executor.models",
+    "vllm_omni.metrics",
+    _BASE,
+)
+
+
+def _load_chain() -> dict[str, Any]:
+    """Import real packages so collection preserves shared module identity."""
+    loaded = {
+        name: importlib.import_module(f"{_BASE}.{name}")
+        for name in ("manifests", "configuration_nemotron_asr", "session", "streaming")
+    }
+    loaded["streaming_transport"] = importlib.import_module("vllm_omni.metrics.streaming_transport")
+    return loaded
+
+
+_MODULES = _load_chain()
+_SESSION = _MODULES["session"]
+_TRANSPORT = _MODULES["streaming_transport"]
+NemotronRealtimeSession = _SESSION.NemotronRealtimeSession
+ReceiptLedger = _SESSION.ReceiptLedger
+StreamingObserver = _TRANSPORT.StreamingObserver
+ChunkReadyHandle = _TRANSPORT.ChunkReadyHandle
+buffer_stream = _MODULES["streaming"].buffer_stream
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+PARK_ID = 13088
+PLACEHOLDER_ID = 13089
+PROMPTS = {"auto": 101, "en-US": 2}
+
+
+def _hf(**overrides: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "eos_token_id": PARK_ID,
+        "audio_chunk_token_id": PLACEHOLDER_ID,
+        "prompt_dictionary": dict(PROMPTS),
+        "num_prompts": 128,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _session(**kwargs: Any) -> Any:
+    # Observer-bearing construction requires the minted correlation key
+    # (PORT-OBS-003 as amended, review F6); tests not about keying get a
+    # fixture key injected so each stays focused on its own concern.
+    if kwargs.get("observer") is not None and "session_key" not in kwargs:
+        kwargs["session_key"] = "test-fixture-key"
+    return NemotronRealtimeSession.from_model_config(_hf(), **kwargs)
+
+
+def _run(coro: Coroutine[Any, Any, Any]) -> Any:
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+def _audio(*sizes: int) -> AsyncIterator[Any]:
+    async def stream() -> AsyncIterator[Any]:
+        for size in sizes:
+            yield np.zeros(size, dtype=np.float32)
+
+    return stream()
+
+
+class _RecordingObserver:
+    """A structurally-conforming fake with REAL per-session ready/in-flight
+    tracking (correction 1's settled design) — needed to exercise, and
+    prove coherent, the single-in-flight-handle park-correlation state
+    machine, not merely record call arguments like the other events.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._waiting: dict[str, deque[Any]] = {}
+        self._inflight: dict[str, Any] = {}
+
+    def session_opened(self, *, session_key: str, cadence_ms: str) -> None:
+        self.calls.append(("session_opened", {"session_key": session_key, "cadence_ms": cadence_ms}))
+
+    def session_finished(self, *, session_key: str, reason: str) -> None:
+        self.calls.append(("session_finished", {"session_key": session_key, "reason": reason}))
+
+    def session_open_rejected(self, *, reason: str) -> None:
+        self.calls.append(("session_open_rejected", {"reason": reason}))
+
+    def accepted_audio_seconds(self, *, cadence_ms: str, seconds: float) -> None:
+        self.calls.append(("accepted_audio_seconds", {"cadence_ms": cadence_ms, "seconds": seconds}))
+
+    def unit_ready(
+        self,
+        *,
+        session_key: str = "default",
+        cadence_ms: str,
+        chunk_type: str,
+        ready_stamp_s: float,
+    ) -> Any:
+        handle = ChunkReadyHandle(
+            session_key=session_key,
+            cadence_ms=cadence_ms,
+            chunk_type=chunk_type,
+            ready_stamp_s=ready_stamp_s,
+        )
+        self._waiting.setdefault(session_key, deque()).append(handle)
+        self.calls.append(
+            (
+                "unit_ready",
+                {
+                    "session_key": session_key,
+                    "cadence_ms": cadence_ms,
+                    "chunk_type": chunk_type,
+                    "ready_stamp_s": ready_stamp_s,
+                },
+            )
+        )
+        return handle
+
+    def unit_minted(self, handle: Any) -> None:
+        waiting = self._waiting.get(handle.session_key)
+        if waiting is not None and handle in waiting:
+            waiting.remove(handle)
+        self._inflight[handle.session_key] = handle
+        self.calls.append(("unit_minted", {"handle": handle}))
+
+    def complete_inflight(self, session_key: str) -> Any:
+        handle = self._inflight.get(session_key)
+        self._inflight[session_key] = None
+        self.calls.append(("complete_inflight", {"session_key": session_key, "resolved": handle}))
+        return handle
+
+    def unit_parked(self, handle: Any, *, park_stamp_s: float) -> None:
+        self.calls.append(("unit_parked", {"handle": handle, "park_stamp_s": park_stamp_s}))
+
+    def unit_cleared(self, handle: Any, *, outcome: str) -> None:
+        session_key = handle.session_key
+        waiting = self._waiting.get(session_key)
+        if waiting is not None and handle in waiting:
+            waiting.remove(handle)
+        if self._inflight.get(session_key) is handle:
+            self._inflight.pop(session_key, None)
+        self.calls.append(("unit_cleared", {"handle": handle, "outcome": outcome}))
+
+    def overflow(self, *, kind: str) -> None:
+        self.calls.append(("overflow", {"kind": kind}))
+
+    def clear_all_outstanding(self, session_key: str, *, outcome: str) -> None:
+        handles = list(self._waiting.get(session_key, ()))
+        inflight = self._inflight.get(session_key)
+        if inflight is not None:
+            handles.append(inflight)
+        for handle in handles:
+            self.unit_cleared(handle, outcome=outcome)
+
+    # ---- test-only introspection -------------------------------------
+    def outstanding(self, session_key: str) -> list[Any]:
+        return list(self._waiting.get(session_key, ()))
+
+
+# ---- protocol shape (PORT-OBS-003) --------------------------------------------
+
+
+# @spec PORT-OBS-003
+def test_recording_fake_satisfies_the_streaming_observer_protocol() -> None:
+    fake = _RecordingObserver()
+    assert isinstance(fake, StreamingObserver)
+
+
+# @spec PORT-OBS-003
+def test_protocol_declares_every_documented_event_method() -> None:
+    for name in (
+        "session_opened",
+        "session_finished",
+        "session_open_rejected",
+        "accepted_audio_seconds",
+        "unit_ready",
+        "unit_minted",
+        "complete_inflight",
+        "unit_parked",
+        "unit_cleared",
+        "overflow",
+    ):
+        assert hasattr(StreamingObserver, name), f"StreamingObserver missing {name}"
+
+
+# @spec PORT-OBS-003
+def test_protocol_no_longer_declares_pop_next_ready() -> None:
+    """The REJECTED FIFO-correlation design (correction 1): a ready-order
+    FIFO cannot serve as the park-correlation authority, so the rejected
+    ``pop_next_ready`` method must not reappear on the protocol."""
+    assert not hasattr(StreamingObserver, "pop_next_ready")
+
+
+# ---- THE required interleaving test (P0 correction 1) — real, GREEN ----------
+# Proves the settled single-in-flight-handle design against the FAKE's
+# real tracking logic (a faithful reference for what the production
+# adapter must implement) and demonstrates why a ready-order FIFO would
+# misclassify the carrierless echo.
+
+
+# @spec PORT-OBS-003
+def test_park_correlation_interleaving_matches_the_settled_design() -> None:
+    """ready A, ready B -> minted A -> park (completes A) -> carrierless
+    echo (ignored; B still outstanding) -> minted B -> park (completes
+    B); every handle gets exactly one disposition."""
+    fake = _RecordingObserver()
+    session_key = "sess-interleave"
+
+    handle_a = fake.unit_ready(session_key=session_key, cadence_ms="560", chunk_type="regular", ready_stamp_s=0.0)
+    handle_b = fake.unit_ready(session_key=session_key, cadence_ms="560", chunk_type="regular", ready_stamp_s=0.56)
+    assert fake.outstanding(session_key) == [handle_a, handle_b]
+
+    fake.unit_minted(handle_a)
+    assert fake.outstanding(session_key) == [handle_b], "B remains waiting once A is minted"
+
+    resolved_a = fake.complete_inflight(session_key)
+    assert resolved_a is handle_a
+    fake.unit_parked(resolved_a, park_stamp_s=0.6)
+
+    # Carrierless async park echo: no unit is in-flight (A already
+    # completed, B never minted) -> must resolve to None, and B must
+    # remain untouched. A ready-order FIFO would instead have wrongly
+    # popped and completed B here.
+    echo = fake.complete_inflight(session_key)
+    assert echo is None
+    assert fake.outstanding(session_key) == [handle_b], "B must still be outstanding after the ignored echo"
+
+    fake.unit_minted(handle_b)
+    assert fake.outstanding(session_key) == []
+    resolved_b = fake.complete_inflight(session_key)
+    assert resolved_b is handle_b
+    fake.unit_parked(resolved_b, park_stamp_s=1.2)
+
+    parked = [c for c in fake.calls if c[0] == "unit_parked"]
+    assert len(parked) == 2
+    disposed = {c[1]["handle"] for c in parked}
+    assert disposed == {handle_a, handle_b}, "every handle received exactly one disposition"
+
+
+# ---- inertness: no observer -> identical behavior (real, GREEN) --------------
+
+
+# @spec PORT-OBS-003
+def test_absent_observer_produces_baseline_behavior_with_zero_observer_traffic() -> None:
+    """No observer supplied: the segmenter's full detection/delivery/
+    budget path runs to completion with zero observer traffic (there is
+    no observer object to call — this is the durable PORT-OBS-003
+    contract: "absent observer -> pre-metrics baseline behavior",
+    forever, not just pre-Phase-6), and produces byte-identical envelopes
+    across two independent back-to-back runs (baseline determinism).
+
+    Lead-authorized fix (Phase-6 round 2, Q1b): retires the sibling
+    "supplied-but-unwired" leg this test used to carry — that leg pinned
+    the Phase-5 stub's literal non-consumption of a supplied observer,
+    an invariant that necessarily breaks once Phase 6 wires real
+    observation (the point of this phase). The absent-observer leg below
+    is what PORT-OBS-003 actually requires long-term.
+    """
+
+    async def run_without_observer() -> list[Any]:
+        session = _session(with_ledger=True, observer=None)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960 * 2), queue, session)
+        envelopes = []
+        async for prompt in agen:
+            if "multi_modal_data" in prompt:
+                envelopes.append(prompt["multi_modal_data"]["audio"].copy())
+            queue.put_nowait([PARK_ID])
+        return envelopes
+
+    first = _run(run_without_observer())
+    second = _run(run_without_observer())
+    assert len(first) == len(second) == 3  # 2 regular + 1 final-tail
+    envelope_header_fields = _MODULES["manifests"].ENVELOPE_HEADER_FIELDS
+    admission_slot = envelope_header_fields.index("admission_ms_mod")
+    for a, b in zip(first, second, strict=True):
+        # The header's admission_ms_mod slot is a genuine wall-clock stamp
+        # (design §Ingress-deadline plumbing) — the two back-to-back runs
+        # are expected to differ there by a millisecond or so; mask it out
+        # so this test compares only observer-independent content.
+        a_masked, b_masked = a.copy(), b.copy()
+        a_masked[admission_slot] = 0.0
+        b_masked[admission_slot] = 0.0
+        np.testing.assert_array_equal(a_masked, b_masked)
+
+
+# ---- regular ready at cadence completion (PORT-OBS-004) — RED ----------------
+
+
+# @spec PORT-OBS-003, PORT-OBS-004
+def test_regular_unit_ready_is_observed_at_cadence_completion() -> None:
+    async def scenario() -> list[tuple[str, dict[str, Any]]]:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960 * 2), queue, session)
+        async for prompt in agen:
+            if "multi_modal_data" in prompt:
+                queue.put_nowait([PARK_ID])
+            else:
+                queue.put_nowait([PARK_ID])
+        return fake.calls
+
+    calls = _run(scenario())
+    ready_calls = [c for c in calls if c[0] == "unit_ready" and c[1]["chunk_type"] == "regular"]
+    # Two regular cadences were completed; each should mint one ready event.
+    assert len(ready_calls) == 2
+
+
+# @spec PORT-OBS-003, PORT-OBS-004
+def test_final_tail_ready_stamp_is_passed_through_verbatim() -> None:
+    """The caller-captured finalize-acceptance stamp must reach the
+    final-tail unit_ready call EXACTLY — never reconstructed inside the
+    generator at resumption."""
+    sentinel_stamp = 123456.789
+
+    async def scenario() -> list[tuple[str, dict[str, Any]]]:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(
+            _audio(4_480),
+            queue,
+            session,
+            final_tail_ready_stamp_s=sentinel_stamp,
+        )
+        async for prompt in agen:
+            queue.put_nowait([PARK_ID])
+        return fake.calls
+
+    calls = _run(scenario())
+    final_ready = [c for c in calls if c[0] == "unit_ready" and c[1]["chunk_type"] == "final_tail"]
+    assert len(final_ready) == 1
+    assert final_ready[0][1]["ready_stamp_s"] == sentinel_stamp
+
+
+# ---- ledgerless session still emits ready (PORT-OBS-003) — RED ---------------
+
+
+# @spec PORT-OBS-003
+def test_ledgerless_session_emits_the_same_ready_events() -> None:
+    async def scenario() -> list[tuple[str, dict[str, Any]]]:
+        fake = _RecordingObserver()
+        # with_ledger=False: the native path constructs a bare, ledgerless
+        # session — observation must not depend on the ledger being armed.
+        session = _session(with_ledger=False, observer=fake)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960), queue, session)
+        async for prompt in agen:
+            queue.put_nowait([PARK_ID])
+        return fake.calls
+
+    calls = _run(scenario())
+    ready_calls = [c for c in calls if c[0] == "unit_ready"]
+    assert len(ready_calls) >= 1
+
+
+# ---- terminal-disposition OWNERSHIP (PORT-OBS-003) -----------------------------
+#
+# buffer_stream/the segmenter does NOT own terminal observation — the
+# native adapter (test_realtime_streaming_metrics.py) or the leased-path
+# lease consumer (test_nemotron_session_observer.py) does. This file
+# therefore asserts only READY-event emission (above); the "every ready
+# unit gets exactly one park-or-clear disposition" invariant is pinned
+# on the CONSUMER side in those two files, not here.
+
+
+# @spec PORT-OBS-003
+def test_clearing_a_unit_twice_is_idempotent() -> None:
+    """Session-level abort/close terminal paths are idempotent, so a
+    double-fire (e.g. an abort racing a natural end) must not double-clear
+    the same unit. Wired through the real constructor params
+    (``session.from_model_config(observer=...)``) rather than a bare
+    disconnected ``ReceiptLedger()``, so a Phase-6 implementation that
+    emits ``unit_cleared`` from the session's own ledger/observer pairing
+    (``session.ledger`` / ``session.observer``) makes this pass —
+    ``ReceiptLedger.fail()`` is already documented idempotent."""
+
+    async def scenario() -> tuple[Any, _RecordingObserver]:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake)
+        ledger = session.ledger
+        assert session.observer is fake  # the real wiring point, not a bare ledger
+        ticket = ledger.mint(final_tail=False, admission_ms_mod=0)
+        error = RuntimeError("boom")
+        ledger.fail(error)
+        ledger.fail(error)  # idempotent no-op on the ledger itself
+        return ticket, fake
+
+    ticket, fake = _run(scenario())
+    assert ticket.done.cancelled() is False
+    ticket.done.exception()  # consume, silence "never retrieved" warning
+    # Once wired, exactly one unit_cleared call should have fired despite
+    # fail() being invoked twice.
+    assert len([c for c in fake.calls if c[0] == "unit_cleared"]) == 1
+
+
+# ---- overflow observed by kind (PORT-OBS-005) — RED ---------------------------
+
+
+# @spec PORT-OBS-003, PORT-OBS-005
+def test_carrier_ledger_overflow_is_observed_by_kind() -> None:
+    """PORT's bounded accepted-audio queue (kind="input_queue") does not
+    exist yet in this codebase slice — see the handoff report. The
+    receipt ledger's own backlog bound (kind="carrier") IS implemented
+    today (ReceiptLedger.mint's RuntimeError), so this pins that half of
+    PORT-OBS-005's overflow contract against the real bound-trip. Wired
+    through ``session.from_model_config(observer=..., max_pending_carriers=1)``
+    — the session's OWN armed ledger — rather than a bare disconnected
+    ``ReceiptLedger()``."""
+
+    async def scenario() -> _RecordingObserver:
+        fake: _RecordingObserver = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake, max_pending_carriers=1)
+        ledger = session.ledger
+        assert session.observer is fake
+        ledger.mint(final_tail=False, admission_ms_mod=0)
+        with pytest.raises(RuntimeError):
+            ledger.mint(final_tail=False, admission_ms_mod=1)
+        # mypy narrows `fake`'s type via the preceding `is` comparison
+        # against `session.observer: StreamingObserver | None`; a known
+        # `is`-narrowing quirk, not a real type-safety issue (verified in
+        # isolation) — see the class docstring for the identical
+        # `unit_cleared` narrowing this file already works around.
+        return fake  # type: ignore[no-any-return]
+
+    fake = _run(scenario())
+    overflow_calls = [c for c in fake.calls if c[0] == "overflow" and c[1]["kind"] == "carrier"]
+    assert len(overflow_calls) == 1
+
+
+# ---- native open pinned at observer-bearing session construction --------------
+# (PORT-OBS-006) — RED. NOT RealtimeConnection.__init__ (that counts
+# WebSockets, the exact thing PORT-OBS-006 forbids) — see
+# test_realtime_streaming_metrics.py's connection-construction NEGATIVE
+# check for the other half of this pin.
+
+
+# @spec PORT-OBS-006
+def test_session_construction_is_the_native_open_boundary() -> None:
+    """Native open is observer-bearing model-session construction after
+    successful validation and before engine request creation. Building a
+    ``NemotronRealtimeSession`` (the classmethod every native/leased path
+    funnels through) with an observer must report ``session_opened``
+    exactly once, at construction — never later, never zero times."""
+    fake = _RecordingObserver()
+    session = _session(with_ledger=False, observer=fake)
+
+    assert session.observer is fake
+    opened = [c for c in fake.calls if c[0] == "session_opened"]
+    # Keyed since the A27 topology cascade: identity-fallback key here
+    # (no minted correlation key was supplied to construction).
+    assert opened == [("session_opened", {"session_key": session.session_key, "cadence_ms": "560"})]
+
+
+# @spec PORT-OBS-006
+def test_construction_failure_reports_no_session_opened() -> None:
+    """A construction that fails validation (unknown cadence) must not
+    report session_opened — open is only for a SUCCESSFUL validated
+    construction."""
+    fake = _RecordingObserver()
+    with pytest.raises(ValueError):
+        NemotronRealtimeSession.from_model_config(_hf(), cadence="not-a-cadence", observer=fake)
+    assert fake.calls == []
+
+
+# ---- accepted-audio budget (PORT-SESS-001, amended Decision 1) ----------------
+# native/segmenter-side cases. Leased-path cases (including "session
+# then follows ordinary terminal clearing", a lease-consumer concern per
+# this file's ownership fix above) live in test_nemotron_session_observer.py.
+
+
+# @spec PORT-SESS-001
+def test_accepted_audio_budget_defaults_to_thirty_seconds() -> None:
+    session = _session(with_ledger=False)
+    assert session.accepted_audio_budget_s == 30.0
+
+
+# @spec PORT-SESS-001
+def test_native_piece_exceeding_the_budget_is_rejected_whole_before_acceptance() -> None:
+    """PORT-SESS-001 (amended): PORT's accepted-audio queue is a
+    per-session SECONDS budget (default 30 s, ``accepted_audio_budget_s`),
+    checked strictly BEFORE acceptance on the native path. A piece that
+    would push accepted audio past a near-zero budget must be rejected
+    atomically, before any of its complete cadences are accepted — never
+    a partial/truncated accept."""
+
+    async def scenario() -> _RecordingObserver:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake, accepted_audio_budget_s=0.001)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960 * 5), queue, session)
+        async for _prompt in agen:
+            queue.put_nowait([PARK_ID])
+        return fake
+
+    with pytest.raises(ValueError, match="buffer_overflow"):
+        _run(scenario())
+
+
+# @spec PORT-SESS-001
+def test_native_rejected_piece_accrues_no_accepted_audio_seconds() -> None:
+    async def scenario() -> _RecordingObserver:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake, accepted_audio_budget_s=0.001)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960 * 5), queue, session)
+        try:
+            async for _prompt in agen:
+                queue.put_nowait([PARK_ID])
+        except ValueError:
+            pass
+        return fake
+
+    fake = _run(scenario())
+    assert [c for c in fake.calls if c[0] == "accepted_audio_seconds"] == []
+
+
+# @spec PORT-SESS-001, PORT-OBS-005
+def test_native_rejected_piece_emits_exactly_one_input_queue_overflow() -> None:
+    async def scenario() -> _RecordingObserver:
+        fake = _RecordingObserver()
+        session = _session(with_ledger=True, observer=fake, accepted_audio_budget_s=0.001)
+        queue: asyncio.Queue = asyncio.Queue()
+        agen = buffer_stream(_audio(8_960 * 5), queue, session)
+        try:
+            async for _prompt in agen:
+                queue.put_nowait([PARK_ID])
+        except ValueError:
+            pass
+        return fake
+
+    fake = _run(scenario())
+    overflow = [c for c in fake.calls if c[0] == "overflow" and c[1]["kind"] == "input_queue"]
+    assert len(overflow) == 1
+
+
+# @spec PORT-SESS-001
+def test_native_occupancy_lifecycle_never_caps_lifetime_cumulative_audio() -> None:
+    """PORT-SESS-001 (amended): the budget bounds QUEUE OCCUPANCY only —
+    audio drained by CHUNK consumption releases its budget, and lifetime
+    cumulative session audio is never capped by it. Accept pieces to near
+    the budget, drain them via CHUNK consumption (parking each ready
+    unit), then accept another piece that would push LIFETIME cumulative
+    audio over the budget but fits comfortably in the now-drained queue —
+    it must be accepted. A duration-cap implementation (rejecting because
+    lifetime total exceeds the budget) must FAIL this test."""
+
+    async def scenario() -> int:
+        fake = _RecordingObserver()
+        # Budget covers exactly 2 regular cadences of queue occupancy.
+        session = _session(with_ledger=True, observer=fake, accepted_audio_budget_s=1.12)
+        queue: asyncio.Queue = asyncio.Queue()
+        # 5 regular cadences total (5 * 0.56s = 2.8s), each drained via a
+        # park before the next is fed — occupancy never exceeds 2
+        # cadences at a time, but LIFETIME cumulative audio (2.8s) is
+        # already well past the 1.12s budget by the third cadence.
+        agen = buffer_stream(_audio(8_960, 8_960, 8_960, 8_960, 8_960), queue, session)
+        accepted = 0
+        async for prompt in agen:
+            if "multi_modal_data" in prompt:
+                accepted += 1
+            queue.put_nowait([PARK_ID])  # drain immediately: occupancy releases
+        return accepted
+
+    accepted = _run(scenario())
+    # All 5 regular cadences plus the final tail must be accepted; none
+    # rejected for exceeding a (nonexistent) lifetime cap.
+    assert accepted == 6
+
+
+# ---- model package imports no prometheus_client (PORT-OBS-003) ---------------
+
+
+# @spec PORT-OBS-003
+def test_model_package_imports_no_prometheus_client() -> None:
+    import re
+
+    banned = re.compile(r"^\s*(import prometheus_client|from prometheus_client)", re.MULTILINE)
+    offenders = []
+    for path in sorted(_PKG.glob("*.py")):
+        text = path.read_text()
+        if banned.search(text):
+            offenders.append(path.name)
+    assert offenders == [], (
+        f"nemotron_asr package files import prometheus_client: {offenders}; "
+        "the observer protocol must stay Prometheus-free (PORT-OBS-003)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A27 topology cascade (amendment 1): the per-generation correlation key
+# threads caller -> classmethod -> buffer_stream -> session construction.
+# ---------------------------------------------------------------------------
+
+
+# @spec PORT-OBS-003
+def test_session_key_param_overrides_the_identity_fallback() -> None:
+    session = _session(session_key="req-under-test")
+    assert session.session_key == "req-under-test"
+
+
+# @spec PORT-OBS-003
+def test_session_key_defaults_to_object_identity_when_not_minted() -> None:
+    session = _session()
+    assert session.session_key == str(id(session))
+
+
+# @spec PORT-OBS-003, PORT-OBS-006
+@pytest.mark.asyncio
+async def test_buffer_stream_threads_observer_and_key_into_the_session() -> None:
+    """The native (bare-config) path: buffer_stream must construct the
+    session WITH the observer and the minted key, so the constructor's
+    single un-duplicated open site fires, keyed — the A27 GPU round
+    proved the override-only threading left session_opened dead."""
+    observer = _RecordingObserver()
+
+    async def _audio() -> AsyncIterator[Any]:
+        return
+        yield  # pragma: no cover
+
+    stream = buffer_stream(
+        _audio(),
+        asyncio.Queue(),
+        _hf(),
+        observer=observer,
+        session_key="rt-native-req-1",
+    )
+    # One step only: session construction (and the open observation)
+    # happens when the generator first runs. Iterating to exhaustion
+    # would hang — buffer-until-drained waits for park tokens nothing
+    # in this unit test feeds.
+    try:
+        await stream.__anext__()
+    except StopAsyncIteration:
+        pass
+    finally:
+        await stream.aclose()
+
+    opens = [c for c in observer.calls if c[0] == "session_opened"]
+    assert len(opens) == 1
+    assert opens[0][1]["session_key"] == "rt-native-req-1"
+    assert opens[0][1]["cadence_ms"] == "560"
+    readies = [c for c in observer.calls if c[0] == "unit_ready"]
+    assert all(r[1]["session_key"] == "rt-native-req-1" for r in readies)
+
+
+# @spec PORT-OBS-003
+def test_ledger_fallback_ready_uses_the_sessions_key_not_the_ledgers() -> None:
+    """The armed ledger's fallback unit_ready keys by the SESSION's
+    correlation key — a ledger-id key would break complete_inflight
+    resolution on the leased path."""
+    observer = _RecordingObserver()
+    session = _session(with_ledger=True, observer=observer, session_key="leased-req-9")
+    ledger = session.ledger
+    assert ledger is not None
+
+    async def scenario() -> None:
+        # mint() creates the ticket's asyncio future — needs a loop.
+        ledger.mint(final_tail=False, admission_ms_mod=0)
+
+    _run(scenario())
+    readies = [c for c in observer.calls if c[0] == "unit_ready"]
+    assert readies, "ledger mint must emit a ready event"
+    assert all(r[1]["session_key"] == "leased-req-9" for r in readies)
+
+
+# @spec PORT-OBS-002, PORT-OBS-003, PORT-STATE-026, PORT-PERF-007
+@pytest.mark.parametrize("mode", ["absent", "disabled", "enabled", "broken", "broken_capability"])
+def test_service_timing_preserves_dispatch_samples_and_calls(monkeypatch: Any, mode: str) -> None:
+    """Exercise real dispatch with deterministic time and previous-ACTUAL pacing."""
+    mod = _MODULES["streaming"]
+    submissions = []
+    dispatch_times = []
+    timing_calls = []
+    sleeps = []
+    clock_reads = []
+    capability_calls = []
+    clock = [1_000_000_000]
+
+    def monotonic_ns() -> int:
+        sampled = clock[0]
+        clock_reads.append(sampled)
+        # Every sample differs: resampling s in the observer cannot accidentally
+        # equal the sample that record_submission actually received.
+        clock[0] += 10_000_000
+        return sampled
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += round(seconds * 1e9)
+
+    class Timing:
+        def submitted(self, handle: Any, logical: int, carrier: int, kind: str, e: int, s: int) -> None:
+            timing_calls.append((handle, logical, carrier, kind, e, s))
+            if mode == "broken":
+                raise RuntimeError("observation failed")
+
+    class Observer(_RecordingObserver):
+        def service_timing(self, key: str) -> Any:
+            capability_calls.append(key)
+            if mode == "broken_capability":
+                raise RuntimeError("capability failed")
+            return Timing() if mode in ("enabled", "broken") else None
+
+    observer = _RecordingObserver() if mode == "absent" else Observer()
+    session = _session(observer=observer)
+    authority = session.accepted_audio
+    authority.cadence_ns = 160_000_000
+    original_dispatch = authority.dispatch_next
+    original_submission = authority.record_submission
+
+    def dispatch(*, now_ns: int) -> Any:
+        dispatch_times.append(now_ns)
+        return original_dispatch(now_ns=now_ns)
+
+    def submit(unit: Any, *, submitted_at_ns: int) -> None:
+        submissions.append((unit.logical_sequence, submitted_at_ns))
+        original_submission(unit, submitted_at_ns=submitted_at_ns)
+
+    monkeypatch.setattr(mod.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(authority, "dispatch_next", dispatch)
+    monkeypatch.setattr(authority, "record_submission", submit)
+
+    async def scenario() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        async for _ in buffer_stream(_audio(8_960 * 2), queue, session, final_tail_ready_stamp_s=1.0):
+            queue.put_nowait([PARK_ID])
+
+    _run(scenario())
+    assert submissions == [(0, 1_020_000_000), (1, 1_200_000_000), (2, 1_380_000_000)]
+    assert dispatch_times == [1_010_000_000, 1_030_000_000, 1_190_000_000, 1_210_000_000, 1_370_000_000]
+    assert sleeps == [0.15, 0.15]
+    # One acceptance + five dispatch attempts + three actual submissions;
+    # this exact sequence is the same in every observer mode.
+    assert clock_reads == [
+        1_000_000_000,
+        1_010_000_000,
+        1_020_000_000,
+        1_030_000_000,
+        1_190_000_000,
+        1_200_000_000,
+        1_210_000_000,
+        1_370_000_000,
+        1_380_000_000,
+    ]
+    assert len(capability_calls) == (0 if mode == "absent" else 1)
+    if mode in ("enabled", "broken"):
+        assert [(c[1], c[4], c[5]) for c in timing_calls] == [
+            (0, 1_000_000_000, 1_020_000_000),
+            (1, 1_180_000_000, 1_200_000_000),
+            (2, 1_360_000_000, 1_380_000_000),
+        ]
+        assert all(call[4] < call[5] for call in timing_calls)
+        assert [(call[1], call[5]) for call in timing_calls] == submissions
+        assert timing_calls[-1][3] == "final_tail"
+        ready_handles = [c[1]["handle"] for c in observer.calls if c[0] == "unit_minted"]
+        assert all(call[0] is h for call, h in zip(timing_calls, ready_handles, strict=True))
+    else:
+        assert timing_calls == []
+        assert authority.observed_eligibility_ns is None
+
+
+# @spec PORT-OBS-002, PORT-OBS-003
+def test_submission_observer_mutates_then_raises_invalidates_trace() -> None:
+    from vllm_omni.metrics.streaming_transport import ServiceTimingTrace
+
+    class Trace(ServiceTimingTrace):
+        def submitted(self, *args: Any) -> None:
+            super().submitted(*args)
+            raise RuntimeError("after successful recording")
+
+    trace = Trace("test-fixture-key")
+
+    class Observer(_RecordingObserver):
+        def service_timing(self, key: str) -> Any:
+            return trace
+
+        def unit_ready(self, **kwargs: Any) -> Any:
+            handle = super().unit_ready(**kwargs)
+            trace.ready(handle)
+            return handle
+
+    observer = Observer()
+    session = _session(observer=observer)
+    session.accepted_audio.cadence_ns = 1
+
+    async def scenario() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        async for prompt in buffer_stream(_audio(1), queue, session):
+            if "multi_modal_data" in prompt:
+                handle = observer.complete_inflight(session.session_key)
+                assert handle is not None
+                trace.disposed(handle, _MODULES["streaming"].time.monotonic_ns() / 1e9, "parked")
+            queue.put_nowait([PARK_ID])
+
+    _run(scenario())
+    result = trace.finish("completed")
+    assert result["complete"]
+    assert not result["valid"]

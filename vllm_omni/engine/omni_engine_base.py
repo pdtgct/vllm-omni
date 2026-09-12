@@ -293,6 +293,7 @@ class OmniEngineBase:
         self.prompt_transform_func: Any | None = None
         self.prompt_expand_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
+        self.orchestrator: OrchestratorBase | None = None
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
         # Janus queues are constructed eagerly here (not deferred to the
@@ -464,6 +465,7 @@ class OmniEngineBase:
                 enable_orch_monitor=self._enable_orch_monitor,
                 event_driven_orch_default=self._event_driven_orch_default,
             )
+            self.orchestrator = orchestrator
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.core import EngineCoreProc
 
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
@@ -269,6 +273,48 @@ def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerF
     metadata = deserialize_additional_information(message.prompt.additional_information)
     assert metadata["omni_final_stage_id"] == 0
     assert metadata["omni_force_kv_transfer"] is True
+
+
+def test_stage_core_restores_omni_metadata_before_scheduler_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-STATE-019 / PORT-MIG-005
+    if "preprocess_add_request" not in StageEngineCoreProc.__dict__:
+        pytest.fail(
+            "PORT-STATE-019 missing engine-request metadata restoration",
+            pytrace=False,
+        )
+    request = OmniEngineCoreRequest.from_request(
+        _make_engine_core_request("bound-request"),
+        additional_information=serialize_additional_information(
+            {
+                "persistent_state_binding": {
+                    "engine_epoch": "epoch-a",
+                    "session_key": "session-a",
+                    "generation": 3,
+                }
+            }
+        ),
+    )
+    scheduled = SimpleNamespace(request_id="bound-request")
+    monkeypatch.setattr(
+        EngineCoreProc,
+        "preprocess_add_request",
+        lambda self, value: (scheduled, 7),
+    )
+    core = object.__new__(StageEngineCoreProc)
+
+    actual, wave = StageEngineCoreProc.preprocess_add_request(core, request)
+
+    assert actual is scheduled
+    assert wave == 7
+    assert actual.additional_information == {
+        "persistent_state_binding": {
+            "engine_epoch": "epoch-a",
+            "session_key": "session-a",
+            "generation": 3,
+        }
+    }
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):

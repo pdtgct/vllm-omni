@@ -5,19 +5,25 @@ import gc
 import os
 
 import torch
+from vllm.config.compilation import CompilationMode
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+from vllm.utils.gpu_sync_debug import enable_gpu_sync_check
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_ar_model_runner_v2 import GPUARModelRunnerV2
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
@@ -32,6 +38,137 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """
 
     model_runner_cls = GPUARModelRunner
+
+    def _select_model_runner_cls(self):
+        """Require MRv2 for persistent models; retain upstream choices otherwise."""
+        from vllm_omni.worker.persistent_state import discover_persistent_state_specs
+
+        if discover_persistent_state_specs(self.vllm_config):
+            if not self.use_v2_model_runner:
+                raise RuntimeError("persistent state requires Model Runner v2")
+            if self.vllm_config.parallel_config.enable_dbo:
+                raise RuntimeError("persistent state does not support more than one microbatch (DBO)")
+            return GPUARModelRunnerV2
+        if self.use_v2_model_runner:
+            from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+            return OmniARModelRunner
+        return self.model_runner_cls
+
+    def _has_persistent_only_cache(self) -> bool:
+        """Return whether this runner has state but no token-cache group."""
+
+        storage = getattr(
+            self.model_runner,
+            "_persistent_state_storage",
+            None,
+        )
+        config = getattr(self.model_runner, "kv_cache_config", None)
+        groups = None if config is None else config.kv_cache_groups
+        return storage is not None and groups == []
+
+    def _has_persistent_cache(self) -> bool:
+        """Return whether the runner owns an allocated state group."""
+
+        return (
+            getattr(
+                self.model_runner,
+                "_persistent_state_storage",
+                None,
+            )
+            is not None
+        )
+
+    def persistent_state_warmup_attestation(self) -> bool:
+        """Return whether this worker completed resident-scatter warmup."""
+
+        return bool(getattr(self, "_persistent_state_warmup_complete", False))
+
+    @instrument(span_name="Warmup persistent-only model (GPU)")
+    @torch.inference_mode()
+    def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:
+        """Finish eager worker warmup without inventing token-cache requests.
+
+        Core MRv2's final ``warmup_kernels`` pass constructs synthetic text
+        requests and divides capacity by their attention/Mamba block demand.
+        A persistent-state-only model deliberately has no such cache group;
+        its canonical maximum-shape profile has already executed the model and
+        sampler. Preserve core's model-neutral kernel warmup and operational
+        postamble while omitting only that incompatible synthetic-request pass.
+
+        This specialization keeps the outer runner eager and non-compiled.
+        A model-owned warmup hook may capture a qualified fixed-shape
+        subregion (for example, the Nemotron dense decoder) before this worker
+        attests readiness; that does not change the outer execution contract.
+
+        Run the complete warmup lifecycle under the same inference-mode
+        contract as activation profiling and served execution.  In
+        particular, a compiled model-owned subregion must see the same tensor
+        dispatch-key set during profiling, warmup, and serving.
+        """
+
+        # @spec PORT-ADV-003, PORT-PERF-009, ENV-MIG-012
+        self._persistent_state_warmup_complete = False
+        if not self.model_config.enforce_eager:
+            raise RuntimeError("persistent-only warmup requires eager execution")
+        if self.compilation_config.mode != CompilationMode.NONE:
+            raise RuntimeError("persistent-only warmup does not support model compilation")
+
+        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        kernel_warmup(self)
+
+        warmup_resident_state = getattr(
+            self.model_runner.model,
+            "warmup_resident_state",
+            None,
+        )
+        if not callable(warmup_resident_state):
+            raise RuntimeError("persistent-only model does not expose resident-state warmup")
+        warmup_resident_state()
+
+        # Profiling and warmup must not perturb request-time randomness.
+        set_random_seed(self.model_config.seed)
+
+        from vllm.utils.jit_monitor import activate as activate_jit_monitor
+
+        activate_jit_monitor(
+            mode=self.observability_config.jit_monitor_mode,
+            verbose=self.observability_config.jit_monitor_verbose,
+        )
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
+        enable_gpu_sync_check()
+        self._persistent_state_warmup_complete = True
+        return CompilationTimes(
+            language_model=self.compilation_config.compilation_time,
+            encoder=self.compilation_config.encoder_compilation_time,
+        )
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Warm ordinary runners normally and persistent-only runners natively."""
+
+        if self._has_persistent_only_cache():
+            runner = self.model_runner
+            model = runner.model
+            model_state = getattr(runner, "model_state", None)
+            storage = getattr(runner, "_persistent_state_storage")
+            state_spec = getattr(storage, "spec", None)
+            logger.info(
+                "Persistent-state execution fingerprint: worker=%s "
+                "runner=%s model=%s model_state=%s state_spec=%s "
+                "is_hybrid=%s eager=%s",
+                type(self).__name__,
+                type(runner).__name__,
+                type(model).__name__,
+                type(model_state).__name__,
+                type(state_spec).__name__,
+                bool(getattr(type(model), "is_hybrid", False)),
+                bool(self.model_config.enforce_eager),
+            )
+            return self._compile_or_warm_up_persistent_only_model()
+        if self._has_persistent_cache():
+            raise RuntimeError("mixed persistent and token-cache warmup is not qualified")
+        return super().compile_or_warm_up_model()
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -115,24 +252,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        model_stage = getattr(self.model_config, "model_stage", None)
-        stage_id = getattr(self.model_config, "stage_id", None)
-
         self.use_v2_model_runner = bool(getattr(self.model_config, "use_v2_model_runner", False))
-        if self.use_v2_model_runner:
-            from vllm_omni.worker_v2.omni_ar_model_runner import (
-                OmniARModelRunner,
-            )
-
-            logger.info(
-                "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
-                stage_id,
-                model_stage,
-            )
-            self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
-        else:
-            self.use_v2_model_runner = False
-            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+        # Construct the model runner
+        runner_cls = self._select_model_runner_cls()
+        self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

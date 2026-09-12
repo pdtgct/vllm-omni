@@ -78,6 +78,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ...     print(output)
     """
 
+    @property
+    def orchestrator(self) -> Any:
+        """The engine's orchestrator binding (``None`` before startup).
+
+        The streaming batch-stat sink attach point (PORT-OBS-008/009):
+        the API server receives this wrapper as its engine client, so
+        the engine's binding is mirrored here the way ``config_path``
+        and ``input_processor`` are. A property, not an ``__init__``
+        snapshot — the engine binds the orchestrator on its bootstrap
+        thread, and a snapshot taken at construction would race it.
+        """
+        return self.engine.orchestrator
+
     engine: AsyncOmniEngine
 
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
@@ -87,6 +100,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         AsyncOmniBase.__init__(self, *args, model=model, **kwargs)
         self.tts_max_instructions_length = tts_max_instructions_length
+        self._persistent_state_service: Any | None = None
+        self._persistent_state_fatal: BaseException | None = None
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         # In-flight EngineCore submits (non-streaming add_request, or each
@@ -128,6 +143,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        request_id_already_unique: bool = False,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -166,7 +182,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # and non-empty, similar to vLLM's input processor. The suffix is used
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
-        request_id = self._get_unique_request_id(external_request_id)
+        if request_id_already_unique:
+            if not request_id:
+                raise ValueError("an already-unique request id cannot be empty")
+        else:
+            request_id = self._get_unique_request_id(external_request_id)
 
         # Wait until generation is resumed if the engine is paused. Non-streaming
         # generate holds an admission slot until add_request completes so sleep()
@@ -401,6 +421,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
+            input_failed = False
             try:
                 async for chunk in input_stream:
                     chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
@@ -443,10 +464,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                input_failed = True
                 await _report_input_error(error)
             finally:
                 try:
-                    if not cancelled:
+                    # A failed input cannot fabricate a terminal [0] request.
+                    # Keep upstream first-input notification even on failure.
+                    if not cancelled and not input_failed:
                         # Send empty final request to indicate that inputs have
                         # finished. Don't send if canceled (session was aborted).
                         final_sampling_params_list = list(sampling_params_list)
@@ -1144,6 +1168,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     # ==================== Properties ====================
 
+    @property
+    def is_running(self) -> bool:
+        return self._persistent_state_fatal is None and super().is_running
+
+    @property
+    def errored(self) -> bool:
+        return self._persistent_state_fatal is not None or super().errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        return self._persistent_state_fatal or super().dead_error
+
     async def get_input_preprocessor(self) -> InputProcessor:
         """Get input preprocessor."""
         return self.input_processor
@@ -1208,3 +1244,37 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Return the task set exposed by the orchestrator-backed engine."""
         return tuple(self.engine.supported_tasks)
+
+    async def check_health(self) -> None:
+        """Check engine health by verifying the Orchestrator process is alive."""
+        await super().check_health()
+        persistent_state = self._persistent_state_service
+        if persistent_state is not None:
+            await persistent_state.check_health()
+
+    def install_persistent_state_service(self, service: Any) -> None:
+        """Install one exact API-process persistent-state owner."""
+        if self._persistent_state_service is not None:
+            raise RuntimeError("persistent state service already installed")
+        self._persistent_state_service = service
+
+    def report_persistent_state_fatal(self, error: BaseException) -> None:
+        """Make a non-converging state authority visible to supervision."""
+
+        if self._persistent_state_fatal is None:
+            self._persistent_state_fatal = error
+
+    def get_persistent_state_service(self) -> Any:
+        """Return the installed service or fail closed before admission."""
+        if self._persistent_state_service is None:
+            raise RuntimeError("persistent state service is not installed")
+        return self._persistent_state_service
+
+    # ==================== Shutdown ====================
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown the engine."""
+        persistent_state = self._persistent_state_service
+        if persistent_state is not None:
+            persistent_state.shutdown()
+        super().shutdown(timeout=timeout)

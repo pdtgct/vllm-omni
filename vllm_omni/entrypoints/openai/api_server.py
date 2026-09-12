@@ -37,7 +37,7 @@ from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
-from vllm.entrypoints.launchers.launcher import serve_http
+from vllm.entrypoints.launchers.launcher import serve_http, terminate_if_errored
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
@@ -73,7 +73,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -88,8 +87,10 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.config.endpoint_policy import (
-    shutdown_unsupported_routes,
+from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
+from vllm_omni.engine.persistent_state_service import PersistentStateServiceUnavailable
+from vllm_omni.engine.persistent_state_startup import (
+    prepare_persistent_state_service,
 )
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
@@ -170,6 +171,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 )
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_realtime import NemotronServingRealtime
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -209,6 +211,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics import streaming_install
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -295,6 +298,8 @@ async def omni_run_server_worker(
     """Run a single API server worker."""
     api_server_count = _resolve_api_server_count(args, client_config)
 
+    api_server_count = getattr(args, "api_server_count", None)
+
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
@@ -353,7 +358,6 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
-
         # Start background processes
         await STORAGE_MANAGER.start()
 
@@ -745,6 +749,131 @@ async def _init_duplex_chat(
     )
 
 
+async def _install_persistent_state_service(
+    engine_client: EngineClient,
+    vllm_config: Any,
+    *,
+    host_fatal_callback: Any | None = None,
+) -> Any | None:
+    """Install and inventory one selected model's state service."""
+
+    from vllm.model_executor.model_loader import get_model_cls
+
+    model_cls = get_model_cls(vllm_config.model_config)
+    if not bool(getattr(model_cls, "supports_persistent_state", False)):
+        return None
+    if not isinstance(engine_client, AsyncOmni):
+        raise RuntimeError("persistent state requires the AsyncOmni engine client")
+    stage_clients = engine_client.engine.stage_clients
+    if len(stage_clients) != 1:
+        raise RuntimeError("persistent state currently requires exactly one stage")
+
+    from vllm_omni.engine.persistent_state_config import (
+        PersistentStateRuntimeConfig,
+    )
+
+    startup_provider = getattr(
+        model_cls,
+        "persistent_state_startup_provider",
+        None,
+    )
+    if startup_provider is None:
+        raise RuntimeError("persistent-state model is missing its startup provider")
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(
+        vllm_config,
+        startup_provider=startup_provider,
+    )
+    service = await prepare_persistent_state_service(
+        engine_client=engine_client,
+        stage_client=stage_clients[0],
+        runtime_config=runtime,
+        startup_provider=startup_provider,
+        host_fatal_callback=host_fatal_callback,
+    )
+    engine_client.install_persistent_state_service(service)
+    logger.info("Persistent-state service installed and ready")
+    return service
+
+
+def _persistent_state_host_fatal_callback(
+    *,
+    state: State,
+    engine_client: Any,
+) -> Any:
+    """Route one state-authority fatal into upstream engine supervision."""
+
+    def report(error: BaseException) -> None:
+        engine_client.report_persistent_state_fatal(error)
+        terminate_if_errored(server=state.server, engine=engine_client)
+
+    return report
+
+
+def _install_streaming_observer_and_build_realtime_serving(
+    state: State,
+    engine_client: EngineClient,
+    *,
+    request_logger: RequestLogger | None,
+) -> None:
+    """PORT-OBS-001/002/003: one-time observer install + realtime serving
+    construction for the omni API server.
+
+    Unconditional, matching the pre-metrics base: this server mounts
+    ``/v1/realtime`` for every deployment and constructed
+    ``OpenAIServingRealtime`` unconditionally, so the serving app state
+    *is* the streaming serving path PORT-OBS-001 scopes family
+    registration to, and PORT-OBS-003 installs exactly one observer per
+    serving app state. Never gate this on the engine task vocabulary:
+    ``AsyncOmniEngine`` derives ``supported_tasks`` only from
+    ``{"generate", "speech"}`` (``async_omni_engine.py``, task
+    derivation), so a ``"realtime"`` membership test — upstream vLLM's
+    ``factories.py`` gate, whose engine *can* advertise ``"realtime"``
+    — is False in every real omni deployment. Gating on it silently
+    replaced ``/v1/realtime`` with an "unavailable" close and skipped
+    the observer install (2026-07-28 GPU-round regression).
+
+    PORT-OBS-002: the server's own host-statistics switch is threaded
+    through (statistics default ON) rather than defaulted inside the
+    install seam, so a caller can never silently drift from what the
+    server was actually configured to collect.
+
+    PORT-OBS-008/009: the orchestrator is built before this app state
+    exists, so its batch-size sub-stat sink is wired post-construction
+    through the engine's ``orchestrator`` binding (never a second,
+    independently-configured ``OmniStreamingMetrics`` instance). A
+    missing binding degrades observability only, never serving — logged
+    loudly rather than passing silently.
+    """
+    installed_streaming_observer = streaming_install.install_streaming_observer(state, log_stats=state.log_stats)
+    persistent_state_service = getattr(state, "persistent_state_service", None)
+    if persistent_state_service is not None:
+        persistent_state_service.install_metrics(installed_streaming_observer.metrics)
+    runtime = (
+        getattr(persistent_state_service, "runtime_config", None) if persistent_state_service is not None else None
+    )
+    state.openai_serving_realtime = NemotronServingRealtime(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        request_logger=request_logger,
+        observer=installed_streaming_observer,
+        runtime_config=runtime,
+    )
+    logger.info(
+        "Streaming metrics observer installed (model_name=%s, log_stats=%s)",
+        state.openai_serving_models.model_name(),
+        state.log_stats,
+    )
+    orchestrator = getattr(engine_client, "orchestrator", None)
+    if orchestrator is not None:
+        orchestrator.set_streaming_metrics(installed_streaming_observer.metrics)
+        logger.info("Streaming batch-stat sink attached to orchestrator")
+    else:
+        logger.warning(
+            "Streaming batch-stat sink NOT attached: engine client exposes "
+            "no orchestrator binding (chunk_batch_size will record nothing)"
+        )
+
+
 async def omni_init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -872,6 +1001,23 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
+
+    # Model-defined persistent state is an engine capability, not a route
+    # side effect.  Install and inventory its single API-process service
+    # before any serving object can admit audio or readiness can succeed.
+    if vllm_config is not None:
+        from vllm.model_executor.model_loader import get_model_cls
+
+        if bool(getattr(get_model_cls(vllm_config.model_config), "supports_persistent_state", False)):
+            streaming_install.assert_single_api_server_invariant(getattr(args, "api_server_count", None) or 1)
+        state.persistent_state_service = await _install_persistent_state_service(
+            engine_client,
+            vllm_config,
+            host_fatal_callback=_persistent_state_host_fatal_callback(
+                state=state,
+                engine_client=engine_client,
+            ),
+        )
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -1180,9 +1326,9 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
+    _install_streaming_observer_and_build_realtime_serving(
+        state,
+        engine_client,
         request_logger=request_logger,
     )
 
@@ -1752,10 +1898,16 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
+    native_persistent = bool(getattr(serving, "_is_recognized_streaming_model", False))
+    # Nemotron admission belongs to its sealed state service. Duplex warmup
+    # and query switches cannot bypass that native protocol.
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = duplex_handler is not None and (
-        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
+    use_duplex_realtime = (
+        not native_persistent
+        and duplex_handler is not None
+        and (duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}))
     )
     if use_duplex_realtime and duplex_handler is not None:
         if await _reject_multi_api_duplex(websocket):
@@ -1764,7 +1916,7 @@ async def realtime_websocket(websocket: WebSocket):
         await duplex_handler.handle_realtime_session(websocket)
         return
 
-    if isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}:
+    if not native_persistent and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}:
         await websocket.accept()
         await websocket.send_json({"type": "error", "code": "unsupported", "error": "VAD realtime is not enabled"})
         await websocket.close(code=1008)
@@ -1776,7 +1928,15 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
         await websocket.close()
         return
-    connection = RealtimeConnection(websocket, serving)
+    # PORT-OBS-003: route-to-session injection — the installed observer
+    # (if any was installed for this app state) is threaded into native
+    # session construction here, never constructed or resolved again.
+    # The park-token id is the serving's model-gated resolution: the
+    # recognized streaming model resolves it (loudly), any other
+    # realtime model yields None and park detection stays inert.
+    observer = streaming_install.resolve_installed_observer(websocket.app.state)
+    park_token_id = getattr(serving, "park_token_id", None)
+    connection = RealtimeConnection(websocket, serving, observer=observer, park_token_id=park_token_id)
     await connection.handle_connection()
 
 
@@ -1953,9 +2113,17 @@ async def health(raw_request: Request) -> JSONResponse:
     try:
         await engine_client.check_health()
         return JSONResponse(content={"status": "healthy"})
-    except EngineDeadError:
+    except PersistentStateServiceUnavailable:
         return JSONResponse(
-            content={"status": "unhealthy"},
+            content={
+                "status": "unhealthy",
+                "reason": "persistent_state_unavailable",
+            },
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    except EngineDeadError as error:
+        return JSONResponse(
+            content={"status": "unhealthy", "reason": str(error)},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 

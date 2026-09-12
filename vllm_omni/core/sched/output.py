@@ -7,6 +7,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.model_executor.persistent_state.manager import StateBinding
 
 
 @dataclass
@@ -80,6 +81,16 @@ class OmniNewRequestData(NewRequestData):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
 
+    @classmethod
+    def from_new_request_data(
+        cls,
+        data: NewRequestData,
+        request: Request | None,
+    ) -> "OmniNewRequestData":
+        """Enrich scheduler output without dropping core runner fields."""
+
+        return cls.from_base(data, request)
+
 
 @dataclass
 class OmniCachedRequestData(CachedRequestData):
@@ -119,3 +130,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+
+    persistent_state_bindings: dict[str, StateBinding] = field(default_factory=dict)

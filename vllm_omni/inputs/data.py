@@ -17,6 +17,7 @@ from vllm_omni.lora.request import LoRARequest
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
+# @spec ENV-MIG-004
 class OmniTextPrompt(TextPrompt):
     """Text prompt with optional embeddings and stage payloads.
 

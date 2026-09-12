@@ -15,6 +15,7 @@ import pytest
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
+import vllm_omni.core.sched.omni_ar_scheduler as scheduler_mod
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -26,6 +27,8 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARS
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+
+from vllm_omni.core.sched.output import OmniNewRequestData
 
 # isort: on
 
@@ -454,6 +457,7 @@ def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> Non
     request.num_stale_output_tokens = 0
 
     sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    sched.log_stats = False
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
@@ -1560,3 +1564,50 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     assert observed_limits == [7 if native else 8]
     assert sched.max_num_running_reqs == 8
+
+
+def test_scheduler_rewrap_preserves_v2_prefill_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec PORT-MIG-005 / PORT-MIG-006
+    scheduler = _make_scheduler()
+    scheduler.waiting = []
+    scheduler.running = []
+    scheduler.input_coordinator = None
+    scheduler._consume_pending_connector_output = lambda model_mode: None
+    scheduler._process_pending_input_timeouts = lambda: None
+    scheduler._should_defer_waiting_admission = lambda: False
+    scheduler.get_finished_requests_needing_kv_transfer = lambda: {}
+    scheduler._wrap_omni_scheduler_output = lambda output, **kwargs: output
+    request = SimpleNamespace(
+        external_req_id="external-v2",
+        prompt_embeds=None,
+        additional_information=None,
+    )
+    scheduler.requests = {"req-v2": request}
+    prefill_token_ids = [401, 402, 403]
+    base_new_request = SimpleNamespace(
+        req_id="req-v2",
+        prompt_token_ids=[401],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([9],),
+        num_computed_tokens=0,
+        lora_request=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=[True],
+        prefill_token_ids=prefill_token_ids,
+    )
+    scheduler_output = SimpleNamespace(scheduled_new_reqs=[base_new_request])
+    monkeypatch.setattr(
+        scheduler_mod.VLLMScheduler,
+        "schedule",
+        lambda self, throttle_prefills=False: scheduler_output,
+    )
+
+    output = scheduler.schedule()
+
+    wrapped = output.scheduled_new_reqs[0]
+    assert isinstance(wrapped, OmniNewRequestData)
+    assert wrapped.prefill_token_ids is prefill_token_ids

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -131,6 +132,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     """Build a minimal stub for OmniARScheduler.update_from_output()."""
     scheduler = SimpleNamespace(
         perf_metrics=None,
+        log_stats=False,
         connector=None,
         chunk_transfer_adapter=None,
         requests={request.request_id: request for request in requests},
@@ -160,6 +162,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     )
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
+    scheduler._forward_streaming_batch_stats = MethodType(OmniARScheduler._forward_streaming_batch_stats, scheduler)
     scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
     scheduler._emit_streaming_context_overflow_outputs = MethodType(
         OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler

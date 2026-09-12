@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+import importlib
+from collections.abc import Sequence
+from typing import Any
 
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
@@ -8,9 +11,19 @@ from vllm.model_executor.models.registry import (
     _resolve_module_name,
 )
 
+from vllm_omni.model_executor.models.nemotron_asr.identity import (
+    ARCHITECTURE as NEMOTRON_ASR_ARCHITECTURE,
+)
+
 _OMNI_MODELS = {
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
+    # @spec PORT-INT-001
+    NEMOTRON_ASR_ARCHITECTURE: (
+        "nemotron_asr",
+        "nemotron_asr",
+        "NemotronASRForRNNT",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
@@ -484,6 +497,31 @@ _OMNI_MODELS = {
         "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
 }
+
+_PERSISTENT_STATE_STARTUP_PROVIDERS = {
+    NEMOTRON_ASR_ARCHITECTURE: (
+        "vllm_omni.model_executor.models.nemotron_asr.startup",
+        "NEMOTRON_PERSISTENT_STATE_STARTUP",
+    ),
+}
+
+
+def get_persistent_state_startup_provider(
+    architectures: Sequence[str],
+) -> Any | None:
+    """Resolve a dependency-light startup provider by model architecture."""
+
+    matches = [
+        _PERSISTENT_STATE_STARTUP_PROVIDERS[architecture]
+        for architecture in architectures
+        if architecture in _PERSISTENT_STATE_STARTUP_PROVIDERS
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError("persistent-state startup requires exactly one provider")
+    module_name, symbol_name = matches[0]
+    return getattr(importlib.import_module(module_name), symbol_name)
 
 
 _VLLM_OMNI_MODELS = {
