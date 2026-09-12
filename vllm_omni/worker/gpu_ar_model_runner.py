@@ -12,7 +12,7 @@ from __future__ import annotations
 import gc
 import threading
 from collections.abc import Callable, Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple, cast
@@ -28,6 +28,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -45,6 +46,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.metrics import streaming_transport
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
@@ -58,6 +60,12 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
+from vllm_omni.worker.persistent_state import (
+    allocate_runner_persistent_state,
+    build_persistent_state_batch,
+    discover_persistent_state_specs,
+    partition_persistent_state_config,
+)
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
@@ -391,6 +399,66 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Add purpose-named persistent state to ordinary core discovery."""
+
+        from vllm_omni.model_executor.persistent_state import (
+            PersistentStateLayerBase,
+            PersistentStateSpec,
+        )
+
+        specs = super().get_kv_cache_spec()
+        persistent_specs = discover_persistent_state_specs(self.vllm_config)
+        if any(not isinstance(spec, PersistentStateSpec) for spec in persistent_specs.values()):
+            raise TypeError("persistent-state discovery returned an unsupported spec")
+        if set(specs) & set(persistent_specs):
+            raise RuntimeError("persistent-state layer collides with core cache discovery")
+        # Keep the purpose-named layer type visible at this pin-guarded seam.
+        assert PersistentStateLayerBase is not None
+        specs.update(persistent_specs)
+        return specs
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        """Partition custom state before core attention/Mamba initialization."""
+
+        from vllm_omni.model_executor.persistent_state import PersistentStateSpec
+
+        persistent_groups = [
+            group for group in kv_cache_config.kv_cache_groups if isinstance(group.kv_cache_spec, PersistentStateSpec)
+        ]
+        partition = partition_persistent_state_config(kv_cache_config)
+        if len(persistent_groups) > 1:
+            raise ValueError("persistent-state profile permits exactly one state group")
+        self._omni_full_kv_cache_config = kv_cache_config
+        super().initialize_kv_cache(
+            partition.ordinary_config,
+            is_profiling=is_profiling,
+            kv_cache_allocation_context=kv_cache_allocation_context,
+        )
+        self._persistent_state_storage = allocate_runner_persistent_state(
+            self,
+            partition,
+        )
+
+    # @spec PORT-INT-007, PORT-STATE-002
+    def profile_run(self) -> None:
+        """Reject prefix caching before persistent-state profiling."""
+
+        persistent_specs = discover_persistent_state_specs(self.vllm_config)
+        if persistent_specs and self.cache_config.enable_prefix_caching:
+            raise ValueError("prefix caching is incompatible with persistent state")
+        super().profile_run()
+
+    def _build_persistent_state_batch(self, rows: Any) -> Any:
+        """Use the runner-neutral state projection without owning its lease."""
+
+        return build_persistent_state_batch(rows)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -2024,6 +2092,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
                 output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
+            # PORT-OBS-008: the runner-side drain hop. The hook is
+            # model-specific (Nemotron-ASR's, not a base-model contract),
+            # so this stays generic across every model this runner loads.
+            if hasattr(self.model, "consume_batch_stats"):
+                streaming_transport.drain_batch_stats_into_runner_output(self.model, output)
         return output
 
     @torch.inference_mode()

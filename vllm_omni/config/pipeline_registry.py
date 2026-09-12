@@ -99,6 +99,9 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_REALTIME_PIPELINE,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
+from vllm_omni.model_executor.models.nemotron_asr.pipeline import (
+    NEMOTRON_ASR_PIPELINE,
+)
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
     NEMOTRON_VOICECHAT_PIPELINE,
 )
@@ -129,6 +132,11 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
+    "nemotron_asr": NEMOTRON_ASR_PIPELINE,
+    # The public HF card's model type (transformers' nemotron3_5_asr);
+    # same pipeline, so deploy-profile resolution keyed on the
+    # pipeline's own model_type is identical on both paths.
+    "nemotron3_5_asr": NEMOTRON_ASR_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,

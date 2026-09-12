@@ -132,6 +132,8 @@ _DIFFUSION_MUST_BE_NONE = {
 }
 _DIFFUSION_MUST_BE_WIRED = _DIFFUSION_APP_STATE_KEYS - _DIFFUSION_MUST_BE_NONE
 _MULTISTAGE_APP_STATE_KEYS = {
+    "persistent_state_service",
+    "_vllm_omni_streaming_observer",
     "engine_client",
     "log_stats",
     "args",
@@ -155,6 +157,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "server_load_metrics",
 }
 _MULTISTAGE_MUST_BE_NONE = {
+    "persistent_state_service",
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
 }
@@ -266,6 +269,10 @@ def _minimal_args(**overrides) -> SimpleNamespace:
 
 
 def _request_for(app: FastAPI, *, method: str = "GET", path: str = "/") -> Request:
+    async def receive():
+        # The request body is consumed; remain connected until cancellation.
+        await asyncio.Future()
+
     return Request(
         {
             "type": "http",
@@ -274,7 +281,8 @@ def _request_for(app: FastAPI, *, method: str = "GET", path: str = "/") -> Reque
             "headers": [],
             "app": app,
             "state": {},
-        }
+        },
+        receive=receive,
     )
 
 
@@ -594,7 +602,7 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_connection(self) -> None:
             calls.append("legacy")
 
-    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving, **_kwargs: _LegacyConnection())
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
@@ -871,9 +879,16 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         ),
     )
 
+    from vllm.model_executor import model_loader
+
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda _: type("OrdinaryModel", (), {}))
+
     class _FakeModels:
         def __init__(self, *args, **kwargs):
             self.base_model_paths = kwargs.get("base_model_paths") or []
+
+        def model_name(self):
+            return "snapshot-model"
 
         async def init_static_loras(self):
             return None
@@ -910,7 +925,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
+    monkeypatch.setattr(api_server, "NemotronServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
     monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
 

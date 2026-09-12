@@ -39,6 +39,25 @@ class OmniPlatform(Platform):
 
     _omni_enum: OmniPlatformEnum
 
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        """Register Omni-owned cache-spec capabilities after core built-ins."""
+
+        # @spec PORT-STATE-002
+        del vllm_config
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_omni.model_executor.persistent_state import (
+            PersistentStateManager,
+            PersistentStateSpec,
+        )
+
+        KVCacheSpecRegistry.register(
+            PersistentStateSpec,
+            PersistentStateManager,
+            uniform_type_base_spec=PersistentStateSpec,
+        )
+
     def is_npu(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.NPU
 

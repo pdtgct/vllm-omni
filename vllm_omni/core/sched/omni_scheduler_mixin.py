@@ -20,9 +20,9 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
-    EngineCoreOutputs,
     FinishReason,
 )
+from vllm.v1.engine import EngineCoreOutputs as CoreEngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -41,6 +41,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 
 logger = init_logger(__name__)
 
@@ -261,6 +262,17 @@ class OmniSchedulerMixin:
         """
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        failed_model_ids = set(getattr(connector_output, "model_failed_req_ids", set())) if connector_output else set()
+        requests = getattr(self, "requests", {})
+        present_failed_ids = {request_id for request_id in failed_model_ids if request_id in requests}
+        if present_failed_ids:
+            statuses = getattr(connector_output, "model_status", {})
+            logger.warning(
+                "Finishing %d request(s) after model transaction status: %s",
+                len(present_failed_ids),
+                {request_id: statuses.get(request_id) for request_id in sorted(present_failed_ids)},
+            )
+            getattr(self, "finish_requests")(present_failed_ids, RequestStatus.FINISHED_ERROR)
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
@@ -544,7 +556,7 @@ class OmniSchedulerMixin:
 
     def _append_request_output(
         self,
-        outputs: dict[int, list[EngineCoreOutput]],
+        outputs: dict[int, list[OmniEngineCoreOutput]],
         request: Request,
         **output_fields: Any,
     ) -> None:
@@ -559,7 +571,7 @@ class OmniSchedulerMixin:
     def _handle_failed_kv_load_outputs(
         self,
         failed_request_ids: set[str] | None,
-        outputs: dict[int, list[EngineCoreOutput]],
+        outputs: dict[int, list[OmniEngineCoreOutput]],
     ) -> list[Request]:
         """Finish unrecoverable KV loads and emit their terminal outputs."""
         if not failed_request_ids or self.recompute_kv_load_failures:
@@ -578,7 +590,7 @@ class OmniSchedulerMixin:
 
     def _attach_finished_request_sets(
         self,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs],
         *,
         synthesize_abort_outputs: bool,
     ) -> None:
@@ -670,7 +682,7 @@ class OmniSchedulerMixin:
 
     def _attach_scheduler_stats(
         self,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs],
         spec_decoding_stats: SpecDecodingStats | None,
         kv_connector_stats: KVConnectorStats | None,
         cudagraph_stats: CUDAGraphStat | None,

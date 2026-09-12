@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass, field, fields
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.model_executor.persistent_state.manager import StateBinding
 
 
 @dataclass
@@ -77,6 +81,16 @@ class OmniNewRequestData(NewRequestData):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )
 
+    @classmethod
+    def from_new_request_data(
+        cls,
+        data: NewRequestData,
+        request: Request | None,
+    ) -> "OmniNewRequestData":
+        """Enrich scheduler output without dropping core runner fields."""
+
+        return cls.from_base(data, request)
+
 
 @dataclass
 class OmniCachedRequestData(CachedRequestData):
@@ -113,3 +127,4 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    persistent_state_bindings: dict[str, StateBinding] = field(default_factory=dict)

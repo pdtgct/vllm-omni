@@ -16,7 +16,8 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreOutputs as CoreEngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -25,7 +26,16 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine import OmniEngineCoreOutput
+
+# PORT-OBS-008/009 (A27 amendment 6): every envelope this scheduler
+# constructs is the OMNI type — the vanilla EngineCoreOutputs is a
+# slotted msgspec struct that cannot carry streaming_chunk_batch_stats
+# (assignment raises AttributeError), so binding the omni type at the
+# module level makes every construction site correct at once and is
+# pinned by test_omni_outputs_envelope.py's module-binding check.
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.metrics import streaming_transport
 
 logger = init_logger(__name__)
 
@@ -329,11 +339,35 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_requests_needing_kv_transfer=finished_reqs,
         )
 
+    def _forward_streaming_batch_stats(
+        self,
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs],
+        model_runner_output: Any,
+    ) -> None:
+        """PORT-OBS-008/009: the scheduler-side hop, gated by this
+        scheduler's own host-statistics switch — mirrors the
+        scheduler_stats "return to only one front-end" selection in
+        ``update_from_output``, since batch stats are likewise a global,
+        not per-client, signal. Gated on the OUTSIDE (not just via
+        ``stats_enabled=``) so a disabled collector never synthesizes an
+        otherwise-unneeded envelope for a step that would send nothing
+        else. A real method (not inline) so the seam is drivable by CPU
+        tests on scheduler-constructed envelopes."""
+        if not self.log_stats:
+            return
+        if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+            engine_core_outputs[0] = eco = EngineCoreOutputs()
+        streaming_transport.forward_batch_stats_to_engine_core_outputs(
+            model_runner_output,
+            eco,
+            stats_enabled=True,
+        )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
-    ) -> dict[int, EngineCoreOutputs]:
+    ) -> dict[int, CoreEngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -366,7 +400,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
-        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        outputs: dict[int, list[OmniEngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -724,7 +758,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
-        engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs] = {
+            client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()
+        }
 
         self._attach_finished_request_sets(
             engine_core_outputs,
@@ -738,6 +774,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             cudagraph_stats,
             perf_stats,
         )
+
+        self._forward_streaming_batch_stats(engine_core_outputs, model_runner_output)
 
         self._capture_omni_connector_output(model_runner_output)
 
@@ -766,7 +804,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """Apply the next streaming update to a persistent session.
 
-        Stage 0 uses upstream prompt extension. A MiniCPM Talker preserves its
+        Stage 0 uses upstream ``session.prompt_token_ids.extend``.
+        A MiniCPM Talker preserves its
         accumulated prompt while it fits, then rebuilds a bounded window and
         re-enters admission. Other downstream stages retain their existing
         replacement or connector-polling behavior.

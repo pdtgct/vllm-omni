@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -10,7 +13,9 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import time
 from typing import Any
+from uuid import uuid4
 
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
@@ -21,7 +26,7 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,
@@ -30,6 +35,10 @@ from vllm.v1.engine.utils import (
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.persistent_state_config import (
+    PersistentStateRuntimeConfig,
+)
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
@@ -75,6 +84,18 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _install_omni_platform_for_stage_core() -> None:
+    """Install Omni's platform before core cache-spec registration."""
+
+    from vllm import platforms as vllm_platforms
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_unspecified():
+        raise RuntimeError("stage core requires a resolved Omni platform")
+    vllm_platforms.current_platform = current_omni_platform
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -83,12 +104,452 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
-    def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
-        """Preserve omni payloads when vLLM builds its scheduler request."""
-        scheduler_request, current_wave = super().preprocess_add_request(request)
-        scheduler_request.additional_information = request.additional_information
-        scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
-        return scheduler_request, current_wave
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._publish_persistent_state_warmup_attestation()
+
+    def _publish_persistent_state_warmup_attestation(self) -> None:
+        """Publish all-worker resident-scatter warmup into the manager."""
+
+        from vllm_omni.model_executor.persistent_state.manager import (
+            PersistentStateManager,
+        )
+
+        managers = getattr(self.scheduler, "kv_cache_manager").coordinator.single_type_managers
+        matches = [manager for manager in managers if isinstance(manager, PersistentStateManager)]
+        if not matches:
+            return
+        if len(matches) != 1:
+            raise RuntimeError("persistent_state requires exactly one resident manager")
+
+        # @spec PORT-ADV-003, ENV-MIG-012
+        attestations = self.model_executor.collective_rpc("persistent_state_warmup_attestation")
+        if not attestations or not all(result is True for result in attestations):
+            raise RuntimeError("persistent-state worker warmup attestation is incomplete")
+        setattr(matches[0], "resident_state_scatter_warmup_complete", True)
+
+    def preprocess_add_request(
+        self,
+        request: EngineCoreRequest,
+    ) -> tuple[Any, int]:
+        """Restore Omni metadata after core constructs its base request."""
+
+        scheduled, request_wave = super().preprocess_add_request(request)
+        payload = getattr(request, "additional_information", None)
+        if payload is not None:
+            setattr(
+                scheduled,
+                "additional_information",
+                deserialize_additional_information(payload),
+            )
+        scheduled.external_req_id = getattr(request, "external_req_id", request.request_id)
+        return scheduled, request_wave
+
+    def _persistent_state_manager(self) -> Any:
+        from vllm_omni.model_executor.persistent_state.manager import (
+            PersistentStateManager,
+        )
+
+        managers = getattr(self.scheduler, "kv_cache_manager").coordinator.single_type_managers
+        matches = [manager for manager in managers if isinstance(manager, PersistentStateManager)]
+        if len(matches) != 1:
+            raise RuntimeError("persistent_state requires exactly one resident manager")
+        manager = matches[0]
+        runtime = PersistentStateRuntimeConfig.from_vllm_config(self.vllm_config)
+        manager.configure_capacity(
+            safety_reserve_slots=runtime.safety_reserve_slots,
+            max_resident_sessions=runtime.max_resident_sessions,
+        )
+        return manager
+
+    def _persistent_state_control(self) -> dict[str, Any]:
+        control = getattr(self, "_persistent_state_control_state", None)
+        if control is None:
+            manager = self._persistent_state_manager()
+            runtime = PersistentStateRuntimeConfig.from_vllm_config(self.vllm_config)
+            scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+            execution_ceiling = int(
+                getattr(
+                    scheduler_config,
+                    "max_num_seqs",
+                    manager.effective_capacity,
+                )
+            )
+            hard_capacity = min(
+                manager.effective_capacity,
+                manager.configured_limit,
+                execution_ceiling,
+            )
+            raw = getattr(self.vllm_config, "additional_config", {}) or {}
+            runtime_allowance = max(32, 4 * hard_capacity)
+            max_tombstones = (
+                runtime.max_tombstones
+                if "persistent_state_max_tombstones" in raw
+                else runtime.bootstrap_operation_budget + runtime_allowance
+            )
+            if max_tombstones < 2 * hard_capacity:
+                raise ValueError(
+                    "persistent_state_max_tombstones must reserve one reserve and one release record per hard-cap slot"
+                )
+            control = {
+                "engine_epoch": manager.engine_epoch,
+                "revision": 0,
+                "operations": {},
+                "pending": {},
+                "claimed": {},
+                "cleanup": {},
+                "binding_created": {},
+                "tombstone_ttl_s": runtime.tombstone_ttl_s,
+                "max_tombstones": max_tombstones,
+                "priming_budget_sha256": runtime.priming_budget_sha256,
+                "bootstrap_operation_budget": (runtime.bootstrap_operation_budget),
+                "runtime_tombstone_allowance": runtime_allowance,
+                "admission_policy": runtime.admission_policy,
+                "pending_claim_timeout_s": runtime.pending_claim_timeout_s,
+            }
+            self._persistent_state_control_state = control
+            setattr(self.scheduler, "persistent_state_registry", self)
+        return control
+
+    @staticmethod
+    def _prune_persistent_state_operations(control: dict[str, Any]) -> None:
+        """Expire completed operation records without evicting live ones."""
+
+        now = time.monotonic()
+        expired = [
+            operation_id for operation_id, record in control["operations"].items() if float(record["expires_at"]) <= now
+        ]
+        for operation_id in expired:
+            control["operations"].pop(operation_id)
+
+    def _persistent_state_operation_result(
+        self,
+        control: dict[str, Any],
+        operation_id: str,
+    ) -> dict[str, Any] | None:
+        self._prune_persistent_state_operations(control)
+        record = control["operations"].get(operation_id)
+        return None if record is None else record["result"]
+
+    @staticmethod
+    def _record_persistent_state_operation(
+        control: dict[str, Any],
+        operation_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        if len(control["operations"]) >= int(control["max_tombstones"]):
+            raise RuntimeError("persistent-state operation tombstone invariant exceeded")
+        control["operations"][operation_id] = {
+            "result": result,
+            "expires_at": time.monotonic() + float(control["tombstone_ttl_s"]),
+        }
+
+    def persistent_state_snapshot(self) -> dict[str, Any]:
+        """Return the resident capability inventory without state content."""
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        self._prune_persistent_state_operations(control)
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        model_config = getattr(self.vllm_config, "model_config", None)
+        compute_hash = getattr(self.vllm_config, "compute_hash", None)
+        return {
+            "engine_epoch": control["engine_epoch"],
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "physical_capacity": manager.physical_capacity,
+            "safety_reserve": manager.safety_reserve_slots,
+            "configured_limit": manager.configured_limit,
+            "effective_capacity": manager.effective_capacity,
+            "slot_bytes": manager.persistent_state_spec.page_size_bytes,
+            "execution_claim_ceiling": int(
+                getattr(
+                    scheduler_config,
+                    "max_num_seqs",
+                    manager.effective_capacity,
+                )
+            ),
+            "execution_environment_key": (compute_hash() if callable(compute_hash) else "test-unavailable"),
+            "precision_policy": str(getattr(model_config, "dtype", "unknown")),
+            "stage": manager.stage,
+            "replica": manager.replica,
+            "capabilities": ["resident"],
+            "resident_state_scatter_warmup_complete": bool(
+                getattr(
+                    manager,
+                    "resident_state_scatter_warmup_complete",
+                    False,
+                )
+            ),
+            "schema_id": manager.persistent_state_spec.schema_id,
+            "profile_id": manager.profile_id,
+            "persistent_state_tombstone_ttl_s": control["tombstone_ttl_s"],
+            "persistent_state_max_tombstones": control["max_tombstones"],
+            "persistent_state_priming_budget_sha256": control["priming_budget_sha256"],
+            "persistent_state_bootstrap_operation_budget": control["bootstrap_operation_budget"],
+            "persistent_state_runtime_tombstone_allowance": control["runtime_tombstone_allowance"],
+            "persistent_state_admission_policy": control["admission_policy"],
+            # PORT-STATE-023: binding inventory for handshake-time orphan
+            # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
+            # across processes on one host, which is the deployment shape
+            # (the service and this proc are co-hosted).
+            "bindings": self._persistent_state_binding_inventory(control),
+        }
+
+    @staticmethod
+    def _persistent_state_binding_inventory(
+        control: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        horizon = float(control["pending_claim_timeout_s"])
+        inventory: list[dict[str, Any]] = []
+        for owner in ("pending", "claimed", "cleanup"):
+            for token, binding in control[owner].items():
+                created = control["binding_created"].get(token)
+                inventory.append(
+                    {
+                        "binding_token": token,
+                        "session_key": binding.request_id,
+                        "generation": binding.generation,
+                        "schema_id": binding.schema_id,
+                        "profile_id": binding.profile_id,
+                        "engine_epoch": binding.engine_epoch,
+                        "claim_expires_at": (None if created is None else created + horizon),
+                    }
+                )
+        return inventory
+
+    def persistent_state_reserve(
+        self,
+        operation_id: str,
+        session_key: str,
+        schema_id: str,
+        profile_id: str,
+    ) -> dict[str, Any]:
+        """Commit one pending persistent_state lease before audio admission."""
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        previous = self._persistent_state_operation_result(control, operation_id)
+        if previous is not None:
+            return previous
+        if len(control["operations"]) + len(manager._bindings) + 2 > int(control["max_tombstones"]):
+            # PORT-STATE-024: typed, retryable backpressure - the horizon
+            # frees by tombstone expiry (pruned on every attempt and probe)
+            # and by release; this is never an invariant failure.
+            raise RuntimeError(
+                "persistent_state_horizon_exhausted: operation tombstone horizon is full; retry after tombstone expiry"
+            )
+        if schema_id != manager.persistent_state_spec.schema_id:
+            raise ValueError("persistent_state schema mismatch")
+        if profile_id != manager.profile_id:
+            raise ValueError("persistent_state profile mismatch")
+        manager.allocate_new_blocks(session_key, 1, 1)
+        binding = manager.get_state_binding(session_key)
+        if binding is None:
+            raise RuntimeError("persistent_state reservation lacks binding")
+        binding_token = uuid4().hex
+        lease = {
+            "engine_epoch": binding.engine_epoch,
+            "session_key": session_key,
+            "generation": binding.generation,
+            "schema_id": binding.schema_id,
+            "profile_id": binding.profile_id,
+            "location": "resident",
+            "binding_token": binding_token,
+        }
+        control["pending"][binding_token] = binding
+        control["binding_created"][binding_token] = time.monotonic()
+        control["revision"] += 1
+        result = {
+            "operation_id": operation_id,
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "lease": lease,
+            "location_event": {
+                "engine_epoch": binding.engine_epoch,
+                "session_key": session_key,
+                "generation": binding.generation,
+                "location": "resident",
+                "transition": "reserved",
+            },
+        }
+        self._record_persistent_state_operation(control, operation_id, result)
+        return result
+
+    def claim_pending_lease(
+        self,
+        *,
+        engine_epoch: str,
+        session_key: str,
+        generation: int,
+        schema_id: str,
+        profile_id: str,
+        binding_token: str | None = None,
+    ) -> Any:
+        """Atomically join the initial scheduler ADD to a pending lease."""
+        control = self._persistent_state_control()
+        if binding_token is None:
+            candidates = list(control["pending"].items())
+            matches = [item for item in candidates if item[1].request_id == session_key]
+            if len(matches) != 1:
+                raise ValueError("persistent_state pending claim is ambiguous")
+            binding_token, binding = matches[0]
+        else:
+            binding = control["pending"].get(binding_token)
+        expected = (
+            engine_epoch,
+            session_key,
+            generation,
+            schema_id,
+            profile_id,
+        )
+        actual = (
+            (
+                binding.engine_epoch,
+                binding.request_id,
+                binding.generation,
+                binding.schema_id,
+                binding.profile_id,
+            )
+            if binding is not None
+            else None
+        )
+        if actual != expected:
+            raise ValueError("persistent_state pending claim mismatch")
+        control["pending"].pop(binding_token)
+        control["claimed"][binding_token] = binding
+        return binding
+
+    def persistent_state_begin_pending_cleanup(
+        self,
+        lease: dict[str, Any],
+    ) -> bool:
+        """Atomically win cleanup against the initial scheduler claim.
+
+        Returning ``False`` means the scheduler already claimed the exact
+        generation. Returning ``True`` moves a still-pending binding into a
+        cleanup-only state that the scheduler can no longer claim; physical
+        release remains owned by the API cleanup operation.
+        """
+
+        control = self._persistent_state_control()
+        binding_token = str(lease["binding_token"])
+        expected = (
+            str(lease["engine_epoch"]),
+            str(lease["session_key"]),
+            int(lease["generation"]),
+            str(lease["schema_id"]),
+            str(lease["profile_id"]),
+        )
+        binding = control["pending"].get(binding_token)
+        if binding is not None:
+            actual = (
+                binding.engine_epoch,
+                binding.request_id,
+                binding.generation,
+                binding.schema_id,
+                binding.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state pending cleanup mismatch")
+            control["pending"].pop(binding_token)
+            control["cleanup"][binding_token] = binding
+            return True
+
+        cleanup_binding = control["cleanup"].get(binding_token)
+        if cleanup_binding is not None:
+            actual = (
+                cleanup_binding.engine_epoch,
+                cleanup_binding.request_id,
+                cleanup_binding.generation,
+                cleanup_binding.schema_id,
+                cleanup_binding.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state cleanup binding mismatch")
+            return True
+
+        claimed = control["claimed"].get(binding_token)
+        if claimed is not None:
+            actual = (
+                claimed.engine_epoch,
+                claimed.request_id,
+                claimed.generation,
+                claimed.schema_id,
+                claimed.profile_id,
+            )
+            if actual != expected:
+                raise ValueError("persistent_state claimed cleanup mismatch")
+            return False
+        raise ValueError("persistent_state pending cleanup lease is stale")
+
+    def mark_terminal(self, binding: Any) -> None:
+        """Record model terminality while API cleanup retains ownership."""
+        self._persistent_state_manager().mark_terminal(binding.request_id)
+
+    def persistent_state_release(
+        self,
+        operation_id: str,
+        lease: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Commit one idempotent persistent_state physical cleanup."""
+        del reason
+        manager = self._persistent_state_manager()
+        control = self._persistent_state_control()
+        previous = self._persistent_state_operation_result(control, operation_id)
+        if previous is not None:
+            return previous
+        if len(control["operations"]) + len(manager._bindings) > int(control["max_tombstones"]):
+            raise RuntimeError("persistent-state cleanup tombstone headroom was not reserved")
+        binding_token = lease["binding_token"]
+        binding = control["pending"].get(binding_token)
+        owner = "pending"
+        if binding is None:
+            binding = control["cleanup"].get(binding_token)
+            owner = "cleanup"
+        if binding is None:
+            claimed = control["claimed"].get(binding_token)
+            if claimed is not None and not manager.is_terminal(claimed.request_id):
+                raise RuntimeError("persistent-state claimed lease is still running")
+            binding = claimed
+            owner = "claimed"
+        if binding is None:
+            raise ValueError("persistent-state release lease is stale")
+        expected = (
+            str(lease["engine_epoch"]),
+            str(lease["session_key"]),
+            int(lease["generation"]),
+            str(lease["schema_id"]),
+            str(lease["profile_id"]),
+        )
+        actual = (
+            binding.engine_epoch,
+            binding.request_id,
+            binding.generation,
+            binding.schema_id,
+            binding.profile_id,
+        )
+        if actual != expected:
+            raise ValueError("persistent-state release lease mismatch")
+        control[owner].pop(binding_token)
+        control["binding_created"].pop(binding_token, None)
+        manager.drop_lease(binding.request_id)
+        generation = binding.generation
+        session_key = binding.request_id
+        control["revision"] += 1
+        result = {
+            "operation_id": operation_id,
+            "manager_revision": control["revision"],
+            "resident_count": len(manager._bindings),
+            "location_event": {
+                "engine_epoch": control["engine_epoch"],
+                "session_key": session_key,
+                "generation": generation,
+                "location": "absent",
+                "transition": "released",
+            },
+        }
+        self._record_persistent_state_operation(control, operation_id, result)
+        return result
 
     @staticmethod
     def run_stage_core(
@@ -118,6 +579,7 @@ class StageEngineCoreProc(EngineCoreProc):
         """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
+        _install_omni_platform_for_stage_core()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves

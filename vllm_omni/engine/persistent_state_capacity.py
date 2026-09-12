@@ -1,0 +1,1668 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Deployment-resolved capacity for manager-backed persistent state."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from fractions import Fraction
+from math import floor, gcd
+from types import MappingProxyType
+from typing import Literal, Protocol
+
+_INT64_MAX = 2**63 - 1
+_SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1_120)
+AdmissionPolicy = Literal["profile", "hard_cap"]
+
+
+class ServiceDemand(Protocol):
+    """A deployment-local service-demand model."""
+
+    def at(self, service_interval_ms: int) -> Fraction: ...
+
+
+@dataclass(frozen=True)
+class PoolCapacityResolution:
+    profiled_block_bound: int
+    allocated_total_blocks: int
+    allocated_real_slots: int
+    requested_count_limit: int
+    resolved_count_limit: int
+    count_was_clamped: bool
+    page_size_bytes: int
+
+
+# @spec PORT-STATE-004
+def resolve_pool_capacity(
+    *,
+    profiled_block_bound: int,
+    safety_reserve_slots: int,
+    max_resident_sessions: int | None,
+    num_gpu_blocks_override: int | None,
+    page_size_bytes: int,
+) -> PoolCapacityResolution:
+    """Resolve physical allocation separately from logical admission policy."""
+    if profiled_block_bound <= 0:
+        raise ValueError("profiled block bound must be positive")
+    if safety_reserve_slots < 0:
+        raise ValueError("safety reserve slots must be non-negative")
+    if page_size_bytes <= 0:
+        raise ValueError("persistent-state page size must be positive")
+    if max_resident_sessions is not None and max_resident_sessions <= 0:
+        raise ValueError("max resident sessions must be positive when set")
+    if num_gpu_blocks_override is not None:
+        if num_gpu_blocks_override <= 0:
+            raise ValueError("num_gpu_blocks_override must be positive")
+        if num_gpu_blocks_override > profiled_block_bound:
+            raise ValueError(
+                "requested num_gpu_blocks_override "
+                f"{num_gpu_blocks_override} exceeds profiled bound "
+                f"{profiled_block_bound} for {page_size_bytes}-byte slots"
+            )
+
+    fixed_blocks = safety_reserve_slots + 1
+    available_total = profiled_block_bound if num_gpu_blocks_override is None else num_gpu_blocks_override
+    available_real = available_total - fixed_blocks
+    if available_real < 1:
+        raise ValueError(
+            "profiled persistent-state capacity cannot fit null block, "
+            "safety reserve, and one real slot: "
+            f"bound={available_total}, page_size_bytes={page_size_bytes}"
+        )
+
+    requested_count = max_resident_sessions or available_real
+    resolved_count = min(requested_count, available_real)
+    allocated_total = available_total
+    if num_gpu_blocks_override is None and requested_count <= available_real:
+        allocated_total = requested_count + fixed_blocks
+    return PoolCapacityResolution(
+        profiled_block_bound=profiled_block_bound,
+        allocated_total_blocks=allocated_total,
+        allocated_real_slots=allocated_total - fixed_blocks,
+        requested_count_limit=requested_count,
+        resolved_count_limit=resolved_count,
+        count_was_clamped=requested_count > available_real,
+        page_size_bytes=page_size_bytes,
+    )
+
+
+@dataclass(frozen=True)
+class OnePointServiceDemand:
+    reference_interval_ms: int
+    reference_demand: Fraction
+
+    def __post_init__(self) -> None:
+        if self.reference_interval_ms <= 0:
+            raise ValueError("reference interval must be positive")
+        if self.reference_demand <= 0:
+            raise ValueError("reference demand must be positive")
+
+    # @spec PORT-STATE-025
+    def at(self, service_interval_ms: int) -> Fraction:
+        if service_interval_ms <= 0:
+            raise ValueError("service interval must be positive")
+        scale = max(
+            Fraction(1),
+            Fraction(self.reference_interval_ms, service_interval_ms),
+        )
+        return self.reference_demand * scale
+
+
+@dataclass(frozen=True)
+class TwoTermServiceDemand:
+    invocation_demand_ms: Fraction
+    audio_rate_demand: Fraction
+
+    def __post_init__(self) -> None:
+        if self.invocation_demand_ms < 0 or self.audio_rate_demand < 0:
+            raise ValueError("service-demand coefficients must be non-negative")
+
+    # @spec PORT-STATE-025
+    def at(self, service_interval_ms: int) -> Fraction:
+        if service_interval_ms <= 0:
+            raise ValueError("service interval must be positive")
+        return self.invocation_demand_ms / service_interval_ms + self.audio_rate_demand
+
+
+@dataclass(frozen=True)
+class ProvisionalServiceProfile:
+    capacity: int
+    reference_interval_ms: int
+    reference_demand: Fraction
+    source: str = "measured_fallback"
+    qualified: bool = False
+
+
+# @spec PORT-STATE-025, PORT-PERF-006
+def derive_provisional_profile(
+    *,
+    measured_sessions: int,
+    derating_factor: Fraction,
+    reference_interval_ms: int,
+) -> ProvisionalServiceProfile:
+    if measured_sessions <= 0:
+        raise ValueError("measured sessions must be positive")
+    if derating_factor <= 0:
+        raise ValueError("derating factor must be positive")
+    if reference_interval_ms <= 0:
+        raise ValueError("reference interval must be positive")
+    capacity = max(1, floor(measured_sessions * derating_factor))
+    return ProvisionalServiceProfile(
+        capacity=capacity,
+        reference_interval_ms=reference_interval_ms,
+        reference_demand=Fraction(1, capacity),
+    )
+
+
+@dataclass(frozen=True)
+class CompiledServiceDemandProfile:
+    intervals_ms: tuple[int, ...]
+    demand_units: tuple[int, ...]
+    scale: int
+    budget: int
+    maximum_charged_population: int
+    least_rational_demand: Fraction
+    aggregate_rounding_bound: Fraction
+
+    def units_at(self, service_interval_ms: int) -> int:
+        try:
+            index = self.intervals_ms.index(service_interval_ms)
+        except ValueError as exc:
+            raise ValueError(f"unsupported service interval {service_interval_ms}") from exc
+        return self.demand_units[index]
+
+
+def _ceil_fraction(value: Fraction) -> int:
+    return -(-value.numerator // value.denominator)
+
+
+# @spec PORT-STATE-025, PORT-PERF-008
+def compile_service_demand_profile(
+    source: Sequence[tuple[int, Fraction]],
+    *,
+    max_charged_population: int,
+) -> CompiledServiceDemandProfile:
+    """Compile rational demand into a signed-64-safe fixed-point profile."""
+    if max_charged_population <= 0:
+        raise ValueError("maximum charged population must be positive")
+    if not source:
+        raise ValueError("service-demand source cannot be empty")
+    intervals = tuple(interval for interval, _ in source)
+    demands = tuple(demand for _, demand in source)
+    if len(set(intervals)) != len(intervals) or any(x <= 0 for x in intervals):
+        raise ValueError("service intervals must be unique and positive")
+    if any(demand <= 0 for demand in demands):
+        raise ValueError("service demands must be positive")
+    least_demand = min(demands)
+
+    for exponent in range(62, -1, -1):
+        scale = 1 << exponent
+        units = tuple(_ceil_fraction(scale * demand) for demand in demands)
+        if max_charged_population * max(units) > _INT64_MAX:
+            continue
+        if Fraction(max_charged_population, scale) >= least_demand:
+            continue
+        return CompiledServiceDemandProfile(
+            intervals_ms=intervals,
+            demand_units=units,
+            scale=scale,
+            budget=scale,
+            maximum_charged_population=max_charged_population,
+            least_rational_demand=least_demand,
+            aggregate_rounding_bound=Fraction(
+                max_charged_population,
+                scale,
+            ),
+        )
+    raise ValueError("no power-of-two scale satisfies signed-64 range and precision")
+
+
+@dataclass(frozen=True)
+class ServiceExecutionTier:
+    tier_id: str
+    max_active_population: int
+
+    def __post_init__(self) -> None:
+        if not self.tier_id or self.max_active_population <= 0:
+            raise ValueError("service execution tier must be named and positive")
+
+
+@dataclass(frozen=True)
+class ServiceRoundExecution:
+    tier_id: str
+    active_population: int
+    elapsed_ns: int
+    service_interval_ms: int
+    geometry_id: int
+    completed_legal_parks: int
+    completed_model_rows: int | None
+    post_jit: bool
+    continuously_loaded: bool
+    dummy_run: bool
+    is_profile: bool
+    scenario_id: str = "ordinary"
+
+    def __post_init__(self) -> None:
+        if self.active_population <= 0 or self.elapsed_ns <= 0:
+            raise ValueError("service-round population and duration must be positive")
+        if self.service_interval_ms <= 0 or self.geometry_id < 0:
+            raise ValueError("service-round geometry must be valid")
+        if not self.scenario_id:
+            raise ValueError("service-round scenario must be named")
+
+
+@dataclass(frozen=True)
+class ServiceProfileContext:
+    pre_override_physical_bound: int
+    allocated_pool: int
+    count_cap: int | None
+    execution_claim_ceiling: int
+    service_budget_source: str
+    service_budget_coefficients: tuple[Fraction, ...]
+    derating_factor: Fraction | None
+    slot_bytes: int
+    execution_environment_key: str
+    precision_policy: str
+    state_profile: str
+    compiler_version: str
+    mixed_composition_policy: str
+
+
+@dataclass(frozen=True)
+class ServiceProfileCandidate:
+    execution_environment_key: str
+    precision_policy: str
+    state_profile: str
+    qualified: bool = False
+    installable: bool = False
+
+
+@dataclass(frozen=True)
+class ServiceProfileReceipt:
+    compiler_version: str
+    reference_interval_ms: int
+    reference_geometry_id: int
+    execution_tier_maxima: Mapping[str, int]
+    measured_upper_duration_ns_by_geometry_and_tier: Mapping[int, Mapping[str, int]]
+    service_interval_ms_by_geometry: Mapping[int, int]
+    expanded_duration_table_sha256: str
+    mixed_composition_policy: str
+    service_demand_scale: int
+    service_demand_units: tuple[int, ...]
+    aggregate_rounding_bound: Fraction
+    maximum_charged_population: int
+    least_rational_demand: Fraction
+    provisional_capacity: int
+    derating_factor: Fraction
+    pre_override_physical_bound: int
+    allocated_pool: int
+    count_cap: int | None
+    execution_claim_ceiling: int
+    service_budget_source: str
+    service_budget_coefficients: tuple[Fraction, ...]
+    slot_bytes: int
+    execution_environment_key: str
+    precision_policy: str
+    state_profile: str
+    receipt_sha256: str
+    evidence_class: str
+    hyperperiod_ns: int
+    window_ns: tuple[int, ...]
+    control_dominance_sha256: str | None
+    control_dominance_evidence: Mapping[str, object] | None
+    fragmentation_table_sha256: str
+    homogeneous_capacity_by_interval: Mapping[int, int]
+    admission_policy: AdmissionPolicy
+    startup_priming: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class StartupServiceProfile:
+    upper_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
+    upper_duration_ns_by_geometry_and_tier: Mapping[int, Mapping[str, int]]
+    service_interval_ms_by_geometry: Mapping[int, int]
+    diagnostic_rows_per_second_by_geometry_and_tier: Mapping[int, Mapping[str, Fraction]]
+    measured_capacity: int
+    provisional_capacity: int
+    reference_demand: Fraction
+    compiled_demand: CompiledServiceDemandProfile
+    profile_candidate: ServiceProfileCandidate
+    receipt: ServiceProfileReceipt
+    fragmentation_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
+    hyperperiod_ns: int
+    window_ns: tuple[int, ...]
+    aligned_frontier_by_interval: Mapping[int, int]
+    fragmentation_frontier_by_interval: Mapping[int, int]
+    homogeneous_capacity_by_interval: Mapping[int, int]
+    control_upper_ns_by_window_and_population: Mapping[int, tuple[int, ...]] | None
+    control_dominance_sha256: str | None
+    derating_factor: Fraction
+    evidence_class: str
+    qualified: bool
+    qualified_support_by_interval: Mapping[int, bool]
+
+
+@dataclass(frozen=True)
+class HardCapAuthority:
+    """Static, profile-free authority for bring-up and characterization."""
+
+    served_intervals_ms: tuple[int, ...]
+    effective_state_slots: int
+    configured_resident_limit: int
+    max_num_seqs: int
+    model_profile_id: str
+    service_profile_identity: None
+    execution_environment_key: str
+    precision_policy: str
+    hard_cap_envelope_sha256: str = ""
+    physical_capacity: int | None = None
+    schema_id: str | None = None
+    slot_bytes: int | None = None
+    stage: int = 0
+    replica: int = 0
+    safety_reserve: int = 0
+    controller_identity: str = ""
+    policy: Literal["hard_cap"] = "hard_cap"
+
+    def __post_init__(self) -> None:
+        if (
+            not self.served_intervals_ms
+            or len(set(self.served_intervals_ms)) != len(self.served_intervals_ms)
+            or any(interval <= 0 for interval in self.served_intervals_ms)
+        ):
+            raise ValueError("hard-cap served intervals must be positive and unique")
+        if (
+            min(
+                self.effective_state_slots,
+                self.configured_resident_limit,
+                self.max_num_seqs,
+            )
+            <= 0
+        ):
+            raise ValueError("hard-cap authorities must be positive")
+        if not self.model_profile_id:
+            raise ValueError("hard-cap model profile identity is required")
+        if not self.execution_environment_key or not self.precision_policy:
+            raise ValueError("hard-cap execution and precision identities are required")
+
+
+@dataclass(frozen=True)
+class PeriodicSchedulability:
+    """Exact result for one fixed-cardinality periodic population."""
+
+    schedulable: bool
+    binding_window_ns: int | None
+    checked_window_count: int
+    demand_ns: int
+    blocking_ns: int
+    control_ns: int
+    binding_authority: str | None
+    charged_demand_ratio: Fraction
+
+
+@dataclass(frozen=True)
+class PeriodicAdmissionHeadroom:
+    """Bounded-search result for one candidate cadence."""
+
+    headroom: int
+    predicate_evaluations: int
+
+
+@dataclass(frozen=True)
+class FixedDispatchCapacity:
+    """One fixed-cardinality projection consumed by a dispatch turn."""
+
+    hard_headroom: int
+    candidate_supported_by_interval: Mapping[int, bool]
+    nominal_dispatchable_by_interval: Mapping[int, int]
+    dispatchable_by_interval: Mapping[int, int]
+    admission_policy: AdmissionPolicy
+    charged_units: int
+    service_budget_units: int
+    execution_claims: int
+    max_num_seqs: int
+
+
+@dataclass(frozen=True)
+class HardCapDispatchCapacity:
+    """Profile-free projection from four fixed-cardinality counters."""
+
+    hard_headroom: int
+    candidate_supported_by_interval: Mapping[int, bool]
+    dispatchable_by_interval: Mapping[int, int]
+    admission_policy: Literal["hard_cap"]
+    execution_claims: int
+    max_num_seqs: int
+
+
+def _hash_json(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_tiers(
+    tiers: Sequence[ServiceExecutionTier],
+    max_population: int,
+) -> tuple[ServiceExecutionTier, ...]:
+    ordered = tuple(tiers)
+    if not ordered:
+        raise ValueError("at least one execution tier is required")
+    maxima = tuple(tier.max_active_population for tier in ordered)
+    if any(left >= right for left, right in zip(maxima, maxima[1:])):
+        raise ValueError("execution tier maxima must be strictly increasing")
+    if maxima[-1] < max_population:
+        raise ValueError(f"population {max_population} requires measured execution tier")
+    return ordered
+
+
+def _checked_int64(value: int, operation: str) -> int:
+    if value < 0 or value > _INT64_MAX:
+        raise ValueError(f"{operation} exceeds signed-64 range")
+    return value
+
+
+def _checked_add(left: int, right: int, operation: str) -> int:
+    return _checked_int64(left + right, operation)
+
+
+def _checked_multiply(left: int, right: int, operation: str) -> int:
+    return _checked_int64(left * right, operation)
+
+
+def _periodic_windows(intervals_ns: Sequence[int]) -> tuple[int, tuple[int, ...]]:
+    hyperperiod = 1
+    for interval in intervals_ns:
+        divisor = gcd(hyperperiod, interval)
+        hyperperiod = _checked_multiply(
+            hyperperiod // divisor,
+            interval,
+            "lcm/hyperperiod",
+        )
+    windows = tuple(
+        sorted({multiple for interval in intervals_ns for multiple in range(interval, hyperperiod + 1, interval)})
+    )
+    return hyperperiod, windows
+
+
+def _compile_fragmentation_table(
+    aligned: Sequence[int],
+) -> tuple[int, ...]:
+    values = [0]
+    for population in range(1, len(aligned) + 1):
+        worst = max(
+            _checked_add(
+                values[population - bucket],
+                aligned[bucket - 1],
+                "fragmentation add",
+            )
+            for bucket in range(1, population + 1)
+        )
+        values.append(worst)
+    return tuple(values[1:])
+
+
+def _frontier(table: Sequence[int], budget_ns: int) -> int:
+    return max(
+        (population for population, duration in enumerate(table, start=1) if duration <= budget_ns),
+        default=0,
+    )
+
+
+def _periodic_counts(
+    profile: StartupServiceProfile,
+    population_by_interval: Mapping[int, int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    intervals = tuple(profile.service_interval_ms_by_geometry.values())
+    if set(population_by_interval) != set(intervals):
+        raise ValueError("periodic population must cover each served interval")
+    counts = tuple(int(population_by_interval[interval]) for interval in intervals)
+    if any(count < 0 for count in counts):
+        raise ValueError("periodic population cannot be negative")
+    return intervals, counts
+
+
+# @spec PORT-STATE-026, PORT-PERF-008
+def evaluate_periodic_schedulability(
+    *,
+    profile: StartupServiceProfile,
+    population_by_interval: Mapping[int, int],
+) -> PeriodicSchedulability:
+    """Evaluate the exact compiled limited-preemption periodic predicate."""
+    intervals_ms, counts = _periodic_counts(profile, population_by_interval)
+    total_population = sum(counts)
+    maximum_population = profile.receipt.maximum_charged_population
+    if total_population > maximum_population:
+        return PeriodicSchedulability(
+            schedulable=False,
+            binding_window_ns=None,
+            checked_window_count=0,
+            demand_ns=0,
+            blocking_ns=0,
+            control_ns=0,
+            binding_authority="search_population",
+            charged_demand_ratio=Fraction(0),
+        )
+
+    geometry_by_interval = {
+        interval: geometry for geometry, interval in profile.service_interval_ms_by_geometry.items()
+    }
+    interval_ns = tuple(_checked_multiply(interval, 1_000_000, "service interval") for interval in intervals_ms)
+    demand_at_hyperperiod = 0
+    for interval, cadence_ns, count in zip(
+        intervals_ms,
+        interval_ns,
+        counts,
+    ):
+        if count == 0:
+            continue
+        geometry = geometry_by_interval[interval]
+        fragmented = profile.fragmentation_duration_ns_by_geometry_and_population[geometry][count - 1]
+        demand_at_hyperperiod = _checked_add(
+            demand_at_hyperperiod,
+            _checked_multiply(
+                profile.hyperperiod_ns // cadence_ns,
+                fragmented,
+                "hyperperiod demand",
+            ),
+            "hyperperiod demand add",
+        )
+    checked_windows = 0
+    last_demand = 0
+    last_blocking = 0
+    last_control = 0
+    numerator = profile.derating_factor.numerator
+    denominator = profile.derating_factor.denominator
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError("derating factor must be positive")
+    _checked_int64(numerator, "derating numerator")
+    _checked_int64(denominator, "derating denominator")
+
+    for window in profile.window_ns:
+        demand = 0
+        blocking = 0
+        for interval, cadence_ns, count in zip(
+            intervals_ms,
+            interval_ns,
+            counts,
+        ):
+            if count == 0:
+                continue
+            geometry = geometry_by_interval[interval]
+            fragmented = profile.fragmentation_duration_ns_by_geometry_and_population[geometry][count - 1]
+            periods = window // cadence_ns
+            demand = _checked_add(
+                demand,
+                _checked_multiply(periods, fragmented, "periodic demand"),
+                "periodic demand add",
+            )
+            if cadence_ns > window:
+                aligned = profile.upper_duration_ns_by_geometry_and_population[geometry][count - 1]
+                blocking = _checked_add(
+                    blocking,
+                    aligned,
+                    "carry-in blocking add",
+                )
+        if demand == 0:
+            continue
+        checked_windows += 1
+        control = 0
+        if profile.control_upper_ns_by_window_and_population is not None:
+            control_table = profile.control_upper_ns_by_window_and_population[window]
+            if total_population:
+                control = control_table[total_population - 1]
+        combined = _checked_add(
+            _checked_add(demand, blocking, "periodic work add"),
+            control,
+            "periodic control add",
+        )
+        required = _checked_multiply(
+            denominator,
+            combined,
+            "derating comparison multiply",
+        )
+        supplied = _checked_multiply(
+            numerator,
+            window,
+            "derating budget multiply",
+        )
+        last_demand = demand
+        last_blocking = blocking
+        last_control = control
+        if required > supplied:
+            return PeriodicSchedulability(
+                schedulable=False,
+                binding_window_ns=window,
+                checked_window_count=checked_windows,
+                demand_ns=demand,
+                blocking_ns=blocking,
+                control_ns=control,
+                binding_authority="periodic_service",
+                charged_demand_ratio=Fraction(
+                    demand_at_hyperperiod,
+                    profile.hyperperiod_ns,
+                ),
+            )
+    return PeriodicSchedulability(
+        schedulable=True,
+        binding_window_ns=None,
+        checked_window_count=checked_windows,
+        demand_ns=last_demand,
+        blocking_ns=last_blocking,
+        control_ns=last_control,
+        binding_authority=None,
+        charged_demand_ratio=Fraction(
+            demand_at_hyperperiod,
+            profile.hyperperiod_ns,
+        ),
+    )
+
+
+def _periodic_fits_counts(
+    profile: StartupServiceProfile,
+    geometry_ids: tuple[int, ...],
+    cadence_ns: tuple[int, ...],
+    counts: tuple[int, ...],
+    *,
+    candidate_index: int,
+    increment: int,
+) -> bool:
+    """Allocation-free serving predicate over fixed-cardinality arrays."""
+    total_population = sum(counts) + increment
+    if total_population > profile.receipt.maximum_charged_population:
+        return False
+    numerator = profile.derating_factor.numerator
+    denominator = profile.derating_factor.denominator
+    for window in profile.window_ns:
+        demand = 0
+        blocking = 0
+        for index, (geometry_id, interval_ns, base_count) in enumerate(zip(geometry_ids, cadence_ns, counts)):
+            count = base_count + (increment if index == candidate_index else 0)
+            if count == 0:
+                continue
+            fragmented = profile.fragmentation_duration_ns_by_geometry_and_population[geometry_id][count - 1]
+            demand = _checked_add(
+                demand,
+                _checked_multiply(
+                    window // interval_ns,
+                    fragmented,
+                    "periodic demand",
+                ),
+                "periodic demand add",
+            )
+            if interval_ns > window:
+                blocking = _checked_add(
+                    blocking,
+                    profile.upper_duration_ns_by_geometry_and_population[geometry_id][count - 1],
+                    "carry-in blocking add",
+                )
+        if demand == 0:
+            continue
+        control = 0
+        if profile.control_upper_ns_by_window_and_population is not None:
+            control = profile.control_upper_ns_by_window_and_population[window][total_population - 1]
+        combined = _checked_add(
+            _checked_add(demand, blocking, "periodic work add"),
+            control,
+            "periodic control add",
+        )
+        if _checked_multiply(
+            denominator,
+            combined,
+            "derating comparison multiply",
+        ) > _checked_multiply(
+            numerator,
+            window,
+            "derating budget multiply",
+        ):
+            return False
+    return True
+
+
+# @spec PORT-OBS-012, PORT-PERF-008
+def periodic_admission_headroom(
+    *,
+    profile: StartupServiceProfile,
+    population_by_interval: Mapping[int, int],
+    candidate_interval_ms: int,
+    hard_headroom: int,
+) -> PeriodicAdmissionHeadroom:
+    """Find exact additional cadence capacity with bounded bisection."""
+    intervals, counts = _periodic_counts(profile, population_by_interval)
+    if candidate_interval_ms not in intervals:
+        raise ValueError("candidate interval is not served")
+    if hard_headroom < 0:
+        raise ValueError("hard headroom cannot be negative")
+    maximum = min(
+        hard_headroom,
+        profile.receipt.maximum_charged_population - sum(counts),
+    )
+    geometry_ids = tuple(profile.service_interval_ms_by_geometry)
+    cadence_ns = tuple(_checked_multiply(interval, 1_000_000, "service interval") for interval in intervals)
+    candidate_index = intervals.index(candidate_interval_ms)
+    low = 0
+    high = max(0, maximum)
+    evaluations = 0
+    while low < high:
+        middle = (low + high + 1) // 2
+        evaluations += 1
+        if _periodic_fits_counts(
+            profile,
+            geometry_ids,
+            cadence_ns,
+            counts,
+            candidate_index=candidate_index,
+            increment=middle,
+        ):
+            low = middle
+        else:
+            high = middle - 1
+    return PeriodicAdmissionHeadroom(
+        headroom=low,
+        predicate_evaluations=evaluations,
+    )
+
+
+# @spec PORT-PERF-006, PORT-PERF-008
+def compile_provisional_service_profile(
+    executions: Sequence[ServiceRoundExecution],
+    *,
+    execution_tiers: Sequence[ServiceExecutionTier],
+    max_population: int,
+    reference_interval_ms: int,
+    reference_geometry_id: int,
+    admitted_geometry_ids: Sequence[int],
+    trailing_rounds: int,
+    derating_factor: Fraction,
+    context: ServiceProfileContext,
+    admission_policy: AdmissionPolicy = "profile",
+    startup_priming_receipt: Mapping[str, object] | None = None,
+    control_upper_ns_by_window_and_population: Mapping[int, Sequence[int]] | None = None,
+    control_dominance_sha256: str | None = None,
+    evidence_class: str = "probe",
+) -> StartupServiceProfile:
+    """Compile complete post-JIT legal-park rounds into startup authority."""
+    if admission_policy not in {"profile", "hard_cap"}:
+        raise ValueError("unknown persistent-state admission policy")
+    if admission_policy == "hard_cap":
+        raise ValueError("hard_cap is profile-free and cannot invoke the service-profile compiler")
+    if max_population <= 0 or trailing_rounds <= 0:
+        raise ValueError("population and trailing-round counts must be positive")
+    if derating_factor <= 0:
+        raise ValueError("derating factor must be positive")
+    if context.derating_factor not in {None, derating_factor}:
+        raise ValueError("context and compiler derating factors disagree")
+    if context.mixed_composition_policy != "periodic_limited_preemption_edf":
+        raise ValueError("startup requires the periodic mixed-composition policy")
+    tiers = _validate_tiers(execution_tiers, max_population)
+    geometries = tuple(admitted_geometry_ids)
+    if len(set(geometries)) != len(geometries) or not geometries:
+        raise ValueError("admitted geometries must be unique and non-empty")
+    if reference_geometry_id not in geometries:
+        raise ValueError("reference geometry must be admitted")
+    samples = tuple(executions)
+    if any(sample.dummy_run or sample.is_profile for sample in samples):
+        raise ValueError("service priming cannot use dummy/profile executions")
+
+    upper_by_tier: dict[int, dict[str, int]] = {}
+    row_rates: dict[int, dict[str, Fraction]] = {}
+    geometry_intervals: dict[int, int] = {}
+    for geometry_id in geometries:
+        upper_by_tier[geometry_id] = {}
+        row_rates[geometry_id] = {}
+        for tier in tiers:
+            matching = tuple(
+                sample
+                for sample in samples
+                if sample.geometry_id == geometry_id
+                and sample.scenario_id == "ordinary"
+                and sample.tier_id == tier.tier_id
+                and sample.active_population == tier.max_active_population
+                and sample.post_jit
+            )
+            if len(matching) < trailing_rounds:
+                underfilled = any(
+                    sample.geometry_id == geometry_id and sample.tier_id == tier.tier_id for sample in samples
+                )
+                if underfilled:
+                    raise ValueError(
+                        f"geometry {geometry_id} tier {tier.tier_id} is "
+                        f"underfilled; active population must equal maximum "
+                        f"{tier.max_active_population}"
+                    )
+                raise ValueError(f"missing geometry {geometry_id} tier {tier.tier_id}")
+            trailing = matching[-trailing_rounds:]
+            if any(not sample.continuously_loaded for sample in trailing):
+                raise ValueError("service priming rounds must be continuously loaded")
+            if any(sample.completed_legal_parks != sample.active_population for sample in trailing):
+                raise ValueError("each complete round must reach one legal park per lease")
+            intervals = {sample.service_interval_ms for sample in trailing}
+            if len(intervals) != 1:
+                raise ValueError("geometry has inconsistent service intervals")
+            interval = next(iter(intervals))
+            old_interval = geometry_intervals.setdefault(geometry_id, interval)
+            if old_interval != interval:
+                raise ValueError("geometry has inconsistent service intervals")
+            upper_by_tier[geometry_id][tier.tier_id] = max(sample.elapsed_ns for sample in trailing)
+            if all(sample.completed_model_rows is not None for sample in trailing):
+                completed_rows = sum(int(sample.completed_model_rows or 0) for sample in trailing)
+                elapsed_ns = sum(sample.elapsed_ns for sample in trailing)
+                row_rates[geometry_id][tier.tier_id] = Fraction(
+                    completed_rows * 1_000_000_000,
+                    elapsed_ns,
+                )
+
+    expanded: dict[int, tuple[int, ...]] = {}
+    for geometry_id in geometries:
+        prefix = 0
+        tier_uppers: list[tuple[int, int]] = []
+        for tier in tiers:
+            prefix = max(prefix, upper_by_tier[geometry_id][tier.tier_id])
+            tier_uppers.append((tier.max_active_population, prefix))
+        expanded[geometry_id] = tuple(
+            next(value for maximum, value in tier_uppers if population <= maximum)
+            for population in range(1, max_population + 1)
+        )
+
+    if evidence_class != "probe":
+        raise ValueError("qualified service support requires public-speech evidence")
+    _checked_int64(derating_factor.numerator, "derating numerator")
+    _checked_int64(derating_factor.denominator, "derating denominator")
+    interval_ns_by_geometry = {
+        geometry_id: _checked_multiply(
+            interval,
+            1_000_000,
+            "service interval",
+        )
+        for geometry_id, interval in geometry_intervals.items()
+    }
+    hyperperiod_ns, window_ns = _periodic_windows(tuple(interval_ns_by_geometry.values()))
+    fragmentation = {geometry_id: _compile_fragmentation_table(table) for geometry_id, table in expanded.items()}
+    aligned_frontier = {
+        geometry_intervals[geometry_id]: _frontier(
+            expanded[geometry_id],
+            interval_ns_by_geometry[geometry_id],
+        )
+        for geometry_id in geometries
+    }
+    fragmentation_frontier = {
+        geometry_intervals[geometry_id]: _frontier(
+            fragmentation[geometry_id],
+            interval_ns_by_geometry[geometry_id],
+        )
+        for geometry_id in geometries
+    }
+
+    def ordinary_homogeneous_schedulable(
+        geometry_id: int,
+        population: int,
+    ) -> bool:
+        cadence_ns = interval_ns_by_geometry[geometry_id]
+        for window in window_ns:
+            demand = _checked_multiply(
+                window // cadence_ns,
+                fragmentation[geometry_id][population - 1],
+                "ordinary homogeneous periodic demand",
+            )
+            if demand == 0:
+                continue
+            if _checked_multiply(
+                derating_factor.denominator,
+                demand,
+                "ordinary derating comparison multiply",
+            ) > _checked_multiply(
+                derating_factor.numerator,
+                window,
+                "ordinary derating budget multiply",
+            ):
+                return False
+        return True
+
+    control_table: dict[int, tuple[int, ...]] | None = None
+    control_dominance_evidence: dict[str, object] | None = None
+    if control_upper_ns_by_window_and_population is not None:
+        if set(control_upper_ns_by_window_and_population) != set(window_ns):
+            raise ValueError("control table must cover every periodic window")
+        control_table = {}
+        for window in window_ns:
+            values = tuple(control_upper_ns_by_window_and_population[window])
+            if len(values) < max_population:
+                raise ValueError("control table lacks population coverage")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _INT64_MAX
+                for value in values
+            ):
+                raise ValueError("control table values must be signed-64 safe")
+            if any(left > right for left, right in zip(values, values[1:])):
+                raise ValueError("control table must be monotone")
+            control_table[window] = values[:max_population]
+    elif control_dominance_sha256 is None:
+        scenario_ids = (
+            "forced_eou_then_chunk",
+            "final_tail_then_flush",
+        )
+        evidence_cells: list[dict[str, object]] = []
+        for geometry_id in geometries:
+            preceding_maximum = 0
+            for tier in tiers:
+                governed_populations = tuple(
+                    range(
+                        preceding_maximum + 1,
+                        min(tier.max_active_population, max_population) + 1,
+                    )
+                )
+                feasible_populations = tuple(
+                    population
+                    for population in governed_populations
+                    if ordinary_homogeneous_schedulable(
+                        geometry_id,
+                        population,
+                    )
+                )
+                admission_relevant = bool(feasible_populations)
+                preceding_maximum = tier.max_active_population
+                ordinary_upper = expanded[geometry_id][tier.max_active_population - 1]
+                for scenario_id in scenario_ids:
+                    matching = tuple(
+                        sample
+                        for sample in samples
+                        if sample.geometry_id == geometry_id
+                        and sample.scenario_id == scenario_id
+                        and sample.tier_id == tier.tier_id
+                        and sample.active_population == tier.max_active_population
+                        and sample.post_jit
+                    )
+                    if len(matching) < trailing_rounds:
+                        raise ValueError(
+                            "missing control-dominance canary "
+                            f"{scenario_id} for geometry {geometry_id} "
+                            f"tier {tier.tier_id}"
+                        )
+                    trailing = matching[-trailing_rounds:]
+                    if any(not sample.continuously_loaded for sample in trailing):
+                        raise ValueError("control-dominance canaries must be continuously loaded")
+                    expected_parks = 2 * tier.max_active_population
+                    if any(sample.completed_legal_parks != expected_parks for sample in trailing):
+                        raise ValueError("control-dominance canary must complete two legal parks per lease")
+                    if any(sample.service_interval_ms != geometry_intervals[geometry_id] for sample in trailing):
+                        raise ValueError("control-dominance canary interval disagrees with ordinary evidence")
+                    scenario_upper = max(sample.elapsed_ns for sample in trailing)
+                    left = _checked_multiply(
+                        derating_factor.numerator,
+                        scenario_upper,
+                        "control-dominance canary multiply",
+                    )
+                    right = _checked_multiply(
+                        derating_factor.denominator,
+                        ordinary_upper,
+                        "control-dominance ordinary multiply",
+                    )
+                    dominance_passed = left <= right
+                    if admission_relevant and not dominance_passed:
+                        raise ValueError(
+                            "control-dominance failed for "
+                            f"{scenario_id} geometry {geometry_id} tier "
+                            f"{tier.tier_id}: {left} > {right}"
+                        )
+                    evidence_cells.append(
+                        {
+                            "scenario_id": scenario_id,
+                            "geometry_id": geometry_id,
+                            "tier_id": tier.tier_id,
+                            "active_population": tier.max_active_population,
+                            "scenario_upper_ns": scenario_upper,
+                            "trailing_observations_ns": tuple(sample.elapsed_ns for sample in trailing),
+                            "ordinary_upper_ns": ordinary_upper,
+                            "derating_numerator": (derating_factor.numerator),
+                            "derating_denominator": (derating_factor.denominator),
+                            "left": left,
+                            "right": right,
+                            "governed_populations": governed_populations,
+                            "ordinary_feasible_populations": (feasible_populations),
+                            "admission_relevant": admission_relevant,
+                            "dominance_passed": dominance_passed,
+                        }
+                    )
+        control_dominance_evidence = {
+            "version": "derated-control-dominance-v2",
+            "compiler_version": context.compiler_version,
+            "execution_environment_key": (context.execution_environment_key),
+            "precision_policy": context.precision_policy,
+            "state_profile": context.state_profile,
+            "startup_priming": (
+                None
+                if startup_priming_receipt is None
+                else tuple(sorted((str(key), value) for key, value in startup_priming_receipt.items()))
+            ),
+            "scenario_ids": scenario_ids,
+            "cells": tuple(evidence_cells),
+        }
+        control_dominance_sha256 = _hash_json(control_dominance_evidence)
+    elif len(control_dominance_sha256) != 64:
+        raise ValueError("measured control-dominance identity must be sha256")
+
+    def homogeneous_schedulable(geometry_id: int, population: int) -> bool:
+        if control_table is None:
+            return ordinary_homogeneous_schedulable(
+                geometry_id,
+                population,
+            )
+        cadence_ns = interval_ns_by_geometry[geometry_id]
+        for window in window_ns:
+            demand = _checked_multiply(
+                window // cadence_ns,
+                fragmentation[geometry_id][population - 1],
+                "homogeneous periodic demand",
+            )
+            if demand == 0:
+                continue
+            blocking = expanded[geometry_id][population - 1] if cadence_ns > window else 0
+            control = 0 if control_table is None else control_table[window][population - 1]
+            combined = _checked_add(
+                _checked_add(demand, blocking, "homogeneous work add"),
+                control,
+                "homogeneous control add",
+            )
+            if _checked_multiply(
+                derating_factor.denominator,
+                combined,
+                "derating comparison multiply",
+            ) > _checked_multiply(
+                derating_factor.numerator,
+                window,
+                "derating budget multiply",
+            ):
+                return False
+        return True
+
+    homogeneous_capacity = {
+        geometry_intervals[geometry_id]: max(
+            (
+                population
+                for population in range(1, max_population + 1)
+                if homogeneous_schedulable(geometry_id, population)
+            ),
+            default=0,
+        )
+        for geometry_id in geometries
+    }
+
+    if geometry_intervals[reference_geometry_id] != reference_interval_ms:
+        raise ValueError("reference geometry does not match reference interval")
+    reference_upper = expanded[reference_geometry_id]
+    interval_ns = reference_interval_ms * 1_000_000
+    measured_capacity = max(
+        (population for population, duration in enumerate(reference_upper, start=1) if duration <= interval_ns),
+        default=0,
+    )
+    if measured_capacity == 0 and admission_policy == "profile":
+        raise ValueError(
+            "reference service interval "
+            f"{reference_interval_ms}ms cannot support one session; "
+            "measured population-one upper duration is "
+            f"{reference_upper[0]}ns"
+        )
+    # The legacy scalar fields remain serialization compatibility only.  The
+    # periodic authority may correctly report a zero homogeneous frontier;
+    # keep the retired scalar denominator defined without turning it into a
+    # serving gate.
+    provisional = max(1, homogeneous_capacity[reference_interval_ms])
+    reference_demand = Fraction(1, provisional)
+    demand_model = OnePointServiceDemand(reference_interval_ms, reference_demand)
+    demand_source = tuple(
+        (
+            geometry_intervals[geometry_id],
+            demand_model.at(geometry_intervals[geometry_id]),
+        )
+        for geometry_id in geometries
+    )
+    compiled = compile_service_demand_profile(
+        demand_source,
+        max_charged_population=max_population,
+    )
+    expanded_hash = _hash_json({str(key): list(value) for key, value in expanded.items()})
+    fragmentation_hash = _hash_json({str(key): list(value) for key, value in fragmentation.items()})
+    tier_maxima = {tier.tier_id: tier.max_active_population for tier in tiers}
+    candidate = ServiceProfileCandidate(
+        execution_environment_key=context.execution_environment_key,
+        precision_policy=context.precision_policy,
+        state_profile=context.state_profile,
+    )
+    receipt_payload = {
+        "compiler_version": context.compiler_version,
+        "reference_interval_ms": reference_interval_ms,
+        "reference_geometry_id": reference_geometry_id,
+        "execution_tier_maxima": tier_maxima,
+        "service_interval_ms_by_geometry": geometry_intervals,
+        "upper": upper_by_tier,
+        "expanded_sha256": expanded_hash,
+        "fragmentation_sha256": fragmentation_hash,
+        "hyperperiod_ns": hyperperiod_ns,
+        "window_ns": window_ns,
+        "control_dominance_sha256": control_dominance_sha256,
+        "control_dominance_evidence": control_dominance_evidence,
+        "homogeneous_capacity_by_interval": homogeneous_capacity,
+        "evidence_class": evidence_class,
+        "admission_policy": admission_policy,
+        "mixed_composition_policy": context.mixed_composition_policy,
+        "scale": compiled.scale,
+        "demand_units": compiled.demand_units,
+        "provisional_capacity": provisional,
+        "derating_factor": str(derating_factor),
+        "context": {
+            key: str(value) if isinstance(value, Fraction) else value for key, value in asdict(context).items()
+        },
+    }
+    if startup_priming_receipt is not None:
+        receipt_payload["startup_priming"] = dict(startup_priming_receipt)
+    receipt_hash = _hash_json(receipt_payload)
+    receipt = ServiceProfileReceipt(
+        compiler_version=context.compiler_version,
+        reference_interval_ms=reference_interval_ms,
+        reference_geometry_id=reference_geometry_id,
+        execution_tier_maxima=tier_maxima,
+        measured_upper_duration_ns_by_geometry_and_tier=upper_by_tier,
+        service_interval_ms_by_geometry=geometry_intervals,
+        expanded_duration_table_sha256=expanded_hash,
+        mixed_composition_policy=context.mixed_composition_policy,
+        service_demand_scale=compiled.scale,
+        service_demand_units=compiled.demand_units,
+        aggregate_rounding_bound=compiled.aggregate_rounding_bound,
+        maximum_charged_population=max_population,
+        least_rational_demand=compiled.least_rational_demand,
+        provisional_capacity=provisional,
+        derating_factor=derating_factor,
+        pre_override_physical_bound=context.pre_override_physical_bound,
+        allocated_pool=context.allocated_pool,
+        count_cap=context.count_cap,
+        execution_claim_ceiling=context.execution_claim_ceiling,
+        service_budget_source=context.service_budget_source,
+        service_budget_coefficients=context.service_budget_coefficients,
+        slot_bytes=context.slot_bytes,
+        execution_environment_key=context.execution_environment_key,
+        precision_policy=context.precision_policy,
+        state_profile=context.state_profile,
+        receipt_sha256=receipt_hash,
+        evidence_class=evidence_class,
+        hyperperiod_ns=hyperperiod_ns,
+        window_ns=window_ns,
+        control_dominance_sha256=control_dominance_sha256,
+        control_dominance_evidence=(
+            None if control_dominance_evidence is None else MappingProxyType(dict(control_dominance_evidence))
+        ),
+        fragmentation_table_sha256=fragmentation_hash,
+        homogeneous_capacity_by_interval=MappingProxyType(dict(homogeneous_capacity)),
+        startup_priming=(None if startup_priming_receipt is None else MappingProxyType(dict(startup_priming_receipt))),
+        admission_policy=admission_policy,
+    )
+    return StartupServiceProfile(
+        upper_duration_ns_by_geometry_and_population=expanded,
+        upper_duration_ns_by_geometry_and_tier=upper_by_tier,
+        service_interval_ms_by_geometry=geometry_intervals,
+        diagnostic_rows_per_second_by_geometry_and_tier=row_rates,
+        measured_capacity=measured_capacity,
+        provisional_capacity=provisional,
+        reference_demand=reference_demand,
+        compiled_demand=compiled,
+        profile_candidate=candidate,
+        receipt=receipt,
+        fragmentation_duration_ns_by_geometry_and_population=MappingProxyType(dict(fragmentation)),
+        hyperperiod_ns=hyperperiod_ns,
+        window_ns=window_ns,
+        aligned_frontier_by_interval=MappingProxyType(dict(aligned_frontier)),
+        fragmentation_frontier_by_interval=MappingProxyType(dict(fragmentation_frontier)),
+        homogeneous_capacity_by_interval=MappingProxyType(dict(homogeneous_capacity)),
+        control_upper_ns_by_window_and_population=(
+            None if control_table is None else MappingProxyType(dict(control_table))
+        ),
+        control_dominance_sha256=control_dominance_sha256,
+        derating_factor=derating_factor,
+        evidence_class=evidence_class,
+        qualified=False,
+        qualified_support_by_interval=MappingProxyType({interval: False for interval in geometry_intervals.values()}),
+    )
+
+
+# @spec PORT-STATE-026, PORT-PERF-008
+def fallback_transaction_duration_ns(
+    *,
+    resident_counts_by_geometry: Sequence[int],
+    homogeneous_upper_duration_ns_by_geometry: Sequence[Sequence[int]],
+    mixed_composition_policy: str,
+) -> int:
+    counts = tuple(resident_counts_by_geometry)
+    tables = tuple(tuple(table) for table in homogeneous_upper_duration_ns_by_geometry)
+    if len(counts) != len(tables) or any(count < 0 for count in counts):
+        raise ValueError("geometry counts and duration tables must align")
+    populated = sum(count > 0 for count in counts)
+    if mixed_composition_policy == "homogeneous_only" and populated > 1:
+        raise ValueError("homogeneous-only profile cannot admit a mixed pool")
+    if mixed_composition_policy not in {
+        "homogeneous_only",
+        "homogeneous_upper_sum",
+    }:
+        raise ValueError("unknown mixed composition policy")
+    total = 0
+    for count, table in zip(counts, tables):
+        if count > len(table):
+            raise ValueError("population exceeds measured homogeneous table")
+        if count:
+            total += table[count - 1]
+    return total
+
+
+# @spec PORT-STATE-004, PORT-STATE-026, PORT-STATE-027, PORT-PERF-008
+def project_fixed_dispatch_capacity(
+    *,
+    profile: StartupServiceProfile | None = None,
+    inventory: Mapping[str, object] | None = None,
+    resident_counts_by_interval: Mapping[int, int] | None = None,
+    submitted_counts_by_interval: Mapping[int, int] | None = None,
+    authority_open: bool,
+    admission_policy: AdmissionPolicy | None = None,
+    startup_authority: HardCapAuthority | None = None,
+    state_resident: int | None = None,
+    state_submitted: int | None = None,
+    execution_committed: int | None = None,
+    execution_submitted: int | None = None,
+) -> FixedDispatchCapacity | HardCapDispatchCapacity:
+    """Project one dispatch decision from bounded counters and table lookups.
+
+    The serving path never calls the population-shaped rational oracle. It
+    charges the compiled integer profile and evaluates at most one candidate
+    per cadence against the immutable homogeneous upper-duration tables.
+    Each cadence result is the exact additional count admitted by the
+    compiled integer budget and monotone duration table. It uses one binary
+    search per cadence, never a loop over resident or pending sessions.
+    """
+
+    if startup_authority is not None:
+        if profile is not None or inventory is not None:
+            raise ValueError("hard-cap and profile projection inputs cannot mix")
+        values = (
+            state_resident,
+            state_submitted,
+            execution_committed,
+            execution_submitted,
+        )
+        if any(value is None or value < 0 for value in values):
+            raise ValueError("hard-cap counters must be non-negative integers")
+        assert state_resident is not None
+        assert state_submitted is not None
+        assert execution_committed is not None
+        assert execution_submitted is not None
+        state_used = state_resident + state_submitted
+        execution_used = execution_committed + execution_submitted
+        hard = max(
+            0,
+            min(
+                startup_authority.effective_state_slots - state_used,
+                startup_authority.configured_resident_limit - state_used,
+                startup_authority.max_num_seqs - execution_used,
+            ),
+        )
+        visible = hard if authority_open else 0
+        return HardCapDispatchCapacity(
+            hard_headroom=visible,
+            candidate_supported_by_interval=dict.fromkeys(
+                startup_authority.served_intervals_ms,
+                True,
+            ),
+            dispatchable_by_interval=dict.fromkeys(
+                startup_authority.served_intervals_ms,
+                visible,
+            ),
+            admission_policy="hard_cap",
+            execution_claims=execution_used,
+            max_num_seqs=startup_authority.max_num_seqs,
+        )
+
+    if profile is None or inventory is None:
+        raise ValueError("profile projection requires profile and inventory")
+    if resident_counts_by_interval is None or submitted_counts_by_interval is None:
+        raise ValueError("profile projection requires cadence counters")
+    if admission_policy != "profile":
+        raise ValueError("unknown persistent-state admission policy")
+    intervals = profile.compiled_demand.intervals_ms
+    if (
+        not 1 <= len(intervals) <= len(_SERVICE_INTERVALS_MS)
+        or len(set(intervals)) != len(intervals)
+        or any(interval <= 0 for interval in intervals)
+    ):
+        raise ValueError("compiled service profile must cover one to five unique intervals")
+    interval_to_geometry: dict[int, int] = {}
+    for geometry_id, interval in profile.service_interval_ms_by_geometry.items():
+        if interval in interval_to_geometry:
+            raise ValueError("service interval must identify exactly one profiled geometry")
+        interval_to_geometry[interval] = geometry_id
+    if set(interval_to_geometry) != set(intervals):
+        raise ValueError("service profile lacks an admitted interval geometry")
+
+    if set(resident_counts_by_interval) != set(intervals) or set(submitted_counts_by_interval) != set(intervals):
+        raise ValueError("capacity counters must cover each admitted interval")
+    counts = {
+        interval: int(resident_counts_by_interval[interval]) + int(submitted_counts_by_interval[interval])
+        for interval in intervals
+    }
+    if any(count < 0 for count in counts.values()):
+        raise ValueError("capacity counters cannot be negative")
+
+    def inventory_int(name: str, default: int | None = None) -> int:
+        value = inventory.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"capacity inventory {name} must be an integer")
+        return value
+
+    resident_count = inventory_int("resident_count")
+    if resident_count != sum(resident_counts_by_interval.values()):
+        raise ValueError("manager resident inventory and API cadence charges disagree")
+    submitted_count = sum(submitted_counts_by_interval.values())
+    execution_claims = resident_count + submitted_count
+    allocated_slots = inventory_int("effective_capacity")
+    count_limit = min(
+        allocated_slots,
+        inventory_int("configured_limit", allocated_slots),
+    )
+    max_num_seqs = profile.receipt.execution_claim_ceiling
+    hard = max(
+        0,
+        min(
+            allocated_slots - resident_count - submitted_count,
+            count_limit - resident_count - submitted_count,
+            max_num_seqs - execution_claims,
+            profile.receipt.maximum_charged_population - execution_claims,
+        ),
+    )
+    current = evaluate_periodic_schedulability(
+        profile=profile,
+        population_by_interval=counts,
+    )
+    demand_at_hyperperiod = current.charged_demand_ratio * profile.hyperperiod_ns
+    if demand_at_hyperperiod.denominator != 1:
+        raise ValueError("hyperperiod demand must compile to integer nanoseconds")
+    charged = _checked_multiply(
+        profile.derating_factor.denominator,
+        demand_at_hyperperiod.numerator,
+        "service demand receipt",
+    )
+    budget = _checked_multiply(
+        profile.derating_factor.numerator,
+        profile.hyperperiod_ns,
+        "service budget receipt",
+    )
+    supported: dict[int, bool] = {}
+    nominal_dispatchable: dict[int, int] = {}
+    for interval in intervals:
+        candidate = {current_interval: 0 for current_interval in intervals}
+        candidate[interval] = 1
+        candidate_supported = evaluate_periodic_schedulability(
+            profile=profile,
+            population_by_interval=candidate,
+        ).schedulable
+        supported[interval] = candidate_supported
+        nominal_dispatchable[interval] = (
+            periodic_admission_headroom(
+                profile=profile,
+                population_by_interval=counts,
+                candidate_interval_ms=interval,
+                hard_headroom=hard,
+            ).headroom
+            if authority_open and candidate_supported
+            else 0
+        )
+    dispatchable = nominal_dispatchable
+    return FixedDispatchCapacity(
+        hard_headroom=hard if authority_open else 0,
+        candidate_supported_by_interval=supported,
+        nominal_dispatchable_by_interval=nominal_dispatchable,
+        dispatchable_by_interval=dispatchable,
+        admission_policy=admission_policy,
+        charged_units=charged,
+        service_budget_units=budget,
+        execution_claims=execution_claims,
+        max_num_seqs=max_num_seqs,
+    )
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    candidate_supported: bool
+    hard_feasible: bool
+    nominal_dispatchable: bool
+    binding_authority: str | None
+    nominal_reason: str | None
+    hard_headroom: int
+
+
+@dataclass(frozen=True)
+class AdmissionHeadroom:
+    hard: int
+    nominal: int
+
+
+TransactionDuration = Callable[[tuple[int, ...]], Fraction]
+
+
+def _candidate_index(candidate_interval_ms: int) -> int:
+    try:
+        return _SERVICE_INTERVALS_MS.index(candidate_interval_ms)
+    except ValueError as exc:
+        raise ValueError(f"unsupported service interval {candidate_interval_ms}") from exc
+
+
+def _next_counts(
+    resident: Sequence[int],
+    reserved: Sequence[int],
+    candidate_index: int,
+    count: int = 1,
+) -> tuple[int, ...]:
+    if len(resident) != len(_SERVICE_INTERVALS_MS) or len(reserved) != len(_SERVICE_INTERVALS_MS):
+        raise ValueError("capacity histograms must cover every service interval")
+    values = [left + right for left, right in zip(resident, reserved)]
+    values[candidate_index] += count
+    return tuple(values)
+
+
+# @spec PORT-STATE-004, PORT-STATE-024, PORT-STATE-025, PORT-STATE-026
+def evaluate_admission(
+    *,
+    resident_counts_by_interval: Sequence[int],
+    reserved_counts_by_interval: Sequence[int],
+    candidate_interval_ms: int,
+    allocated_slots: int,
+    count_limit: int,
+    resident_count: int,
+    reserved_count: int,
+    execution_claims: int,
+    max_num_seqs: int,
+    charged_demand: Fraction,
+    service_budget: Fraction,
+    candidate_demand: Fraction,
+    transaction_duration_ms: TransactionDuration,
+) -> AdmissionDecision:
+    index = _candidate_index(candidate_interval_ms)
+    hard_headroom = max(
+        0,
+        min(
+            allocated_slots - resident_count - reserved_count,
+            count_limit - resident_count - reserved_count,
+            max_num_seqs - execution_claims,
+        ),
+    )
+    candidate_counts = tuple(1 if position == index else 0 for position in range(5))
+    candidate_supported = (
+        candidate_demand <= service_budget and transaction_duration_ms(candidate_counts) <= candidate_interval_ms
+    )
+    if not candidate_supported:
+        return AdmissionDecision(
+            candidate_supported=False,
+            hard_feasible=False,
+            nominal_dispatchable=False,
+            binding_authority="candidate_alone",
+            nominal_reason=None,
+            hard_headroom=hard_headroom,
+        )
+    authority = None
+    if allocated_slots <= resident_count + reserved_count:
+        authority = "physical_slots"
+    elif count_limit <= resident_count + reserved_count:
+        authority = "logical_count"
+    elif max_num_seqs <= execution_claims:
+        authority = "execution_claims"
+    if authority is not None:
+        return AdmissionDecision(
+            candidate_supported=True,
+            hard_feasible=False,
+            nominal_dispatchable=False,
+            binding_authority=authority,
+            nominal_reason=None,
+            hard_headroom=hard_headroom,
+        )
+    counts = _next_counts(
+        resident_counts_by_interval,
+        reserved_counts_by_interval,
+        index,
+    )
+    if charged_demand + candidate_demand > service_budget:
+        nominal_reason = "service_budget"
+    elif transaction_duration_ms(counts) > min(
+        interval for interval, count in zip(_SERVICE_INTERVALS_MS, counts) if count
+    ):
+        nominal_reason = "transaction_time"
+    else:
+        nominal_reason = None
+    return AdmissionDecision(
+        candidate_supported=True,
+        hard_feasible=True,
+        nominal_dispatchable=nominal_reason is None,
+        binding_authority=None,
+        nominal_reason=nominal_reason,
+        hard_headroom=hard_headroom,
+    )
+
+
+# @spec PORT-OBS-012, PORT-PERF-008
+def admission_headroom(
+    *,
+    resident_counts_by_interval: Sequence[int],
+    reserved_counts_by_interval: Sequence[int],
+    candidate_interval_ms: int,
+    allocated_slots: int,
+    count_limit: int,
+    resident_count: int,
+    reserved_count: int,
+    execution_claims: int,
+    max_num_seqs: int,
+    charged_demand: Fraction,
+    service_budget: Fraction,
+    candidate_demand: Fraction,
+    transaction_duration_ms: TransactionDuration,
+) -> AdmissionHeadroom:
+    index = _candidate_index(candidate_interval_ms)
+    hard = max(
+        0,
+        min(
+            allocated_slots - resident_count - reserved_count,
+            count_limit - resident_count - reserved_count,
+            max_num_seqs - execution_claims,
+        ),
+    )
+    if hard == 0 or candidate_demand <= 0:
+        return AdmissionHeadroom(hard=hard, nominal=0)
+    budget_room = max(Fraction(), service_budget - charged_demand)
+    budget_cap = floor(budget_room / candidate_demand)
+    upper = min(hard, budget_cap)
+    if upper <= 0:
+        return AdmissionHeadroom(hard=hard, nominal=0)
+
+    def fits(count: int) -> bool:
+        counts = _next_counts(
+            resident_counts_by_interval,
+            reserved_counts_by_interval,
+            index,
+            count,
+        )
+        deadline = min(interval for interval, population in zip(_SERVICE_INTERVALS_MS, counts) if population)
+        return transaction_duration_ms(counts) <= deadline
+
+    low, high = 0, upper
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if fits(midpoint):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return AdmissionHeadroom(hard=hard, nominal=low)
+
+
+@dataclass(frozen=True)
+class AdmissionClaim:
+    lease_key: str
+    service_interval_ms: int
+    demand: Fraction
+
+
+@dataclass(frozen=True)
+class AdmissionSnapshot:
+    execution_claims: int
+    charged_demand: Fraction
+    intervals_ms: tuple[int, ...]
+
+
+class PersistentStateAdmissionController:
+    """Compatibility authority for exact-rational admission tests."""
+
+    # @spec PORT-STATE-004, PORT-STATE-025
+    def __init__(
+        self,
+        *,
+        allocated_slots: int,
+        count_limit: int,
+        max_num_seqs: int,
+        service_budget: Fraction,
+        demand_model: ServiceDemand,
+        transaction_duration_ms: Callable[[Sequence[int]], Fraction],
+        service_source: str = "measured_fallback",
+    ) -> None:
+        if service_source not in {"qualified_profile", "measured_fallback"}:
+            raise ValueError("unknown service-budget source")
+        self._demand_model = demand_model
+        self._claims: dict[str, AdmissionClaim] = {}
+
+    @property
+    def snapshot(self) -> AdmissionSnapshot:
+        claims = tuple(self._claims.values())
+        return AdmissionSnapshot(
+            execution_claims=len(claims),
+            charged_demand=sum(
+                (claim.demand for claim in claims),
+                Fraction(),
+            ),
+            intervals_ms=tuple(claim.service_interval_ms for claim in claims),
+        )
+
+    def reserve(self, lease_key: str, *, service_interval_ms: int) -> AdmissionClaim:
+        if lease_key in self._claims:
+            raise ValueError(f"duplicate persistent-state claim {lease_key!r}")
+        claim = AdmissionClaim(
+            lease_key,
+            service_interval_ms,
+            self._demand_model.at(service_interval_ms),
+        )
+        self._claims[lease_key] = claim
+        return claim
+
+    def park(self, claim: AdmissionClaim) -> None:
+        if self._claims.get(claim.lease_key) != claim:
+            raise ValueError("unknown persistent-state admission claim")
+
+    def release(self, claim: AdmissionClaim) -> None:
+        if self._claims.get(claim.lease_key) == claim:
+            del self._claims[claim.lease_key]

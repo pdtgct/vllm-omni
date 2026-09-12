@@ -17,9 +17,8 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
-    EngineCoreOutput,
-    EngineCoreOutputs,
 )
+from vllm.v1.engine import EngineCoreOutputs as CoreEngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -27,6 +26,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutputs as EngineCoreOutputs
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -351,7 +352,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: OmniModelRunnerOutput,
-    ) -> dict[int, EngineCoreOutputs]:
+    ) -> dict[int, CoreEngineCoreOutputs]:
         """Update scheduler state and finish completed one-shot work."""
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
@@ -385,7 +386,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
-        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        outputs: dict[int, list[OmniEngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -646,7 +647,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
-        engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        engine_core_outputs: dict[int, CoreEngineCoreOutputs] = {
+            client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()
+        }
 
         self._attach_finished_request_sets(
             engine_core_outputs,

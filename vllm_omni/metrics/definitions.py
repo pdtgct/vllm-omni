@@ -420,6 +420,157 @@ def resolve_audio_sample_rate(
     return rate if rate is not None else default
 
 
+# ============================================================================
+# Production streaming-metrics family (PORT-OBS-001..010, port-design.md
+# §Production metric export). Streaming-generic: labels carry cadence and
+# deployment identity, never checkpoint-specific vocabulary, so a future
+# cache-aware streaming model reuses these families unchanged.
+# ============================================================================
+STREAMING_SESSIONS_ACTIVE = METRIC_PREFIX + "streaming_sessions_active"
+STREAMING_SESSIONS_FINISHED = METRIC_PREFIX + "streaming_sessions_finished"
+STREAMING_CHUNK_LATENCY_S = METRIC_PREFIX + "streaming_chunk_latency_s"
+STREAMING_CHUNKS = METRIC_PREFIX + "streaming_chunks"
+STREAMING_DEADLINE_MISSES = METRIC_PREFIX + "streaming_deadline_misses"
+STREAMING_BACKLOG_CHUNKS = METRIC_PREFIX + "streaming_backlog_chunks"
+STREAMING_BACKLOG_OVERFLOWS = METRIC_PREFIX + "streaming_backlog_overflows"
+STREAMING_SESSION_OPEN_REJECTIONS = METRIC_PREFIX + "streaming_session_open_rejections"
+STREAMING_ADMISSION_REJECTIONS = METRIC_PREFIX + "streaming_admission_rejections"
+PERSISTENT_STATE_SLOTS = METRIC_PREFIX + "persistent_state_slots"
+PERSISTENT_STATE_SERVICE_DEMAND_RATIO = METRIC_PREFIX + "persistent_state_service_demand_ratio"
+PERSISTENT_STATE_EXECUTION_CLAIMS = METRIC_PREFIX + "persistent_state_execution_claims"
+PERSISTENT_STATE_ADMISSION_HEADROOM = METRIC_PREFIX + "persistent_state_admission_headroom"
+PERSISTENT_STATE_ADMISSION_PENDING = METRIC_PREFIX + "persistent_state_admission_pending"
+PERSISTENT_STATE_ADMISSION_WAIT_S = METRIC_PREFIX + "persistent_state_admission_wait_s"
+STREAMING_INPUT_AUDIO_SECONDS = METRIC_PREFIX + "streaming_input_audio_seconds"
+STREAMING_CHUNK_BATCH_SIZE = METRIC_PREFIX + "streaming_chunk_batch_size"
+
+# Label sets. Every family also carries "model_name" (the host serving
+# registry's primary served model name — never the CLI/engine canonical
+# model path, PORT-OBS-001).
+STREAMING_CADENCE_LABELS = ("model_name", "cadence_ms")
+STREAMING_FINISHED_LABELS = ("model_name", "cadence_ms", "reason")
+STREAMING_CHUNK_LATENCY_LABELS = ("model_name", "cadence_ms", "chunk_type")
+STREAMING_CHUNKS_LABELS = ("model_name", "cadence_ms", "chunk_type", "outcome")
+STREAMING_DEADLINE_MISS_LABELS = ("model_name", "cadence_ms", "chunk_type")
+STREAMING_BACKLOG_LABELS = ("model_name", "cadence_ms")
+STREAMING_OVERFLOW_LABELS = ("model_name", "kind")
+# Deliberately no cadence_ms: the rejected value is untrusted client input
+# and belongs in logs, not label space (PORT-OBS-007).
+STREAMING_OPEN_REJECTION_LABELS = ("model_name", "reason")
+STREAMING_ADMISSION_REJECTION_LABELS = ("model_name", "reason")
+PERSISTENT_STATE_SLOT_LABELS = ("model_name", "stage", "replica", "kind")
+PERSISTENT_STATE_SERVICE_DEMAND_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "kind",
+    "source",
+)
+PERSISTENT_STATE_EXECUTION_CLAIMS_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "kind",
+)
+PERSISTENT_STATE_ADMISSION_HEADROOM_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "kind",
+)
+PERSISTENT_STATE_ADMISSION_PENDING_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "state",
+)
+PERSISTENT_STATE_ADMISSION_WAIT_LABELS = (
+    "model_name",
+    "stage",
+    "replica",
+    "cadence_ms",
+    "outcome",
+)
+STREAMING_INPUT_AUDIO_LABELS = ("model_name", "cadence_ms")
+STREAMING_BATCH_SIZE_LABELS = ("model_name", "stage", "replica", "cadence_ms")
+
+# Bounded label enumerations (PORT-OBS-001).
+STREAMING_CADENCE_MS_VALUES = ("80", "160", "320", "560", "1120")
+STREAMING_CHUNK_TYPES = ("regular", "final_tail")
+STREAMING_CHUNK_OUTCOMES = ("parked", "aborted", "error")
+STREAMING_FINISHED_REASONS = ("completed", "aborted", "error")
+STREAMING_OVERFLOW_KINDS = ("input_queue", "carrier", "receipt")
+STREAMING_OPEN_REJECTION_REASONS = ("model", "cadence", "locale", "config")
+STREAMING_ADMISSION_REJECTION_REASONS = (
+    "capacity",
+    "unavailable",
+    "unsupported",
+)
+PERSISTENT_STATE_SLOT_KINDS = (
+    "resident",
+    "safety_reserve",
+    "physical_capacity",
+    "configured_limit",
+    "effective_capacity",
+)
+PERSISTENT_STATE_SERVICE_DEMAND_KINDS = ("budget", "charged_demand")
+PERSISTENT_STATE_SERVICE_DEMAND_SOURCES = (
+    "qualified_profile",
+    "measured_fallback",
+)
+PERSISTENT_STATE_EXECUTION_CLAIMS_KINDS = ("claims", "max_num_seqs")
+PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS = ("hard", "nominal")
+PERSISTENT_STATE_ADMISSION_PENDING_STATES = (
+    "waiting",
+    "submitted",
+    "reconciling",
+    "committed_cleanup",
+)
+PERSISTENT_STATE_ADMISSION_WAIT_OUTCOMES = (
+    "admitted",
+    "shed",
+    "unavailable",
+    "cancelled",
+)
+
+# Latency ladder: every admitted cadence period (in seconds) is an explicit
+# bucket edge, so quantile estimates never smear across the deadline they
+# are compared against (port-design.md §Production metric export).
+STREAMING_LATENCY_BUCKETS = (
+    0.01,
+    0.02,
+    0.04,
+    0.08,
+    0.16,
+    0.32,
+    0.56,
+    0.84,
+    1.12,
+    1.68,
+    2.24,
+    4.48,
+    10.0,
+)
+
+# Chunk-batch-size ladder — fixed import-time series; physical resident
+# capacity is a runtime value and cannot size a module-level singleton.
+STREAMING_BATCH_SIZE_BUCKETS = (
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+    1000,
+    2000,
+)
+
+
 def stream_pcm_format_from_env(
     *,
     default_sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE,

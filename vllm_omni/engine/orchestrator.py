@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 import janus
 import torch
@@ -74,14 +74,16 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError, StageUpdateResult
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.streaming_install import observe_chunk_batch_stats
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
+from vllm_omni.outputs.output_processor import StreamingTerminalDisposition
 
 logger = init_logger(__name__)
 
@@ -265,6 +267,9 @@ class StreamingInputState:
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
+    # Claimed synchronously before a terminal path first yields.
+    terminal_update_owned: bool = False
+    terminal_disposition: StreamingTerminalDisposition | None = None
     # Synchronous stage-transition capability installed by the orchestrator
     # while the downstream input processor consumes upstream token output.
     source_token_decoder: Callable[..., str] | None = None
@@ -406,7 +411,9 @@ class _OrchestratorDuplexStagePort:
         return DuplexStageSubmissionResult(
             request_id=context.request_id,
             stage_id=context.stage_id,
-            replica_id=replica_id,
+            # This submission is resumable=True; only terminal updates return
+            # StageUpdateResult, so its result is the ordinary replica ID.
+            replica_id=cast(int, replica_id),
         )
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
@@ -424,6 +431,10 @@ class Orchestrator:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
+    # PORT-OBS-008/009: set post-construction, via set_streaming_metrics
+    # (the orchestrator is built before the FastAPI app state that owns
+    # the one-time install seam exists) — None means not collecting.
+    _streaming_metrics: Any = None
 
     def __init__(
         self,
@@ -598,6 +609,39 @@ class Orchestrator:
             raise RuntimeError("duplex control plane is disabled")
         return self.duplex_control_plane
 
+    def set_streaming_metrics(self, metrics: Any) -> None:
+        """Wire the PORT-OBS-008/009 batch-size sub-stat sink post-
+        construction.
+
+        The orchestrator is constructed before the FastAPI app state
+        that owns the one-time streaming-metrics install seam
+        (``streaming_install.install_streaming_observer``) exists, so
+        the resolved ``OmniStreamingMetrics`` (never the observer
+        wrapper — this sink is engine-output-driven, not chunk-
+        lifecycle-driven) is threaded in here once, after install.
+        ``None`` (never installed, or a non-streaming deployment) keeps
+        the orchestration loop's dispatch a no-op.
+        """
+        self._streaming_metrics = metrics
+
+    def _observe_batch_stats(self, raw_outputs: Any, stage_id: int, replica_id: int) -> None:
+        """PORT-OBS-008/009: dispatch the runner-drained, scheduler-
+        forwarded ``(cadence_ms, rows)`` batch-size sub-stat under this
+        loop's existing stage/replica identity.
+
+        A no-op when no sink was ever installed (``self._streaming_metrics
+        is None``); ``observe_chunk_batch_stats`` itself already skips a
+        ``None``/``[]`` payload without observation.
+        """
+        if self._streaming_metrics is None:
+            return
+        observe_chunk_batch_stats(
+            self._streaming_metrics,
+            getattr(raw_outputs, "streaming_chunk_batch_stats", None),
+            stage=str(stage_id),
+            replica=str(replica_id),
+        )
+
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
@@ -723,7 +767,7 @@ class Orchestrator:
                     self._shutdown_event.wait(),
                     timeout=self._duplex_reaper_interval_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 plane = self.duplex_control_plane
                 if plane is not None:
                     try:
@@ -804,6 +848,7 @@ class Orchestrator:
         request_id = msg.request_id
         request = msg.prompt
         final_stage_id = msg.final_stage_id
+        is_terminal = getattr(request, "resumable", None) is False
         req_state = self.request_states.get(request_id)
         if req_state is None:
             # Streaming updates always follow the first-chunk add_request
@@ -812,10 +857,19 @@ class Orchestrator:
             # aborted (e.g. the client disconnected). Re-adding it would
             # resurrect a headless session that keeps cycling through the
             # stages with nobody consuming its outputs (issue #4271).
+            if is_terminal:
+                logger.debug(
+                    "[Orchestrator] dropping terminal streaming_update for already-clean req=%s",
+                    request_id,
+                )
+                return
             logger.warning(
                 "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
+            return
+
+        if is_terminal and req_state.streaming.terminal_update_owned:
             return
 
         if msg.sampling_params_list:
@@ -823,21 +877,152 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[stage_id].submit_update(
+        if not is_terminal:
+            if not await self._dispatch_or_fail_request(
+                lambda: self.stage_pools[stage_id].submit_update(
+                    request_id, req_state, request, prompt_text=msg.output_prompt_text
+                ),
+                req_id=request_id,
+                stage_id=stage_id,
+                operation="streaming_update",
+            ):
+                return
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            return
+
+        try:
+            result = await self.stage_pools[stage_id].submit_update(
                 request_id,
                 req_state,
                 request,
                 prompt_text=msg.output_prompt_text,
-            ),
-            req_id=request_id,
-            stage_id=stage_id,
-            operation="streaming_update",
-        ):
+            )
+        except Exception as error:
+            if not is_terminal:
+                raise
+            await self._fail_streaming_terminal(
+                request_id,
+                stage_id,
+                req_state,
+                error,
+            )
+            return
+
+        if is_terminal:
+            await self._handle_terminal_update_result(
+                request_id,
+                stage_id,
+                req_state,
+                result,
+            )
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
+
+    # @spec PORT-INT-009, PORT-INT-010, PORT-INT-011, PORT-INT-012
+    async def _handle_terminal_update_result(
+        self,
+        request_id: str,
+        stage_id: int,
+        req_state: OrchestratorRequestState,
+        result: int | StageUpdateResult,
+    ) -> None:
+        """Promote one terminal StagePool result or fail it closed."""
+        if self.request_states.get(request_id) is not req_state:
+            return
+
+        if not isinstance(result, StageUpdateResult):
+            await self._fail_streaming_terminal(
+                request_id,
+                stage_id,
+                req_state,
+                RuntimeError("streaming terminal lifecycle divergence: StagePool returned no terminal disposition"),
+            )
+            return
+
+        disposition = result.terminal_disposition
+        if disposition is StreamingTerminalDisposition.CORE_REQUIRED:
+            return
+        if disposition is StreamingTerminalDisposition.UNKNOWN:
+            await self._fail_streaming_terminal(
+                request_id,
+                stage_id,
+                req_state,
+                RuntimeError(
+                    f"streaming terminal lifecycle divergence: request {request_id} has no output-processor state"
+                ),
+            )
+            return
+        if not result.owns_completion:
+            return
+
+        pool = self.stage_pools[stage_id]
+        if not pool.final_output or stage_id != req_state.final_stage_id:
+            await self._fail_streaming_terminal(
+                request_id,
+                stage_id,
+                req_state,
+                RuntimeError(
+                    f"unsupported streaming terminal lifecycle: parked completion at intermediate stage {stage_id}"
+                ),
+            )
+            return
+
+        stage_client = pool.stage_client
+        terminal_output = _build_terminal_empty_output(
+            request_id,
+            final_output_type=getattr(stage_client, "final_output_type", None),
+            audio_sample_rate=pool._infer_audio_sample_rate(),
+        )
+        # The terminal marker normally follows a committed FLUSH park. That
+        # park leaves the most recent segment boundary latched, but this
+        # synthetic output completes the request rather than another segment.
+        # Clear the boundary before routing so _route_output promotes the
+        # outer OutputMessage to finished and the client generator can close.
+        req_state.streaming.segments.pop(stage_id, None)
+        await self._route_output(
+            stage_id,
+            result.replica_id,
+            terminal_output,
+            req_state,
+            None,
+        )
+
+    # @spec PORT-INT-009, PORT-INT-012
+    async def _fail_streaming_terminal(
+        self,
+        request_id: str,
+        stage_id: int,
+        req_state: OrchestratorRequestState,
+        error: BaseException,
+    ) -> None:
+        """Emit one request-scoped terminal error and release its resources."""
+        if self.request_states.get(request_id) is not req_state:
+            return
+        req_state.streaming.terminal_update_owned = True
+        req_state.streaming.terminal_disposition = StreamingTerminalDisposition.UNKNOWN
+        await self.output_async_queue.put(
+            ErrorMessage(
+                request_id=request_id,
+                stage_id=stage_id,
+                error=str(error),
+                error_type="streaming_terminal_lifecycle_error",
+            )
+        )
+        if self.request_states.get(request_id) is not req_state:
+            return
+        try:
+            await self._abort_request_ids([request_id], release_bindings=False)
+        except Exception as cleanup_error:
+            logger.warning(
+                "[Orchestrator] terminal cleanup failed for req=%s: %s",
+                request_id,
+                cleanup_error,
+            )
+        if self.request_states.get(request_id) is req_state:
+            await self._cleanup_request_ids([request_id])
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -972,7 +1157,7 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+    async def _abort_request_ids(self, request_ids: list[str], *, release_bindings: bool = True) -> list[OutputMessage]:
         """Forward abort requests to all stage pools.
 
         Collects final-stage AR abort outputs (partial tokens) while request
@@ -982,8 +1167,14 @@ class Orchestrator:
         if not request_ids:
             return []
         abort_outputs: list[OutputMessage] = []
+        first_error: Exception | None = None
         for pool in self.stage_pools:
-            stage_outputs = await pool.abort_requests(request_ids) or []
+            try:
+                stage_outputs = await pool.abort_requests(request_ids) or []
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                continue
             if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
                 final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
                 for orch_req_id, request_output in stage_outputs:
@@ -1012,7 +1203,10 @@ class Orchestrator:
                             stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
                         )
                     )
-            pool.release_bindings(request_ids)
+            if release_bindings:
+                pool.release_bindings(request_ids)
+        if first_error is not None:
+            raise first_error
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
             last_index_by_req[output_msg.request_id] = index
@@ -1105,6 +1299,7 @@ class Orchestrator:
         ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
+        self._observe_batch_stats(raw_outputs, stage_id, replica_id)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
@@ -1266,6 +1461,7 @@ class Orchestrator:
                         not raw_outputs.outputs
                         and raw_outputs.scheduler_stats is None
                         and not raw_outputs.finished_requests
+                        and not getattr(raw_outputs, "streaming_chunk_batch_stats", None)
                     ):
                         await asyncio.sleep(0.001)
                         continue
@@ -1943,7 +2139,7 @@ class Orchestrator:
         self,
         stage_id: int,
         request_id: str,
-        replica_id: int,
+        replica_id: int | StageUpdateResult,
         req_state: OrchestratorRequestState,
     ) -> None:
         del replica_id

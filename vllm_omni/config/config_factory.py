@@ -501,6 +501,14 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            additional_override = stage.runtime_overrides.pop("additional_config", None)
+            if additional_override is not None:
+                from vllm_omni.config.stage_config import merge_persistent_state_additional_config
+
+                stage.yaml_engine_args["additional_config"] = merge_persistent_state_additional_config(
+                    stage.yaml_engine_args.get("additional_config"),
+                    additional_override,
+                )
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)

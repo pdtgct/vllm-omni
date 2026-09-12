@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -95,10 +98,11 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. profiled_usage = weights + peak_activation + non_torch_increase
-               (measured by ``memory_profiling`` around ``profile_run()``;
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time)
+            2. profiled_usage = profile_result.non_kv_cache_memory
+               vLLM measures total device-memory consumption across startup
+               and adds only transient peak headroom. Retained allocations
+               are already included, even when a pluggable allocator bypasses
+               PyTorch's reserved-memory tracking.
 
             3. available_kv_cache = requested_memory - profiled_usage
 
@@ -110,12 +114,23 @@ class OmniGPUWorkerBase(GPUWorker):
             makes each measurement quiescent, so the device-level number is the
             correct, conservative budget. The NVML helpers in
             ``gpu_memory_utils`` are retained for diffusion memory reporting.
+            Persistent-state runners prepare model-owned execution inventory
+            inside this profile before the final transient peak measurement.
         """
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
             if current_omni_platform.is_rocm():
                 torch.accelerator.synchronize()
-            return kv_cache_memory_bytes
+            available_memory_bytes = int(kv_cache_memory_bytes)
+            from vllm_omni.worker.persistent_state import (
+                resolve_persistent_state_available_memory,
+            )
+
+            return resolve_persistent_state_available_memory(
+                self.vllm_config,
+                available_memory_bytes=available_memory_bytes,
+                cache_specs=self.model_runner.get_kv_cache_spec(),
+            )
 
         with memory_profiling(
             self.init_snapshot,
@@ -124,18 +139,13 @@ class OmniGPUWorkerBase(GPUWorker):
             self.model_runner.profile_run()
 
         self.non_torch_memory = profile_result.non_torch_increase
-        self.peak_activation_memory = profile_result.torch_peak_increase
-        # Upstream 58b2012aa2 added `total_consumed` to the profiling result
-        # and reads it in GPUWorker.compile_or_warm_up_model() (when
-        # kv_cache_memory_bytes is None and peak_activation_memory is set, both
-        # true here). Mirror upstream so the omni override keeps it populated.
+        # Core warmup adds these two fields when reporting memory usage.
+        # Persistent allocations are in total_consumed already; adding the
+        # legacy torch peak increase would count some of them twice.
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         self.total_consumed = profile_result.total_consumed
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-        )
+        profiled_usage = profile_result.non_kv_cache_memory
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
             "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
@@ -146,12 +156,20 @@ class OmniGPUWorkerBase(GPUWorker):
             format_gib(self.available_kv_cache_memory_bytes),
         )
         logger.info_once(
-            "Available KV cache memory: %s GiB (device-level profiling)",
+            "Available KV cache memory: %s GiB (device consumption plus transient peak headroom)",
             format_gib(self.available_kv_cache_memory_bytes),
             scope="local",
         )
 
-        return int(self.available_kv_cache_memory_bytes)
+        from vllm_omni.worker.persistent_state import (
+            resolve_persistent_state_available_memory,
+        )
+
+        return resolve_persistent_state_available_memory(
+            self.vllm_config,
+            available_memory_bytes=int(self.available_kv_cache_memory_bytes),
+            cache_specs=self.model_runner.get_kv_cache_spec(),
+        )
 
     # Provide memory pool context
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:

@@ -29,6 +29,10 @@ class OmniConnectorOutput:
         stage_recv_req_ids: Request IDs that received batch stage inputs.
         has_pending_kv_work: True if the mixin has pending, active, or
             completed KV transfers that the scheduler should account for.
+        model_status: Transaction status bits keyed by request ID, consumed
+            at the normal scheduler boundary.
+        model_failed_req_ids: Status-bearing requests the model classified
+            terminal after request/generation validation.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -37,6 +41,8 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    model_status: dict[str, int] = field(default_factory=dict)
+    model_failed_req_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -52,6 +58,13 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
         inter_stage_outputs: Optional per-request list of inter-stage payload dicts
             for connector transport (``save_async`` / full_payload).  Not forwarded
             to the orchestrator output processor.
+        streaming_chunk_batch_stats: PORT-OBS-008/009 (amended) — one
+            ``(cadence_ms, rows)`` entry per executed nonempty CHUNK
+            geometry bucket this step, drained from the model's
+            consume-once extraction hook (cadence already resolved from
+            the geometry authority at recording time). ``None`` means
+            not collecting; ``[]`` means a step that executed no
+            nonempty CHUNK bucket; downstream consumers skip both.
     """
 
     multimodal_outputs: list[dict[str, object]] | None = None
@@ -60,6 +73,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    streaming_chunk_batch_stats: list[tuple[str, int]] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

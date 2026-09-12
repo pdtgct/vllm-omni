@@ -40,6 +40,7 @@ from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
     iter_mm_outputs,
 )
+from vllm_omni.outputs.output_processor import StreamingTerminalDisposition
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -67,6 +68,15 @@ class _ReplicaMetrics:
     batch_seq: int = 0
     agg_total_tokens: int = 0
     agg_total_gen_time_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class StageUpdateResult:
+    """Typed result for a terminal streaming update."""
+
+    replica_id: int
+    terminal_disposition: StreamingTerminalDisposition
+    owns_completion: bool
 
 
 class StagePool:
@@ -1048,12 +1058,19 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
-    ) -> int:
+    ) -> int | StageUpdateResult:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
+        is_terminal = (
+            self.stage_id == 0 and req_state.streaming.enabled and getattr(request, "resumable", None) is False
+        )
         replica_id = self.get_bound_replica_id(request_id)
+        if is_terminal and (replica_id is None or replica_id >= len(self.clients) or self.clients[replica_id] is None):
+            raise RuntimeError(
+                f"streaming terminal lifecycle divergence: request {request_id} has no live bound replica"
+            )
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
 
@@ -1069,6 +1086,14 @@ class StagePool:
                 )
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
         else:
+            if is_terminal:
+                return await self._submit_llm_terminal_update(
+                    request_id,
+                    req_state,
+                    request,
+                    replica_id=replica_id,
+                    prompt_text=prompt_text,
+                )
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
@@ -1114,6 +1139,77 @@ class StagePool:
             raise ValueError(str(reason))
         return replica_id
 
+    # @spec PORT-INT-009, PORT-INT-010, PORT-INT-012
+    async def _submit_llm_terminal_update(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        request: Any,
+        *,
+        replica_id: int,
+        prompt_text: Any,
+    ) -> StageUpdateResult:
+        """Submit or synchronously promote one terminal streaming update."""
+        if req_state.streaming.terminal_update_owned:
+            return StageUpdateResult(
+                replica_id=replica_id,
+                terminal_disposition=(req_state.streaming.terminal_disposition or StreamingTerminalDisposition.UNKNOWN),
+                owns_completion=False,
+            )
+
+        disposition = self.output_processor.apply_terminal_update(
+            request,
+            prompt_text,
+        )
+        if disposition is StreamingTerminalDisposition.UNKNOWN:
+            return StageUpdateResult(
+                replica_id=replica_id,
+                terminal_disposition=disposition,
+                owns_completion=False,
+            )
+
+        req_state.streaming.terminal_update_owned = True
+        req_state.streaming.terminal_disposition = disposition
+        client = self._llm_client(replica_id)
+        if disposition is StreamingTerminalDisposition.CORE_REQUIRED:
+            try:
+                await client.add_request_async(request)
+            except Exception:
+                try:
+                    await client.abort_requests_async([request_id])
+                except Exception as abort_error:
+                    logger.warning(
+                        "[StagePool] terminal submission cleanup failed for req=%s stage-%s: %s",
+                        request_id,
+                        self.stage_id,
+                        abort_error,
+                    )
+                try:
+                    self.output_processor.abort_requests(
+                        [request_id],
+                        internal=True,
+                    )
+                except Exception as abort_error:
+                    logger.warning(
+                        "[StagePool] output-processor terminal cleanup failed for req=%s stage-%s: %s",
+                        request_id,
+                        self.stage_id,
+                        abort_error,
+                    )
+                raise
+            return StageUpdateResult(
+                replica_id=replica_id,
+                terminal_disposition=disposition,
+                owns_completion=False,
+            )
+
+        await client.abort_requests_async([request_id])
+        return StageUpdateResult(
+            replica_id=replica_id,
+            terminal_disposition=disposition,
+            owns_completion=True,
+        )
+
     async def _pick_or_select(
         self,
         request_id: str,
@@ -1134,7 +1230,12 @@ class StagePool:
         # upstream by emitting SchedulerStats on throttled ticks even when no
         # request output is produced, and dropping those batches loses KV/queue
         # gauges for that interval.
-        if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
+        if (
+            not outputs.outputs
+            and outputs.scheduler_stats is None
+            and not outputs.finished_requests
+            and not getattr(outputs, "streaming_chunk_batch_stats", None)
+        ):
             return None
         return outputs
 
@@ -1231,6 +1332,10 @@ class StagePool:
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
+        # A missing core route can still leave output-processor state behind.
+        unbound_ids = [rid for rid in request_ids if self.get_bound_replica_id(rid) is None]
+        if unbound_ids and self._output_processor is not None:
+            self._output_processor.abort_requests(unbound_ids, internal=False)
         abort_outputs: list[tuple[str, Any]] = []
         is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():

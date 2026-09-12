@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Engine components for vLLM-Omni.
 """
@@ -137,3 +140,11 @@ class OmniEngineCoreOutput(EngineCoreOutput):
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
+    # PORT-OBS-008/009 (amended): the runner-drained
+    # ``(cadence_ms, rows)`` batch-size sub-stat (cadence already
+    # resolved from the geometry authority at recording time), forwarded
+    # by the omni scheduler only while host statistics collection is
+    # enabled. ``None`` means not collecting; ``[]`` means no nonempty
+    # CHUNK bucket executed this step. Every hop is an existing
+    # omni-owned subclass — no vLLM core type changes.
+    streaming_chunk_batch_stats: list[tuple[str, int]] | None = None

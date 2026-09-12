@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Self
+from typing import ClassVar
+
+from typing_extensions import Self
 
 from vllm_omni.diffusion.interaction.types import (
     InteractionChunkMetadata,
