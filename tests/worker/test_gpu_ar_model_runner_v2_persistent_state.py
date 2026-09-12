@@ -521,15 +521,23 @@ def test_v2_cache_discovery_and_initialization_are_thin_pin_guarded_overrides() 
     assert "MambaSpec" not in discovery + initialization
 
 
-def test_worker_selects_v2_without_mutating_the_requested_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_selects_v2_before_model_state_layers_exist(monkeypatch: pytest.MonkeyPatch) -> None:
     # @spec PORT-MIG-005 / PORT-MIG-006
+    from vllm.model_executor import model_loader
+
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
     from vllm_omni.worker import persistent_state
     from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
     worker = object.__new__(GPUARWorker)
-    worker.vllm_config = object()
+    worker.vllm_config = SimpleNamespace(model_config=object())
     worker.use_v2_model_runner = True
-    monkeypatch.setattr(persistent_state, "discover_persistent_state_specs", lambda config: {"state": object()})
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda config: NemotronASRForRNNT)
+
+    def unconstructed_layers(config):
+        pytest.fail("runner selection precedes state-layer construction")
+
+    monkeypatch.setattr(persistent_state, "discover_persistent_state_specs", unconstructed_layers)
     assert worker._select_model_runner_cls() is _runner_cls()
     assert worker.use_v2_model_runner is True
     worker.use_v2_model_runner = False
@@ -539,13 +547,14 @@ def test_worker_selects_v2_without_mutating_the_requested_runner(monkeypatch: py
 
 def test_worker_preserves_upstream_runner_for_other_models(monkeypatch: pytest.MonkeyPatch) -> None:
     # @spec PORT-MIG-006
-    from vllm_omni.worker import persistent_state
+    from vllm.model_executor import model_loader
+
     from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
     worker = object.__new__(GPUARWorker)
-    worker.vllm_config = object()
+    worker.vllm_config = SimpleNamespace(model_config=object())
     worker.use_v2_model_runner = True
-    monkeypatch.setattr(persistent_state, "discover_persistent_state_specs", lambda config: {})
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda config: torch.nn.Linear)
     assert worker._select_model_runner_cls() is GPUARWorker.model_runner_cls
     assert worker.use_v2_model_runner is False
 

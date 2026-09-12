@@ -105,6 +105,32 @@ def _write_deploy(
 class TestNemotronPersistentStateDeploy:
     """@spec ENV-MIG-011/012: typed deploy and package startup contracts."""
 
+    def test_native_reference_launch_preserves_served_alias(self, tmp_path: Path) -> None:
+        """@spec ENV-MIG-011: native launch aliases reach core and metric labels."""
+        from vllm_omni.config.omni_config import VllmOmniConfig
+
+        deploy_path = _write_deploy(tmp_path)
+        overrides = {
+            "served_model_name": ["nemotron"],
+            "dtype": "float32",
+            "max_num_seqs": 4,
+            "hf_overrides": {
+                "supported_num_lookahead_tokens": [1],
+                "decode_dispatch_arm": "dense-graphed",
+                "encoder_execution_arm": "dense-graphed",
+            },
+        }
+        structured = VllmOmniConfig.from_pipeline_config(
+            _pipeline(),
+            deploy_config_path=str(deploy_path),
+            cli_overrides=overrides,
+        )
+        assert structured.stage_by_id(0).model_config.served_model_name == ["nemotron"]
+        stage = _resolved_stage(deploy_path, overrides).to_omegaconf()
+        assert stage.engine_args.served_model_name == ["nemotron"]
+        assert stage.engine_args.max_num_seqs == 4
+        assert stage.engine_args.hf_overrides.supported_num_lookahead_tokens == [1]
+
     def test_persistent_state_is_reserved_typed_stage_config(self, tmp_path: Path) -> None:
         """@spec ENV-MIG-011: persistent state is never an engine extra."""
         deploy_path = _write_deploy(
