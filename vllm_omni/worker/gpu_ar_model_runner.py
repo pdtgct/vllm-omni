@@ -419,6 +419,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         specs.update(persistent_specs)
         return specs
 
+    # @spec PORT-MIG-006
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -439,11 +440,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().initialize_kv_cache(
             partition.ordinary_config,
             is_profiling=is_profiling,
-            kv_cache_allocation_context=kv_cache_allocation_context,
+            kv_cache_allocation_context=(kv_cache_allocation_context if partition.state_group is None else None),
         )
         self._persistent_state_storage = allocate_runner_persistent_state(
             self,
             partition,
+            kv_cache_allocation_context=kv_cache_allocation_context,
         )
 
     # @spec PORT-INT-007, PORT-STATE-002
@@ -939,7 +941,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         payload: dict[str, object] = {}
         if not audio_sparse_output:
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                req_hidden_states = req_hidden_states_cpu[rid]
+                req_hidden_states: torch.Tensor | None = req_hidden_states_cpu[rid]
             else:
                 req_hidden_states = self._resolve_req_hidden_states(
                     hidden_states_cpu,

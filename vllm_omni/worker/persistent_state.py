@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -16,13 +17,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.worker.utils import allocate_kv_cache
 
 from vllm_omni.model_executor.persistent_state import (
     PersistentStateBatch,
     PersistentStateLayerBase,
     PersistentStateSpec,
     PersistentStateStorage,
-    allocate_persistent_state_storage,
     persistent_state_storage_from_raw,
 )
 
@@ -162,25 +163,54 @@ def partition_persistent_state_config(
     )
 
 
+# @spec PORT-STATE-002, PORT-STATE-011
 def allocate_runner_persistent_state(
     runner: Any,
     partition: PersistentStatePartition,
+    *,
+    kv_cache_allocation_context: AbstractContextManager | None = None,
 ) -> PersistentStateStorage | None:
     """Allocate and bind the state group after ordinary core initialization."""
 
     if partition.state_group is None:
         return None
+    # The initial native profile has no state-preserving sleep contract. Core tags these
+    # pages as kv_cache, whose contents CuMem sleep discards while leases live.
+    model_config = runner.vllm_config.model_config
+    for flag in ("enable_sleep_mode", "enable_cumem_allocator"):
+        if getattr(model_config, flag, None) is not False:
+            raise ValueError(f"native persistent-state allocation requires {flag}=False")
     assert partition.state_tensor is not None
     spec = partition.state_group.kv_cache_spec
     assert isinstance(spec, PersistentStateSpec)
     expected_size = partition.ordinary_config.num_blocks * spec.page_size_bytes
     if partition.state_tensor.size != expected_size:
         raise ValueError("persistent-state tensor size disagrees with slot geometry")
-    storage = allocate_persistent_state_storage(
-        spec,
-        partition.ordinary_config.num_blocks,
-        runner.device,
+    state_config = replace(
+        partition.ordinary_config,
+        kv_cache_groups=[partition.state_group],
+        kv_cache_tensors=[partition.state_tensor],
     )
+    allocation_context = kv_cache_allocation_context if kv_cache_allocation_context is not None else nullcontext()
+    with allocation_context:
+        caches = allocate_kv_cache(
+            state_config,
+            runner.device,
+            runner.vllm_config.cache_config.get_resolved_kv_cache_layout(),
+        )
+    layer_name = partition.state_group.layer_names[0]
+    raw_view = caches[layer_name]
+    expected_shape = (state_config.num_blocks, 1, 1, spec.page_size_bytes)
+    if (
+        tuple(raw_view.shape) != expected_shape
+        or raw_view.dtype not in (torch.int8, torch.uint8)
+        or not raw_view.is_contiguous()
+        or raw_view.stride(0) != spec.page_size_bytes
+        or raw_view.numel() != expected_size
+    ):
+        raise ValueError("core persistent-state allocation has incompatible byte layout")
+    # view() cannot copy: descriptor views retain the core allocation directly.
+    storage = persistent_state_storage_from_raw(spec, raw_view.view(-1))
     layers = get_layers_from_vllm_config(
         runner.vllm_config,
         PersistentStateLayerBase,
