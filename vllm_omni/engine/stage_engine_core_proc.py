@@ -246,6 +246,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
     def persistent_state_snapshot(self) -> dict[str, Any]:
         """Return the resident capability inventory without state content."""
+        # @spec PORT-STATE-014, PORT-STATE-022
         manager = self._persistent_state_manager()
         control = self._persistent_state_control()
         self._prune_persistent_state_operations(control)
@@ -292,12 +293,13 @@ class StageEngineCoreProc(EngineCoreProc):
             # reconciliation. claim_expires_at is CLOCK_MONOTONIC, shared
             # across processes on one host, which is the deployment shape
             # (the service and this proc are co-hosted).
-            "bindings": self._persistent_state_binding_inventory(control),
+            "bindings": self._persistent_state_binding_inventory(control, manager),
         }
 
     @staticmethod
     def _persistent_state_binding_inventory(
         control: dict[str, Any],
+        manager: Any,
     ) -> list[dict[str, Any]]:
         horizon = float(control["pending_claim_timeout_s"])
         inventory: list[dict[str, Any]] = []
@@ -312,6 +314,9 @@ class StageEngineCoreProc(EngineCoreProc):
                         "schema_id": binding.schema_id,
                         "profile_id": binding.profile_id,
                         "engine_epoch": binding.engine_epoch,
+                        # Unclaimed owners are releasable without model terminality;
+                        # the release RPC rechecks ownership and claimed-work safety.
+                        "terminal": owner != "claimed" or manager.is_terminal(binding.request_id),
                         "claim_expires_at": (None if created is None else created + horizon),
                     }
                 )
