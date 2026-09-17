@@ -407,6 +407,9 @@ class NemotronASRForRNNT(nn.Module):
 
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
+        self.core.encoder.configure_stream_fused_kv_projection(
+            getattr(hf_config, "experimental_fused_kv_projection", False)
+        )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(

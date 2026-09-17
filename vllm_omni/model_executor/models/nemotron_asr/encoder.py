@@ -320,10 +320,26 @@ class FastConformerEncoder(nn.Module):
         # lengths are transition windows (new output width + left cache),
         # not session state; never add or replace them from stream_step.
         self._stream_relative_position_lengths: tuple[int, ...] = ()
+        self._stream_fused_kv_projection_enabled = False
 
     @staticmethod
     def _stream_relative_position_name(length: int) -> str:
         return f"_stream_relative_position_{length}"
+
+    @staticmethod
+    def _stream_fused_kv_name() -> str:
+        return "_stream_fused_kv_weight"
+
+    @staticmethod
+    def _stream_fused_kv_bias_name() -> str:
+        return "_stream_fused_kv_bias"
+
+    def configure_stream_fused_kv_projection(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("experimental_fused_kv_projection must be a boolean")
+        if any(self._stream_fused_kv_name() in layer.self_attn._buffers for layer in self.layers):
+            raise RuntimeError("fused K/V projections are immutable after materialization")
+        self._stream_fused_kv_projection_enabled = enabled
 
     def invalidate_stream_relative_position_projections(self) -> None:
         """Drop derived serving projections before a model mutation."""
@@ -331,6 +347,9 @@ class FastConformerEncoder(nn.Module):
             attn = layer.self_attn
             for length in self._stream_relative_position_lengths:
                 name = self._stream_relative_position_name(length)
+                if name in attn._buffers:
+                    delattr(attn, name)
+            for name in (self._stream_fused_kv_name(), self._stream_fused_kv_bias_name()):
                 if name in attn._buffers:
                     delattr(attn, name)
         self._stream_relative_position_lengths = ()
@@ -414,6 +433,58 @@ class FastConformerEncoder(nn.Module):
         for attn, name, projection in prepared:
             attn.register_buffer(name, projection, persistent=False)
         self._stream_relative_position_lengths = lengths
+
+    def prepare_stream_fused_kv_projections(self, *, reference: torch.Tensor) -> None:
+        if not self._stream_fused_kv_projection_enabled:
+            return
+        if self.training or torch.is_grad_enabled() or reference.dtype != torch.float32:
+            raise ValueError("fused K/V projections require frozen FP32 inference")
+        weight_name = self._stream_fused_kv_name()
+        bias_name = self._stream_fused_kv_bias_name()
+        materialized = tuple(weight_name in layer.self_attn._buffers for layer in self.layers)
+        if any(materialized):
+            if not all(materialized):
+                raise ValueError("fused K/V projection materialization is incomplete")
+            for layer in self.layers:
+                attn = layer.self_attn
+                weight = getattr(attn, weight_name)
+                bias = getattr(attn, bias_name)
+                if (
+                    not isinstance(weight, torch.Tensor)
+                    or weight.shape != (2 * attn.linear_k.out_features, attn.linear_k.in_features)
+                    or weight.device != reference.device
+                    or weight.dtype != reference.dtype
+                    or ((attn.linear_k.bias is None) != (bias is None))
+                ):
+                    raise ValueError("fused K/V projection materialization differs from execution")
+                if isinstance(bias, torch.Tensor) and (
+                    bias.shape != (2 * attn.linear_k.out_features,)
+                    or bias.device != reference.device
+                    or bias.dtype != reference.dtype
+                ):
+                    raise ValueError("fused K/V projection bias materialization differs from execution")
+            return
+        prepared: list[tuple[RelPositionMHA, torch.Tensor, torch.Tensor | None]] = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            key, value = attn.linear_k, attn.linear_v
+            if (key.bias is None) != (value.bias is None):
+                raise ValueError("fused K/V projection requires matching bias presence")
+            if any(t.device != reference.device or t.dtype != reference.dtype for t in (key.weight, value.weight)):
+                raise ValueError("fused K/V projection weight metadata differs from execution")
+            if key.bias is not None and (
+                key.bias.device != reference.device
+                or value.bias is None
+                or value.bias.device != reference.device
+                or key.bias.dtype != reference.dtype
+                or value.bias.dtype != reference.dtype
+            ):
+                raise ValueError("fused K/V projection bias metadata differs from execution")
+            bias = None if key.bias is None else torch.cat((key.bias, value.bias), dim=0).contiguous()
+            prepared.append((attn, torch.cat((key.weight, value.weight), dim=0).contiguous(), bias))
+        for attn, weight, bias in prepared:
+            attn.register_buffer(self._stream_fused_kv_name(), weight, persistent=False)
+            attn.register_buffer(self._stream_fused_kv_bias_name(), bias, persistent=False)
 
     def stream_relative_position_projections(
         self,
@@ -527,8 +598,14 @@ def _stream_attention(
 
     b, t2 = batch, keys.shape[1]
     q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
-    k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
-    v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    fused_weight = getattr(attn, "_stream_fused_kv_weight", None)
+    if fused_weight is None:
+        k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+        v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    else:
+        kv = nn.functional.linear(keys, fused_weight, getattr(attn, "_stream_fused_kv_bias", None))
+        k, v = kv.unflatten(-1, (2, attn.h, attn.d_k)).unbind(dim=-3)
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
     if projected_pos is None:
         if pos_emb is None:
             raise ValueError("stream attention requires positional embeddings or a prepared projection")

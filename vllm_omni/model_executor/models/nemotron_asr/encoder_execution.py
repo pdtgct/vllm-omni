@@ -810,6 +810,9 @@ class ResolvedEncoderExecution:
                 cache_len=self._history_frames,
                 reference=reference,
             )
+        prepare_fused_kv = getattr(encoder, "prepare_stream_fused_kv_projections", None)
+        if callable(prepare_fused_kv):
+            prepare_fused_kv(reference=reference)
         self._runner_device = runner_device
         self._model_state = _compiled_transition_model_state(self._core)
 
@@ -1377,6 +1380,11 @@ def build_encoder_execution(
         raise ValueError(
             f"unknown encoder_execution_arm {arm!r} (known: ['compiled-static', 'dense-graphed', 'eager'])"
         )
+    fused_kv = getattr(hf_config, "experimental_fused_kv_projection", False)
+    if not isinstance(fused_kv, bool):
+        raise ValueError("experimental_fused_kv_projection must be a boolean")
+    if fused_kv and arm == "eager":
+        raise ValueError("experimental_fused_kv_projection requires compiled encoder execution")
 
     def transition(
         mel: torch.Tensor,
