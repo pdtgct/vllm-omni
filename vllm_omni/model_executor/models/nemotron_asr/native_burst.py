@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ROLE_CHUNK,
@@ -166,6 +167,13 @@ class NativeBurstSampler:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
 
+    def add_request(self, req_idx: int, prompt_len: int, sampling_params: SamplingParams) -> None:
+        """Skip generic sampler staging on the validated native-only lane."""
+        del req_idx, prompt_len, sampling_params
+
+    def apply_staged_writes(self) -> None:
+        """The native sampler has no generic sampler writes to commit."""
+
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
@@ -235,6 +243,9 @@ def validate_native_burst_sampling(params: Any, *, park_id: int, capacity: int) 
         or params.n != 1
         or params.min_tokens != 0
         or params.ignore_eos
+        or getattr(params, "repetition_penalty", None) != 1.0
+        or getattr(params, "frequency_penalty", None) != 0.0
+        or getattr(params, "presence_penalty", None) != 0.0
         or (params.max_tokens is not None and params.max_tokens < capacity + 1)
         or any(
             getattr(params, name, None) is not None
