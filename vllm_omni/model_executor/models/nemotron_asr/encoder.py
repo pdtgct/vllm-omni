@@ -315,6 +315,129 @@ class FastConformerEncoder(nn.Module):
             )
             for _ in range(n_layers)
         )
+        # Streaming projections are derived from frozen ``linear_pos``
+        # weights during startup-owned execution materialization. Their
+        # lengths are transition windows (new output width + left cache),
+        # not session state; never add or replace them from stream_step.
+        self._stream_relative_position_lengths: tuple[int, ...] = ()
+
+    @staticmethod
+    def _stream_relative_position_name(length: int) -> str:
+        return f"_stream_relative_position_{length}"
+
+    def invalidate_stream_relative_position_projections(self) -> None:
+        """Drop derived serving projections before a model mutation."""
+        for layer in self.layers:
+            attn = layer.self_attn
+            for length in self._stream_relative_position_lengths:
+                name = self._stream_relative_position_name(length)
+                if name in attn._buffers:
+                    delattr(attn, name)
+        self._stream_relative_position_lengths = ()
+
+    def _apply(self, fn, recurse: bool = True):
+        # A device or dtype transition must rebuild from the original full
+        # precision weights; casting a derived projection changes its origin.
+        self.invalidate_stream_relative_position_projections()
+        return super()._apply(fn, recurse=recurse)
+
+    def train(self, mode: bool = True) -> "FastConformerEncoder":
+        if mode:
+            self.invalidate_stream_relative_position_projections()
+        return super().train(mode)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        self.invalidate_stream_relative_position_projections()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def prepare_stream_relative_position_projections(
+        self,
+        *,
+        out_widths: tuple[int, ...],
+        cache_len: int,
+        reference: torch.Tensor,
+    ) -> None:
+        """Precompute every declared exact relative-position projection.
+
+        Each layer owns a nonpersistent buffer for each complete transition
+        window.  The source is the original centered positional slice from
+        the full positional table, passed through that layer's original
+        ``linear_pos``; it is never a crop of another projected window.
+        """
+        if self.training or torch.is_grad_enabled():
+            raise ValueError("stream relative-position projections require frozen inference")
+        if cache_len < 0 or not out_widths or any(width <= 0 for width in out_widths):
+            raise ValueError("stream relative-position projection geometry is invalid")
+        lengths = tuple(sorted({int(width) + cache_len for width in out_widths}))
+        if self._stream_relative_position_lengths:
+            if self._stream_relative_position_lengths != lengths:
+                raise ValueError("stream relative-position projection geometry changed after materialization")
+            return
+        self.pos_enc._extend(max(lengths), reference)
+        center = self.pos_enc.pe.size(1) // 2 + 1
+        prepared: list[tuple[RelPositionMHA, str, torch.Tensor]] = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            weight = attn.linear_pos.weight
+            if weight.device != reference.device or weight.dtype != reference.dtype:
+                raise ValueError("stream relative-position projection weight metadata differs from execution")
+            for length in lengths:
+                pos_emb = self.pos_enc.pe[:, center - length : center + length - 1]
+                projection = (
+                    attn.linear_pos(pos_emb)
+                    .view(
+                        pos_emb.size(0),
+                        -1,
+                        attn.h,
+                        attn.d_k,
+                    )
+                    .transpose(1, 2)
+                )
+                prepared.append((attn, self._stream_relative_position_name(length), projection))
+        for attn, name, projection in prepared:
+            attn.register_buffer(name, projection, persistent=False)
+        self._stream_relative_position_lengths = lengths
+
+    def stream_relative_position_projections(
+        self,
+        *,
+        out_width: int,
+        cache_len: int,
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Return immutable startup projections or select the eager oracle."""
+        if self.training or torch.is_grad_enabled():
+            return None
+        length = int(out_width) + cache_len
+        if length not in self._stream_relative_position_lengths:
+            return None
+        name = self._stream_relative_position_name(length)
+        projections = tuple(getattr(layer.self_attn, name, None) for layer in self.layers)
+        if any(
+            not isinstance(projection, torch.Tensor)
+            or projection.device != reference.device
+            or projection.dtype != reference.dtype
+            for projection in projections
+        ):
+            return None
+        return projections
 
     def forward(self, mel: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``(B, feat_in, T_mel)`` -> ``(B, T, d_model)`` encoder_raw.
@@ -377,9 +500,10 @@ def _stream_attention(
     *,
     cache: torch.Tensor,
     valid: torch.Tensor,
-    pos_emb: torch.Tensor,
+    pos_emb: torch.Tensor | None,
     new_valid: torch.Tensor,
     new_lengths: torch.Tensor,
+    projected_pos: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
@@ -405,7 +529,12 @@ def _stream_attention(
     q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
     k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
     v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
-    p = attn.linear_pos(pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
+    if projected_pos is None:
+        if pos_emb is None:
+            raise ValueError("stream attention requires positional embeddings or a prepared projection")
+        p = attn.linear_pos(pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
+    else:
+        p = projected_pos
     q_u = (q + attn.pos_bias_u).transpose(1, 2)
     q_v = (q + attn.pos_bias_v).transpose(1, 2)
     matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
@@ -521,15 +650,22 @@ def stream_step(
     x = x.gather(1, gidx.unsqueeze(-1).expand(b, out_width, x.shape[2]))
     new_valid = torch.arange(out_width, device=device).unsqueeze(0) < out_lengths.view(-1, 1)
     cache_len = caches.channel.shape[2]
-    pos_emb = encoder.pos_enc(
-        torch.zeros(
-            1,
-            out_width + cache_len,
-            x.shape[2],
-            device=device,
-            dtype=x.dtype,
-        )
+    projections = encoder.stream_relative_position_projections(
+        out_width=out_width,
+        cache_len=cache_len,
+        reference=x,
     )
+    pos_emb = None
+    if projections is None:
+        pos_emb = encoder.pos_enc(
+            torch.zeros(
+                1,
+                out_width + cache_len,
+                x.shape[2],
+                device=device,
+                dtype=x.dtype,
+            )
+        )
     for idx, layer in enumerate(encoder.layers):
         residual = x
         y = layer.norm_feed_forward1(x)
@@ -543,6 +679,7 @@ def stream_step(
             pos_emb=pos_emb,
             new_valid=new_valid,
             new_lengths=out_lengths,
+            projected_pos=None if projections is None else projections[idx],
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)

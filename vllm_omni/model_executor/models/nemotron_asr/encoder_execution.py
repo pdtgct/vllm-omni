@@ -713,6 +713,13 @@ class ResolvedEncoderExecution:
         dispatch_keys = str(torch._C._dispatch_keys(positional))
         if "Autograd" in dispatch_keys or "ADInplaceOrView" in dispatch_keys:
             raise ValueError("encoder.pos_enc.pe materialization is outside serving inference mode")
+        prepare_projections = getattr(encoder, "prepare_stream_relative_position_projections", None)
+        if callable(prepare_projections):
+            prepare_projections(
+                out_widths=tuple(shape.out_width for shape in self._geometry_shapes.values()),
+                cache_len=self._history_frames,
+                reference=reference,
+            )
         self._runner_device = runner_device
         self._model_state = _compiled_transition_model_state(self._core)
 
