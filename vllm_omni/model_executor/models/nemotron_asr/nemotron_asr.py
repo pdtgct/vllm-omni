@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     HostStaging,
     ResolvedDecode,
     make_mrv1_adapter,
+    make_replay_validation_fusion,
 )
 from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
@@ -62,6 +63,7 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
+    SESSION_LIMITS,
 )
 from vllm_omni.model_executor.models.nemotron_asr.plan import (
     ObservedRow,
@@ -394,6 +396,32 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
+        replay_validation_fusion = getattr(hf_config, "replay_validation_fusion", False)
+        if not isinstance(replay_validation_fusion, bool):
+            raise ValueError("replay_validation_fusion must be boolean")
+        self._replay_proposed_book_validator = None
+        self._replay_projection_validator = None
+        if replay_validation_fusion:
+            proposed_validator, replay_validator = make_replay_validation_fusion(
+                park_id=int(hf_config.eos_token_id),
+                blank_id=int(self.core.blank_id),
+                queue_capacity=int(SESSION_LIMITS["queue_capacity"]),
+                eou_token_id=int(hf_config.eou_token_id),
+            )
+            # This is an opt-in model-owned compiler path for pure replay
+            # validation only. It has no persistent state or graph authority.
+            self._replay_proposed_book_validator = torch.compile(
+                proposed_validator,
+                fullgraph=True,
+                dynamic=True,
+                options={"triton.cudagraphs": False},
+            )
+            self._replay_projection_validator = torch.compile(
+                replay_validator,
+                fullgraph=True,
+                dynamic=True,
+                options={"triton.cudagraphs": False},
+            )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
@@ -947,6 +975,8 @@ class NemotronASRForRNNT(nn.Module):
             commit_sink=self._ensure_commit_sink(inputs_embeds.device),
             staging=self._ensure_host_staging(),
             graph_covers_decode=graph_covers_decode,
+            replay_proposed_book_validator=self._replay_proposed_book_validator,
+            replay_projection_validator=self._replay_projection_validator,
         )
 
     def consume_batch_stats(self) -> list[tuple[str, int]] | None:

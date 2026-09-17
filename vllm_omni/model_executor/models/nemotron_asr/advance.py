@@ -916,6 +916,225 @@ def make_mrv1_adapter(
     return adapter
 
 
+def _proposed_book_bad_rows(
+    projection_queue: torch.Tensor,
+    projection_book: torch.Tensor,
+    plan_geom_dev: torch.Tensor,
+    admitted_prompt_dev: torch.Tensor,
+    slot: torch.Tensor,
+    *,
+    blank_id: int,
+    queue_capacity: int,
+    eou_token_id: int | None,
+) -> torch.Tensor:
+    """Return the existing proposed-book invariant mask without side effects."""
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    phead = projection_book[:, QUEUE_HEAD].long()
+    plen = projection_book[:, QUEUE_LEN].long()
+    ppend_col = projection_book[:, BOOK_PENDING_ECHO]
+    ppend = ppend_col == 1
+    pexpected = projection_book[:, BOOK_EXPECTED_LABEL].long()
+    plast = projection_book[:, QUEUE_LAST_LABEL].long()
+    premaining = plen - phead
+    proposed_queue_value_valid = (projection_queue >= 0) & (projection_queue < blank_id)
+    if eou_token_id is not None:
+        proposed_queue_value_valid |= projection_queue == eou_token_id
+    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
+    proposed_prior_emitted = (
+        projection_queue.gather(
+            1,
+            (phead - 1).clamp(min=0, max=queue_capacity - 1).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_queue_last = (
+        projection_queue.gather(
+            1,
+            (plen - 1).clamp(min=0, max=queue_capacity - 1).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_tail_is_eou = torch.zeros_like(ppend)
+    proposed_expected_is_eou = torch.zeros_like(ppend)
+    if eou_token_id is not None:
+        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == eou_token_id)
+        proposed_expected_is_eou = pexpected == eou_token_id
+    return (
+        (phead < 0)
+        | (phead > plen)
+        | (plen > queue_capacity)
+        | ((ppend_col != 0) & (ppend_col != 1))
+        | (plast < 0)
+        | (plast > blank_id)
+        | (pexpected < 0)
+        | ((pexpected > blank_id) & (~proposed_expected_is_eou))
+        | (ppend & (pexpected >= blank_id) & (~proposed_expected_is_eou))
+        | proposed_queued_bad
+        | (ppend & (phead < 1))
+        | (ppend & (pexpected != proposed_prior_emitted))
+        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
+        | ((premaining > 0) & (~ppend))
+        | (projection_book[:, BOOK_GEOMETRY].long() != plan_geom_dev)
+        | (projection_book[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
+    )
+
+
+def _mrv1_replay_projection_bad_rows(
+    roles: torch.Tensor,
+    context_queue: torch.Tensor,
+    context_book: torch.Tensor,
+    prompt_index: torch.Tensor,
+    effective_status: torch.Tensor,
+    projection_rows: torch.Tensor,
+    projection_queue: torch.Tensor,
+    projection_book: torch.Tensor,
+    *,
+    park_id: int,
+    blank_id: int,
+    queue_capacity: int,
+    eou_token_id: int | None,
+) -> torch.Tensor:
+    """Return the MRV1 invariant mask for a host-proven replay-only turn."""
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    decision = projection_rows[:, 0]
+    finite = torch.isfinite(decision)
+    integral = finite & (decision == decision.trunc())
+    legal = (decision == park_id) | ((decision >= 0) & (decision < blank_id))
+    if eou_token_id is not None:
+        legal |= decision == eou_token_id
+    bad = (~integral) | (~legal)
+    if projection_rows.shape[1] > 1:
+        bad |= (projection_rows[:, 1:] != 0).any(dim=1)
+
+    queue_changed = (projection_queue != context_queue).any(dim=1)
+    book_changed = (projection_book != context_book).any(dim=1)
+    clean = effective_status == 0
+    failed = ~clean
+    bad |= failed & ((decision != park_id) | queue_changed | book_changed)
+
+    is_flush = clean & (roles == ROLE_FLUSH)
+    bad |= is_flush & ((decision != park_id) | queue_changed | book_changed)
+
+    head = context_book[:, QUEUE_HEAD].long()
+    length = context_book[:, QUEUE_LEN].long()
+    next_label = (
+        context_queue.gather(
+            1,
+            head.clamp(min=0, max=queue_capacity - 1).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    replay = clean & (roles == ROLE_REPLAY)
+    replay_emits = replay & (head < length)
+    replay_drained = replay & ~replay_emits
+    expected_replay_decision = torch.where(
+        replay_emits,
+        next_label,
+        torch.full_like(next_label, park_id),
+    )
+    expected_replay_head = torch.where(replay_emits, head + 1, head)
+    expected_replay_pending = torch.where(
+        replay_emits,
+        torch.ones_like(head),
+        torch.zeros_like(head),
+    )
+    expected_replay_label = torch.where(
+        replay_emits,
+        next_label,
+        context_book[:, BOOK_EXPECTED_LABEL].long(),
+    )
+    replay_bad = (
+        (decision.long() != expected_replay_decision)
+        | queue_changed
+        | (projection_book[:, QUEUE_HEAD].long() != expected_replay_head)
+        | (projection_book[:, QUEUE_LEN] != context_book[:, QUEUE_LEN])
+        | (projection_book[:, QUEUE_LAST_LABEL] != context_book[:, QUEUE_LAST_LABEL])
+        | (projection_book[:, QUEUE_PROMPT] != context_book[:, QUEUE_PROMPT])
+        | (projection_book[:, BOOK_PENDING_ECHO].long() != expected_replay_pending)
+        | (projection_book[:, BOOK_EXPECTED_LABEL].long() != expected_replay_label)
+        | (projection_book[:, BOOK_GEOMETRY] != context_book[:, BOOK_GEOMETRY])
+    )
+    return bad | ((replay | replay_drained) & replay_bad)
+
+
+def make_replay_validation_fusion(
+    *,
+    park_id: int,
+    blank_id: int,
+    queue_capacity: int,
+    eou_token_id: int | None,
+) -> tuple[Callable[..., torch.Tensor], Callable[..., torch.Tensor]]:
+    """Build pure bounded validator closures for the opt-in replay fast path."""
+    if queue_capacity <= 0:
+        raise ValueError("replay validation fusion requires a positive queue capacity")
+
+    def proposed(
+        projection_queue: torch.Tensor,
+        projection_book: torch.Tensor,
+        plan_geom_dev: torch.Tensor,
+        admitted_prompt_dev: torch.Tensor,
+        slot: torch.Tensor,
+    ) -> torch.Tensor:
+        return _proposed_book_bad_rows(
+            projection_queue,
+            projection_book,
+            plan_geom_dev,
+            admitted_prompt_dev,
+            slot,
+            blank_id=blank_id,
+            queue_capacity=queue_capacity,
+            eou_token_id=eou_token_id,
+        )
+
+    def replay(
+        roles: torch.Tensor,
+        context_queue: torch.Tensor,
+        context_book: torch.Tensor,
+        prompt_index: torch.Tensor,
+        effective_status: torch.Tensor,
+        projection_rows: torch.Tensor,
+        projection_queue: torch.Tensor,
+        projection_book: torch.Tensor,
+    ) -> torch.Tensor:
+        return _mrv1_replay_projection_bad_rows(
+            roles,
+            context_queue,
+            context_book,
+            prompt_index,
+            effective_status,
+            projection_rows,
+            projection_queue,
+            projection_book,
+            park_id=park_id,
+            blank_id=blank_id,
+            queue_capacity=queue_capacity,
+            eou_token_id=eou_token_id,
+        )
+
+    return proposed, replay
+
+
 def _mrv1_projection_invariant_rows(
     result: AdvanceResult,
     context: EmissionContext,
@@ -2249,6 +2468,8 @@ def advance_model_rows(
     graph_covers_decode: bool = False,
     memory_profile: bool = False,
     staging: HostStaging | None = None,
+    replay_proposed_book_validator: Callable[..., torch.Tensor] | None = None,
+    replay_projection_validator: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -2355,6 +2576,11 @@ def advance_model_rows(
     device = inputs_embeds.device
     idx_cpu = _structural_preflight(plan, int(input_ids.shape[0]), int(inputs_embeds.shape[0]))
     has_chunk = bool(plan.is_chunk.any())
+    if (replay_proposed_book_validator is None) != (replay_projection_validator is None):
+        raise ValueError("replay validation fusion requires both pure validator callables")
+    replay_projection_fusion = (
+        not has_chunk and replay_proposed_book_validator is not None and replay_projection_validator is not None
+    )
     if graph_covers_decode and has_chunk and plan.execution_tier <= 0:
         raise ValueError("regional graph decode requires a positive RowPlan execution tier")
     if not graph_covers_decode and plan.execution_tier != 0:
@@ -3071,74 +3297,58 @@ def advance_model_rows(
 
     # Validate the adapter's proposed persistent book before it can
     # become resident. Any defect is a row-tier masked park/no-store.
-    pbook = projection.book
-    phead = pbook[:, QUEUE_HEAD].long()
-    plen = pbook[:, QUEUE_LEN].long()
-    ppend_col = pbook[:, BOOK_PENDING_ECHO]
-    ppend = ppend_col == 1
-    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
-    plast = pbook[:, QUEUE_LAST_LABEL].long()
-    premaining = plen - phead
-    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_queue_value_valid |= projection.queue == int(eou_token_id)
-    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
-    proposed_prior_emitted = (
-        projection.queue.gather(
-            1,
-            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+    # This pure mask has no CHUNK-specific semantics, so the opt-in compiler
+    # may cover all turn shapes. The MRV1 projection mask below remains
+    # restricted to host-proven replay-only turns.
+    validator_eou_id = eou_token_id if endpoint_enabled else None
+    if replay_proposed_book_validator is not None:
+        assert replay_proposed_book_validator is not None
+        proposed_bad = replay_proposed_book_validator(
+            projection.queue,
+            projection.book,
+            plan_geom_dev,
+            admitted_prompt_dev,
+            slot,
         )
-        .squeeze(1)
-        .long()
-    )
-    proposed_queue_last = (
-        projection.queue.gather(
-            1,
-            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+    else:
+        proposed_bad = _proposed_book_bad_rows(
+            projection.queue,
+            projection.book,
+            plan_geom_dev,
+            admitted_prompt_dev,
+            slot,
+            blank_id=blank,
+            queue_capacity=cap,
+            eou_token_id=validator_eou_id,
         )
-        .squeeze(1)
-        .long()
-    )
-    proposed_tail_is_eou = torch.zeros_like(ppend)
-    proposed_expected_is_eou = torch.zeros_like(ppend)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
-        proposed_expected_is_eou = pexpected == int(eou_token_id)
-    proposed_bad = (
-        (phead < 0)
-        | (phead > plen)
-        | (plen > cap)
-        | ((ppend_col != 0) & (ppend_col != 1))
-        | (plast < 0)
-        | (plast > blank)
-        | (pexpected < 0)
-        | ((pexpected > blank) & (~proposed_expected_is_eou))
-        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
-        | proposed_queued_bad
-        | (ppend & (phead < 1))
-        | (ppend & (pexpected != proposed_prior_emitted))
-        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
-        | ((premaining > 0) & (~ppend))
-        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
-        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
-    )
     incoming_adapter_status = status
     lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
     status = incoming_adapter_status | projection.row_status
     status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
-    projection_bad = _mrv1_projection_invariant_rows(
-        merged,
-        context,
-        projection,
-        status,
-        park_id=park_id,
-        blank_id=blank,
-        eou_token_id=eou_token_id if endpoint_enabled else None,
-    )
+    if replay_projection_fusion:
+        assert replay_projection_validator is not None
+        projection_bad = replay_projection_validator(
+            roles,
+            context.queue,
+            context.book,
+            context.prompt_index,
+            status,
+            projection.rows,
+            projection.queue,
+            projection.book,
+        )
+    else:
+        projection_bad = _mrv1_projection_invariant_rows(
+            merged,
+            context,
+            projection,
+            status,
+            park_id=park_id,
+            blank_id=blank,
+            eou_token_id=validator_eou_id,
+        )
     status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     failed = status != 0
     projection_rows = projection.rows
