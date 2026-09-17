@@ -35,6 +35,14 @@ class _OmniProjectionState(Protocol):
 class GPUARModelRunnerV2(GPUModelRunner):
     """Thin core-V2 subclass; lifecycle projection lands in the P5 slice."""
 
+    def _dummy_sampler_run(self, hidden_states: Any) -> None:
+        handoff = getattr(self.model, "_native_burst_handoff", None)
+        if handoff is None:
+            super()._dummy_sampler_run(hidden_states)
+            return
+        with handoff.dummy_sampling(park_id=int(self.model.config.eos_token_id)):
+            super()._dummy_sampler_run(hidden_states)
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Add the purpose-named group outside core attention discovery."""
 
@@ -102,6 +110,10 @@ class GPUARModelRunnerV2(GPUModelRunner):
     def add_requests(self, scheduler_output: Any) -> None:
         """Keep the custom group out of core V2's ordinary block tables."""
 
+        validate_request = getattr(self.model_state, "validate_omni_request", None)
+        if validate_request is not None:
+            for data in scheduler_output.scheduled_new_reqs:
+                validate_request(data)
         original = [data.block_ids for data in scheduler_output.scheduled_new_reqs]
         try:
             for data in scheduler_output.scheduled_new_reqs:
