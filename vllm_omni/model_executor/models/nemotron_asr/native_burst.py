@@ -235,6 +235,9 @@ def validate_native_burst_sampling(params: Any, *, park_id: int, capacity: int) 
         or params.n != 1
         or params.min_tokens != 0
         or params.ignore_eos
+        or getattr(params, "repetition_penalty", None) != 1.0
+        or getattr(params, "frequency_penalty", None) != 0.0
+        or getattr(params, "presence_penalty", None) != 0.0
         or (params.max_tokens is not None and params.max_tokens < capacity + 1)
         or any(
             getattr(params, name, None) is not None
