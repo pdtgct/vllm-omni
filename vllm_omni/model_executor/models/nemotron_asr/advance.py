@@ -2250,6 +2250,7 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    endpoint_observer: Callable[..., Any] | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -2812,6 +2813,7 @@ def advance_model_rows(
         endpoint_transition = None
         if endpoint_enabled:
             from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
+                _validate_tensor_observer_inputs,
                 observe_chunk_tensors,
             )
 
@@ -2819,20 +2821,44 @@ def advance_model_rows(
                 raise ValueError("selected decode arm does not expose frame-aligned endpoint symbols")
             assert endpoint_history is not None
             assert endpoint_book is not None
-            endpoint_transition = observe_chunk_tensors(
-                history=endpoint_history.index_select(0, rows_dev),
-                book=endpoint_book.index_select(0, rows_dev),
-                frame_emission_counts=result.frame_emission_counts,
-                valid_frame_lengths=result.frame_valid_lengths,
-                token_ids=result.token_ids,
-                token_lengths=result.token_lengths,
-                final_tail=batch.final_tail.to(device),
-                mode=_h2d(endpoint_mode_cpu.index_select(0, pos_t), device),
-                threshold_frames=_h2d(endpoint_threshold_cpu.index_select(0, pos_t), device),
-                residue_frames=_h2d(endpoint_residue_cpu.index_select(0, pos_t), device),
-                eou_token_id=int(eou_token_id),
-                row_clean=result.row_status == 0,
-            )
+            history_rows = endpoint_history.index_select(0, rows_dev)
+            book_rows = endpoint_book.index_select(0, rows_dev)
+            endpoint_mode = _h2d(endpoint_mode_cpu.index_select(0, pos_t), device)
+            endpoint_threshold = _h2d(endpoint_threshold_cpu.index_select(0, pos_t), device)
+            endpoint_residue = _h2d(endpoint_residue_cpu.index_select(0, pos_t), device)
+            row_clean = result.row_status == 0
+            if endpoint_observer is None:
+                endpoint_transition = observe_chunk_tensors(
+                    history=history_rows,
+                    book=book_rows,
+                    frame_emission_counts=result.frame_emission_counts,
+                    valid_frame_lengths=result.frame_valid_lengths,
+                    token_ids=result.token_ids,
+                    token_lengths=result.token_lengths,
+                    final_tail=batch.final_tail.to(device),
+                    mode=endpoint_mode,
+                    threshold_frames=endpoint_threshold,
+                    residue_frames=endpoint_residue,
+                    eou_token_id=int(eou_token_id),
+                    row_clean=row_clean,
+                )
+            else:
+                endpoint_kwargs = dict(
+                    history=history_rows,
+                    book=book_rows,
+                    frame_emission_counts=result.frame_emission_counts,
+                    valid_frame_lengths=result.frame_valid_lengths,
+                    token_ids=result.token_ids,
+                    token_lengths=result.token_lengths,
+                    final_tail=batch.final_tail.to(device),
+                    mode=endpoint_mode,
+                    threshold_frames=endpoint_threshold,
+                    residue_frames=endpoint_residue,
+                    eou_token_id=int(eou_token_id),
+                    row_clean=row_clean,
+                )
+                _validate_tensor_observer_inputs(**endpoint_kwargs)
+                endpoint_transition = endpoint_observer(**endpoint_kwargs)
             assert result.row_status is not None
             endpoint_status = result.row_status | (
                 endpoint_transition.overflow.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT

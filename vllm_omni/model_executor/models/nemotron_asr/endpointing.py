@@ -230,8 +230,7 @@ def apply_forced_eou_tensors(
     return ForcedTensorEndpointTransition(book=next_book, is_eou=emit)
 
 
-# @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
-def observe_chunk_tensors(
+def _validate_tensor_observer_inputs(
     *,
     history: torch.Tensor,
     book: torch.Tensor,
@@ -245,13 +244,13 @@ def observe_chunk_tensors(
     residue_frames: torch.Tensor,
     eou_token_id: int,
     row_clean: torch.Tensor,
-) -> TensorEndpointTransition:
-    """Tensor equivalent of :func:`observe_chunk` without host readback."""
+) -> None:
+    """Keep structural validation outside the pure device transition."""
 
     if history.dim() != 2 or book.dim() != 2 or book.shape[1] != 6:
         raise ValueError("endpoint resident tensors have invalid shape")
     rows, capacity = history.shape
-    frame_rows, frame_width = frame_emission_counts.shape
+    frame_rows, _ = frame_emission_counts.shape
     if frame_rows != rows or tuple(valid_frame_lengths.shape) != (rows,):
         raise ValueError("endpoint frame tensors have invalid shape")
     if tuple(token_lengths.shape) != (rows,) or token_ids.shape[0] != rows:
@@ -267,6 +266,28 @@ def observe_chunk_tensors(
         )
     ):
         raise ValueError("endpoint policy tensors have invalid shape")
+
+
+# @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
+def _observe_chunk_tensors_impl(
+    *,
+    history: torch.Tensor,
+    book: torch.Tensor,
+    frame_emission_counts: torch.Tensor,
+    valid_frame_lengths: torch.Tensor,
+    token_ids: torch.Tensor,
+    token_lengths: torch.Tensor,
+    final_tail: torch.Tensor,
+    mode: torch.Tensor,
+    threshold_frames: torch.Tensor,
+    residue_frames: torch.Tensor,
+    eou_token_id: int,
+    row_clean: torch.Tensor,
+) -> TensorEndpointTransition:
+    """Pure device transition equivalent of :func:`observe_chunk`."""
+
+    rows, capacity = history.shape
+    _, frame_width = frame_emission_counts.shape
 
     next_history = history.clone()
     next_book = book.clone()
@@ -376,6 +397,64 @@ def observe_chunk_tensors(
         token_lengths=next_lengths,
         is_eou=is_eou,
         overflow=overflow | ~valid_policy,
+    )
+
+
+def observe_chunk_tensors(
+    *,
+    history: torch.Tensor,
+    book: torch.Tensor,
+    frame_emission_counts: torch.Tensor,
+    valid_frame_lengths: torch.Tensor,
+    token_ids: torch.Tensor,
+    token_lengths: torch.Tensor,
+    final_tail: torch.Tensor,
+    mode: torch.Tensor,
+    threshold_frames: torch.Tensor,
+    residue_frames: torch.Tensor,
+    eou_token_id: int,
+    row_clean: torch.Tensor,
+) -> TensorEndpointTransition:
+    """Validated eager reference for one endpoint observation."""
+
+    _validate_tensor_observer_inputs(
+        history=history,
+        book=book,
+        frame_emission_counts=frame_emission_counts,
+        valid_frame_lengths=valid_frame_lengths,
+        token_ids=token_ids,
+        token_lengths=token_lengths,
+        final_tail=final_tail,
+        mode=mode,
+        threshold_frames=threshold_frames,
+        residue_frames=residue_frames,
+        eou_token_id=eou_token_id,
+        row_clean=row_clean,
+    )
+    return _observe_chunk_tensors_impl(
+        history=history,
+        book=book,
+        frame_emission_counts=frame_emission_counts,
+        valid_frame_lengths=valid_frame_lengths,
+        token_ids=token_ids,
+        token_lengths=token_lengths,
+        final_tail=final_tail,
+        mode=mode,
+        threshold_frames=threshold_frames,
+        residue_frames=residue_frames,
+        eou_token_id=eou_token_id,
+        row_clean=row_clean,
+    )
+
+
+def make_native_endpoint_observer() -> Callable[..., TensorEndpointTransition]:
+    """Build the opt-in dynamic full-graph endpoint observer."""
+
+    return torch.compile(
+        _observe_chunk_tensors_impl,
+        fullgraph=True,
+        dynamic=True,
+        options={"triton.cudagraphs": False},
     )
 
 

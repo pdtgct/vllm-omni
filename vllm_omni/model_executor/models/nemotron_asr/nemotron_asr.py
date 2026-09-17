@@ -407,6 +407,18 @@ class NemotronASRForRNNT(nn.Module):
 
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
+        endpoint_fusion_enabled = getattr(hf_config, "experimental_native_endpoint_fusion", False)
+        if not isinstance(endpoint_fusion_enabled, bool):
+            raise ValueError("experimental_native_endpoint_fusion must be a boolean")
+        self._endpoint_observer = None
+        if endpoint_fusion_enabled:
+            if not native_burst_enabled:
+                raise ValueError("experimental_native_endpoint_fusion requires experimental_native_burst")
+            from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
+                make_native_endpoint_observer,
+            )
+
+            self._endpoint_observer = make_native_endpoint_observer()
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
@@ -967,6 +979,7 @@ class NemotronASRForRNNT(nn.Module):
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
+                endpoint_observer=self._endpoint_observer,
             )
         except BaseException:
             if native_handoff is not None:

@@ -243,6 +243,7 @@ def run_persistent_state_profile(
         )
         pools = invocation.pools
         native_handoff = getattr(model, "_native_burst_handoff", None)
+        endpoint_observer = getattr(model, "_endpoint_observer", None)
         if device.type == "cuda":
             warmup_advance_model_rows_scatter(
                 channel_pools=list(pools.channel),
@@ -297,6 +298,7 @@ def run_persistent_state_profile(
                 capture=False,
                 memory_profile=True,
                 native_burst_handoff=native_profile_sink,
+                endpoint_observer=endpoint_observer,
                 staging=None,
             )
 
