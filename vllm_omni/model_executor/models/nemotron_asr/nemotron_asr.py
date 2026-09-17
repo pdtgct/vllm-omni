@@ -394,6 +394,19 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
+        native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
+        if not isinstance(native_burst_enabled, bool):
+            raise ValueError("experimental_native_burst must be a boolean")
+        self._native_burst_handoff = None
+        if native_burst_enabled:
+            from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+                NativeBurstHandoff,
+                native_burst_token_budget,
+                validate_native_burst_config,
+            )
+
+            validate_native_burst_config(vllm_config, hf_config=hf_config)
+            self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
@@ -921,33 +934,44 @@ class NemotronASRForRNNT(nn.Module):
             num_pool_blocks=int(pools.replay_queue.shape[0]),
             execution_tier=execution_tier,
         )
-        return advance_model_rows(
-            self.core,
-            input_ids.long(),
-            inputs_embeds,
-            plan,
-            channel_pools=list(pools.channel),
-            time_pools=list(pools.convolution),
-            len_pools=list(pools.valid_length),
-            h_pool=pools.predictor_h,
-            c_pool=pools.predictor_c,
-            queue_pool=pools.replay_queue,
-            book_pool=pools.replay_book,
-            frontend_raw_pool=pools.frontend_raw,
-            frontend_mel_pool=pools.frontend_mel,
-            frontend_counter_pool=pools.frontend_counters,
-            endpoint_history_pool=pools.endpoint_history,
-            endpoint_book_pool=pools.endpoint_book,
-            eou_token_id=int(self.config.eou_token_id),
-            adapter=self._emission_adapter,
-            decode_resolver=self._decode_resolver,
-            encoder_transition=self._encoder_execution.transition,
-            placeholder_id=int(self.config.audio_chunk_token_id),
-            park_id=int(self.config.eos_token_id),
-            commit_sink=self._ensure_commit_sink(inputs_embeds.device),
-            staging=self._ensure_host_staging(),
-            graph_covers_decode=graph_covers_decode,
-        )
+        native_handoff = self._native_burst_handoff
+        if native_handoff is not None:
+            if persistent_state_projection is None:
+                raise RuntimeError("native burst requires a native runner projection")
+            native_handoff.prepare(persistent_state_projection)
+        try:
+            return advance_model_rows(
+                self.core,
+                input_ids.long(),
+                inputs_embeds,
+                plan,
+                channel_pools=list(pools.channel),
+                time_pools=list(pools.convolution),
+                len_pools=list(pools.valid_length),
+                h_pool=pools.predictor_h,
+                c_pool=pools.predictor_c,
+                queue_pool=pools.replay_queue,
+                book_pool=pools.replay_book,
+                frontend_raw_pool=pools.frontend_raw,
+                frontend_mel_pool=pools.frontend_mel,
+                frontend_counter_pool=pools.frontend_counters,
+                endpoint_history_pool=pools.endpoint_history,
+                endpoint_book_pool=pools.endpoint_book,
+                eou_token_id=int(self.config.eou_token_id),
+                adapter=self._emission_adapter,
+                decode_resolver=self._decode_resolver,
+                encoder_transition=self._encoder_execution.transition,
+                placeholder_id=int(self.config.audio_chunk_token_id),
+                park_id=int(self.config.eos_token_id),
+                commit_sink=self._ensure_commit_sink(inputs_embeds.device),
+                staging=self._ensure_host_staging(),
+                graph_covers_decode=graph_covers_decode,
+                native_burst_handoff=native_handoff,
+            )
+        except BaseException:
+            if native_handoff is not None:
+                native_handoff.clear()
+            raise
 
     def consume_batch_stats(self) -> list[tuple[str, int]] | None:
         from vllm_omni.model_executor.models.nemotron_asr.advance import (

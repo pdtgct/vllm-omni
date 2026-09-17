@@ -207,9 +207,38 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         self._projected_binding_keys: set[tuple[str, int]] = set()
         self._initialized_binding_keys: set[tuple[str, int]] = set()
 
+    def validate_omni_request(self, new_req_data: NewRequestData) -> None:
+        handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
+        if handoff is None:
+            return
+        from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+            validate_native_burst_history,
+            validate_native_burst_sampling,
+        )
+
+        validate_native_burst_sampling(
+            new_req_data.sampling_params,
+            park_id=int(self.model.config.eos_token_id),
+            capacity=handoff.max_tokens - 1,
+        )
+        validate_native_burst_history(
+            new_req_data,
+            max_model_len=self.model_config.max_model_len,
+            burst_tokens=handoff.max_tokens,
+        )
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         del req_index
+        self.validate_omni_request(new_req_data)
         self._request_metadata.add(new_req_data)
+
+    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
+        handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
+        if handoff is None:
+            return None
+        from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstSampler
+
+        return NativeBurstSampler(sampler, handoff), None
 
     def remove_request(self, req_id: str) -> None:
         # MRv2 removes every streaming request before re-adding its next turn;
@@ -234,8 +263,12 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         )
         self._scheduler_output = scheduler_output
         self._projection_epoch = epoch
+        self._native_projection_committed = False
 
     def end_omni_projection(self) -> None:
+        handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
+        if handoff is not None and not getattr(self, "_native_projection_committed", False):
+            handoff.clear()
         if self._projection_epoch is not None:
             self._projection.end(self._projection_epoch)
         self._projection_epoch = None
@@ -252,6 +285,9 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         if preempted_req_ids:
             raise RuntimeError("no-recompute persistent state cannot survive preemption")
         terminal = sorted(finished_req_ids - resident_req_ids)
+        handoff = getattr(getattr(self, "model", None), "_native_burst_handoff", None)
+        if handoff is not None:
+            handoff.cancel_requests(frozenset(terminal))
         self._request_metadata.prune_finished(terminal)
         terminal_set = set(terminal)
         initialized: set[tuple[str, int]] = getattr(
@@ -265,6 +301,7 @@ class NemotronASRModelState(ModelState):  # type: ignore[misc]
         """Publish freshness only after the selected execution succeeds."""
 
         self._initialized_binding_keys.update(self._projected_binding_keys)
+        self._native_projection_committed = True
 
     def prepare_inputs_embeds(
         self,
