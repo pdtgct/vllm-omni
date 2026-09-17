@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     HostStaging,
     ResolvedDecode,
     make_mrv1_adapter,
+    make_native_egress_prepare,
 )
 from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
@@ -62,6 +63,7 @@ from vllm_omni.model_executor.models.nemotron_asr.lid import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
+    SESSION_LIMITS,
 )
 from vllm_omni.model_executor.models.nemotron_asr.plan import (
     ObservedRow,
@@ -397,7 +399,13 @@ class NemotronASRForRNNT(nn.Module):
         native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
         if not isinstance(native_burst_enabled, bool):
             raise ValueError("experimental_native_burst must be a boolean")
+        native_egress_fusion_enabled = getattr(hf_config, "experimental_native_egress_fusion", False)
+        if not isinstance(native_egress_fusion_enabled, bool):
+            raise ValueError("experimental_native_egress_fusion must be a boolean")
+        if native_egress_fusion_enabled and not native_burst_enabled:
+            raise ValueError("experimental native egress fusion requires experimental_native_burst")
         self._native_burst_handoff = None
+        self._native_egress_prepare = None
         if native_burst_enabled:
             from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
                 NativeBurstHandoff,
@@ -407,6 +415,21 @@ class NemotronASRForRNNT(nn.Module):
 
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
+            native_egress_prepare = make_native_egress_prepare(
+                park_id=int(hf_config.eos_token_id),
+                blank_id=self.core.blank_id,
+                queue_capacity=int(SESSION_LIMITS["queue_capacity"]),
+                eou_token_id=int(hf_config.eou_token_id),
+                max_tokens=native_burst_token_budget(hf_config),
+            )
+            if native_egress_fusion_enabled:
+                native_egress_prepare = torch.compile(
+                    native_egress_prepare,
+                    fullgraph=True,
+                    dynamic=True,
+                    options={"triton.cudagraphs": False},
+                )
+            self._native_egress_prepare = native_egress_prepare
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
@@ -654,13 +677,22 @@ class NemotronASRForRNNT(nn.Module):
             raise RuntimeError("MRv2 projection omitted request metadata")
         rows: list[ObservedRow] = []
         for index, (request_id, binding) in enumerate(zip(projection.req_ids, projection.bindings)):
-            if int(input_batch.num_scheduled_tokens[index]) != 1:
-                raise ValueError("every streaming row must be single-token")
             request = metadata[request_id]
             token_ids = request.prefill_token_ids or request.prompt_token_ids
             if token_ids is None:
                 raise RuntimeError("MRv2 request has no token authority")
             computed = int(input_batch.num_computed_tokens_np[index])
+            scheduled = int(input_batch.num_scheduled_tokens[index])
+            if scheduled != 1:
+                raise ValueError(
+                    "every streaming row must be single-token: "
+                    f"row_index={index} scheduled_tokens={scheduled} "
+                    f"batch_rows={len(projection.req_ids)} "
+                    f"batch_scheduled_tokens={sum(int(value) for value in input_batch.num_scheduled_tokens)} "
+                    f"computed_tokens={computed} token_authority_length={len(token_ids)} "
+                    f"prefill_length={len(request.prefill_token_ids or ())} "
+                    f"prompt_length={len(request.prompt_token_ids or ())}"
+                )
             if not 0 <= computed < len(token_ids):
                 raise RuntimeError("MRv2 scheduled token is outside request data")
             token = int(token_ids[computed])
@@ -967,6 +999,7 @@ class NemotronASRForRNNT(nn.Module):
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
+                native_egress_prepare=self._native_egress_prepare,
             )
         except BaseException:
             if native_handoff is not None:

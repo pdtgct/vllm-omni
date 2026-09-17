@@ -110,6 +110,8 @@ class NemotronASRConfig(PretrainedConfig):
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
+        experimental_native_burst: bool = False,
+        experimental_native_egress_fusion: bool = False,
         prompt_dictionary: dict[str, int] | None = None,
         d_model: int = 1024,
         n_layers: int = 24,
@@ -167,6 +169,14 @@ class NemotronASRConfig(PretrainedConfig):
         self.decode_dispatch_arm = decode_dispatch_arm
         self.decode_dispatch_table = decode_dispatch_table
         self.performance_gated = performance_gated
+        if not isinstance(experimental_native_burst, bool):
+            raise ValueError("experimental_native_burst must be a boolean")
+        if not isinstance(experimental_native_egress_fusion, bool):
+            raise ValueError("experimental_native_egress_fusion must be a boolean")
+        if experimental_native_egress_fusion and not experimental_native_burst:
+            raise ValueError("experimental native egress fusion requires experimental_native_burst")
+        self.experimental_native_burst = experimental_native_burst
+        self.experimental_native_egress_fusion = experimental_native_egress_fusion
         # Complete locale -> prompt-row authority, authored from the
         # source checkpoint metadata. Serving must never rely on a
         # sidecar path or reconstruct this binding from labels.

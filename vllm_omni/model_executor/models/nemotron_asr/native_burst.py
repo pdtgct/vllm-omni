@@ -127,6 +127,15 @@ class NativeBurstHandoff:
             raise RuntimeError("native burst receipt is already reserved")
         if self._key(self._snapshot) != self._identity:
             raise RuntimeError("native burst snapshot changed")
+        if (
+            payload.sampled_token_ids.ndim != 2
+            or payload.sampled_token_ids.dtype != torch.int64
+            or payload.num_sampled.ndim != 1
+            or payload.num_sampled.dtype != torch.int32
+            or payload.num_sampled.device != payload.sampled_token_ids.device
+            or payload.num_sampled.shape[0] != payload.sampled_token_ids.shape[0]
+        ):
+            raise RuntimeError("native burst payload shape/count contract mismatch")
         if payload.sampled_token_ids.shape[0] != len(self._snapshot.req_ids):
             raise RuntimeError("native burst payload row count mismatch")
         self._reserved = True

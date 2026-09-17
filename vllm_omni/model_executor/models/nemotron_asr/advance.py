@@ -1056,6 +1056,179 @@ def _mrv1_projection_invariant_rows(
     return bad
 
 
+def make_native_egress_prepare(
+    *,
+    park_id: int,
+    blank_id: int,
+    queue_capacity: int,
+    eou_token_id: int | None,
+    max_tokens: int,
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Build the pure, opt-in native egress-preparation region.
+
+    The closure owns only fresh scratch tensors.  It deliberately stops before
+    the native handoff reservation and all resident scatters, so compilation
+    cannot acquire persistent-state authority.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+        finalize_native_burst,
+        native_burst_invariant_rows,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    def prepare_native_egress(
+        projection_rows: torch.Tensor,
+        projection_queue: torch.Tensor,
+        projection_book: torch.Tensor,
+        projection_status: torch.Tensor,
+        merged_ids: torch.Tensor,
+        merged_lengths: torch.Tensor,
+        roles: torch.Tensor,
+        input_ids: torch.Tensor,
+        chunk_rows: torch.Tensor,
+        context_queue: torch.Tensor,
+        context_book: torch.Tensor,
+        prompt_index: torch.Tensor,
+        incoming_status: torch.Tensor,
+        plan_geometry: torch.Tensor,
+        admitted_prompt: torch.Tensor,
+        slot: torch.Tensor,
+        endpoint_enabled: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return fresh native payload tensors after every egress validation."""
+        active_eou_token_id = eou_token_id if endpoint_enabled else None
+        phead = projection_book[:, QUEUE_HEAD].long()
+        plen = projection_book[:, QUEUE_LEN].long()
+        ppend_col = projection_book[:, BOOK_PENDING_ECHO]
+        ppend = ppend_col == 1
+        pexpected = projection_book[:, BOOK_EXPECTED_LABEL].long()
+        plast = projection_book[:, QUEUE_LAST_LABEL].long()
+        premaining = plen - phead
+        value_valid = (projection_queue >= 0) & (projection_queue < blank_id)
+        if active_eou_token_id is not None:
+            value_valid |= projection_queue == active_eou_token_id
+        queued_bad = ((~value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
+        prior = (
+            projection_queue.gather(1, (phead - 1).clamp(min=0, max=queue_capacity - 1).unsqueeze(1)).squeeze(1).long()
+        )
+        queue_last = (
+            projection_queue.gather(1, (plen - 1).clamp(min=0, max=queue_capacity - 1).unsqueeze(1)).squeeze(1).long()
+        )
+        tail_is_eou = torch.zeros_like(ppend)
+        expected_is_eou = torch.zeros_like(ppend)
+        if active_eou_token_id is not None:
+            tail_is_eou = (plen > 0) & (queue_last == active_eou_token_id)
+            expected_is_eou = pexpected == active_eou_token_id
+        proposed_bad = (
+            (phead < 0)
+            | (phead > plen)
+            | (plen > queue_capacity)
+            | ((ppend_col != 0) & (ppend_col != 1))
+            | (plast < 0)
+            | (plast > blank_id)
+            | (pexpected < 0)
+            | ((pexpected > blank_id) & (~expected_is_eou))
+            | (ppend & (pexpected >= blank_id) & (~expected_is_eou))
+            | queued_bad
+            | (ppend & (phead < 1))
+            | (ppend & (pexpected != prior))
+            | ((plen > 0) & (~tail_is_eou) & (plast != queue_last))
+            | ((premaining > 0) & (~ppend))
+            | (projection_book[:, BOOK_GEOMETRY].long() != plan_geometry)
+            | (projection_book[:, QUEUE_PROMPT].long() != admitted_prompt)
+        )
+        status = incoming_status | projection_status
+        lost_status = (projection_status & incoming_status) != incoming_status
+        status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        status |= ((projection_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+        merged = AdvanceResult(
+            token_ids=merged_ids,
+            token_lengths=merged_lengths,
+            row_status=None,
+        )
+        context = EmissionContext(
+            roles=roles,
+            input_ids=input_ids,
+            chunk_rows=chunk_rows,
+            queue=context_queue,
+            book=context_book,
+            prompt_index=prompt_index,
+            row_status=incoming_status,
+        )
+        projection = EmissionProjection(
+            rows=projection_rows,
+            queue=projection_queue,
+            book=projection_book,
+            row_status=projection_status,
+        )
+        projection_bad = _mrv1_projection_invariant_rows(
+            merged,
+            context,
+            projection,
+            status,
+            park_id=park_id,
+            blank_id=blank_id,
+            eou_token_id=active_eou_token_id,
+        )
+        status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        source = EmissionProjection(
+            rows=projection_rows,
+            queue=projection_queue,
+            book=projection_book,
+            row_status=status.clone(),
+        )
+        native = finalize_native_burst(
+            source,
+            context,
+            park_id=park_id,
+            blank_id=blank_id,
+        )
+        native_bad = native_burst_invariant_rows(
+            source,
+            context,
+            native,
+            park_id=park_id,
+            blank_id=blank_id,
+            eou_token_id=active_eou_token_id,
+        )
+        native_bad |= native.num_sampled > max_tokens
+        status |= native_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        sampled = native.sampled_token_ids.masked_fill(native_bad.unsqueeze(1), -1)
+        sampled = torch.cat(
+            (
+                torch.where(native_bad.unsqueeze(1), torch.full_like(sampled[:, :1], park_id), sampled[:, :1]),
+                sampled[:, 1:],
+            ),
+            dim=1,
+        )
+        num_sampled = torch.where(
+            native_bad,
+            torch.ones_like(native.num_sampled),
+            native.num_sampled,
+        )
+        failed = status != 0
+        rows = native.rows.masked_fill(failed.unsqueeze(1), 0)
+        rows = torch.cat(
+            (
+                torch.where(failed, torch.full_like(rows[:, 0], park_id), rows[:, 0]).unsqueeze(1),
+                rows[:, 1:],
+            ),
+            dim=1,
+        )
+        return rows, native.queue, native.book, status, sampled, num_sampled
+
+    return prepare_native_egress
+
+
 # @spec PORT-ADV-001, PORT-ADV-004
 def advance_session(
     core: NemotronASRCore,
@@ -2250,6 +2423,10 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    native_egress_prepare: Callable[
+        ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]
+    | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -3070,116 +3247,139 @@ def advance_model_rows(
     ):
         raise ValueError("adapter row_status must be device-local int32 shaped (N,)")
 
-    # Validate the adapter's proposed persistent book before it can
-    # become resident. Any defect is a row-tier masked park/no-store.
-    pbook = projection.book
-    phead = pbook[:, QUEUE_HEAD].long()
-    plen = pbook[:, QUEUE_LEN].long()
-    ppend_col = pbook[:, BOOK_PENDING_ECHO]
-    ppend = ppend_col == 1
-    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
-    plast = pbook[:, QUEUE_LAST_LABEL].long()
-    premaining = plen - phead
-    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_queue_value_valid |= projection.queue == int(eou_token_id)
-    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
-    proposed_prior_emitted = (
-        projection.queue.gather(
-            1,
-            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+    # Native callers always use the extracted fresh-scratch preparation seam.
+    # The model may replace this eager closure with its opt-in compiled sibling,
+    # while direct transaction callers retain the same semantics and test oracle.
+    if native_burst_handoff is not None and native_egress_prepare is None:
+        native_egress_prepare = make_native_egress_prepare(
+            park_id=park_id,
+            blank_id=blank,
+            queue_capacity=cap,
+            eou_token_id=eou_token_id,
+            max_tokens=native_burst_handoff.max_tokens,
         )
-        .squeeze(1)
-        .long()
-    )
-    proposed_queue_last = (
-        projection.queue.gather(
-            1,
-            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    proposed_tail_is_eou = torch.zeros_like(ppend)
-    proposed_expected_is_eou = torch.zeros_like(ppend)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
-        proposed_expected_is_eou = pexpected == int(eou_token_id)
-    proposed_bad = (
-        (phead < 0)
-        | (phead > plen)
-        | (plen > cap)
-        | ((ppend_col != 0) & (ppend_col != 1))
-        | (plast < 0)
-        | (plast > blank)
-        | (pexpected < 0)
-        | ((pexpected > blank) & (~proposed_expected_is_eou))
-        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
-        | proposed_queued_bad
-        | (ppend & (phead < 1))
-        | (ppend & (pexpected != proposed_prior_emitted))
-        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
-        | ((premaining > 0) & (~ppend))
-        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
-        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
-    )
-    incoming_adapter_status = status
-    lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
-    status = incoming_adapter_status | projection.row_status
-    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
-    projection_bad = _mrv1_projection_invariant_rows(
-        merged,
-        context,
-        projection,
-        status,
-        park_id=park_id,
-        blank_id=blank,
-        eou_token_id=eou_token_id if endpoint_enabled else None,
-    )
-    status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     native_stage: Callable[[], None] | None = None
-    if native_burst_handoff is not None:
+    if native_burst_handoff is not None and native_egress_prepare is not None:
         from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
-            finalize_native_burst,
-            native_burst_invariant_rows,
+            NativeBurstProjection,
         )
 
-        source_projection = EmissionProjection(
+        (
+            rows,
+            native_queue,
+            native_book,
+            native_status,
+            sampled_token_ids,
+            num_sampled,
+        ) = native_egress_prepare(
             projection.rows,
             projection.queue,
             projection.book,
-            status.clone(),
+            projection.row_status,
+            merged.token_ids,
+            merged.token_lengths,
+            context.roles,
+            context.input_ids,
+            context.chunk_rows,
+            context.queue,
+            context.book,
+            context.prompt_index,
+            status,
+            plan_geom_dev,
+            admitted_prompt_dev,
+            slot,
+            endpoint_enabled,
         )
-        native_projection = finalize_native_burst(
-            source_projection,
-            context,
-            park_id=park_id,
-            blank_id=blank,
+        native_projection = NativeBurstProjection(
+            rows=rows,
+            queue=native_queue,
+            book=native_book,
+            row_status=native_status,
+            sampled_token_ids=sampled_token_ids,
+            num_sampled=num_sampled,
         )
-        native_bad = native_burst_invariant_rows(
-            source_projection,
+        if (
+            native_projection.sampled_token_ids.ndim != 2
+            or tuple(native_projection.sampled_token_ids.shape)
+            != (native_projection.queue.shape[0], native_projection.queue.shape[1] + 1)
+            or tuple(native_projection.num_sampled.shape) != (native_projection.queue.shape[0],)
+        ):
+            raise ValueError("native burst payload does not match its queue authority")
+        projection = native_projection
+        status = native_status
+        native_stage = native_burst_handoff.reserve(native_projection)
+    else:
+        # Validate the adapter's proposed persistent book before it can
+        # become resident. Any defect is a row-tier masked park/no-store.
+        pbook = projection.book
+        phead = pbook[:, QUEUE_HEAD].long()
+        plen = pbook[:, QUEUE_LEN].long()
+        ppend_col = pbook[:, BOOK_PENDING_ECHO]
+        ppend = ppend_col == 1
+        pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
+        plast = pbook[:, QUEUE_LAST_LABEL].long()
+        premaining = plen - phead
+        proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
+        if endpoint_enabled:
+            assert eou_token_id is not None
+            proposed_queue_value_valid |= projection.queue == int(eou_token_id)
+        proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
+        proposed_prior_emitted = (
+            projection.queue.gather(
+                1,
+                (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+            )
+            .squeeze(1)
+            .long()
+        )
+        proposed_queue_last = (
+            projection.queue.gather(
+                1,
+                (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+            )
+            .squeeze(1)
+            .long()
+        )
+        proposed_tail_is_eou = torch.zeros_like(ppend)
+        proposed_expected_is_eou = torch.zeros_like(ppend)
+        if endpoint_enabled:
+            assert eou_token_id is not None
+            proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
+            proposed_expected_is_eou = pexpected == int(eou_token_id)
+        proposed_bad = (
+            (phead < 0)
+            | (phead > plen)
+            | (plen > cap)
+            | ((ppend_col != 0) & (ppend_col != 1))
+            | (plast < 0)
+            | (plast > blank)
+            | (pexpected < 0)
+            | ((pexpected > blank) & (~proposed_expected_is_eou))
+            | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
+            | proposed_queued_bad
+            | (ppend & (phead < 1))
+            | (ppend & (pexpected != proposed_prior_emitted))
+            | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
+            | ((premaining > 0) & (~ppend))
+            | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
+            | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
+        )
+        incoming_adapter_status = status
+        lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
+        status = incoming_adapter_status | projection.row_status
+        status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+        projection_bad = _mrv1_projection_invariant_rows(
+            merged,
             context,
-            native_projection,
+            projection,
+            status,
             park_id=park_id,
             blank_id=blank,
             eou_token_id=eou_token_id if endpoint_enabled else None,
         )
-        native_bad |= native_projection.num_sampled > native_burst_handoff.max_tokens
-        status |= native_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-        native_projection.sampled_token_ids.masked_fill_(native_bad.unsqueeze(1), -1)
-        native_projection.sampled_token_ids[:, 0] = torch.where(
-            native_bad,
-            park_id,
-            native_projection.sampled_token_ids[:, 0],
-        )
-        native_projection.num_sampled.masked_fill_(native_bad, 1)
-        native_projection.row_status.copy_(status)
-        projection = native_projection
-        native_stage = native_burst_handoff.reserve(native_projection)
+        status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     failed = status != 0
     projection_rows = projection.rows
     projection_rows.masked_fill_(failed.reshape(-1, 1), 0)

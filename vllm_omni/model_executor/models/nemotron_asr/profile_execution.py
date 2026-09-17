@@ -297,6 +297,7 @@ def run_persistent_state_profile(
                 capture=False,
                 memory_profile=True,
                 native_burst_handoff=native_profile_sink,
+                native_egress_prepare=getattr(model, "_native_egress_prepare", None),
                 staging=None,
             )
 
