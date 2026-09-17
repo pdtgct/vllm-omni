@@ -457,6 +457,9 @@ class NemotronASRForRNNT(nn.Module):
             remap_card_name,
         )
 
+        if self._encoder_execution._model_state is not None:
+            raise RuntimeError("encoder weights are immutable after execution materialization; use a fresh worker")
+        self.core.encoder.invalidate_stream_relative_position_projections()
         expected: dict[str, torch.Tensor] = dict(self.core.named_parameters())
         expected.update(self.core.named_buffers())
         required = set(self.core.state_dict())
