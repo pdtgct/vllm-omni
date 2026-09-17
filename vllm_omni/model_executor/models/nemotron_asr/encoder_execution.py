@@ -1365,8 +1365,10 @@ def build_encoder_execution(
     eager fallback: a graph break or compilation failure invalidates that
     experimental arm. ``dynamic=False`` may cache multiple exact-shape
     specializations; the profiling warmup must cover the measured shapes.
-    ``dense-graphed`` retains that compiler domain and then explicitly captures
-    every exact geometry/population transition through the platform graph seam.
+    ``dense-graphed`` explicitly captures every exact geometry/population
+    transition through the platform graph seam. This experimental branch uses
+    Dynamo's eager backend for that transition, preserving Dynamo guards while
+    avoiding Inductor arithmetic transforms.
     """
     if isinstance(maximum_population, bool) or not isinstance(maximum_population, int) or maximum_population <= 0:
         raise ValueError("maximum encoder population must be positive")
@@ -1384,7 +1386,10 @@ def build_encoder_execution(
     if not isinstance(fused_kv, bool):
         raise ValueError("experimental_fused_kv_projection must be a boolean")
     if fused_kv and arm == "eager":
-        raise ValueError("experimental_fused_kv_projection requires compiled encoder execution")
+        raise ValueError(
+            "experimental_fused_kv_projection requires compiled-static or "
+            "dense-graphed execution"
+        )
 
     def transition(
         mel: torch.Tensor,
@@ -1429,12 +1434,24 @@ def build_encoder_execution(
         else tuple(range(1, maximum_population + 1))
     )
     specialization_budget = len(geometries) * len(populations)
-    compiled = torch.compile(
-        transition,
-        fullgraph=True,
-        dynamic=False,
-        options={"triton.cudagraphs": False},
-    )
+    # EXPERIMENT: keep Dynamo's guards but use its eager backend inside the
+    # existing dense graph domain. Compiled-static keeps the Inductor path.
+    if arm == "dense-graphed":
+        compiled = torch.compile(  # type: ignore[call-overload]
+            transition,
+            backend="eager",
+            fullgraph=True,
+            dynamic=False,
+            options=None,
+            isolate_recompiles=True,
+        )
+    else:
+        compiled = torch.compile(
+            transition,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
     execution = ResolvedEncoderExecution(
         arm=arm,
         transition=transition,
