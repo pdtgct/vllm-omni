@@ -227,12 +227,15 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
     Returns:
         The state manifest dict.
     """
+    projected_history = getattr(config, "experimental_projected_history", False)
+    if not isinstance(projected_history, bool):
+        raise ValueError("experimental_projected_history must be a boolean")
     entries: list[dict[str, Any]] = []
     for i in range(config.n_layers):
         entries.append(
             {
                 "name": f"encoder.layers.{i}.window.channel",
-                "shape": [config.att_context_left, config.d_model],
+                "shape": [config.att_context_left, (3 if projected_history else 1) * config.d_model],
                 "dtype": "float32",
                 "init": "zeros",
             }
@@ -341,7 +344,7 @@ def author_state_manifest(config: Any) -> dict[str, Any]:
             }
         )
     return {
-        "schema": "state-manifest-v1",
+        "schema": "experimental-projected-history-state-manifest-v1" if projected_history else "state-manifest-v1",
         "precision_policy": PRECISION_POLICY_ID,
         "entries": entries,
         "total_page_bytes": sum(_entry_bytes(e) for e in entries),

@@ -813,6 +813,9 @@ class ResolvedEncoderExecution:
         prepare_fused_kv = getattr(encoder, "prepare_stream_fused_kv_projections", None)
         if callable(prepare_fused_kv):
             prepare_fused_kv(reference=reference)
+        prepare_projected_history = getattr(encoder, "prepare_stream_projected_history", None)
+        if callable(prepare_projected_history):
+            prepare_projected_history(reference=reference)
         self._runner_device = runner_device
         self._model_state = _compiled_transition_model_state(self._core)
 
@@ -1386,10 +1389,14 @@ def build_encoder_execution(
     if not isinstance(fused_kv, bool):
         raise ValueError("experimental_fused_kv_projection must be a boolean")
     if fused_kv and arm == "eager":
-        raise ValueError(
-            "experimental_fused_kv_projection requires compiled-static or "
-            "dense-graphed execution"
-        )
+        raise ValueError("experimental_fused_kv_projection requires compiled-static or dense-graphed execution")
+    projected_history = getattr(hf_config, "experimental_projected_history", False)
+    if not isinstance(projected_history, bool):
+        raise ValueError("experimental_projected_history must be a boolean")
+    if projected_history and fused_kv:
+        raise ValueError("projected history cannot be combined with fused K/V projection")
+    if projected_history and arm != "dense-graphed":
+        raise ValueError("projected history requires dense-graphed execution")
 
     def transition(
         mel: torch.Tensor,
@@ -1420,6 +1427,8 @@ def build_encoder_execution(
     history_frames = int(hf_config.att_context_left)
     if history_frames < 0:
         raise ValueError("encoder attention history must be nonnegative")
+    if projected_history and (history_frames != 56 or int(getattr(hf_config, "d_model", 0)) != 1024):
+        raise ValueError("projected history requires C=56 and D=1024")
     geometry_shapes = tuple(encoder_geometry_shape(core, geometry) for geometry in geometries)
     geometry_shape_by_id = dict(zip(geometries, geometry_shapes, strict=True))
     t_cap = max(shape.out_width + history_frames for shape in geometry_shapes)
@@ -1486,6 +1495,14 @@ def build_encoder_execution(
             out_width,
             prompt_index,
         )
+        declared_model_width = getattr(hf_config, "d_model", None)
+        if isinstance(declared_model_width, int):
+            expected_channel_width = (3 if projected_history else 1) * declared_model_width
+            if any(item.shape[-1] != expected_channel_width for item in signature.channel):
+                raise ValueError(
+                    "encoder channel width disagrees with projected-history configuration "
+                    f"(expected {expected_channel_width})"
+                )
         population = signature.mel.shape[0]
         active_cell = execution._active_cell
         staging_cell = execution._staging_cell

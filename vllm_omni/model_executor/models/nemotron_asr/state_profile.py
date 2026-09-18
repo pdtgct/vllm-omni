@@ -84,10 +84,15 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
 
     if offset != manifest["total_page_bytes"]:
         raise ValueError("state manifest byte total disagrees with its entries")
+    projected_history = getattr(config, "experimental_projected_history", False)
+    if not isinstance(projected_history, bool):
+        raise ValueError("experimental_projected_history must be a boolean")
     return PersistentStateSpec(
         descriptors=descriptors,
         page_size_bytes=offset,
-        state_name="nemotron.cache_aware_streaming",
+        state_name=(
+            "EXPERIMENTAL.nemotron.projected_history_ieee.v1" if projected_history else "nemotron.cache_aware_streaming"
+        ),
     )
 
 

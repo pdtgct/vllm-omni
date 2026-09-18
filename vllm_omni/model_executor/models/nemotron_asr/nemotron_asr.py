@@ -407,9 +407,14 @@ class NemotronASRForRNNT(nn.Module):
 
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
-        self.core.encoder.configure_stream_fused_kv_projection(
-            getattr(hf_config, "experimental_fused_kv_projection", False)
-        )
+        fused_kv = getattr(hf_config, "experimental_fused_kv_projection", False)
+        projected_history = getattr(hf_config, "experimental_projected_history", False)
+        if not isinstance(projected_history, bool):
+            raise ValueError("experimental_projected_history must be a boolean")
+        if projected_history and fused_kv:
+            raise ValueError("projected history cannot be combined with fused K/V projection")
+        self.core.encoder.configure_stream_projected_history(projected_history)
+        self.core.encoder.configure_stream_fused_kv_projection(fused_kv)
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
@@ -794,6 +799,7 @@ class NemotronASRForRNNT(nn.Module):
         binding = self._decode_graph_binding
         keys = () if binding is None else binding.captured_keys
         decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        projected_history = bool(getattr(self.config, "experimental_projected_history", False))
         return {
             "schema": "nemotron-execution-profile/1",
             "decode": {
@@ -802,6 +808,12 @@ class NemotronASRForRNNT(nn.Module):
                 "ready": binding is None or bool(keys),
             },
             "encoder": self._encoder_execution.ready_receipt(),
+            "experimental_projected_history": {
+                "enabled": projected_history,
+                "state_layout": "[hidden, key, value]" if projected_history else None,
+                "canonical_projection": "public-core-ieee-fp32-128x128x32" if projected_history else None,
+                "k_v_bias": "none-required" if projected_history else None,
+            },
         }
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:

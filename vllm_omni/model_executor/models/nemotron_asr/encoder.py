@@ -23,10 +23,15 @@ source refs @ NeMo de242add.
 """
 
 import math
+from typing import cast
 
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.nemotron_asr.experimental_projected_history import (
+    CanonicalProject,
+    hybrid_kv,
+)
 from vllm_omni.model_executor.models.nemotron_asr.masks import (
     chunked_limited_mask,
 )
@@ -321,6 +326,8 @@ class FastConformerEncoder(nn.Module):
         # not session state; never add or replace them from stream_step.
         self._stream_relative_position_lengths: tuple[int, ...] = ()
         self._stream_fused_kv_projection_enabled = False
+        self._stream_projected_history_enabled = False
+        self._stream_projected_history_projection: CanonicalProject | None = None
 
     @staticmethod
     def _stream_relative_position_name(length: int) -> str:
@@ -341,6 +348,13 @@ class FastConformerEncoder(nn.Module):
             raise RuntimeError("fused K/V projections are immutable after materialization")
         self._stream_fused_kv_projection_enabled = enabled
 
+    def configure_stream_projected_history(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("experimental_projected_history must be a boolean")
+        if self._stream_projected_history_projection is not None:
+            raise RuntimeError("projected history is immutable after materialization")
+        self._stream_projected_history_enabled = enabled
+
     def invalidate_stream_relative_position_projections(self) -> None:
         """Drop derived serving projections before a model mutation."""
         for layer in self.layers:
@@ -353,6 +367,7 @@ class FastConformerEncoder(nn.Module):
                 if name in attn._buffers:
                     delattr(attn, name)
         self._stream_relative_position_lengths = ()
+        self._stream_projected_history_projection = None
 
     def _apply(self, fn, recurse: bool = True):
         # A device or dtype transition must rebuild from the original full
@@ -486,6 +501,33 @@ class FastConformerEncoder(nn.Module):
             attn.register_buffer(self._stream_fused_kv_name(), weight, persistent=False)
             attn.register_buffer(self._stream_fused_kv_bias_name(), bias, persistent=False)
 
+    def prepare_stream_projected_history(self, *, reference: torch.Tensor) -> None:
+        """Construct the experimental fixed IEEE projector before graph capture."""
+        if not self._stream_projected_history_enabled:
+            return
+        if self.training or torch.is_grad_enabled() or reference.dtype != torch.float32:
+            raise ValueError("projected history requires frozen FP32 inference")
+        if self._stream_projected_history_projection is not None:
+            return
+        for layer in self.layers:
+            attn = cast(ConformerLayer, layer).self_attn
+            if (
+                attn.h * attn.d_k != 1024
+                or tuple(attn.linear_k.weight.shape) != (1024, 1024)
+                or tuple(attn.linear_v.weight.shape) != (1024, 1024)
+                or attn.linear_k.bias is not None
+                or attn.linear_v.bias is not None
+            ):
+                raise ValueError("projected history requires the fixed FP32 Nemotron K/V projection geometry")
+        from vllm_omni.model_executor.models.nemotron_asr.experimental_core_ieee_projection import (
+            CoreIEEEProjection,
+        )
+
+        self._stream_projected_history_projection = cast(
+            CanonicalProject,
+            CoreIEEEProjection(reference.device),
+        )
+
     def stream_relative_position_projections(
         self,
         *,
@@ -551,9 +593,19 @@ class StreamingCaches:
         conv_kernel: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        projected_history: bool = False,
     ) -> None:
         self.left_context = left_context
-        self.channel = torch.zeros(n_layers, batch, left_context, d_model, device=device, dtype=dtype)
+        if not isinstance(projected_history, bool):
+            raise ValueError("projected_history must be a boolean")
+        self.channel = torch.zeros(
+            n_layers,
+            batch,
+            left_context,
+            (3 if projected_history else 1) * d_model,
+            device=device,
+            dtype=dtype,
+        )
         self.time = torch.zeros(
             n_layers,
             batch,
@@ -575,6 +627,7 @@ def _stream_attention(
     new_valid: torch.Tensor,
     new_lengths: torch.Tensor,
     projected_pos: torch.Tensor | None = None,
+    projected_history: CanonicalProject | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
@@ -589,23 +642,48 @@ def _stream_attention(
     cache.
     """
     attn = layer.self_attn
-    batch, new_frames, _ = x.shape
+    batch, new_frames, width = x.shape
     capacity = cache.shape[1]
-    # The cache keeps its own policy axis (attention_cache); compute
-    # runs in the activations dtype, so read-cast here, write-cast on
-    # advance (PORT-PREC-001/005 — state dtype never follows compute).
-    keys = torch.cat([cache.to(x.dtype), x], dim=1)  # (B, C+F, d)
-
-    b, t2 = batch, keys.shape[1]
-    q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
+    b, t2 = batch, capacity + new_frames
     fused_weight = getattr(attn, "_stream_fused_kv_weight", None)
-    if fused_weight is None:
-        k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
-        v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    if projected_history is not None and fused_weight is not None:
+        raise ValueError("projected history cannot be combined with fused K/V projection")
+    # This experimental selector is admitted only for the validated fixed
+    # FP32 geometries. Other shapes retain the full hidden-history path.
+    use_shadow_kv = (
+        projected_history is not None
+        and batch in (64, 128)
+        and new_frames == 4
+        and capacity == 56
+        and width == 1024
+        and x.dtype == torch.float32
+    )
+    if projected_history is not None:
+        q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
+        k_linear, v_linear, new_cache = hybrid_kv(
+            x,
+            cache,
+            new_lengths,
+            projected_history,
+            attn.linear_k,
+            attn.linear_v,
+            use_shadow_kv,
+        )
+        k = k_linear.view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+        v = v_linear.view(b, t2, attn.h, attn.d_k).transpose(1, 2)
     else:
-        kv = nn.functional.linear(keys, fused_weight, getattr(attn, "_stream_fused_kv_bias", None))
-        k, v = kv.unflatten(-1, (2, attn.h, attn.d_k)).unbind(dim=-3)
-        k, v = k.transpose(1, 2), v.transpose(1, 2)
+        # The cache keeps its own policy axis (attention_cache); compute
+        # runs in the activations dtype, so read-cast here, write-cast on
+        # advance (PORT-PREC-001/005 — state dtype never follows compute).
+        keys = torch.cat([cache.to(x.dtype), x], dim=1)  # (B, C+F, d)
+        q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
+        if fused_weight is None:
+            k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+            v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+        else:
+            kv = nn.functional.linear(keys, fused_weight, getattr(attn, "_stream_fused_kv_bias", None))
+            k, v = kv.unflatten(-1, (2, attn.h, attn.d_k)).unbind(dim=-3)
+            k, v = k.transpose(1, 2), v.transpose(1, 2)
     if projected_pos is None:
         if pos_emb is None:
             raise ValueError("stream attention requires positional embeddings or a prepared projection")
@@ -632,12 +710,13 @@ def _stream_attention(
     # Advance cache by each row's logical length: slot j of the new
     # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
     # bit-identical; gather indices never touch padded frames.
-    aidx = (
-        (new_lengths.view(-1, 1) + torch.arange(capacity, device=x.device).unsqueeze(0))
-        .unsqueeze(-1)
-        .expand(b, capacity, keys.shape[2])
-    )
-    new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, aidx)
+    if projected_history is None:
+        aidx = (
+            (new_lengths.view(-1, 1) + torch.arange(capacity, device=x.device).unsqueeze(0))
+            .unsqueeze(-1)
+            .expand(b, capacity, keys.shape[2])
+        )
+        new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, aidx)
     return attn.linear_out(out), new_cache
 
 
@@ -757,6 +836,7 @@ def stream_step(
             new_valid=new_valid,
             new_lengths=out_lengths,
             projected_pos=None if projections is None else projections[idx],
+            projected_history=encoder._stream_projected_history_projection,
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)

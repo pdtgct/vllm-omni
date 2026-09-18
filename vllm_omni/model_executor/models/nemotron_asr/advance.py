@@ -2796,7 +2796,11 @@ def advance_model_rows(
                 (
                     int(rows_dev.shape[0]),
                     capture_geometry.out_width,
-                    int(state.channel[0].shape[2]),
+                    (
+                        int(state.channel[0].shape[2]) // 3
+                        if bool(getattr(core.encoder, "_stream_projected_history_enabled", False))
+                        else int(state.channel[0].shape[2])
+                    ),
                 ),
                 state.channel[0].dtype,
             )
