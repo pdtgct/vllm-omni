@@ -64,7 +64,6 @@ from vllm.entrypoints.generate.base.protocol import (
     ToolCall,
 )
 from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
-from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -112,6 +111,7 @@ from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.entrypoints.launcher import request_application_shutdown
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
@@ -2342,10 +2342,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Actively signal shutdown instead of waiting for the watchdog
             # (5s polling interval).
             if raw_request is not None:
-                terminate_if_errored(
-                    server=raw_request.app.state.server,
-                    engine=self.engine_client,
-                )
+                request_application_shutdown(raw_request.app.state, self.engine_client, e)
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -3489,10 +3486,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             data = self.create_streaming_error_response(exc)
             yield f"data: {data}\n\n"
             if raw_request is not None:
-                terminate_if_errored(
-                    server=raw_request.app.state.server,
-                    engine=self.engine_client,
-                )
+                request_application_shutdown(raw_request.app.state, self.engine_client, exc)
             else:
                 logger.warning(
                     "[OmniOpenAIServingChat] Engine dead during streaming image edit, "

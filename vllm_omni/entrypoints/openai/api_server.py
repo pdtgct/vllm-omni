@@ -6,8 +6,10 @@ This module owns app construction, server startup, app-state initialization,
 and route bodies that have not yet moved to endpoint-owned modules."""
 
 import asyncio
+import copy
 import dataclasses
 import json
+import math
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -24,15 +26,16 @@ from typing import Annotated, Any, Literal
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from PIL import Image
 from starlette.datastructures import State
+from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
-from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
@@ -56,6 +59,8 @@ from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.instrumentator.health import health as vllm_health
+from vllm.entrypoints.serve.instrumentator.metrics import PrometheusResponse
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
@@ -90,6 +95,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
+from vllm_omni.entrypoints.launcher import serve_http
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
 from vllm_omni.entrypoints.openai.app_state import (
     ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL,
@@ -98,6 +104,19 @@ from vllm_omni.entrypoints.openai.app_state import (
     Omnichat,
     Omnispeech,
     _get_engine_and_model,
+)
+from vllm_omni.entrypoints.openai.application_plugins import (
+    DEFAULT_WS_MAX_SIZE,
+    ApplicationASGIComposition,
+    ApplicationPluginHostContext,
+    ApplicationPluginLifetime,
+    SelectedApplicationPlugin,
+    add_application_plugin_args,
+    application_plugin_lifetime,
+    create_application_admission,
+    discover_application_plugins,
+    prepare_application_plugin_asgi_wrappers,
+    validate_application_plugin_options,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template_json
@@ -188,6 +207,8 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
+_remove_route_from_app = remove_route_from_app
+
 logger = init_logger(__name__)
 router = APIRouter()
 
@@ -195,6 +216,161 @@ profiler_router = APIRouter()
 
 
 # Server entry points
+
+
+_APPLICATION_SERVER_ONLY_ARGS = (
+    "application_plugin",
+    "application_plugin_config",
+    "application_plugin_startup_timeout",
+    "ws_max_size",
+)
+
+
+def _engine_args_without_application_options(args: Any) -> Any:
+    """Copy CLI args without API-server-only application policy."""
+    # @spec ING-VEH-003
+    if isinstance(args, TrackingNamespace):
+        unfiltered_args = Namespace(**vars(args))
+        for name in _APPLICATION_SERVER_ONLY_ARGS:
+            vars(unfiltered_args).pop(name, None)
+        explicit_keys = args.explicit_keys.difference(_APPLICATION_SERVER_ONLY_ARGS)
+        return TrackingNamespace(unfiltered_args, frozenset(explicit_keys))
+
+    engine_args = copy.copy(args)
+    for name in _APPLICATION_SERVER_ONLY_ARGS:
+        if hasattr(engine_args, name):
+            delattr(engine_args, name)
+    return engine_args
+
+
+async def _initialize_endpoint_plugin_state(
+    app: Any,
+    engine_client: Any,
+    args: Any,
+) -> None:
+    """Complete upstream EndpointPlugin phase B on retained instances."""
+    # @spec ING-VEH-023
+    for plugin in getattr(app.state, "endpoint_plugins", ()):
+        await plugin.init_state(engine_client, app.state, args)
+
+
+async def _application_live() -> Response:
+    """Report process liveness independently from application readiness."""
+    return Response(status_code=HTTPStatus.OK.value)
+
+
+def _install_and_validate_application_operations_routes(app: Any) -> None:
+    """Reserve host operations routes before selected participants enter."""
+    health_routes = [route for route in app.routes if getattr(route, "path", None) == "/health"]
+    if len(health_routes) != 1 or health_routes[0].endpoint is not health:
+        raise RuntimeError("application plugin operations route collision: /health")
+    if any(getattr(route, "path", None) == "/live" for route in app.routes):
+        raise RuntimeError("application plugin operations route collision: /live")
+
+    metrics_routes = [route for route in app.routes if getattr(route, "path", None) == "/metrics"]
+    for route in metrics_routes:
+        if isinstance(route, APIRoute):
+            owned = (
+                route.response_class is PrometheusResponse
+                and getattr(route.endpoint, "__module__", None) == "prometheus_fastapi_instrumentator.instrumentation"
+                and getattr(route.endpoint, "__qualname__", "").endswith(".metrics")
+            )
+        elif isinstance(route, Mount):
+            mounted_app = route.app
+            owned = getattr(mounted_app, "__module__", None) == "prometheus_client.asgi" and getattr(
+                mounted_app, "__qualname__", ""
+            ).endswith(".prometheus_app")
+        else:
+            owned = False
+        if not owned:
+            raise RuntimeError("application plugin operations route collision: /metrics")
+    if metrics_routes and (
+        sum(isinstance(route, APIRoute) for route in metrics_routes) != 1
+        or sum(isinstance(route, Mount) for route in metrics_routes) != 1
+    ):
+        raise RuntimeError("application plugin operations route collision: /metrics")
+    app.add_api_route(
+        "/live",
+        _application_live,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+
+
+class _ApplicationServerLifecycleHook:
+    """Bridge host admission and participant barriers into the launcher."""
+
+    def __init__(
+        self,
+        admission: Any,
+        lifetime: ApplicationPluginLifetime,
+    ) -> None:
+        self._admission = admission
+        self._lifetime = lifetime
+        self._bound_lock = asyncio.Lock()
+        self._bound = False
+        self._ready = False
+        self._drain_task: asyncio.Task[None] | None = None
+        self._exit_task: asyncio.Task[None] | None = None
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    @property
+    def shutdown_grace(self) -> float:
+        return self._lifetime.shutdown_grace
+
+    async def on_bound(self) -> None:
+        """Linearize composed readiness once after the HTTP listener binds."""
+        # @spec ING-VEH-016, ING-VEH-018, ING-VEH-020
+        async with self._bound_lock:
+            if self._bound:
+                return
+            await self._admission.open_after_http_listener_bound()
+            try:
+                await self._lifetime.mark_serving()
+            except BaseException:
+                self._admission.close_from_launcher_thread()
+                raise
+            self._ready = True
+            self._bound = True
+
+    def on_shutdown_requested(
+        self,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Close admission synchronously before any awaited shutdown work."""
+        # @spec ING-VEH-017, ING-VEH-020
+        del cause
+        self._ready = False
+        self._admission.close_from_launcher_thread()
+
+    async def before_http_shutdown(self) -> None:
+        """Drain participants once, sharing the result across callers."""
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain())
+        await asyncio.shield(self._drain_task)
+
+    async def _drain(self) -> None:
+        await self._admission.close_before_owner_drain()
+        await self._lifetime.quiesce_and_drain()
+
+    async def before_engine_shutdown(self) -> None:
+        """Exit participant contexts once after HTTP has stopped."""
+        if self._exit_task is None:
+            self._exit_task = asyncio.create_task(self._lifetime.__aexit__(None, None, None))
+        await asyncio.shield(self._exit_task)
+
+    async def wait_failed(self) -> None:
+        await self._lifetime.wait_failed()
+
+
+async def _within_startup_deadline(awaitable: Any, deadline: float) -> None:
+    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    try:
+        await asyncio.wait_for(awaitable, timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError("application plugin startup budget expired") from exc
 
 
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
@@ -243,8 +419,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    selected_plugin_names = list(getattr(args, "application_plugin", []))
+    engine_args = _engine_args_without_application_options(args)
     async with build_async_omni(
-        args,
+        engine_args,
         client_config=client_config,
     ) as engine_client:
         supported_tasks: tuple[str, ...]
@@ -261,120 +439,234 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
 
-        # OMNI: Remove upstream routes that we override with omni-specific handlers
-        remove_route_from_app(app, "/v1/chat/completions", {"POST"})
-        remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
-        remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
-        remove_route_from_app(app, "/health", {"GET"})
-        app.include_router(router)
-
-        # OMNI: Override upstream exception handlers with Omni-aware versions
-        # that understand the multi-stage orchestrator lifecycle.
-        _register_omni_exception_handlers(app)
-
-        await omni_init_app_state(engine_client, app.state, args)
-
-        # After initializing the app state, shut down any endpoints that are model specific
-        if hasattr(engine_client, "endpoint_restrictions"):
-            shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
-        else:
-            logger.warning("engine client has no endpoint restrictions attribute")
-
-        # Start background processes
-        await STORAGE_MANAGER.start()
-
-        # Conditionally register profiler endpoints based on stage YAML configs
-        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        if _should_enable_profiler_endpoints(stage_configs):
-            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
-            remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
-            remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
-            app.include_router(profiler_router)
-
-        vllm_config = await openai_app_state._get_vllm_config(engine_client)
-
-        # Check if pure diffusion mode (vllm_config will be None)
-        is_pure_diffusion = vllm_config is None
-        if is_pure_diffusion:
-            logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
-                listen_address,
+        application_admission = create_application_admission() if selected_plugin_names else None
+        asgi_composition: ApplicationASGIComposition | None = None
+        try:
+            # OMNI: Remove upstream routes that we override with omni-specific handlers
+            remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+            remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
+            remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+            remove_route_from_app(
+                app,
+                "/health",
+                {"GET"},
+                endpoint=vllm_health if application_admission is not None else None,
             )
-            # The vLLM 0.27 launcher's shutdown path reads
-            # engine_client.vllm_config.shutdown_timeout; AsyncOmni.vllm_config
-            # is None for pure diffusion (no comprehension stage), which would
-            # crash handle_shutdown and hang teardown. Wrap app.state.engine_client
-            # with a shim that only overrides vllm_config and forwards everything
-            # else (get_vllm_config still returns None for pure-diffusion detection).
-            app.state.engine_client = PureDiffusionLauncherAdapter(
-                engine_client,
-                shutdown_timeout=getattr(args, "shutdown_timeout", 0),
-            )
-        else:
-            logger.info(
-                "Starting vLLM API server %d on %s",
-                vllm_config.parallel_config._api_process_rank,
-                listen_address,
-            )
+            app.include_router(router)
 
-        class _TimestampMiddleware:
-            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+            # OMNI: Override upstream exception handlers with Omni-aware versions
+            # that understand the multi-stage orchestrator lifecycle.
+            _register_omni_exception_handlers(app)
 
-            Wraps the fully-built Starlette app as an outer ASGI layer so no
-            Starlette internals (user_middleware, middleware_stack, etc.) are
-            touched. Websocket and lifespan scopes pass through unchanged.
-            """
+            if application_admission is not None:
+                _install_and_validate_application_operations_routes(app)
+                asgi_composition = prepare_application_plugin_asgi_wrappers(app, admission=application_admission.view)
 
-            def __init__(self, inner: ASGIApp) -> None:
-                self._inner = inner
+            await omni_init_app_state(engine_client, app.state, args)
+            await _initialize_endpoint_plugin_state(app, engine_client, args)
+        except BaseException:
+            if asgi_composition is not None:
+                asgi_composition.fail()
+            sock.close()
+            raise
 
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
-
-            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-                if scope["type"] == "http":
-                    scope.setdefault("state", {})
-                    scope["state"]["request_timestamp"] = time.time()
-                await self._inner(scope, receive, send)
-
-        # Startup duplex warmup (duplex_session.warmup_frames in the deploy
-        # yaml): real /v1/realtime connections wait on this event so the
-        # first client never pays cold-start costs.
-        duplex_warmup_frames = 0
-        if getattr(app.state, "openai_serving_duplex", None) is not None:
-            duplex_cfg = getattr(engine_client, "duplex_session_config", None)
-            duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
-        app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
         warmup_task: asyncio.Task | None = None
-        if duplex_warmup_frames > 0:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
-            warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
+        try:
+            # After initializing the app state, shut down any endpoints that are model specific
+            if hasattr(engine_client, "endpoint_restrictions"):
+                shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
+            else:
+                logger.warning("engine client has no endpoint restrictions attribute")
 
-        shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
-            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
-            h11_max_header_count=args.h11_max_header_count,
-            **uvicorn_kwargs,
-        )
+            # Start background processes
+            await STORAGE_MANAGER.start()
+
+            # Conditionally register profiler endpoints based on stage YAML configs
+            stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+            if _should_enable_profiler_endpoints(stage_configs):
+                logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+                remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
+                remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
+                app.include_router(profiler_router)
+
+            vllm_config = await openai_app_state._get_vllm_config(engine_client)
+
+            # Check if pure diffusion mode (vllm_config will be None)
+            is_pure_diffusion = vllm_config is None
+            if is_pure_diffusion and not selected_plugin_names:
+                logger.info(
+                    "Starting vLLM API server (pure diffusion mode) on %s",
+                    listen_address,
+                )
+                # The vLLM 0.27 launcher's shutdown path reads
+                # engine_client.vllm_config.shutdown_timeout; AsyncOmni.vllm_config
+                # is None for pure diffusion (no comprehension stage), which would
+                # crash handle_shutdown and hang teardown. Wrap app.state.engine_client
+                # with a shim that only overrides vllm_config and forwards everything
+                # else (get_vllm_config still returns None for pure-diffusion detection).
+                app.state.engine_client = PureDiffusionLauncherAdapter(
+                    engine_client,
+                    shutdown_timeout=getattr(args, "shutdown_timeout", 0),
+                )
+            elif not is_pure_diffusion:
+                logger.info(
+                    "Starting vLLM API server %d on %s",
+                    vllm_config.parallel_config._api_process_rank,
+                    listen_address,
+                )
+
+            class _TimestampMiddleware:
+                """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+
+                Wraps the fully-built Starlette app as an outer ASGI layer so no
+                Starlette internals (user_middleware, middleware_stack, etc.) are
+                touched. Websocket and lifespan scopes pass through unchanged.
+                """
+
+                def __init__(self, inner: ASGIApp) -> None:
+                    self._inner = inner
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+                async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                    if scope["type"] == "http":
+                        scope.setdefault("state", {})
+                        scope["state"]["request_timestamp"] = time.time()
+                    await self._inner(scope, receive, send)
+
+            # Startup duplex warmup (duplex_session.warmup_frames in the deploy
+            # yaml): real /v1/realtime connections wait on this event so the
+            # first client never pays cold-start costs.
+            duplex_warmup_frames = 0
+            if getattr(app.state, "openai_serving_duplex", None) is not None:
+                duplex_cfg = getattr(engine_client, "duplex_session_config", None)
+                duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
+            app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
+            if duplex_warmup_frames > 0:
+                # Scheduled before serve_http (which may not return until
+                # shutdown); the coroutine retries its self-connect until the
+                # server socket is accepting.
+                warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
+
+        except BaseException:
+            if warmup_task is not None:
+                warmup_task.cancel()
+            if asgi_composition is not None:
+                asgi_composition.fail()
+            sock.close()
+            raise
+
+        async def run_http_server(
+            lifecycle_hook: _ApplicationServerLifecycleHook | None = None,
+        ) -> None:
+            server_options = dict(uvicorn_kwargs)
+            ws_max_size = server_options.pop(
+                "ws_max_size",
+                getattr(args, "ws_max_size", DEFAULT_WS_MAX_SIZE),
+            )
+            if lifecycle_hook is not None:
+                host_shutdown_grace = server_options.pop("timeout_graceful_shutdown", None)
+                participant_shutdown_grace = lifecycle_hook.shutdown_grace
+                if (
+                    isinstance(host_shutdown_grace, (int, float))
+                    and not isinstance(host_shutdown_grace, bool)
+                    and math.isfinite(host_shutdown_grace)
+                    and host_shutdown_grace > 0
+                ):
+                    participant_shutdown_grace = max(
+                        participant_shutdown_grace,
+                        float(host_shutdown_grace),
+                    )
+                server_options["timeout_graceful_shutdown"] = participant_shutdown_grace
+            shutdown = await serve_http(
+                _TimestampMiddleware(app),
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                ssl_ciphers=args.ssl_ciphers,
+                h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                h11_max_header_count=args.h11_max_header_count,
+                ws_max_size=ws_max_size,
+                lifecycle_hook=lifecycle_hook,
+                **server_options,
+            )
+            await shutdown
 
         try:
-            await shutdown_task
+            if not selected_plugin_names:
+                await run_http_server()
+            else:
+                assert application_admission is not None
+                assert asgi_composition is not None
+                api_server_count = getattr(args, "api_server_count", None)
+                worker_count = api_server_count if api_server_count is not None else 1
+                config_by_name = validate_application_plugin_options(
+                    selected_plugin_names,
+                    list(getattr(args, "application_plugin_config", [])),
+                    api_server_worker_count=worker_count,
+                )
+                selected_plugins = [
+                    SelectedApplicationPlugin(name, entry_point, config_by_name[name])
+                    for name, entry_point in zip(
+                        selected_plugin_names,
+                        discover_application_plugins(selected_plugin_names),
+                        strict=True,
+                    )
+                ]
+                if any(
+                    plugin.config is None and not getattr(plugin.entry_point, "config_optional", False)
+                    for plugin in selected_plugins
+                ):
+                    raise ValueError("application plugin requires configuration")
+                context = ApplicationPluginHostContext(
+                    app=app,
+                    engine_client=engine_client,
+                    admission=application_admission.view,
+                    install_asgi_wrapper=asgi_composition.install,
+                )
+                lifetime = application_plugin_lifetime(selected_plugins, context)
+                startup_deadline = asyncio.get_running_loop().time() + float(
+                    getattr(args, "application_plugin_startup_timeout", 60.0)
+                )
+                entered = False
+                hook: _ApplicationServerLifecycleHook | None = None
+                try:
+                    await _within_startup_deadline(lifetime.__aenter__(), startup_deadline)
+                    entered = True
+                    hook = _ApplicationServerLifecycleHook(application_admission, lifetime)
+                    app.state._application_lifecycle_ready = hook.is_ready
+                    await _within_startup_deadline(lifetime.wait_ready(), startup_deadline)
+                    asgi_composition.seal()
+                    await run_http_server(hook)
+                except BaseException as primary:
+                    if hook is not None:
+                        hook.on_shutdown_requested(primary)
+                        try:
+                            await hook.before_http_shutdown()
+                        except BaseException:
+                            logger.exception("Application plugin startup rollback drain failed")
+                        try:
+                            await hook.before_engine_shutdown()
+                        except BaseException:
+                            logger.exception("Application plugin startup rollback exit failed")
+                    elif entered:
+                        await lifetime.__aexit__(type(primary), primary, primary.__traceback__)
+                    raise
+        except BaseException:
+            if asgi_composition is not None:
+                asgi_composition.fail()
+            raise
         finally:
             if warmup_task is not None:
                 warmup_task.cancel()
@@ -1548,6 +1840,13 @@ async def health(raw_request: Request) -> JSONResponse:
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 
+    lifecycle_ready = getattr(raw_request.app.state, "_application_lifecycle_ready", None)
+    if lifecycle_ready is not None and not lifecycle_ready():
+        return JSONResponse(
+            content={"status": "unhealthy"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
     try:
         await engine_client.check_health()
         return JSONResponse(content={"status": "healthy"})
@@ -2601,6 +2900,7 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
 if __name__ == "__main__":
     parser = TrackingArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
+    add_application_plugin_args(parser)
     # Ensure that passing --omni won't crash the server.
     # NOTE: the value here does not matter since we are always running the Omni server
     # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
