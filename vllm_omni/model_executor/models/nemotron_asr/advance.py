@@ -2249,6 +2249,7 @@ def advance_model_rows(
     graph_covers_decode: bool = False,
     memory_profile: bool = False,
     staging: HostStaging | None = None,
+    native_burst_handoff: Any | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -3140,6 +3141,45 @@ def advance_model_rows(
         eou_token_id=eou_token_id if endpoint_enabled else None,
     )
     status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    native_stage: Callable[[], None] | None = None
+    if native_burst_handoff is not None:
+        from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+            finalize_native_burst,
+            native_burst_invariant_rows,
+        )
+
+        source_projection = EmissionProjection(
+            projection.rows,
+            projection.queue,
+            projection.book,
+            status.clone(),
+        )
+        native_projection = finalize_native_burst(
+            source_projection,
+            context,
+            park_id=park_id,
+            blank_id=blank,
+        )
+        native_bad = native_burst_invariant_rows(
+            source_projection,
+            context,
+            native_projection,
+            park_id=park_id,
+            blank_id=blank,
+            eou_token_id=eou_token_id if endpoint_enabled else None,
+        )
+        native_bad |= native_projection.num_sampled > native_burst_handoff.max_tokens
+        status |= native_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+        native_projection.sampled_token_ids.masked_fill_(native_bad.unsqueeze(1), -1)
+        native_projection.sampled_token_ids[:, 0] = torch.where(
+            native_bad,
+            park_id,
+            native_projection.sampled_token_ids[:, 0],
+        )
+        native_projection.num_sampled.masked_fill_(native_bad, 1)
+        native_projection.row_status.copy_(status)
+        projection = native_projection
+        native_stage = native_burst_handoff.reserve(native_projection)
     failed = status != 0
     projection_rows = projection.rows
     projection_rows.masked_fill_(failed.reshape(-1, 1), 0)
@@ -3286,4 +3326,6 @@ def advance_model_rows(
         # ---- ONE no-fail combined stage through the reserved ticket ----
         if stage_reservation is not None:
             stage_reservation(status)
+        if native_stage is not None:
+            native_stage()
     return projection_rows

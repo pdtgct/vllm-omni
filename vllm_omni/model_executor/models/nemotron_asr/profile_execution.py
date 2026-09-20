@@ -242,6 +242,7 @@ def run_persistent_state_profile(
             **invocation_kwargs,
         )
         pools = invocation.pools
+        native_handoff = getattr(model, "_native_burst_handoff", None)
         if device.type == "cuda":
             warmup_advance_model_rows_scatter(
                 channel_pools=list(pools.channel),
@@ -259,6 +260,13 @@ def run_persistent_state_profile(
             )
 
         def invoke() -> torch.Tensor:
+            native_profile_sink = None
+            if native_handoff is not None:
+                from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+                    NativeBurstProfileSink,
+                )
+
+                native_profile_sink = NativeBurstProfileSink(max_tokens=native_handoff.max_tokens)
             return advance_model_rows(
                 model.core,
                 invocation.input_ids,
@@ -288,6 +296,7 @@ def run_persistent_state_profile(
                 commit_sink=None,
                 capture=False,
                 memory_profile=True,
+                native_burst_handoff=native_profile_sink,
                 staging=None,
             )
 

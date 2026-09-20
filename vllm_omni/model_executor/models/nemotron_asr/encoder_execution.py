@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 logger = logging.getLogger(__name__)
 
 _Result = TypeVar("_Result")
+_GATHERED_CACHE_TYPE = "vllm_omni.model_executor.models.nemotron_asr.advance._GatheredCaches"
 
 if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import (
@@ -402,6 +403,94 @@ def _copy_cache_storage_(
             destination_tensor.copy_(source_tensor)
 
 
+def _population_capture_tiers(maximum: int) -> tuple[int, ...]:
+    """Return the bounded dense-graph capture domain for an opt-in bucketed arm."""
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        raise ValueError("maximum encoder population must be positive")
+    tiers: list[int] = []
+    tier = 1
+    while tier < maximum:
+        tiers.append(tier)
+        tier *= 2
+    tiers.append(maximum)
+    return tuple(tiers)
+
+
+def _capture_tier(*, live: int, tiers: tuple[int, ...]) -> int:
+    if isinstance(live, bool) or not isinstance(live, int) or live <= 0:
+        raise ValueError("encoder live population must be positive")
+    for tier in tiers:
+        if live <= tier:
+            return tier
+    raise ValueError("encoder live population exceeds the declared capture domain")
+
+
+def _row_major_bucket_signature(
+    signature: TensorSignature,
+    *,
+    live: int,
+    tier: int,
+    name: str,
+) -> TensorSignature:
+    """Normalize one validated row-major tensor to its captured tier shape."""
+    if (
+        not signature.shape
+        or signature.shape[0] != live
+        or signature.layout != str(torch.strided)
+        or signature.storage_offset != 0
+    ):
+        raise ValueError(f"bucketed encoder {name} is not zero-offset row-major storage")
+    expected_stride: list[int] = []
+    stride = 1
+    for dimension in reversed(signature.shape):
+        expected_stride.append(stride)
+        stride *= dimension
+    if tuple(reversed(expected_stride)) != signature.stride:
+        raise ValueError(f"bucketed encoder {name} is not contiguous row-major storage")
+    return signature._replace(shape=(tier, *signature.shape[1:]))
+
+
+def _bucketed_encoder_signature(
+    signature: EncoderSignature,
+    *,
+    live: int,
+    tier: int,
+) -> EncoderSignature:
+    """Map an admitted live row prefix to one declared static graph contract."""
+    if signature.cache_type != _GATHERED_CACHE_TYPE:
+        raise TypeError("bucketed encoder requires the row-major gathered-cache adapter")
+
+    def row(item: TensorSignature, name: str) -> TensorSignature:
+        return _row_major_bucket_signature(item, live=live, tier=tier, name=name)
+
+    channel = tuple(row(item, "channel") for item in signature.channel)
+    time = tuple(row(item, "time") for item in signature.time)
+    return signature._replace(
+        mel=row(signature.mel, "mel"),
+        channel=channel,
+        time=time,
+        valid=row(signature.valid, "valid"),
+        out_offsets=row(signature.out_offsets, "out_offsets"),
+        out_lengths=row(signature.out_lengths, "out_lengths"),
+        prompt_index=row(signature.prompt_index, "prompt_index"),
+    )
+
+
+def _bucketed_cache_storage_signature(
+    storage: EncoderCacheStorage,
+    *,
+    live: int,
+    tier: int,
+) -> tuple[tuple[TensorSignature, ...], ...]:
+    return tuple(
+        tuple(
+            _row_major_bucket_signature(_tensor_signature(tensor), live=live, tier=tier, name="cache")
+            for tensor in family
+        )
+        for family in storage
+    )
+
+
 def _cuda_memory_snapshot(
     device: torch.device,
     *,
@@ -500,6 +589,7 @@ class ResolvedEncoderExecution:
     transition: EncoderTransition
     warmup_geometries: tuple[int, ...] = ()
     warmup_populations: tuple[int, ...] = ()
+    _population_bucketing: bool = False
     t_cap: int = 0
     _history_frames: int = 0
     _geometry_shapes: dict[int, EncoderGeometryShape] = field(
@@ -1156,6 +1246,59 @@ class ResolvedEncoderExecution:
             _copy_cache_storage_(caller_storage, entry.cache_storage())
             return entry.raw.clone(), entry.conditioned.clone()
 
+    def _replay_bucketed_graph_entry(
+        self,
+        *,
+        signature: EncoderSignature,
+        live: int,
+        tier: int,
+        mel: torch.Tensor,
+        caches: EncoderCaches,
+        out_offsets: torch.Tensor,
+        out_lengths: torch.Tensor,
+        prompt_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay one captured tier from a validated live row prefix."""
+        normalized = _bucketed_encoder_signature(signature, live=live, tier=tier)
+        matches = [entry for entry in self._graph_entries.values() if entry.signature == normalized]
+        if len(matches) != 1:
+            raise ValueError("bucketed encoder signature has no unique captured graph")
+        entry = matches[0]
+        if entry.key[1] != tier or type(caches) is not type(entry.caches):
+            raise TypeError("bucketed encoder cache adapter differs from its captured graph")
+        caller_storage = _cache_storage(caches)
+        if _bucketed_cache_storage_signature(caller_storage, live=live, tier=tier) != entry.storage_signature:
+            raise ValueError("bucketed encoder cache storage differs from its captured graph")
+        graph_storage = entry.cache_storage()
+        copies = tuple(
+            (destination, source)
+            for destination_family, source_family in zip(graph_storage, caller_storage, strict=True)
+            for destination, source in zip(destination_family, source_family, strict=True)
+        )
+        runtime = self._graph_runtime
+        if runtime is None:
+            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+        with phase("port.encode.stage_in"):
+            for destination, source in (
+                (entry.mel, mel),
+                (entry.out_offsets, out_offsets),
+                (entry.out_lengths, out_lengths),
+                (entry.prompt_index, prompt_index),
+                *copies,
+            ):
+                destination[live:].zero_()
+                destination[:live].copy_(source)
+        try:
+            with phase("port.encode.replay"):
+                self._call_graph_entry(entry, mode=runtime.graph_mode)
+        except Exception:
+            self._discard()
+            raise
+        with phase("port.encode.stage_out"):
+            for source, destination in copies:
+                destination[:live].copy_(source[:live])
+            return entry.raw[:live].clone(), entry.conditioned[:live].clone()
+
     def ready_receipt(self) -> dict[str, Any]:
         """Return the machine-readable resolved-arm readiness receipt."""
         receipt: dict[str, Any] = {
@@ -1167,6 +1310,8 @@ class ResolvedEncoderExecution:
         }
         if self.arm == "dense-graphed":
             receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
+        if self._population_bucketing:
+            receipt["population_bucketing"] = "powers_of_two_plus_exact_cap"
         if self._memory_diagnostics:
             receipt["memory_diagnostics"] = list(self._memory_diagnostics)
         return receipt
@@ -1265,7 +1410,16 @@ def build_encoder_execution(
     geometry_shapes = tuple(encoder_geometry_shape(core, geometry) for geometry in geometries)
     geometry_shape_by_id = dict(zip(geometries, geometry_shapes, strict=True))
     t_cap = max(shape.out_width + history_frames for shape in geometry_shapes)
-    populations = tuple(range(1, maximum_population + 1))
+    population_bucketing = getattr(hf_config, "encoder_population_bucketing", False)
+    if not isinstance(population_bucketing, bool):
+        raise ValueError("encoder_population_bucketing must be boolean")
+    if population_bucketing and arm != "dense-graphed":
+        raise ValueError("encoder_population_bucketing requires dense-graphed execution")
+    populations = (
+        _population_capture_tiers(maximum_population)
+        if population_bucketing
+        else tuple(range(1, maximum_population + 1))
+    )
     specialization_budget = len(geometries) * len(populations)
     compiled = torch.compile(
         transition,
@@ -1278,6 +1432,7 @@ def build_encoder_execution(
         transition=transition,
         warmup_geometries=geometries,
         warmup_populations=populations,
+        _population_bucketing=population_bucketing,
         t_cap=t_cap,
         _history_frames=history_frames,
         _geometry_shapes=geometry_shape_by_id,
@@ -1307,7 +1462,25 @@ def build_encoder_execution(
             prompt_index,
         )
         population = signature.mel.shape[0]
-        if population not in execution.warmup_populations:
+        active_cell = execution._active_cell
+        staging_cell = execution._staging_cell
+        if active_cell is not None and population != active_cell[1]:
+            raise ValueError(f"{arm} encoder population differs from declared cell")
+        if staging_cell is not None and active_cell != staging_cell:
+            raise ValueError("encoder graph staging cell differs from active compiler cell")
+        bucketed_replay = (
+            execution._sealed and execution._population_bucketing and active_cell is None and staging_cell is None
+        )
+        replay_tier = population
+        replay_signature = signature
+        if bucketed_replay:
+            # A served underfilled bucket is a live prefix of one declared
+            # capture tier. Normalize before the exact-population and
+            # signature gates, which remain strict for every startup,
+            # profile, capture, and non-bucketed invocation.
+            replay_tier = _capture_tier(live=population, tiers=execution.warmup_populations)
+            replay_signature = _bucketed_encoder_signature(signature, live=population, tier=replay_tier)
+        elif population not in execution.warmup_populations:
             raise ValueError(f"{arm} encoder population {population} was not declared")
         required = int(out_width) + execution._history_frames
         if required > execution.t_cap:
@@ -1317,7 +1490,6 @@ def build_encoder_execution(
             )
         if int(caches.left_context) != execution._history_frames:
             raise ValueError("encoder transition history differs from declared resident history")
-        active_cell = execution._active_cell
         if active_cell is not None:
             geometry = active_cell[0]
             declared_shape = execution._geometry_shapes[geometry]
@@ -1329,7 +1501,7 @@ def build_encoder_execution(
                     f"declared_mel_width={declared_shape.mel_width}, "
                     f"declared_out_width={declared_shape.out_width}"
                 )
-        if execution._sealed and signature not in execution._allowed_signatures:
+        if execution._sealed and replay_signature not in execution._allowed_signatures:
             raise ValueError(f"{arm} encoder signature was not warmed")
         if execution._sealed:
             if execution.arm == "dense-graphed":
@@ -1354,14 +1526,26 @@ def build_encoder_execution(
                         prompt_index,
                     )
                 else:
-                    result = execution._replay_graph_entry(
-                        signature=signature,
-                        mel=mel,
-                        caches=caches,
-                        out_offsets=out_offsets,
-                        out_lengths=out_lengths,
-                        prompt_index=prompt_index,
-                    )
+                    if bucketed_replay:
+                        result = execution._replay_bucketed_graph_entry(
+                            signature=signature,
+                            live=population,
+                            tier=replay_tier,
+                            mel=mel,
+                            caches=caches,
+                            out_offsets=out_offsets,
+                            out_lengths=out_lengths,
+                            prompt_index=prompt_index,
+                        )
+                    else:
+                        result = execution._replay_graph_entry(
+                            signature=signature,
+                            mel=mel,
+                            caches=caches,
+                            out_offsets=out_offsets,
+                            out_lengths=out_lengths,
+                            prompt_index=prompt_index,
+                        )
             else:
                 result = compiled(
                     mel,
