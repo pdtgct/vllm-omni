@@ -36,12 +36,12 @@ from typing import Any, Literal, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
-from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
+from vllm_omni.entrypoints.launcher import request_application_shutdown
 from vllm_omni.entrypoints.openai.app_state import Omnivideo
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -377,10 +377,7 @@ async def _run_video_generation_job(
         # Background tasks can't propagate exceptions to FastAPI handlers.
         # Actively signal shutdown when the engine is dead.
         if app_state is not None and isinstance(exc, EngineDeadError):
-            terminate_if_errored(
-                server=app_state.server,
-                engine=app_state.engine_client,
-            )
+            request_application_shutdown(app_state, app_state.engine_client, exc)
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 
