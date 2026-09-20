@@ -24,6 +24,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
+from vllm_omni.entrypoints.openai.application_plugins import (
+    add_application_plugin_args,
+    validate_application_plugin_options,
+)
 from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -145,6 +149,18 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        selected_plugins = list(getattr(args, "application_plugin", []))
+        api_server_count = getattr(args, "api_server_count", None)
+        validate_application_plugin_options(
+            selected_plugins,
+            list(getattr(args, "application_plugin_config", [])),
+            api_server_worker_count=(api_server_count if api_server_count is not None else 1),
+        )
+        if selected_plugins and args.headless:
+            raise ValueError("--application-plugin is unavailable with --headless")
+        if selected_plugins and not getattr(args, "omni", False):
+            raise ValueError("--application-plugin requires --omni")
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
@@ -180,6 +196,8 @@ class OmniServeCommand(CLISubcommand):
                 "api_server_count": "--api-server-count",
                 "enable_expert_parallel": "--enable-expert-parallel",
             }
+            if selected_plugins:
+                prohibited_with_omni.pop("api_server_count")
             offenders = sorted(flag for dest, flag in prohibited_with_omni.items() if dest in explicit_cli_keys)
             if offenders:
                 raise ValueError(
@@ -231,6 +249,7 @@ class OmniServeCommand(CLISubcommand):
         _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
+        add_application_plugin_args(serve_parser)
 
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output

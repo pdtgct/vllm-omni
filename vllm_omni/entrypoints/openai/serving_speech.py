@@ -28,13 +28,13 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
-from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.entrypoints.launcher import request_application_shutdown
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -1688,10 +1688,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             # Actively signal shutdown rather than relying on the watchdog.
             if raw_request is not None:
-                terminate_if_errored(
-                    server=raw_request.app.state.server,
-                    engine=self.engine_client,
-                )
+                request_application_shutdown(raw_request.app.state, self.engine_client, e)
             raise
         except Exception as e:
             record_stream_abort("error")

@@ -17,12 +17,18 @@ def remove_route_from_app(
     app: FastAPI,
     path: str,
     methods: Set[str],
+    *,
+    endpoint: object | None = None,
 ) -> None:
-    """Remove app routes matching a path and one of the given HTTP methods."""
+    """Remove app routes matching an owned endpoint and HTTP method."""
     routes_to_remove = [
         route
         for route in app.routes
-        if isinstance(route, Route) and route.path == path and route.methods is not None and route.methods & methods
+        if isinstance(route, Route)
+        and route.path == path
+        and route.methods is not None
+        and route.methods & methods
+        and (endpoint is None or route.endpoint is endpoint)
     ]
     for route in routes_to_remove:
         app.routes.remove(route)

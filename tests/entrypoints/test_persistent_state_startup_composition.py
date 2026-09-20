@@ -449,17 +449,21 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
     engine = SimpleNamespace(report_persistent_state_fatal=lambda error: events.append("report"))
     server = object()
     state = SimpleNamespace(server=server)
-    monkeypatch.setattr(
-        api_server,
-        "terminate_if_errored",
-        lambda *, server, engine: events.append("terminate"),
-    )
+    error = RuntimeError("release recovery exhausted")
+
+    def shutdown(app_state, engine_client, cause):
+        assert (app_state, engine_client, cause) == (state, engine, error)
+        events.append("terminate")
+
+    # The fatal goes through the application shutdown boundary, which closes
+    # plugin admission before upstream termination supervision.
+    monkeypatch.setattr(api_server, "request_application_shutdown", shutdown)
 
     callback = api_server._persistent_state_host_fatal_callback(
         state=state,
         engine_client=engine,
     )
-    callback(RuntimeError("release recovery exhausted"))
+    callback(error)
     assert events == ["report", "terminate"]
 
 
