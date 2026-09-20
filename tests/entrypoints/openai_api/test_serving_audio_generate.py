@@ -519,7 +519,7 @@ class TestErrorHandling:
         handler.create_audio_generate = AsyncMock(side_effect=exc)
         app = _make_api_server_test_app(handler)
 
-        with patch.object(serve_errors, "terminate_if_errored") as terminate_mock:
+        with patch.object(serve_errors, "request_application_shutdown") as shutdown_mock:
             with TestClient(app) as client:
                 response = client.post("/v1/audio/generate", json={"input": "Hello"})
 
@@ -529,7 +529,7 @@ class TestErrorHandling:
         assert payload["error"]["code"] == 500
         assert payload["error"]["request_id"] == "audio-gen-req-1"
         assert payload["error"]["error_stage_id"] == expected_stage_id
-        terminate_mock.assert_called_once()
+        shutdown_mock.assert_called_once_with(app.state, app.state.engine_client, exc)
 
 
 # End-to-End via TestClient

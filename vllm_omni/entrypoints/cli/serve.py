@@ -31,6 +31,10 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
+from vllm_omni.entrypoints.openai.application_plugins import (
+    add_application_plugin_args,
+    validate_application_plugin_options,
+)
 from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -160,6 +164,18 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        selected_plugins = list(getattr(args, "application_plugin", []))
+        api_server_count = getattr(args, "api_server_count", None)
+        validate_application_plugin_options(
+            selected_plugins,
+            list(getattr(args, "application_plugin_config", [])),
+            api_server_worker_count=(api_server_count if api_server_count is not None else 1),
+        )
+        if selected_plugins and args.headless:
+            raise ValueError("--application-plugin is unavailable with --headless")
+        if selected_plugins and not getattr(args, "omni", False):
+            raise ValueError("--application-plugin requires --omni")
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
@@ -325,6 +341,7 @@ class OmniServeCommand(CLISubcommand):
         _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
+        add_application_plugin_args(serve_parser)
 
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output
