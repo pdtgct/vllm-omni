@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from numpy.typing import NDArray
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
@@ -354,7 +355,7 @@ class TestSpeechAPI:
     @pytest.fixture(autouse=True)
     def _mock_upload_io(self, mocker: MockerFixture):
         """Mock soundfile/safetensors so upload accepts fake audio bytes."""
-        samples = np.zeros(88200, dtype=np.float32)  # 2s @ 44.1 kHz
+        samples: NDArray[np.float32] = np.zeros(88200, dtype=np.float32)  # 2s @ 44.1 kHz
         mocker.patch("soundfile.read", return_value=(samples, 44100))
 
         def _fake_save_file(tensors, path, metadata=None):
@@ -1476,8 +1477,8 @@ class TestTTSMethods:
         )
         speech_server._speaker_cache.clear()
 
-        left = np.full(32000, 0.5, dtype=np.float32)
-        right = np.full(32000, -0.25, dtype=np.float32)
+        left: NDArray[np.float32] = np.full(32000, 0.5, dtype=np.float32)
+        right: NDArray[np.float32] = np.full(32000, -0.25, dtype=np.float32)
         samples = np.stack((left, right), axis=-1)
         mocker.patch("soundfile.read", return_value=(samples, 16000))
         saved: dict[str, object] = {}
@@ -4101,7 +4102,7 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
         )
     )
 
-    terminate_mock = mocker.patch.object(serve_errors, "terminate_if_errored")
+    terminate_mock = mocker.patch.object(serve_errors, "request_application_shutdown")
 
     raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
     raw_request.app.state.args = SimpleNamespace(log_error_stack=False)
@@ -4133,7 +4134,7 @@ def test_omni_engine_error_handler_includes_request_and_stage_id(mocker: MockerF
     )
     app.state.server = SimpleNamespace()
 
-    terminate_mock = mocker.patch.object(serve_errors, "terminate_if_errored")
+    terminate_mock = mocker.patch.object(serve_errors, "request_application_shutdown")
     serve_errors._register_omni_exception_handlers(app)
 
     @app.get("/boom")

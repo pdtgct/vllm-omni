@@ -9,10 +9,11 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+
+from vllm_omni.entrypoints.launcher import request_application_shutdown
 
 logger = init_logger(__name__)
 
@@ -55,10 +56,7 @@ def _create_engine_error_json_response(
             error_stage_id,
         )
 
-    terminate_if_errored(
-        server=req.app.state.server,
-        engine=engine,
-    )
+    request_application_shutdown(req.app.state, engine, exc)
 
     payload, status_code = _build_engine_error_payload(exc, request_id=request_id)
     return JSONResponse(content=payload, status_code=status_code)
