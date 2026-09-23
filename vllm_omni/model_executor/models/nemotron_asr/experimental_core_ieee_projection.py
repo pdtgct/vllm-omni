@@ -7,8 +7,10 @@
 Kernel copied from vllm/model_executor/determinism/batch_invariant.py at
 98dff2a81d747d1dba01a47f939f48c3526d4206 (Apache-2.0). It removes
 optional launch metadata and requests input_precision="ieee" explicitly.
-The experiment fixes the public core's FP32 128x128x32 tiling. Device state
-is resolved at startup, before graph capture; no global override is installed.
+The reduction keeps IEEE FP32 32-wide dots. With the default launch config,
+flattened row counts up to 128 use a 16-row tile; larger counts retain 128 rows.
+Explicit nondefault row tiles remain available through the existing config.
+Device state is resolved at startup, before graph capture; no global override is installed.
 """
 
 import torch
@@ -118,7 +120,7 @@ def matmul_kernel_persistent(
 
 
 class CoreIEEEProjection:
-    """Device-bound fixed-tile callable, constructed outside torch.compile."""
+    """Device-bound callable with a static small-row launch policy."""
 
     def __init__(self, device: torch.device) -> None:
         self.programs_per_sm = 1
@@ -141,11 +143,14 @@ class CoreIEEEProjection:
         b = weight.t()
         m, k = a.shape
         n = b.shape[1]
+        config = dict(self.config)
+        if config["BLOCK_SIZE_M"] == CONFIG["BLOCK_SIZE_M"] and m <= 128:
+            config["BLOCK_SIZE_M"] = 16
         out = torch.empty((m, n), device=x.device, dtype=x.dtype)
         grid = (
             min(
                 self.program_budget,
-                triton.cdiv(m, self.config["BLOCK_SIZE_M"]) * triton.cdiv(n, self.config["BLOCK_SIZE_N"]),
+                triton.cdiv(m, config["BLOCK_SIZE_M"]) * triton.cdiv(n, config["BLOCK_SIZE_N"]),
             ),
         )
         compiled = matmul_kernel_persistent[grid](
@@ -167,7 +172,7 @@ class CoreIEEEProjection:
             B_LARGE=b.numel() > 2**31,
             C_LARGE=out.numel() > 2**31,
             HAS_BIAS=False,
-            **self.config,
+            **config,
         )
         result = out.reshape(x.shape[:-1] + (n,))
         return (result, compiled) if capture else result

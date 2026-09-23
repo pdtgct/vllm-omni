@@ -811,7 +811,9 @@ class NemotronASRForRNNT(nn.Module):
             "experimental_projected_history": {
                 "enabled": projected_history,
                 "state_layout": "[hidden, key, value]" if projected_history else None,
-                "canonical_projection": "public-core-ieee-fp32-128x128x32" if projected_history else None,
+                "canonical_projection": "public-core-ieee-fp32-m16-if-m-le128-else-m128-n128-k32"
+                if projected_history
+                else None,
                 "k_v_bias": "none-required" if projected_history else None,
             },
         }
