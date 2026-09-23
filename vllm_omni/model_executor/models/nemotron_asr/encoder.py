@@ -648,11 +648,12 @@ def _stream_attention(
     fused_weight = getattr(attn, "_stream_fused_kv_weight", None)
     if projected_history is not None and fused_weight is not None:
         raise ValueError("projected history cannot be combined with fused K/V projection")
-    # This experimental selector is admitted only for the validated fixed
-    # FP32 geometries. Other shapes retain the full hidden-history path.
+    # B64 is not numerically admitted to the shadow fast path. Other shapes
+    # retain full hidden-history attention while still updating canonical
+    # shadows for a later B128 transition.
     use_shadow_kv = (
         projected_history is not None
-        and batch in (64, 128)
+        and batch == 128
         and new_frames == 4
         and capacity == 56
         and width == 1024
