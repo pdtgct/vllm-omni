@@ -403,16 +403,21 @@ def _copy_cache_storage_(
             destination_tensor.copy_(source_tensor)
 
 
-def _population_capture_tiers(maximum: int) -> tuple[int, ...]:
+def _population_capture_tiers(maximum: int, *, capture_b96: bool = False) -> tuple[int, ...]:
     """Return the bounded dense-graph capture domain for an opt-in bucketed arm."""
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
         raise ValueError("maximum encoder population must be positive")
+    if not isinstance(capture_b96, bool) or (capture_b96 and maximum != 128):
+        raise ValueError("B96 capture requires a boolean opt-in and maximum 128")
     tiers: list[int] = []
     tier = 1
     while tier < maximum:
         tiers.append(tier)
         tier *= 2
     tiers.append(maximum)
+    if capture_b96:
+        tiers.append(96)
+        tiers.sort()
     return tuple(tiers)
 
 
@@ -1317,7 +1322,11 @@ class ResolvedEncoderExecution:
         if self.arm == "dense-graphed":
             receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
         if self._population_bucketing:
-            receipt["population_bucketing"] = "powers_of_two_plus_exact_cap"
+            receipt["population_bucketing"] = (
+                "powers_of_two_plus_b96_plus_exact_cap"
+                if 96 in self.warmup_populations and self.warmup_populations[-1] == 128
+                else "powers_of_two_plus_exact_cap"
+            )
         if self._memory_diagnostics:
             receipt["memory_diagnostics"] = list(self._memory_diagnostics)
         return receipt
@@ -1385,6 +1394,17 @@ def build_encoder_execution(
         raise ValueError(
             f"unknown encoder_execution_arm {arm!r} (known: ['compiled-static', 'dense-graphed', 'eager'])"
         )
+    capture_b96 = getattr(hf_config, "experimental_encoder_capture_b96", False)
+    if not isinstance(capture_b96, bool):
+        raise ValueError("experimental_encoder_capture_b96 must be a boolean")
+    if capture_b96 and (
+        arm != "dense-graphed"
+        or getattr(hf_config, "encoder_population_bucketing", False) is not True
+        or maximum_population != 128
+    ):
+        raise ValueError(
+            "experimental_encoder_capture_b96 requires dense-graphed population bucketing with maximum 128"
+        )
     fused_kv = getattr(hf_config, "experimental_fused_kv_projection", False)
     if not isinstance(fused_kv, bool):
         raise ValueError("experimental_fused_kv_projection must be a boolean")
@@ -1438,7 +1458,7 @@ def build_encoder_execution(
     if population_bucketing and arm != "dense-graphed":
         raise ValueError("encoder_population_bucketing requires dense-graphed execution")
     populations = (
-        _population_capture_tiers(maximum_population)
+        _population_capture_tiers(maximum_population, capture_b96=capture_b96)
         if population_bucketing
         else tuple(range(1, maximum_population + 1))
     )
