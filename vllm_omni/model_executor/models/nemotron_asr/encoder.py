@@ -596,10 +596,7 @@ def _stream_conv(
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
-    y = y.permute(1, 0, 2).contiguous().view(1, width, batch * frames)
-    y = conv.pointwise_conv2(y)
-    y = y.view(conv.pointwise_conv2.out_channels, batch, frames).permute(1, 0, 2).contiguous()
-    return y.transpose(1, 2), new_cache
+    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
 
 
 def stream_step(
