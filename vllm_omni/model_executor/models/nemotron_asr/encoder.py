@@ -580,10 +580,35 @@ def _stream_conv(
     """
     conv = layer.conv
     batch, frames, width = x.shape
-    y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
-    y = conv.pointwise_conv1(y)
-    y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
-    y = torch.nn.functional.glu(y, dim=1)
+    # Select the fold only for the fixed four-frame inference geometry. This
+    # per-call choice does not qualify a session's earlier cache history.
+    fold_conv1 = (
+        not torch.is_grad_enabled()
+        and x.is_cuda
+        and not torch.is_autocast_enabled("cuda")
+        and x.dtype == torch.float32
+        and batch in (1, 2, 4, 8, 16, 32, 64)
+        and frames == 4
+        and width == 1024
+        and conv.pointwise_conv1.in_channels == 1024
+        and conv.pointwise_conv1.out_channels == 2048
+        and conv.pointwise_conv1.kernel_size == (1,)
+        and conv.pointwise_conv1.stride == (1,)
+        and conv.pointwise_conv1.padding == (0,)
+        and conv.pointwise_conv1.dilation == (1,)
+        and conv.pointwise_conv1.groups == 1
+        and conv.pointwise_conv1.bias is None
+        and conv.pointwise_conv1.weight.dtype == torch.float32
+        and conv.pointwise_conv1.weight.device == x.device
+    )
+    if fold_conv1:
+        y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
+        y = conv.pointwise_conv1(y)
+        y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
+        y = torch.nn.functional.glu(y, dim=1)
+    else:
+        y = x.transpose(1, 2)
+        y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
     cw = cache.shape[-1]
