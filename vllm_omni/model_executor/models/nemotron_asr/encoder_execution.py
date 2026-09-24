@@ -1426,7 +1426,11 @@ def build_encoder_execution(
         fullgraph=True,
         dynamic=False,
         # Keep reduction arithmetic independent of timing-selected launch configurations.
-        options={"triton.cudagraphs": False, "deterministic": True},
+        options={
+            "triton.cudagraphs": False,
+            "deterministic": True,
+            "eager_numerics.use_pytorch_libdevice": True,
+        },
     )
     execution = ResolvedEncoderExecution(
         arm=arm,
