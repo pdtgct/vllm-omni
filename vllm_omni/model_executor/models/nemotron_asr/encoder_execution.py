@@ -6,6 +6,8 @@ All arms execute the same encoder, language-conditioning, and padded-row
 zeroing function. Inductor specializes the compiled arms for exact tensor
 shapes with compiler-owned CUDA graphs disabled. The dense-graphed arm then
 captures that compiled transition with explicit, stable graph-owned scratch.
+The experimental eager-graphed arm captures native eager arithmetic with the
+same scratch ownership, exact population domain, and fail-closed lifecycle.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar, cast
@@ -371,14 +373,14 @@ def _encoder_signature(
 def _cache_storage(caches: EncoderCaches) -> EncoderCacheStorage:
     storage_factory = getattr(caches, "graph_storage", None)
     if not callable(storage_factory):
-        raise TypeError("dense-graphed encoder caches require graph_storage()")
+        raise TypeError("graphed encoder caches require graph_storage()")
     storage = storage_factory()
     if not isinstance(storage, EncoderCacheStorage):
         raise TypeError("encoder cache graph_storage() returned malformed storage")
     if not storage.channel or not storage.time or not storage.valid:
-        raise ValueError("dense-graphed encoder cache storage is incomplete")
+        raise ValueError("graphed encoder cache storage is incomplete")
     if any(not isinstance(tensor, torch.Tensor) for family in storage for tensor in family):
-        raise TypeError("dense-graphed encoder cache storage must contain tensors")
+        raise TypeError("graphed encoder cache storage must contain tensors")
     return storage
 
 
@@ -552,6 +554,8 @@ class _EncoderGraphEntry:
 # Nemotron scopes cannot restore stale values.
 _COMPILER_BUDGET_LOCK = RLock()
 _COMPILED_ARMS = frozenset({"compiled-static", "dense-graphed"})
+_GRAPHED_ARMS = frozenset({"dense-graphed", "eager-graphed"})
+_STATIC_ARMS = _COMPILED_ARMS | _GRAPHED_ARMS
 
 
 # @spec PORT-PERF-009
@@ -607,6 +611,7 @@ class ResolvedEncoderExecution:
     _sealed: bool = False
     _failed: bool = False
     _model_state: CompilerModelState | None = None
+    # Direct native callable for eager-graphed; compiled callable for older arms.
     _compiled_transition: EncoderTransition | None = field(default=None, repr=False)
     _vllm_config: Any | None = field(default=None, repr=False)
     _graph_runtime: GraphRuntime | None = field(default=None, repr=False)
@@ -629,7 +634,7 @@ class ResolvedEncoderExecution:
         """Whether the selected arm is safe to admit served work."""
         if self.arm == "eager":
             return True
-        if self.arm == "dense-graphed":
+        if self.arm in _GRAPHED_ARMS:
             expected = {
                 (geometry, population) for geometry in self.warmup_geometries for population in self.warmup_populations
             }
@@ -648,9 +653,9 @@ class ResolvedEncoderExecution:
         population: int,
         invoke: Callable[[], Any],
     ) -> None:
-        """Execute and attest exactly one compiler invocation for a cell."""
-        if self.arm not in _COMPILED_ARMS:
-            raise ValueError("encoder warmup cells require a compiled encoder arm")
+        """Execute and attest exactly one transition invocation for a cell."""
+        if self.arm not in _STATIC_ARMS:
+            raise ValueError("encoder warmup cells require a static encoder arm")
         self._raise_if_failed()
         if self._sealed:
             raise ValueError(f"{self.arm} encoder execution is already sealed")
@@ -687,7 +692,7 @@ class ResolvedEncoderExecution:
         invoke: Callable[[], _Result],
     ) -> _Result:
         """Authorize and attest the sole activation-memory profile cell."""
-        if self.arm not in _COMPILED_ARMS:
+        if self.arm not in _STATIC_ARMS:
             return invoke()
         self._raise_if_failed()
         if self._sealed:
@@ -777,6 +782,7 @@ class ResolvedEncoderExecution:
                 "encoder.pos_enc.pe capacity is smaller than the transition window: "
                 f"required={required}, declared={self.t_cap}"
             )
+        self._assert_native_projection_state()
         if self._model_state is not None:
             return
         encoder = self._core.encoder
@@ -804,7 +810,7 @@ class ResolvedEncoderExecution:
         if "Autograd" in dispatch_keys or "ADInplaceOrView" in dispatch_keys:
             raise ValueError("encoder.pos_enc.pe materialization is outside serving inference mode")
         prepare_projections = getattr(encoder, "prepare_stream_relative_position_projections", None)
-        if callable(prepare_projections):
+        if self.arm in _COMPILED_ARMS and callable(prepare_projections):
             prepare_projections(
                 out_widths=tuple(shape.out_width for shape in self._geometry_shapes.values()),
                 cache_len=self._history_frames,
@@ -813,7 +819,18 @@ class ResolvedEncoderExecution:
         self._runner_device = runner_device
         self._model_state = _compiled_transition_model_state(self._core)
 
+    def _assert_native_projection_state(self) -> None:
+        if self.arm != "eager-graphed" or self._core is None:
+            return
+        encoder = self._core.encoder
+        if getattr(encoder, "_stream_relative_position_lengths", ()) or any(
+            name.rsplit(".", 1)[-1].startswith("_stream_relative_position_")
+            for name, _buffer in encoder.named_buffers()
+        ):
+            raise ValueError("eager-graphed encoder rejects prepared learned position projections")
+
     def _assert_model_state(self) -> None:
+        self._assert_native_projection_state()
         if self._core is None or self._model_state is None:
             raise ValueError(f"{self.arm} encoder model state was not materialized")
         changed = _changed_model_state_name(
@@ -830,9 +847,9 @@ class ResolvedEncoderExecution:
         expected_cells: tuple[tuple[int, int], ...],
         invoke: Callable[[int, int], Any],
     ) -> None:
-        """Compile and seal the complete finite specialization domain."""
-        if self.arm not in _COMPILED_ARMS:
-            raise ValueError("encoder warmup domain requires a compiled encoder arm")
+        """Warm and seal the complete finite exact-shape domain."""
+        if self.arm not in _STATIC_ARMS:
+            raise ValueError("encoder warmup domain requires a static encoder arm")
         self._raise_if_failed()
         if self._sealed:
             raise ValueError(f"{self.arm} encoder execution is already sealed")
@@ -874,13 +891,15 @@ class ResolvedEncoderExecution:
                 # staging and capture must reuse exactly that compiler domain.
                 with _compiler_specialization_budget(len(cells)), torch._dynamo.config.patch(error_on_recompile=True):
                     self._capture_graph_domain(cells=cells, invoke=invoke)
+            elif self.arm == "eager-graphed":
+                self._capture_graph_domain(cells=cells, invoke=invoke)
         except Exception:
             self._discard()
             raise
 
     def _seal(self) -> None:
         """Seal the exact signatures proven by product-owned warmup."""
-        if self.arm not in _COMPILED_ARMS:
+        if self.arm not in _STATIC_ARMS:
             return
         self._assert_model_state()
         expected = {
@@ -918,7 +937,7 @@ class ResolvedEncoderExecution:
         for tensor in storage.valid:
             tensor.copy_(valid.reshape(tensor.shape).to(tensor.dtype))
         if entry.out_width <= 0:
-            raise ValueError("dense-graphed encoder output width must be positive")
+            raise ValueError("graphed encoder output width must be positive")
         if variant == "full":
             entry.out_offsets.copy_(rows.remainder(2) * min(2, entry.out_width - 1))
             entry.out_lengths.copy_(entry.out_width - entry.out_offsets)
@@ -926,7 +945,7 @@ class ResolvedEncoderExecution:
             zero_rows = rows.remainder(2) == 0
             entry.out_offsets.copy_(torch.where(zero_rows, min(2, entry.out_width), 0))
             entry.out_lengths.copy_(torch.where(zero_rows, 0, entry.out_width))
-        # Compiler warmup established this authority before graph parity.
+        # Transition warmup established this authority before graph parity.
         core = self._core
         assert core is not None
         entry.prompt_index.copy_(rows.remainder(core.lid.num_prompts))
@@ -945,21 +964,21 @@ class ResolvedEncoderExecution:
         out_width: int,
         prompt_index: torch.Tensor,
     ) -> _EncoderGraphEntry:
-        compiled = self._compiled_transition
+        run_transition = self._compiled_transition
         runtime = self._graph_runtime
-        if compiled is None or runtime is None or self._vllm_config is None:
-            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+        if run_transition is None or runtime is None or self._vllm_config is None:
+            raise ValueError("graphed encoder runtime authority is unavailable")
         empty_like = getattr(caches, "empty_like", None)
         if not callable(empty_like):
-            raise TypeError("dense-graphed encoder caches require empty_like()")
+            raise TypeError("graphed encoder caches require empty_like()")
         stable_caches = empty_like()
         if type(stable_caches) is not type(caches):
-            raise TypeError("dense-graphed encoder cache factory changed adapter class")
+            raise TypeError("graphed encoder cache factory changed adapter class")
         caller_storage = _cache_storage(caches)
         stable_storage = _cache_storage(stable_caches)
         caller_storage_signature = _cache_storage_signature(caller_storage)
         if _cache_storage_signature(stable_storage) != caller_storage_signature:
-            raise ValueError("dense-graphed encoder cache factory changed tensor layout")
+            raise ValueError("graphed encoder cache factory changed tensor layout")
 
         stable_mel = torch.empty_like(mel)
         stable_offsets = torch.empty_like(out_offsets)
@@ -968,7 +987,7 @@ class ResolvedEncoderExecution:
         descriptor = runtime.descriptor_factory(cell[1])
 
         # Discover result layouts before allocating strong graph outputs. This
-        # executes the already-sealed compiled transition on graph-owned scratch.
+        # executes the already-sealed transition on graph-owned scratch.
         provisional = _EncoderGraphEntry(
             key=cell,
             signature=signature,
@@ -991,7 +1010,7 @@ class ResolvedEncoderExecution:
             cudagraph_runtime_mode=runtime.eager_mode,
             batch_descriptor=descriptor,
         ):
-            raw, conditioned = compiled(
+            raw, conditioned = run_transition(
                 stable_mel,
                 stable_caches,
                 stable_offsets,
@@ -1000,7 +1019,7 @@ class ResolvedEncoderExecution:
                 stable_prompt,
             )
         if not isinstance(raw, torch.Tensor) or not isinstance(conditioned, torch.Tensor):
-            raise TypeError("dense-graphed encoder transition returned malformed outputs")
+            raise TypeError("graphed encoder transition returned malformed outputs")
         entry = _EncoderGraphEntry(
             key=cell,
             signature=signature,
@@ -1018,7 +1037,7 @@ class ResolvedEncoderExecution:
         )
 
         def run() -> tuple[torch.Tensor, ...]:
-            next_raw, next_conditioned = compiled(
+            next_raw, next_conditioned = run_transition(
                 entry.mel,
                 entry.caches,
                 entry.out_offsets,
@@ -1045,7 +1064,7 @@ class ResolvedEncoderExecution:
     ) -> tuple[torch.Tensor, ...]:
         runtime = self._graph_runtime
         if runtime is None or self._vllm_config is None:
-            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+            raise ValueError("graphed encoder runtime authority is unavailable")
         with runtime.forward_context(
             None,
             self._vllm_config,
@@ -1055,9 +1074,9 @@ class ResolvedEncoderExecution:
             output = entry.wrapper()
         expected_count = len(entry.output_tuple())
         if not isinstance(output, tuple) or len(output) != expected_count:
-            raise TypeError("dense-graphed encoder wrapper returned malformed output")
+            raise TypeError("graphed encoder wrapper returned malformed output")
         if any(not isinstance(tensor, torch.Tensor) for tensor in output):
-            raise TypeError("dense-graphed encoder wrapper returned a non-tensor output")
+            raise TypeError("graphed encoder wrapper returned a non-tensor output")
         return output
 
     @staticmethod
@@ -1075,12 +1094,12 @@ class ResolvedEncoderExecution:
         if len(expected) != len(actual) or any(
             not torch.equal(left, right) for left, right in zip(expected, actual, strict=True)
         ):
-            raise RuntimeError(f"dense-graphed encoder capture/replay differs from compiled transition at key {key}")
+            raise RuntimeError(f"graphed encoder capture/replay differs from uncaptured transition at key {key}")
 
     def _capture_graph_entry(self, entry: _EncoderGraphEntry) -> None:
         runtime = self._graph_runtime
         if runtime is None:
-            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+            raise ValueError("graphed encoder runtime authority is unavailable")
         for variant in ("full", "mixed"):
             self._seed_graph_entry(entry, variant=variant)
             eager = self._snapshot_graph_entry(self._call_graph_entry(entry, mode=runtime.eager_mode))
@@ -1115,14 +1134,14 @@ class ResolvedEncoderExecution:
         cells: tuple[tuple[int, int], ...],
         invoke: Callable[[int, int], Any],
     ) -> None:
-        if self.arm != "dense-graphed" or not self._sealed:
-            raise ValueError("encoder graph capture requires a sealed compiler domain")
+        if self.arm not in _GRAPHED_ARMS or not self._sealed:
+            raise ValueError("encoder graph capture requires a sealed static domain")
         if self._graph_entries or self._pending_graph_entries:
-            raise ValueError("dense-graphed encoder capture was repeated")
+            raise ValueError("graphed encoder capture was repeated")
         runtime = self._graph_runtime
         device = self._runner_device
         if runtime is None or device is None:
-            raise ValueError("dense-graphed encoder runtime device is unavailable")
+            raise ValueError("graphed encoder runtime device is unavailable")
         stage = "staging"
         cell: tuple[int, int] | None = None
         try:
@@ -1169,7 +1188,7 @@ class ResolvedEncoderExecution:
             try:
                 self._record_memory_diagnostic(device, stage=f"failure-{stage}", key=cell)
                 logger.error(
-                    "dense-graphed encoder startup failed: memory_diagnostics=%s", json.dumps(self._memory_diagnostics)
+                    "graphed encoder startup failed: memory_diagnostics=%s", json.dumps(self._memory_diagnostics)
                 )
             except Exception:
                 pass
@@ -1191,7 +1210,7 @@ class ResolvedEncoderExecution:
             raise ValueError(f"encoder graph staging cell {cell} was repeated")
         expected_signature = self._warmup_signatures.get(cell)
         if expected_signature is None or signature != expected_signature:
-            raise ValueError("encoder graph staging signature differs from compiler warmup")
+            raise ValueError("encoder graph staging signature differs from transition warmup")
         self._pending_graph_entries[cell] = self._new_graph_entry(
             cell=cell,
             signature=signature,
@@ -1215,15 +1234,15 @@ class ResolvedEncoderExecution:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         matches = [entry for entry in self._graph_entries.values() if entry.signature == signature]
         if not matches:
-            raise ValueError("dense-graphed encoder signature was not captured")
+            raise ValueError("graphed encoder signature was not captured")
         if len(matches) != 1:
-            raise ValueError("dense-graphed encoder signature maps to multiple graph keys")
+            raise ValueError("graphed encoder signature maps to multiple graph keys")
         entry = matches[0]
         if type(caches) is not type(entry.caches):
-            raise TypeError("dense-graphed encoder cache adapter class changed")
+            raise TypeError("graphed encoder cache adapter class changed")
         caller_storage = _cache_storage(caches)
         if _cache_storage_signature(caller_storage) != entry.storage_signature:
-            raise ValueError("dense-graphed encoder cache storage signature changed")
+            raise ValueError("graphed encoder cache storage signature changed")
 
         # The finalized model is immutable through this execution domain's
         # lifetime, as in compiled-static. Reconfiguration requires a fresh
@@ -1233,7 +1252,7 @@ class ResolvedEncoderExecution:
         # mutate caller or graph scratch. The graph mutates only entry storage.
         runtime = self._graph_runtime
         if runtime is None:
-            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+            raise ValueError("graphed encoder runtime authority is unavailable")
         with phase("port.encode.stage_in"):
             entry.mel.copy_(mel)
             _copy_cache_storage_(entry.cache_storage(), caller_storage)
@@ -1277,7 +1296,7 @@ class ResolvedEncoderExecution:
         )
         runtime = self._graph_runtime
         if runtime is None:
-            raise ValueError("dense-graphed encoder runtime authority is unavailable")
+            raise ValueError("graphed encoder runtime authority is unavailable")
         with phase("port.encode.stage_in"):
             for destination, source in (
                 (entry.mel, mel),
@@ -1308,7 +1327,7 @@ class ResolvedEncoderExecution:
             "warmup_geometries": list(self.warmup_geometries),
             "warmup_populations": list(self.warmup_populations),
         }
-        if self.arm == "dense-graphed":
+        if self.arm in _GRAPHED_ARMS:
             receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
         if self._population_bucketing:
             receipt["population_bucketing"] = "powers_of_two_plus_exact_cap"
@@ -1364,6 +1383,8 @@ def build_encoder_execution(
     specializations; the profiling warmup must cover the measured shapes.
     ``dense-graphed`` retains that compiler domain and then explicitly captures
     every exact geometry/population transition through the platform graph seam.
+    ``eager-graphed`` captures the uncompiled transition, including its native
+    learned position projections, for every exact population without padding.
     """
     if isinstance(maximum_population, bool) or not isinstance(maximum_population, int) or maximum_population <= 0:
         raise ValueError("maximum encoder population must be positive")
@@ -1373,9 +1394,10 @@ def build_encoder_execution(
     if any(geometry < 0 for geometry in geometries) or len(set(geometries)) != len(geometries):
         raise ValueError("encoder warmup geometries must be unique nonnegative ids")
     arm = getattr(hf_config, "encoder_execution_arm", None) or "eager"
-    if arm not in {"eager", "compiled-static", "dense-graphed"}:
+    if arm not in {"eager", *_STATIC_ARMS}:
         raise ValueError(
-            f"unknown encoder_execution_arm {arm!r} (known: ['compiled-static', 'dense-graphed', 'eager'])"
+            f"unknown encoder_execution_arm {arm!r} "
+            "(known: ['compiled-static', 'dense-graphed', 'eager', 'eager-graphed'])"
         )
 
     def transition(
@@ -1398,12 +1420,12 @@ def build_encoder_execution(
 
     if arm == "eager":
         return ResolvedEncoderExecution(arm=arm, transition=transition)
-    if arm == "dense-graphed" and vllm_config is None:
-        raise ValueError("dense-graphed encoder execution requires vllm_config")
-    if arm == "dense-graphed":
+    if arm in _GRAPHED_ARMS and vllm_config is None:
+        raise ValueError("graphed encoder execution requires vllm_config")
+    if arm in _GRAPHED_ARMS:
         num_prompts = getattr(core.lid, "num_prompts", None)
         if isinstance(num_prompts, bool) or not isinstance(num_prompts, int) or num_prompts <= 0:
-            raise ValueError("dense-graphed encoder requires a positive integer lid.num_prompts")
+            raise ValueError("graphed encoder requires a positive integer lid.num_prompts")
     history_frames = int(hf_config.att_context_left)
     if history_frames < 0:
         raise ValueError("encoder attention history must be nonnegative")
@@ -1421,12 +1443,14 @@ def build_encoder_execution(
         else tuple(range(1, maximum_population + 1))
     )
     specialization_budget = len(geometries) * len(populations)
-    compiled = torch.compile(
-        transition,
-        fullgraph=True,
-        dynamic=False,
-        options={"triton.cudagraphs": False},
-    )
+    run_transition = transition
+    if arm in _COMPILED_ARMS:
+        run_transition = torch.compile(
+            transition,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
     execution = ResolvedEncoderExecution(
         arm=arm,
         transition=transition,
@@ -1437,9 +1461,9 @@ def build_encoder_execution(
         _history_frames=history_frames,
         _geometry_shapes=geometry_shape_by_id,
         _core=core,
-        _compiled_transition=compiled,
+        _compiled_transition=run_transition,
         _vllm_config=vllm_config,
-        _graph_runtime=(graph_runtime or platform_graph_runtime() if arm == "dense-graphed" else None),
+        _graph_runtime=(graph_runtime or platform_graph_runtime() if arm in _GRAPHED_ARMS else None),
     )
 
     def guarded_transition(
@@ -1467,7 +1491,7 @@ def build_encoder_execution(
         if active_cell is not None and population != active_cell[1]:
             raise ValueError(f"{arm} encoder population differs from declared cell")
         if staging_cell is not None and active_cell != staging_cell:
-            raise ValueError("encoder graph staging cell differs from active compiler cell")
+            raise ValueError("encoder graph staging cell differs from active transition cell")
         bucketed_replay = (
             execution._sealed and execution._population_bucketing and active_cell is None and staging_cell is None
         )
@@ -1504,7 +1528,7 @@ def build_encoder_execution(
         if execution._sealed and replay_signature not in execution._allowed_signatures:
             raise ValueError(f"{arm} encoder signature was not warmed")
         if execution._sealed:
-            if execution.arm == "dense-graphed":
+            if execution.arm in _GRAPHED_ARMS:
                 staging_cell = execution._staging_cell
                 if staging_cell is not None:
                     execution._stage_graph_entry(
@@ -1517,7 +1541,7 @@ def build_encoder_execution(
                         out_width=out_width,
                         prompt_index=prompt_index,
                     )
-                    result = compiled(
+                    result = run_transition(
                         mel,
                         caches,
                         out_offsets,
@@ -1547,7 +1571,7 @@ def build_encoder_execution(
                             prompt_index=prompt_index,
                         )
             else:
-                result = compiled(
+                result = run_transition(
                     mel,
                     caches,
                     out_offsets,
@@ -1571,8 +1595,8 @@ def build_encoder_execution(
                 prompt_index,
                 runner_device=execution._runner_device,
             )
-            with _compiler_specialization_budget(specialization_budget):
-                result = compiled(
+            with _compiler_specialization_budget(specialization_budget) if arm in _COMPILED_ARMS else nullcontext():
+                result = run_transition(
                     mel,
                     caches,
                     out_offsets,

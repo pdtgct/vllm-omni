@@ -110,9 +110,9 @@ def _compiled_config() -> SimpleNamespace:
     )
 
 
-def _dense_graphed_config() -> SimpleNamespace:
+def _dense_graphed_config(arm: str = "dense-graphed") -> SimpleNamespace:
     return SimpleNamespace(
-        encoder_execution_arm="dense-graphed",
+        encoder_execution_arm=arm,
         att_context_left=56,
     )
 
@@ -1346,8 +1346,10 @@ def test_compiled_static_failure_restores_budget_and_discards_authority(
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_replays_outputs_and_every_cache_family_with_independent_lifetime(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-011
     seen_cache_types: list[type[Any]] = []
@@ -1364,7 +1366,7 @@ def test_dense_graphed_replays_outputs_and_every_cache_family_with_independent_l
     )
     execution = build_encoder_execution(
         _compiled_core(),
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=2,
         warmup_geometries=(0,),
         vllm_config=object(),
@@ -1418,8 +1420,10 @@ def test_dense_graphed_replays_outputs_and_every_cache_family_with_independent_l
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_rejects_unknown_signature_before_mutating_caller_state(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-011
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
@@ -1430,7 +1434,7 @@ def test_dense_graphed_rejects_unknown_signature_before_mutating_caller_state(
     )
     execution = build_encoder_execution(
         _compiled_core(),
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=1,
         warmup_geometries=(0,),
         vllm_config=object(),
@@ -1456,8 +1460,10 @@ def test_dense_graphed_rejects_unknown_signature_before_mutating_caller_state(
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_incomplete_capture_discards_all_keys_and_fresh_start_recovers(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-011
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
@@ -1470,7 +1476,7 @@ def test_dense_graphed_incomplete_capture_discards_all_keys_and_fresh_start_reco
     def build(runtime: GraphRuntime) -> Any:
         return build_encoder_execution(
             _compiled_core(),
-            _dense_graphed_config(),
+            _dense_graphed_config(arm),
             maximum_population=2,
             warmup_geometries=(0,),
             vllm_config=object(),
@@ -1498,7 +1504,7 @@ def test_dense_graphed_incomplete_capture_discards_all_keys_and_fresh_start_reco
         ),
     )
     assert fresh.ready_receipt() == {
-        "arm": "dense-graphed",
+        "arm": arm,
         "ready": True,
         "warmup_cells": [[0, 1], [0, 2]],
         "warmup_geometries": [0],
@@ -1556,8 +1562,10 @@ def test_dense_graphed_real_dynamo_reuses_cache_adapter_guards_for_capture_stagi
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_model_drift_during_capture_discards_readiness(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-010, PORT-PERF-011
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
@@ -1569,7 +1577,7 @@ def test_dense_graphed_model_drift_during_capture_discards_readiness(
     )
     execution = build_encoder_execution(
         core,
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=1,
         warmup_geometries=(0,),
         vllm_config=object(),
@@ -1587,8 +1595,10 @@ def test_dense_graphed_model_drift_during_capture_discards_readiness(
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA capture")
 @torch.inference_mode()
-def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_outputs(
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
     from vllm.config import VllmConfig
@@ -1598,6 +1608,8 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
     from vllm_omni.model_executor.models.nemotron_asr.lid import PromptConditioner
     from vllm_omni.model_executor.models.nemotron_asr.precision import PrecisionPolicy
 
+    if arm == "eager-graphed":
+        monkeypatch.setattr(torch, "compile", lambda *_args, **_kwargs: pytest.fail("native graph must not compile"))
     torch.manual_seed(17)
     # This fixture installs the three real transition members immediately;
     # the outer resident/decoder model is intentionally absent.
@@ -1631,7 +1643,7 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
     runtime = replace(platform_graph_runtime(), capture_context=capture_stream)
     execution = build_encoder_execution(
         core,
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=4,
         warmup_geometries=(0, 1, 2, 3, 4),
         vllm_config=VllmConfig(),
@@ -1650,13 +1662,18 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
                         torch.full((population, 56, 32), base + layer * 0.01, device=device) for layer in range(2)
                     ],
                     time=[torch.full((population, 32, 4), base + layer * 0.02, device=device) for layer in range(2)],
-                    window_valid=[((rows + variant) % 5).to(torch.int32).reshape(-1, 1) for _ in range(2)],
+                    window_valid=[
+                        (torch.full_like(rows, 56) if variant == 2 else (rows + variant) % 5)
+                        .to(torch.int32)
+                        .reshape(-1, 1)
+                        for _ in range(2)
+                    ],
                 ),
             )
         )
-        offsets = (rows + variant) % 3
+        offsets = torch.zeros_like(rows) if variant == 2 else (rows + variant) % 3
         lengths = torch.where(
-            (rows + variant) % 2 == 0,
+            ((rows + variant) % 2 == 0) & (variant != 2),
             torch.zeros_like(rows),
             torch.full_like(rows, shape.out_width) - offsets,
         )
@@ -1673,7 +1690,8 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
     original_capture = execution._capture_graph_domain
 
     def capture_sealed(**kwargs: Any) -> None:
-        assert torch._dynamo.config.error_on_recompile
+        if arm == "dense-graphed":
+            assert torch._dynamo.config.error_on_recompile
         capture_graph_counts.append(torch._dynamo.utils.counters["stats"]["unique_graphs"])
         original_capture(**kwargs)
         capture_graph_counts.append(torch._dynamo.utils.counters["stats"]["unique_graphs"])
@@ -1685,7 +1703,8 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
         invoke=lambda geometry, population: execution.transition(*args(geometry, population)),
     )
     assert execution.ready
-    assert capture_graph_counts == [20, 20]
+    assert capture_graph_counts[0] == capture_graph_counts[1]
+    assert bool(core.encoder._stream_relative_position_lengths) == (arm == "dense-graphed")
     assert execution.ready_receipt()["captured_keys"] == [list(cell) for cell in cells]
     retained: list[tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]] = []
     compiled = execution._compiled_transition
@@ -1693,8 +1712,9 @@ def test_dense_graphed_real_cuda_compiled_encoder_matches_state_and_retained_out
     with torch._dynamo.config.patch(error_on_recompile=True):
         # Revisiting every cell after every capture also catches cross-entry
         # reuse of pooled outputs and intermediates.
-        for variant in (0, 1):
-            for geometry, population in reversed(cells):
+        for variant in (0, 1, 2):
+            order = (*cells[::2], *reversed(cells[1::2])) if variant == 1 else tuple(reversed(cells))
+            for geometry, population in order:
                 actual_args = args(geometry, population, base=0.25 + variant, variant=variant)
                 expected_args = args(geometry, population, base=0.25 + variant, variant=variant)
                 before = tuple(t.clone() for family in actual_args[1].graph_storage() for t in family)
@@ -1757,8 +1777,10 @@ def test_dense_graphed_review_seeds_discriminate_rows_positions_and_full_history
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_review_population_one_rejects_noop_graph_replay(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-011
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
@@ -1772,7 +1794,7 @@ def test_dense_graphed_review_population_one_rejects_noop_graph_replay(
 
     execution = build_encoder_execution(
         _compiled_core(),
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=1,
         warmup_geometries=(0,),
         vllm_config=object(),
@@ -1842,8 +1864,10 @@ def test_dense_graphed_review_rejects_postseal_dynamo_recompile(
 @pytest.mark.cpu
 @pytest.mark.parametrize("snapshot_fails", [False, True])
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_review_oom_emits_memory_diagnostics_preserving_cause(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
     caplog: pytest.LogCaptureFixture,
     snapshot_fails: bool,
 ) -> None:
@@ -1867,7 +1891,7 @@ def test_dense_graphed_review_oom_emits_memory_diagnostics_preserving_cause(
     original = torch.cuda.OutOfMemoryError("injected capture OOM")
     execution = build_encoder_execution(
         _compiled_core(),
-        _dense_graphed_config(),
+        _dense_graphed_config(arm),
         maximum_population=1,
         warmup_geometries=(0,),
         vllm_config=object(),
@@ -1890,8 +1914,10 @@ def test_dense_graphed_review_oom_emits_memory_diagnostics_preserving_cause(
 
 @pytest.mark.cpu
 @torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_dense_graphed_review_staging_failure_discards_partial_storage_and_recovers(
     monkeypatch: pytest.MonkeyPatch,
+    arm: str,
 ) -> None:
     # @spec PORT-PERF-011
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
@@ -1907,7 +1933,7 @@ def test_dense_graphed_review_staging_failure_discards_partial_storage_and_recov
     def build() -> Any:
         return build_encoder_execution(
             _compiled_core(),
-            _dense_graphed_config(),
+            _dense_graphed_config(arm),
             maximum_population=2,
             warmup_geometries=(0,),
             vllm_config=object(),
@@ -2030,3 +2056,168 @@ def test_ready_profile_preserves_seal_and_rejects_changed_signature(monkeypatch)
     with pytest.raises(ValueError, match="signature"):
         execution.profile_ready_cell(geometry=0, population=1, invoke=lambda: invoke(changed=True))
     assert not execution.ready
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_eager_graphed_exact_domain_never_enters_compiler_or_prepares_projections(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("native graph must not compile or prepare learned projections")
+
+    monkeypatch.setattr(torch, "compile", forbidden)
+    monkeypatch.setattr(encoder_execution_module, "_compiler_specialization_budget", forbidden)
+    monkeypatch.setattr(torch._dynamo, "config", SimpleNamespace(patch=forbidden))
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    core = _compiled_core()
+    core.encoder.prepare_stream_relative_position_projections = forbidden
+    core.encoder._stream_relative_position_lengths = ()
+    execution = build_encoder_execution(
+        core,
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=3,
+        warmup_geometries=(0,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    assert execution.warmup_populations == (1, 2, 3)
+    assert not execution.ready
+    with pytest.raises(ValueError, match="authority"):
+        execution.transition(*_graph_transition_args(population=3))
+    execution.profile_cell(
+        geometry=0,
+        population=3,
+        invoke=lambda: execution.transition(*_graph_transition_args(population=3)),
+    )
+    assert core.encoder.pos_enc.pe.shape == (1, 2 * execution.t_cap - 1, 8)
+    execution.warmup_domain(
+        expected_cells=((0, 1), (0, 2), (0, 3)),
+        invoke=lambda _geometry, population: execution.transition(*_graph_transition_args(population=population)),
+    )
+    execution.profile_ready_cell(
+        geometry=0,
+        population=3,
+        invoke=lambda: execution.transition(*_graph_transition_args(population=3)),
+    )
+    assert execution.ready_receipt()["captured_keys"] == [[0, 1], [0, 2], [0, 3]]
+    assert core.encoder._stream_relative_position_lengths == ()
+    for population in (3, 1, 2, 3):
+        execution.transition(*_graph_transition_args(population=population))
+    with pytest.raises(ValueError, match="population"):
+        execution.transition(*_graph_transition_args(population=4))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("bucketing", [True, 1, "false"])
+def test_eager_graphed_rejects_bucketing_and_nonboolean_flags(bucketing):
+    config = _dense_graphed_config("eager-graphed")
+    config.encoder_population_bucketing = bucketing
+    with pytest.raises(ValueError, match="encoder_population_bucketing"):
+        build_encoder_execution(
+            _compiled_core(),
+            config,
+            maximum_population=3,
+            warmup_geometries=(0,),
+            vllm_config=object(),
+            graph_runtime=_graph_runtime(),
+        )
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("prepared", ["lengths", "buffer"])
+def test_eager_graphed_rejects_prepared_learned_projection_state(monkeypatch, prepared):
+    monkeypatch.setattr(torch, "compile", lambda *_args, **_kwargs: pytest.fail("native graph must not compile"))
+    core = _compiled_core()
+    if prepared == "lengths":
+        core.encoder._stream_relative_position_lengths = (59,)
+    else:
+        core.encoder.register_buffer("_stream_relative_position_59", torch.zeros(1))
+    with pytest.raises(ValueError, match="prepared.*projection"):
+        execution = build_encoder_execution(
+            core,
+            _dense_graphed_config("eager-graphed"),
+            maximum_population=1,
+            warmup_geometries=(0,),
+            vllm_config=object(),
+            graph_runtime=_graph_runtime(),
+        )
+        execution.profile_cell(
+            geometry=0,
+            population=1,
+            invoke=lambda: execution.transition(*_graph_transition_args(population=1)),
+        )
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_eager_graphed_native_profile_matches_unprepared_encoder(monkeypatch):
+    from vllm_omni.model_executor.models.nemotron_asr.encoder import FastConformerEncoder, StreamingCaches
+    from vllm_omni.model_executor.models.nemotron_asr.lid import PromptConditioner
+
+    monkeypatch.setattr(torch, "compile", lambda *_args, **_kwargs: pytest.fail("native graph must not compile"))
+    core = _compiled_core()
+    core.encoder = FastConformerEncoder(
+        feat_in=16,
+        d_model=32,
+        d_ff=64,
+        n_layers=2,
+        n_heads=4,
+        conv_kernel=5,
+        subsampling_channels=16,
+        att_context=(56, 1),
+    )
+    core.lid = PromptConditioner(enc_hidden=32, num_prompts=4)
+    core.eval()
+    execution = build_encoder_execution(
+        core,
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=3,
+        warmup_geometries=(1,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    shape = execution._geometry_shapes[1]
+    mel = torch.randn(3, 16, shape.mel_width)
+    offsets = torch.tensor([0, 1, 2])
+    lengths = torch.tensor([shape.out_width, 0, 1])
+    prompts = torch.tensor([0, 2, 1])
+    caches = [
+        StreamingCaches(
+            n_layers=2,
+            batch=3,
+            left_context=56,
+            d_model=32,
+            conv_kernel=5,
+            device=torch.device("cpu"),
+        )
+        for _ in range(2)
+    ]
+    calls = []
+    hooks = [
+        layer.self_attn.linear_pos.register_forward_hook(lambda *_: calls.append(True)) for layer in core.encoder.layers
+    ]
+    try:
+        actual = execution.profile_cell(
+            geometry=1,
+            population=3,
+            invoke=lambda: execution.transition(mel, caches[0], offsets, lengths, shape.out_width, prompts),
+        )
+        assert len(calls) == 2
+        expected = encoder_execution_module.execute_encoder_transition(
+            core,
+            mel,
+            caches[1],
+            offsets,
+            lengths,
+            shape.out_width,
+            prompts,
+        )
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert len(calls) == 4
+    assert core.encoder._stream_relative_position_lengths == ()
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    for family in ("channel", "time", "valid"):
+        torch.testing.assert_close(getattr(caches[0], family), getattr(caches[1], family), rtol=0, atol=0)
