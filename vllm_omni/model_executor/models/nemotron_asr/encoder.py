@@ -23,6 +23,7 @@ source refs @ NeMo de242add.
 """
 
 import math
+import threading
 
 import torch
 from torch import nn
@@ -32,6 +33,72 @@ from vllm_omni.model_executor.models.nemotron_asr.masks import (
 )
 
 _LOG_BASE = 10000.0
+_DEPTHWISE_OP = "nemotron_asr_native_subsampling_depthwise_conv2d"
+_DEPTHWISE_LOCK = threading.Lock()
+_DEPTHWISE_REGISTERED = False
+
+
+def _native_subsampling_depthwise_conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> torch.Tensor:
+    # Canonicalize singleton strides too: depthwise weights can be contiguous
+    # while still suggesting channels-last to convolution backend selection.
+    input = input.contiguous().view(input.shape)
+    weight = weight.contiguous().view(weight.shape)
+    return nn.functional.conv2d(input, weight, bias, stride, padding, dilation, groups)
+
+
+def _fake_subsampling_depthwise_conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> torch.Tensor:
+    spatial = [
+        (input.shape[i + 2] + 2 * padding[i] - dilation[i] * (weight.shape[i + 2] - 1) - 1) // stride[i] + 1
+        for i in range(2)
+    ]
+    return input.new_empty((input.shape[0], weight.shape[0], *spatial))
+
+
+def _ensure_subsampling_depthwise_registered() -> None:
+    global _DEPTHWISE_REGISTERED
+    if _DEPTHWISE_REGISTERED:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    with _DEPTHWISE_LOCK:
+        if _DEPTHWISE_REGISTERED:
+            return
+        implementation = (_native_subsampling_depthwise_conv2d.__code__, _fake_subsampling_depthwise_conv2d.__code__)
+        expected_schema = (
+            f"vllm::{_DEPTHWISE_OP}{torch.library.infer_schema(_native_subsampling_depthwise_conv2d, mutates_args=[])}"
+        )
+        op = getattr(torch.ops.vllm, _DEPTHWISE_OP, None)
+        if op is None:
+            direct_register_custom_op(
+                op_name=_DEPTHWISE_OP,
+                op_func=_native_subsampling_depthwise_conv2d,
+                mutates_args=[],
+                fake_impl=_fake_subsampling_depthwise_conv2d,
+            )
+            op = getattr(torch.ops.vllm, _DEPTHWISE_OP)
+            op._nemotron_implementation = implementation
+        elif (
+            str(op.default._schema) != expected_schema
+            or getattr(op, "_nemotron_implementation", None) != implementation
+        ):
+            raise RuntimeError("incompatible Nemotron subsampling depthwise registration; use a fresh process")
+        _DEPTHWISE_REGISTERED = True
 
 
 def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
@@ -49,6 +116,21 @@ class CausalConv2dSub(nn.Conv2d):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(nn.functional.pad(x, self._pad))
+
+
+class _NativeDepthwiseConv2dSub(CausalConv2dSub):
+    """Preserve native NCHW convolution and bias accumulation during compilation."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _ensure_subsampling_depthwise_registered()
+
+    def _conv_forward(self, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+            return torch.ops.vllm.nemotron_asr_native_subsampling_depthwise_conv2d(
+                input, weight, bias, list(self.stride), list(self.padding), list(self.dilation), self.groups
+            )
+        return super()._conv_forward(input, weight, bias)
 
 
 class SubsamplingDwStriding(nn.Module):
@@ -74,7 +156,7 @@ class SubsamplingDwStriding(nn.Module):
         ]
         for _ in range(stages - 1):
             layers.append(
-                CausalConv2dSub(
+                _NativeDepthwiseConv2dSub(
                     conv_channels,
                     conv_channels,
                     kernel,
