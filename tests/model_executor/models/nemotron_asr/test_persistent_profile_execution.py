@@ -294,7 +294,7 @@ def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
     assert captured["memory_profile"] is True
 
 
-@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed"])
+@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed", "eager-graphed"])
 def test_compiled_profile_uses_largest_admitted_geometry(
     monkeypatch: pytest.MonkeyPatch,
     encoder_arm: str,
@@ -417,7 +417,7 @@ def test_profile_execution_drains_stats_on_empty_dispatch(
     assert drained == [True]
 
 
-@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed"])
+@pytest.mark.parametrize("encoder_arm", ["compiled-static", "dense-graphed", "eager-graphed"])
 def test_static_encoder_warmup_is_product_owned_cartesian_execution(
     monkeypatch: pytest.MonkeyPatch,
     encoder_arm: str,

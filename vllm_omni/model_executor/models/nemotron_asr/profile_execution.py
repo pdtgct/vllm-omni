@@ -230,6 +230,7 @@ def run_persistent_state_profile(
         if geometry_id is None and getattr(execution, "arm", None) in {
             "compiled-static",
             "dense-graphed",
+            "eager-graphed",
         }:
             geometry_id = max(execution.warmup_geometries)
         invocation_kwargs: dict[str, Any] = {}
@@ -305,11 +306,12 @@ def run_persistent_state_profile(
             in {
                 "compiled-static",
                 "dense-graphed",
+                "eager-graphed",
             }
             and not execution.cell_active
         ):
             if geometry_id is None:
-                raise ValueError("compiled-static encoder profile geometry is missing")
+                raise ValueError("static encoder profile geometry is missing")
             profile_cell = execution.profile_ready_cell if ready_domain else execution.profile_cell
             return profile_cell(
                 geometry=geometry_id,
@@ -327,9 +329,9 @@ def warmup_static_encoder_execution(
     *,
     device: torch.device,
 ) -> None:
-    """Compile and attest every served geometry/population cell."""
+    """Warm and attest every served geometry/population cell."""
     execution = model._encoder_execution
-    if execution.arm not in {"compiled-static", "dense-graphed"}:
+    if execution.arm not in {"compiled-static", "dense-graphed", "eager-graphed"}:
         return
     if getattr(execution, "ready", False):
         return
