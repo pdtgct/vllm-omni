@@ -579,8 +579,11 @@ def _stream_conv(
     [cache | glu][j + F_b], each row's own logical append.
     """
     conv = layer.conv
-    y = x.transpose(1, 2)
-    y = torch.nn.functional.glu(conv.pointwise_conv1(y), dim=1)
+    batch, frames, width = x.shape
+    y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
+    y = conv.pointwise_conv1(y)
+    y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
+    y = torch.nn.functional.glu(y, dim=1)
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
     cw = cache.shape[-1]
@@ -593,7 +596,10 @@ def _stream_conv(
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
-    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
+    y = y.permute(1, 0, 2).contiguous().view(1, width, batch * frames)
+    y = conv.pointwise_conv2(y)
+    y = y.view(conv.pointwise_conv2.out_channels, batch, frames).permute(1, 0, 2).contiguous()
+    return y.transpose(1, 2), new_cache
 
 
 def stream_step(
