@@ -23,6 +23,7 @@ source refs @ NeMo de242add.
 """
 
 import math
+import threading
 
 import torch
 from torch import nn
@@ -32,6 +33,73 @@ from vllm_omni.model_executor.models.nemotron_asr.masks import (
 )
 
 _LOG_BASE = 10000.0
+_LAYER_NORM_OP = "nemotron_asr_encoder_native_layer_norm"
+_LAYER_NORM_LOCK = threading.Lock()
+_LAYER_NORM_REGISTERED = False
+
+
+def _native_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    return nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
+
+
+def _fake_native_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(input, memory_format=torch.contiguous_format)
+
+
+def _ensure_native_layer_norm_registered() -> None:
+    global _LAYER_NORM_REGISTERED
+    if _LAYER_NORM_REGISTERED:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    with _LAYER_NORM_LOCK:
+        if _LAYER_NORM_REGISTERED:
+            return
+        implementation = (_native_layer_norm.__code__, _fake_native_layer_norm.__code__)
+        expected_schema = f"vllm::{_LAYER_NORM_OP}{torch.library.infer_schema(_native_layer_norm, mutates_args=[])}"
+        op = getattr(torch.ops.vllm, _LAYER_NORM_OP, None)
+        if op is None:
+            direct_register_custom_op(
+                op_name=_LAYER_NORM_OP,
+                op_func=_native_layer_norm,
+                mutates_args=[],
+                fake_impl=_fake_native_layer_norm,
+            )
+            op = getattr(torch.ops.vllm, _LAYER_NORM_OP)
+            op._nemotron_implementation = implementation
+        elif (
+            str(op.default._schema) != expected_schema
+            or getattr(op, "_nemotron_implementation", None) != implementation
+        ):
+            raise RuntimeError("incompatible Nemotron encoder LayerNorm registration; use a fresh process")
+        _LAYER_NORM_REGISTERED = True
+
+
+class _EncoderLayerNorm(nn.LayerNorm):
+    """Keep native normalization opaque during compiled encoder inference."""
+
+    def __init__(self, normalized_shape: int) -> None:
+        super().__init__(normalized_shape)
+        _ensure_native_layer_norm_registered()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+            return torch.ops.vllm.nemotron_asr_encoder_native_layer_norm(
+                input, list(self.normalized_shape), self.weight, self.bias, self.eps
+            )
+        return super().forward(input)
 
 
 def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
@@ -199,7 +267,7 @@ class ConformerConv(nn.Module):
         self.pointwise_conv1 = nn.Conv1d(d_model, d_model * 2, 1, bias=False)
         self.depthwise_conv = nn.Conv1d(d_model, d_model, kernel, groups=d_model, bias=False)
         if norm_type == "layer_norm":
-            self.batch_norm: nn.Module = nn.LayerNorm(d_model)
+            self.batch_norm: nn.Module = _EncoderLayerNorm(d_model)
         elif norm_type == "batch_norm":
             self.batch_norm = nn.BatchNorm1d(d_model)
         else:
@@ -250,15 +318,15 @@ class ConformerLayer(nn.Module):
         conv_norm_type: str,
     ) -> None:
         super().__init__()
-        self.norm_feed_forward1 = nn.LayerNorm(d_model)
+        self.norm_feed_forward1 = _EncoderLayerNorm(d_model)
         self.feed_forward1 = FeedForward(d_model=d_model, d_ff=d_ff)
-        self.norm_self_att = nn.LayerNorm(d_model)
+        self.norm_self_att = _EncoderLayerNorm(d_model)
         self.self_attn = RelPositionMHA(d_model=d_model, n_heads=n_heads)
-        self.norm_conv = nn.LayerNorm(d_model)
+        self.norm_conv = _EncoderLayerNorm(d_model)
         self.conv = ConformerConv(d_model=d_model, kernel=conv_kernel, norm_type=conv_norm_type)
-        self.norm_feed_forward2 = nn.LayerNorm(d_model)
+        self.norm_feed_forward2 = _EncoderLayerNorm(d_model)
         self.feed_forward2 = FeedForward(d_model=d_model, d_ff=d_ff)
-        self.norm_out = nn.LayerNorm(d_model)
+        self.norm_out = _EncoderLayerNorm(d_model)
 
     def forward(
         self,
