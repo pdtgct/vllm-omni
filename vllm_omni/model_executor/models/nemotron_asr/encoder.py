@@ -582,8 +582,10 @@ def _stream_conv(
     batch, frames, width = x.shape
     y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
     y = conv.pointwise_conv1(y)
-    y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
     y = torch.nn.functional.glu(y, dim=1)
+    # GLU is positionwise: keep the folded layout until the cache
+    # concatenation materializes the channel-first depthwise input.
+    y = y.view(width, batch, frames).permute(1, 0, 2)
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
     cw = cache.shape[-1]
