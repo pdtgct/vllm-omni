@@ -596,7 +596,12 @@ def _stream_conv(
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
-    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
+    # Keep each session's convolution geometry without packing the input.
+    weight = conv.pointwise_conv2.weight.squeeze(-1).unsqueeze(0).expand(batch, -1, -1)
+    y = torch.bmm(weight, y)
+    if conv.pointwise_conv2.bias is not None:
+        y = y + conv.pointwise_conv2.bias.view(1, -1, 1)
+    return y.transpose(1, 2), new_cache
 
 
 def stream_step(
