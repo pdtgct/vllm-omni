@@ -397,6 +397,19 @@ def _copy_cache_storage_(
     # Layouts are validated once, before any staging mutation. Graph-owned
     # storage remains fixed for the lifetime of the published domain.
     for destination_family, source_family in zip(destination, source, strict=True):
+        if destination_family and len(destination_family) == len(source_family):
+            # Foreach may execute entries concurrently. Preserve sequential
+            # semantics for shared destination storage or source dependencies,
+            # including views whose data pointers differ by a storage offset.
+            destination_storage = {
+                (tensor.device, tensor.untyped_storage().data_ptr()) for tensor in destination_family
+            }
+            if len(destination_storage) == len(destination_family) and all(
+                (tensor.device, tensor.untyped_storage().data_ptr()) not in destination_storage
+                for tensor in source_family
+            ):
+                torch._foreach_copy_(destination_family, source_family)
+                continue
         for destination_tensor, source_tensor in zip(
             destination_family,
             source_family,

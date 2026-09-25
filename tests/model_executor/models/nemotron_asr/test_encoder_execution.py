@@ -35,6 +35,82 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "case",
+    [
+        "distinct",
+        "duplicate_source",
+        "duplicate_destination",
+        "overlapping_destination",
+        "source_dependency",
+        "strided",
+    ],
+)
+def test_cache_copy_preserves_sequential_alias_semantics(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    # @spec PORT-PERF-011
+    def families(dtype: torch.dtype) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        first = torch.arange(8, dtype=dtype)
+        second = first + 20
+        buffer = torch.full((8,), -1, dtype=dtype)
+        other = torch.full((4,), -2, dtype=dtype)
+        if case == "duplicate_source":
+            return (buffer[:4], other), (first[:4], first[:4])
+        if case == "duplicate_destination":
+            return (buffer[:4], buffer[:4]), (first[:4], second[:4])
+        if case == "overlapping_destination":
+            return (buffer[:4], buffer[2:6]), (first[:4], second[:4])
+        if case == "source_dependency":
+            return (buffer[:4], other), (first[:4], buffer[2:6])
+        if case == "strided":
+            return (buffer[::2], other), (first[::2], second[:4])
+        return (buffer[:4], other), (first[:4], second[:4])
+
+    actual = [families(dtype) for dtype in (torch.float32, torch.float32, torch.int32)]
+    expected = [families(dtype) for dtype in (torch.float32, torch.float32, torch.int32)]
+    for destination, source in expected:
+        for dst, src in zip(destination, source, strict=True):
+            dst.copy_(src)
+    storage = encoder_execution_module.EncoderCacheStorage
+    destination = storage(*(pair[0] for pair in actual))
+    source = storage(*(pair[1] for pair in actual))
+    pointers = [tensor.data_ptr() for family in destination for tensor in family]
+    foreach_calls = []
+    original = torch._foreach_copy_
+
+    def observed(dst: tuple[torch.Tensor, ...], src: tuple[torch.Tensor, ...]) -> None:
+        foreach_calls.append(len(dst))
+        original(dst, src)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", observed)
+    encoder_execution_module._copy_cache_storage_(destination, source)
+    assert [tensor.data_ptr() for family in destination for tensor in family] == pointers
+    for (actual_dst, actual_src), (expected_dst, expected_src) in zip(actual, expected, strict=True):
+        for a, e in zip((*actual_dst, *actual_src), (*expected_dst, *expected_src), strict=True):
+            torch.testing.assert_close(a, e, rtol=0, atol=0)
+    assert foreach_calls == ([2, 2, 2] if case in ("distinct", "duplicate_source", "strided") else [])
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_cache_copy_preserves_family_order_and_mismatched_length_behavior() -> None:
+    storage = encoder_execution_module.EncoderCacheStorage
+    first, second, third = (torch.zeros(4) for _ in range(3))
+    source = torch.arange(4, dtype=torch.float32)
+    encoder_execution_module._copy_cache_storage_(
+        storage((first,), (second,), (third,)), storage((source,), (first,), (second,))
+    )
+    for tensor in (first, second, third):
+        torch.testing.assert_close(tensor, source, rtol=0, atol=0)
+
+    first.zero_()
+    with pytest.raises(ValueError, match="zip"):
+        encoder_execution_module._copy_cache_storage_(storage((first, second), (), ()), storage((source,), (), ()))
+    torch.testing.assert_close(first, source, rtol=0, atol=0)
+    encoder_execution_module._copy_cache_storage_(storage((), (), ()), storage((), (), ()))
+
+
 def build_encoder_execution(
     core: nn.Module | SimpleNamespace,
     hf_config: object,
