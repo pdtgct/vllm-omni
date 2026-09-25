@@ -596,7 +596,12 @@ def _stream_conv(
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
-    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
+    # LayerNorm leaves channels contiguous; project all batch/frame rows
+    # directly without repacking them for a channel-first convolution.
+    y = torch.nn.functional.linear(
+        y.transpose(1, 2), conv.pointwise_conv2.weight.squeeze(-1), conv.pointwise_conv2.bias
+    )
+    return y, new_cache
 
 
 def stream_step(

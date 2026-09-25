@@ -149,8 +149,34 @@ def test_weight_names_follow_nemo_layout():
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (  # noqa: E402
     StreamingCaches,
     _stream_attention,
+    _stream_conv,
     stream_step,
 )
+
+
+@pytest.mark.parametrize("batch", [1, 3, 64, 128])
+@pytest.mark.parametrize("frames", [1, 4, 14])
+@pytest.mark.parametrize("bias", [False, True])
+def test_stream_conv_matches_full_context_and_advances_logical_tail(batch: int, frames: int, bias: bool) -> None:
+    layer = _tiny().layers[0]
+    if bias:
+        layer.conv.pointwise_conv2.bias = torch.nn.Parameter(torch.randn(32))
+    x = torch.randn(batch, frames, 32)
+    cache = torch.zeros(batch, 32, 4)
+    lengths = torch.arange(batch).remainder(frames + 1)
+
+    with torch.no_grad():
+        expected = layer.conv(x, None)
+        actual, advanced = _stream_conv(layer, x, cache, new_lengths=lengths)
+        glu = torch.nn.functional.glu(layer.conv.pointwise_conv1(x.transpose(1, 2)), dim=1)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (batch, frames, 32)
+    assert actual.is_contiguous()
+    for row, length in enumerate(lengths.tolist()):
+        expected_tail = torch.cat([cache[row], glu[row, :, :length]], dim=-1)[:, -4:]
+        torch.testing.assert_close(advanced[row], expected_tail)
+    assert torch.count_nonzero(cache) == 0
 
 
 def _caches(batch: int, enc: FastConformerEncoder) -> StreamingCaches:
