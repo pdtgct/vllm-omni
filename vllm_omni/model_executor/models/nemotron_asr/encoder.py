@@ -528,7 +528,6 @@ def _stream_attention(
     b, t2 = batch, keys.shape[1]
     q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
     k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
-    v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
     if projected_pos is None:
         if pos_emb is None:
             raise ValueError("stream attention requires positional embeddings or a prepared projection")
@@ -550,8 +549,16 @@ def _stream_attention(
     mask = mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
     scores = scores.masked_fill(mask, -_LOG_BASE)
     weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
-    out = torch.matmul(weights, v)
-    out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
+    # Value projection has no bias: apply each head's weights to the
+    # attention-weighted inputs instead of projecting the entire history.
+    # Flatten heads into query rows so history is not copied per head.
+    pooled = torch.bmm(weights.reshape(b, attn.h * new_frames, t2), keys)
+    pooled = pooled.view(b, attn.h, new_frames, keys.shape[2]).permute(1, 0, 2, 3)
+    pooled = pooled.reshape(attn.h, b * new_frames, keys.shape[2])
+    value_weight = attn.linear_v.weight.view(attn.h, attn.d_k, keys.shape[2])
+    out = torch.bmm(pooled, value_weight.transpose(1, 2))
+    out = out.view(attn.h, b, new_frames, attn.d_k).permute(1, 2, 0, 3)
+    out = out.reshape(batch, new_frames, attn.h * attn.d_k)
     # Advance cache by each row's logical length: slot j of the new
     # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
     # bit-identical; gather indices never touch padded frames.
