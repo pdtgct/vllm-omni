@@ -494,6 +494,26 @@ class StreamingCaches:
         self.valid = torch.zeros(batch, dtype=torch.long, device=device)
 
 
+def _stream_attention_mask(
+    valid: torch.Tensor,
+    new_valid: torch.Tensor,
+    capacity: int,
+) -> torch.Tensor:
+    """Mask dead cached keys, padded new keys, and padded queries."""
+    batch, new_frames = new_valid.shape
+    row = torch.arange(capacity, device=new_valid.device).unsqueeze(0)
+    dead = row < (capacity - valid.unsqueeze(1))
+    mask = torch.zeros(batch, 1, new_frames, capacity + new_frames, dtype=torch.bool, device=new_valid.device)
+    mask[:, :, :, :capacity] = dead.unsqueeze(1).unsqueeze(2)
+    mask[:, :, :, capacity:] = (~new_valid).unsqueeze(1).unsqueeze(2)
+    return mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
+
+
+def _stream_cache_indices(new_lengths: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Select each row's retained history after its logical append."""
+    return new_lengths.view(-1, 1) + torch.arange(capacity, device=new_lengths.device).unsqueeze(0)
+
+
 def _stream_attention(
     layer: ConformerLayer,
     x: torch.Tensor,
@@ -504,6 +524,8 @@ def _stream_attention(
     new_valid: torch.Tensor,
     new_lengths: torch.Tensor,
     projected_pos: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    cache_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
@@ -542,12 +564,8 @@ def _stream_attention(
     scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / attn.s_d_k
     # Mask: cache rows beyond each element's valid count are dead;
     # padded new frames are dead keys; padded queries mask fully.
-    row = torch.arange(capacity, device=x.device).unsqueeze(0)
-    dead = row < (capacity - valid.unsqueeze(1))  # (B, C) True = dead
-    mask = torch.zeros(batch, 1, new_frames, t2, dtype=torch.bool, device=x.device)
-    mask[:, :, :, :capacity] = dead.unsqueeze(1).unsqueeze(2)
-    mask[:, :, :, capacity:] = (~new_valid).unsqueeze(1).unsqueeze(2)
-    mask = mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
+    if mask is None:
+        mask = _stream_attention_mask(valid, new_valid, capacity)
     scores = scores.masked_fill(mask, -_LOG_BASE)
     weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
     out = torch.matmul(weights, v)
@@ -555,12 +573,9 @@ def _stream_attention(
     # Advance cache by each row's logical length: slot j of the new
     # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
     # bit-identical; gather indices never touch padded frames.
-    aidx = (
-        (new_lengths.view(-1, 1) + torch.arange(capacity, device=x.device).unsqueeze(0))
-        .unsqueeze(-1)
-        .expand(b, capacity, keys.shape[2])
-    )
-    new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, aidx)
+    if cache_indices is None:
+        cache_indices = _stream_cache_indices(new_lengths, capacity).unsqueeze(-1).expand(b, capacity, keys.shape[2])
+    new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, cache_indices)
     return attn.linear_out(out), new_cache
 
 
@@ -570,6 +585,7 @@ def _stream_conv(
     cache: torch.Tensor,
     *,
     new_lengths: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Conv module over [time_cache | new] (CausalConv1D.update_cache).
 
@@ -587,12 +603,9 @@ def _stream_conv(
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
     cw = cache.shape[-1]
-    aidx = (
-        (new_lengths.view(-1, 1) + torch.arange(cw, device=y.device).unsqueeze(0))
-        .unsqueeze(1)
-        .expand(y.shape[0], y.shape[1], cw)
-    )
-    new_cache = padded.gather(2, aidx).to(cache.dtype)
+    if cache_indices is None:
+        cache_indices = _stream_cache_indices(new_lengths, cw).unsqueeze(1).expand(y.shape[0], y.shape[1], cw)
+    new_cache = padded.gather(2, cache_indices).to(cache.dtype)
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
@@ -653,6 +666,12 @@ def stream_step(
     x = x.gather(1, gidx.unsqueeze(-1).expand(b, out_width, x.shape[2]))
     new_valid = torch.arange(out_width, device=device).unsqueeze(0) < out_lengths.view(-1, 1)
     cache_len = caches.channel.shape[2]
+    # All layers share the same logical lengths and cache geometry. Build
+    # their read-only masks and gather indices once for this transition.
+    mask = _stream_attention_mask(caches.valid, new_valid, cache_len)
+    attn_indices = _stream_cache_indices(out_lengths, cache_len).unsqueeze(-1).expand(b, cache_len, x.shape[2])
+    conv_len = caches.time.shape[-1]
+    conv_indices = _stream_cache_indices(out_lengths, conv_len).unsqueeze(1).expand(b, x.shape[2], conv_len)
     projections = encoder.stream_relative_position_projections(
         out_width=out_width,
         cache_len=cache_len,
@@ -683,10 +702,14 @@ def stream_step(
             new_valid=new_valid,
             new_lengths=out_lengths,
             projected_pos=None if projections is None else projections[idx],
+            mask=mask,
+            cache_indices=attn_indices,
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)
-        conv_out, caches.time[idx] = _stream_conv(layer, y, caches.time[idx], new_lengths=out_lengths)
+        conv_out, caches.time[idx] = _stream_conv(
+            layer, y, caches.time[idx], new_lengths=out_lengths, cache_indices=conv_indices
+        )
         residual = residual + conv_out
         y = layer.norm_feed_forward2(residual)
         residual = residual + 0.5 * layer.feed_forward2(y)
