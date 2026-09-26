@@ -2646,6 +2646,8 @@ def advance_model_rows(
     unresolved.sort(key=lambda item: (item[2], item[3]))
     ready = len(unresolved)
     bucket_pos: list[tuple[int, torch.Tensor, ResolvedDecode]] = []
+    bucket_transitions: dict[int, Callable[..., ChunkBucketResult]] = {}
+    resolve_bucket = getattr(bucket_transition, "resolve", None)
     for geometry, positions, _, _ in unresolved:
         live = int(positions.numel())
         if (lookaheads[geometry] + 1) * MAX_SYMBOLS_PER_STEP > cap:
@@ -2662,6 +2664,17 @@ def advance_model_rows(
         )
         if not isinstance(resolved, ResolvedDecode) or not callable(resolved.decode_fn):
             raise ValueError("decode resolver returned an invalid binding")
+        if callable(resolve_bucket):
+            selected = resolve_bucket(
+                geometry=geometry,
+                population=live,
+                decode_fn=resolved.decode_fn,
+                encoder_transition=encoder_transition,
+                capture=capture,
+            )
+            if not callable(selected):
+                raise ValueError("CHUNK resolver returned an invalid transition")
+            bucket_transitions[geometry] = selected
         bucket_pos.append((geometry, positions, resolved))
 
     # PORT-OBS-008 (amended): one (cadence_ms, rows) entry per executed
@@ -2881,7 +2894,7 @@ def advance_model_rows(
             c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
-        transition = advance_chunk_bucket if bucket_transition is None else bucket_transition
+        transition = bucket_transitions.get(g, advance_chunk_bucket if bucket_transition is None else bucket_transition)
         bucket = transition(
             core,
             env,

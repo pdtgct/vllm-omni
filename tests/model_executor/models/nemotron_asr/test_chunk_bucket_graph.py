@@ -31,17 +31,155 @@ from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _fixture():
+def _fixture(population=32):
     core = _tiny_core()
-    env = torch.stack([_envelope(torch.randn(2560), final=False, seq=0, geometry=1) for _ in range(32)])
-    state = _fresh_state(32)
+    env = torch.stack([_envelope(torch.randn(2560), final=False, seq=0, geometry=1) for _ in range(population)])
+    state = _fresh_state(population)
     args = dict(
         geometry=1,
-        admitted_prompt=torch.zeros(32, dtype=torch.long),
-        incoming_status=torch.zeros(32, dtype=torch.int32),
+        admitted_prompt=torch.zeros(population, dtype=torch.long),
+        incoming_status=torch.zeros(population, dtype=torch.int32),
         queue_capacity=48,
     )
     return core, env, state, args
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("population,tier", [(31, 32), (63, 64)])
+def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outputs(population, tier):
+    from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
+
+    core, env, state, args = _fixture(population)
+    encoder_populations = []
+    hook = core.encoder.pre_encode.register_forward_pre_hook(
+        lambda _module, inputs: encoder_populations.append(int(inputs[0].shape[0]))
+    )
+    decoder_populations = []
+
+    def binding(decode_fn):
+        result = DenseGraphBinding(
+            decode_fn=decode_fn,
+            predictor=core.predictor,
+            joint=core.joint,
+            vllm_config=None,
+            frame_widths=(None, 2),
+            tiers=(tier,),
+            encoder_hidden=state.channel[0].shape[-1],
+            predictor_layers=2,
+            predictor_hidden=16,
+            blank_id=core.blank_id,
+            runtime=_graph_runtime(),
+        )
+        result.warmup(torch.device("cpu"), torch.float32)
+        return result
+
+    # Startup uses full tiers; padding assertions apply only after it completes.
+    candidate_decoder = binding(rnnt.decode_dense_masked_frames)
+    reference_decoder = binding(rnnt.decode_dense_masked_frames)
+    # The eager tier wrapper keeps its original raw callable; inspect its staging
+    # through an independent eager tier, while both paths use identical arithmetic.
+    graph_decode = candidate_decoder.decode_fn(geometry=1, tier=tier)
+    eager_decode = candidate_decoder.uncaptured_decode_fn(geometry=1, tier=tier)
+
+    def checked_decode(frames, lengths, predictor, joint, decoder_state):
+        result = eager_decode(frames, lengths, predictor, joint, decoder_state)
+        entry = candidate_decoder._entries[(1, tier)]
+        decoder_populations.append(int(entry.enc_frames.shape[0]))
+        assert torch.count_nonzero(entry.enc_lengths[population:]) == 0
+        assert torch.count_nonzero(entry.enc_frames[population:]) == 0
+        assert torch.count_nonzero(entry.h[:, population:]) == 0
+        assert torch.count_nonzero(entry.c[:, population:]) == 0
+        assert torch.all(entry.last_label[population:] == core.blank_id)
+        return result
+
+    encoder_binding = object()
+    transition = capture_chunk_bucket(
+        core,
+        env,
+        state,
+        **args,
+        vllm_config=None,
+        runtime=_graph_runtime(),
+        capture_decode_fn=checked_decode,
+        admitted_decode_fn=graph_decode,
+        admitted_encoder_transition=encoder_binding,
+        decoder_tier=tier,
+    )
+    assert set(encoder_populations) == {population}
+    held, held_copy = None, ()
+    for step in range(3):
+        env[:, advance.ENV_CHUNK_SEQUENCE] = step
+        env[:, advance.ENVELOPE_HEADER_SLOTS :] *= 0.71
+        if step == 2:
+            args["incoming_status"][0] = advance.ROW_STATUS_DECODE_INVARIANT
+        expected_state = _clone_state(state)
+        expected = advance.advance_chunk_bucket(
+            core, env, expected_state, **args, decode_fn=reference_decoder.decode_fn(geometry=1, tier=tier)
+        )
+        # Every padding slot must be overwritten before it reaches the decoder.
+        entry = candidate_decoder._entries[(1, tier)]
+        entry.enc_frames.fill_(float("nan"))
+        entry.h.fill_(float("nan"))
+        entry.c.fill_(float("nan"))
+        entry.enc_lengths.fill_(99)
+        entry.last_label.fill_(999999)
+        actual = transition(core, env, state, **args, decode_fn=graph_decode, encoder_transition=encoder_binding)
+        assert transition.replay_count == step + 1
+        assert encoder_populations[-1] == population
+        for left, right in zip(
+            (*_outputs(actual), *_state_tensors(state)),
+            (*_outputs(expected), *_state_tensors(expected_state)),
+            strict=True,
+        ):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+        # The fallback exact encoder cell uses the SAME decoder tier workspace.
+        # Its writes must not modify any escaped prior CHUNK outputs.
+        fallback_env = torch.stack([_envelope(torch.randn(2560), final=False, seq=0, geometry=1) for _ in range(tier)])
+        advance.advance_chunk_bucket(
+            core,
+            fallback_env,
+            _fresh_state(tier),
+            geometry=1,
+            admitted_prompt=torch.zeros(tier, dtype=torch.long),
+            incoming_status=torch.zeros(tier, dtype=torch.int32),
+            queue_capacity=48,
+            decode_fn=graph_decode,
+        )
+        assert encoder_populations[-1] == tier
+        if held is not None:
+            for left, right in zip(_outputs(held), held_copy, strict=True):
+                torch.testing.assert_close(left, right, atol=0, rtol=0)
+        held, held_copy = actual, tuple(t.clone() for t in _outputs(actual))
+    hook.remove()
+    assert set(encoder_populations) == {population, tier}
+    assert set(decoder_populations) == {tier}
+
+
+@torch.inference_mode()
+def test_chunk_binding_resolution_failure_precedes_resident_gather(monkeypatch):
+    core, env, _state, _args = _fixture(31)
+
+    class UnreadyBinding:
+        def resolve(self, **_kwargs):
+            raise ValueError("CHUNK graph inventory is incomplete")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unready CHUNK binding read resident state")
+
+    monkeypatch.setattr(advance, "_gather_initialized_rows", forbidden)
+    with pytest.raises(ValueError, match="CHUNK graph inventory"):
+        advance.advance_model_rows(
+            core,
+            torch.full((31,), PLACEHOLDER_ID, dtype=torch.long),
+            env,
+            _plan(prefills=list(range(1, 32)), num_pool_blocks=32, geometries=[1] * 31),
+            **_fresh_pools(32),
+            adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
+            decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            bucket_transition=UnreadyBinding(),
+        )
 
 
 @torch.inference_mode()
@@ -77,6 +215,7 @@ def test_bucket_replay_changed_contents_lifetime_and_fail_closed():
     before = tuple(t.clone() for t in _state_tensors(state))
     with pytest.raises(ValueError, match="captured cell"):
         transition(core, env, state, **(args | {"geometry": 0}), decode_fn=rnnt.decode_dense_masked_frames)
+    assert transition.replay_count == 3
     for left, right in zip(_state_tensors(state), before, strict=True):
         torch.testing.assert_close(left, right, atol=0, rtol=0)
 

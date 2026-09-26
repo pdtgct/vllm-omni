@@ -337,6 +337,7 @@ class DenseGraphBinding:
         finally:
             runtime.set_capture_enabled(False)
         decode_fns = {key: self._bind_decode(entry, runtime) for key, entry in pending.items()}
+        self._runtime = runtime
         self._entries = pending
         self._decode_fns = decode_fns
 
@@ -344,6 +345,8 @@ class DenseGraphBinding:
         self,
         entry: _GraphEntry,
         runtime: GraphRuntime,
+        *,
+        captured: bool = True,
     ) -> Callable[..., Any]:
         def decode(
             enc_frames: torch.Tensor,
@@ -399,7 +402,7 @@ class DenseGraphBinding:
             entry.c[:, :live].copy_(state.c)
             entry.last_label.fill_(self._blank_id)
             entry.last_label[:live].copy_(state.last_label)
-            output = self._call(entry, runtime, runtime.graph_mode)
+            output = self._call(entry, runtime, runtime.graph_mode if captured else runtime.eager_mode)
             (
                 token_ids,
                 token_lengths,
@@ -422,6 +425,19 @@ class DenseGraphBinding:
             )
 
         return decode
+
+    def uncaptured_decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
+        """Reuse sealed tier storage while an enclosing CHUNK graph captures it.
+
+        Input padding, output layouts and numerical arithmetic are identical to
+        the split decoder. The nested wrapper runs eagerly, so the enclosing
+        capture records the decoder operations instead of another graph replay.
+        Callers must serialize this storage with the ordinary decoder binding.
+        """
+        key = (geometry, tier)
+        if key not in self._entries or self._runtime is None:
+            raise ValueError(f"uncaptured dense graph key geometry={geometry} tier={tier}")
+        return self._bind_decode(self._entries[key], self._runtime, captured=False)
 
     def decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
         """Return the startup-bound callable for one exact graph key."""

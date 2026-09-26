@@ -614,3 +614,115 @@ def test_prepare_inputs_snapshot_flows_directly_into_forward(
     assert output.dtype == inputs_embeds.dtype
     assert output.device == inputs_embeds.device
     assert calls == [(1, torch.device("cpu"))]
+
+
+@pytest.mark.parametrize("fail_selected_profile", [False, True])
+def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_resident_allocation(
+    monkeypatch, fail_selected_profile
+):
+    profile = _profile_module()
+    model = _no_state_model()
+    events = []
+    parameter = torch.zeros(1)
+    execution = SimpleNamespace(ready=False, _chunk_graph_cells=frozenset({(1, 31), (1, 63)}))
+    decoder = SimpleNamespace(captured_keys=())
+    chunk = SimpleNamespace(ready=False)
+
+    def encoder_warmup(value, *, device):
+        assert value is model and device == parameter.device
+        events.append("encoder")
+
+    def decoder_warmup(device, dtype):
+        assert not execution.ready
+        events.append("decoder")
+        decoder.captured_keys = tuple((1, n) for n in (1, 2, 4, 8, 16, 32, 64, 128))
+
+    def chunk_warmup(device):
+        assert len(decoder.captured_keys) == 8
+        events.append("chunk")
+        execution.ready = chunk.ready = True
+
+    def discard():
+        events.append("discard")
+        execution.ready = chunk.ready = False
+
+    def final_profile(value, *, num_rows, device, geometry_id, ready_domain):
+        assert value is model and ready_domain and execution.ready and chunk.ready
+        assert geometry_id == 1 and device == parameter.device
+        events.append(num_rows)
+        if fail_selected_profile:
+            raise RuntimeError("selected profile failed")
+
+    execution._discard = discard
+    decoder.warmup = decoder_warmup
+    chunk.warmup = chunk_warmup
+    for name, value in {
+        "config": SimpleNamespace(supported_num_lookahead_tokens=[1], decode_dispatch_arm="dense-graphed"),
+        "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter]))),
+        "_max_num_seqs": 128,
+        "_encoder_execution": execution,
+        "_decode_graph_binding": decoder,
+        "_chunk_bucket_binding": chunk,
+        "_execution_memory_prepared": False,
+        "_execution_memory_failed": False,
+        "_state_pools": lambda: pytest.fail("startup touched resident state"),
+    }.items():
+        object.__setattr__(model, name, value)
+    monkeypatch.setattr(profile, "warmup_static_encoder_execution", encoder_warmup)
+    monkeypatch.setattr(profile, "run_persistent_state_profile", final_profile)
+    if fail_selected_profile:
+        with pytest.raises(RuntimeError, match="selected profile"):
+            model.prepare_execution_memory()
+        assert events == ["encoder", "decoder", "chunk", 31, "discard"]
+        assert model._execution_memory_failed and not model._execution_memory_prepared
+        assert not execution.ready and not chunk.ready
+    else:
+        model.prepare_execution_memory()
+        assert events == ["encoder", "decoder", "chunk", 31, 63, 128]
+        assert model._execution_memory_prepared
+
+
+def test_chunk_final_profile_uses_sealed_decoder_tier_and_live_graph_route(monkeypatch):
+    profile = _profile_module()
+    model = _no_state_model()
+    config = _config(decode_dispatch_arm="dense-graphed")
+    for name, value in {
+        "d_model": 8,
+        "n_layers": 2,
+        "conv_kernel": 3,
+        "att_context_left": 4,
+        "pred_hidden": 4,
+        "pred_rnn_layers": 1,
+        "n_mels": 2,
+    }.items():
+        setattr(config, name, value)
+    execution = SimpleNamespace(
+        arm="eager-graphed",
+        cell_active=False,
+        warmup_geometries=(1,),
+        transition=object(),
+        profile_ready_cell=lambda *, geometry, population, invoke: invoke(),
+    )
+    chunk_binding, decode_resolver = object(), object()
+    for name, value in {
+        "config": config,
+        "_encoder_execution": execution,
+        "_decode_graph_binding": SimpleNamespace(execution_tier=lambda _n: 32),
+        "_chunk_bucket_binding": chunk_binding,
+        "_decode_resolver": decode_resolver,
+    }.items():
+        object.__setattr__(model, name, value)
+    calls = []
+
+    def advance(_core, _ids, _env, plan, **kwargs):
+        assert plan.execution_tier == 32 and plan.num_prefills == 31
+        assert kwargs["graph_covers_decode"] is True and kwargs["memory_profile"] is False
+        assert kwargs["bucket_transition"] is chunk_binding and kwargs["decode_resolver"] is decode_resolver
+        calls.append(True)
+        return torch.zeros(31)
+
+    monkeypatch.setattr(profile, "advance_model_rows", advance)
+    profile.run_persistent_state_profile(
+        model, num_rows=31, device=torch.device("cpu"), geometry_id=1, ready_domain=True
+    )
+    assert calls == [True]

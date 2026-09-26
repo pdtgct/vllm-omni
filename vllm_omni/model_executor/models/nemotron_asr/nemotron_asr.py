@@ -443,6 +443,23 @@ class NemotronASRForRNNT(nn.Module):
             hf_config,
             graph_binding=self._decode_graph_binding,
         )
+        self._chunk_bucket_binding = None
+        chunk_populations = getattr(hf_config, "chunk_bucket_graph_populations", ())
+        if not isinstance(chunk_populations, (tuple, list)):
+            raise ValueError("chunk_bucket_graph_populations must be a sequence")
+        if chunk_populations:
+            from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
+            from vllm_omni.model_executor.models.nemotron_asr.native_burst import validate_native_burst_config
+
+            # Reuse the existing initial-profile configuration guard only.
+            # This does not enable native burst; shared decoder scratch requires
+            # synchronous, non-speculative single-device worker execution.
+            if native_burst_enabled:
+                raise ValueError("CHUNK serving pilot requires native burst disabled")
+            validate_native_burst_config(vllm_config, hf_config=hf_config)
+            self._chunk_bucket_binding = ExactChunkGraphBinding(
+                self.core, hf_config, self._encoder_execution, self._decode_graph_binding, chunk_populations
+            )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
         self._execution_memory_prepared = False
@@ -699,6 +716,9 @@ class NemotronASRForRNNT(nn.Module):
         """Validate complete model-owned inventory without creating allocations."""
         if not self._encoder_execution.ready:
             raise RuntimeError("encoder execution inventory is incomplete")
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None and not chunk_binding.ready:
+            raise RuntimeError("CHUNK execution inventory is incomplete")
         binding = self._decode_graph_binding
         if binding is None:
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
@@ -734,9 +754,17 @@ class NemotronASRForRNNT(nn.Module):
             warmup_static_encoder_execution(self, device=device)
             if self._decode_graph_binding is not None:
                 self._decode_graph_binding.warmup(device, parameter.dtype)
+            chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+            if chunk_binding is not None:
+                chunk_binding.warmup(device)
             self._require_execution_inventory_ready()
             # All retained graph buffers must coexist with this temporary
             # transaction so the profiler sees their combined high-water mark.
+            if chunk_binding is not None:
+                for geometry, population in sorted(self._encoder_execution._chunk_graph_cells):
+                    run_persistent_state_profile(
+                        self, num_rows=population, device=device, geometry_id=geometry, ready_domain=True
+                    )
             run_persistent_state_profile(
                 self,
                 num_rows=self._max_num_seqs,
@@ -747,6 +775,8 @@ class NemotronASRForRNNT(nn.Module):
             self._require_execution_inventory_ready()
         except Exception:
             self._execution_memory_failed = True
+            if getattr(self, "_chunk_bucket_binding", None) is not None:
+                self._encoder_execution._discard()
             raise
         self._execution_memory_prepared = True
 
@@ -791,7 +821,7 @@ class NemotronASRForRNNT(nn.Module):
         binding = self._decode_graph_binding
         keys = () if binding is None else binding.captured_keys
         decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
-        return {
+        receipt = {
             "schema": "nemotron-execution-profile/1",
             "decode": {
                 "arm": decode_arm,
@@ -800,6 +830,10 @@ class NemotronASRForRNNT(nn.Module):
             },
             "encoder": self._encoder_execution.ready_receipt(),
         }
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None:
+            receipt["chunk"] = chunk_binding.receipt()
+        return receipt
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
@@ -961,6 +995,7 @@ class NemotronASRForRNNT(nn.Module):
                 adapter=self._emission_adapter,
                 decode_resolver=self._decode_resolver,
                 encoder_transition=self._encoder_execution.transition,
+                bucket_transition=getattr(self, "_chunk_bucket_binding", None),
                 placeholder_id=int(self.config.audio_chunk_token_id),
                 park_id=int(self.config.eos_token_id),
                 commit_sink=self._ensure_commit_sink(inputs_embeds.device),
