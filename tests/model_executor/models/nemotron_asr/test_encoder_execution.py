@@ -2225,7 +2225,8 @@ def test_eager_graphed_native_profile_matches_unprepared_encoder(monkeypatch):
 
 @pytest.mark.cpu
 @torch.inference_mode()
-def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(monkeypatch):
+@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32)])
+def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(monkeypatch, population, tier):
     import json
 
     from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
@@ -2240,7 +2241,7 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
         graph_runtime=_graph_runtime(),
     )
     binding = ExactChunkGraphBinding(
-        execution._core, object(), execution, SimpleNamespace(execution_tier=lambda _n: 32), [31]
+        execution._core, object(), execution, SimpleNamespace(execution_tier=lambda _n: tier), [population]
     )
     shape = execution._geometry_shapes[1]
 
@@ -2253,7 +2254,7 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
         expected_cells=tuple((1, n) for n in range(1, 32)),
         invoke=lambda _geometry, population: execution.transition(*arguments(population)),
     )
-    assert set(execution._graph_entries) == {(1, n) for n in range(1, 31)}
+    assert set(execution._graph_entries) == {(1, n) for n in range(1, 32) if n != population}
     assert not execution.ready
     assert not execution._pending_graph_entries
     with pytest.raises(ValueError, match="inventory"):
@@ -2265,11 +2266,11 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
         return None
 
     setattr(replacement, "replay_count", 4)
-    execution.publish_chunk_graphs({(1, 31): replacement})
+    execution.publish_chunk_graphs({(1, population): replacement})
     assert execution.ready
     receipt = execution.ready_receipt()
-    assert receipt["captured_keys"] == [[1, n] for n in range(1, 31)]
-    assert receipt["chunk_graph_keys"] == [[1, 31]]
+    assert receipt["captured_keys"] == [[1, n] for n in range(1, 32) if n != population]
+    assert receipt["chunk_graph_keys"] == [[1, population]]
     assert not set(execution._graph_entries) & set(execution._chunk_graph_entries)
     assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == {(1, n) for n in range(1, 32)}
     first = binding.receipt()
@@ -2282,7 +2283,7 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
     execution.transition(*arguments(30))
     # A reserved cell can never fall through to a second or lazily built encoder graph.
     with pytest.raises(ValueError, match="not captured"):
-        execution.transition(*arguments(31))
+        execution.transition(*arguments(population))
     execution._discard()
     assert not execution.ready
     assert not execution._chunk_graph_entries and not execution._graph_entries

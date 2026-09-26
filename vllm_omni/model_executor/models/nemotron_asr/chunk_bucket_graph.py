@@ -4,7 +4,7 @@
 
 The caller constructs this binding before measured execution and keeps its model
 immutable. Exact encoder populations are independent of the padded decoder
-tier. The optional serving pilot replaces only declared 160-ms B31/B63 cells.
+tier. The optional serving pilot replaces only declared 160-ms B1/B31/B63 cells.
 """
 
 import hashlib
@@ -98,18 +98,18 @@ def capture_chunk_bucket(
 ) -> Callable[..., ChunkBucketResult]:
     """Capture a single explicit cell, preserving caller state and output lifetime.
 
-    B31/B63 retain exact frontend/encoder rows and use the existing split
-    decoder's B32/B64 staging and arithmetic. Unsupported shapes fail before staging.
+    B1/B31/B63 retain exact frontend/encoder rows and use the existing split
+    decoder's B1/B32/B64 staging and arithmetic. Unsupported shapes fail before staging.
     Fresh-aware resident gathers and every transaction commit remain outside.
     """
     population = int(env.shape[0])
-    if geometry != 1 or population not in (31, 32, 63, 64):
-        raise ValueError("experimental bucket graph supports only 160-ms B31/B32/B63/B64")
-    expected_tier = 32 if population <= 32 else 64
+    if geometry != 1 or population not in (1, 31, 32, 63, 64):
+        raise ValueError("experimental bucket graph supports only 160-ms B1/B31/B32/B63/B64")
+    expected_tier = 1 if population == 1 else (32 if population <= 32 else 64)
     if decoder_tier is not None and decoder_tier != expected_tier:
         raise ValueError("CHUNK decoder tier differs from the existing split decoder")
-    if population in (31, 63) and (capture_decode_fn is None or decoder_tier is None):
-        raise ValueError("non-tier CHUNK population requires the sealed padded decoder")
+    if population in (1, 31, 63) and (capture_decode_fn is None or decoder_tier is None):
+        raise ValueError("selected CHUNK population requires the sealed split decoder")
     execute_decode = decode_dense_masked_frames if capture_decode_fn is None else capture_decode_fn
     if getattr(core.encoder, "_stream_relative_position_lengths", ()):
         raise ValueError("bucket graph requires unprepared native positional projections")
@@ -251,7 +251,7 @@ def capture_chunk_bucket(
 
 
 class ExactChunkGraphBinding:
-    """Opt-in serving pilot replacing the native B31/B63 encoder captures.
+    """Opt-in serving pilot replacing the native B1/B31/B63 encoder captures.
 
     The encoder execution inventory owns the graph callables. Decoder staging
     borrows the already-sealed tier workspace; all calls use the worker's serial
@@ -262,13 +262,13 @@ class ExactChunkGraphBinding:
         if (
             not isinstance(populations, (tuple, list))
             or not populations
-            or any(type(n) is not int or n not in (31, 63) for n in populations)
+            or any(type(n) is not int or n not in (1, 31, 63) for n in populations)
             or len(set(populations)) != len(populations)
             or decoder_binding is None
         ):
-            raise ValueError("CHUNK serving pilot requires distinct populations 31/63 and a dense graph decoder")
-        if any(decoder_binding.execution_tier(n) != (32 if n == 31 else 64) for n in populations):
-            raise ValueError("CHUNK pilot requires unchanged physical decoder tiers 32/64")
+            raise ValueError("CHUNK serving pilot requires distinct populations 1/31/63 and a dense graph decoder")
+        if any(decoder_binding.execution_tier(n) != (1 if n == 1 else (32 if n == 31 else 64)) for n in populations):
+            raise ValueError("CHUNK pilot requires unchanged physical decoder tiers 1/32/64")
         self._core = core
         self._config = config
         self._encoder = encoder_execution

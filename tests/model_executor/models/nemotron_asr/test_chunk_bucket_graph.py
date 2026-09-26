@@ -45,7 +45,7 @@ def _fixture(population=32):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("population,tier", [(31, 32), (63, 64)])
+@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32), (63, 64)])
 def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outputs(population, tier):
     from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
 
@@ -153,6 +153,13 @@ def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outpu
     hook.remove()
     assert set(encoder_populations) == {population, tier}
     assert set(decoder_populations) == {tier}
+
+
+@pytest.mark.parametrize("tier", [None, 2])
+def test_single_chunk_requires_existing_sealed_decoder_tier(tier):
+    core, env, state, args = _fixture(1)
+    with pytest.raises(ValueError, match="decoder"):
+        capture_chunk_bucket(core, env, state, **args, vllm_config=None, decoder_tier=tier)
 
 
 @torch.inference_mode()
