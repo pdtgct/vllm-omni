@@ -315,15 +315,21 @@ class ExactChunkGraphBinding:
                 # Fresh profile rows deliberately do not read page contents.
                 # The final capture owns one cloned cache, replacing the cache
                 # the skipped standalone encoder entry would otherwise retain.
+                # Singleton slices retain packed page strides under preserve_format;
+                # serving gathers use canonical contiguous scratch at every size.
                 state = SessionStateBatch(
-                    raw_tail=torch.zeros_like(pools.frontend_raw[1:]),
-                    mel_tail=torch.zeros_like(pools.frontend_mel[1:]),
-                    frontend_counters=torch.zeros_like(pools.frontend_counters[1:]),
-                    channel=[torch.zeros_like(t[1:]) for t in pools.channel],
-                    window_valid=[torch.zeros_like(t[1:]) for t in pools.valid_length],
-                    time=[torch.zeros_like(t[1:]) for t in pools.convolution],
-                    h=torch.zeros_like(pools.predictor_h[1:]),
-                    c=torch.zeros_like(pools.predictor_c[1:]),
+                    raw_tail=torch.zeros_like(pools.frontend_raw[1:], memory_format=torch.contiguous_format),
+                    mel_tail=torch.zeros_like(pools.frontend_mel[1:], memory_format=torch.contiguous_format),
+                    frontend_counters=torch.zeros_like(
+                        pools.frontend_counters[1:], memory_format=torch.contiguous_format
+                    ),
+                    channel=[torch.zeros_like(t[1:], memory_format=torch.contiguous_format) for t in pools.channel],
+                    window_valid=[
+                        torch.zeros_like(t[1:], memory_format=torch.contiguous_format) for t in pools.valid_length
+                    ],
+                    time=[torch.zeros_like(t[1:], memory_format=torch.contiguous_format) for t in pools.convolution],
+                    h=torch.zeros_like(pools.predictor_h[1:], memory_format=torch.contiguous_format),
+                    c=torch.zeros_like(pools.predictor_c[1:], memory_format=torch.contiguous_format),
                     last_label=torch.full((population,), int(self._core.blank_id), device=device, dtype=torch.long),
                 )
                 tier = self._decoder.execution_tier(population)

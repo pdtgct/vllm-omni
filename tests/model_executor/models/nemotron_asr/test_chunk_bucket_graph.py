@@ -163,6 +163,81 @@ def test_single_chunk_requires_existing_sealed_decoder_tier(tier):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32), (63, 64)])
+def test_chunk_warmup_scratch_matches_real_gather_layout(monkeypatch, population, tier):
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+    from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import NemotronASRConfig
+    from vllm_omni.model_executor.models.nemotron_asr.profile_execution import build_profile_invocation
+
+    core = _tiny_core()
+    config = NemotronASRConfig(
+        num_asr_labels=12,
+        vocab_size=17,
+        eos_token_id=13,
+        audio_chunk_token_id=14,
+        eou_token_id=15,
+        flush_token_id=16,
+        n_mels=16,
+        d_model=32,
+        n_layers=2,
+        conv_kernel=5,
+        att_context_left=8,
+        att_context_right=1,
+        pred_hidden=16,
+        joint_hidden=16,
+        num_prompts=4,
+        prompt_dictionary={"en-US": 0},
+        supported_num_lookahead_tokens=[1],
+    )
+    pools = build_profile_invocation(config, num_rows=population, device=torch.device("cpu"), geometry_id=1).pools
+    source_pools = (
+        pools.frontend_raw,
+        pools.frontend_mel,
+        pools.frontend_counters,
+        *pools.channel,
+        *pools.valid_length,
+        *pools.convolution,
+        pools.predictor_h,
+        pools.predictor_c,
+    )
+    rows = torch.arange(1, population + 1)
+    observed = []
+
+    def capture(_core, _env, state, **_kwargs):
+        for tensor, pool in zip(_state_tensors(state)[:-1], source_pools, strict=True):
+            for fresh in (False, True):
+                gathered = advance._gather_initialized_rows(pool, rows, torch.full((population,), fresh))
+                assert graph._tensor_signature(tensor) == graph._tensor_signature(gathered)
+            assert torch.count_nonzero(tensor) == 0
+            if population > 1:
+                assert graph._tensor_signature(tensor) == graph._tensor_signature(torch.zeros_like(pool[1:]))
+        observed.append(population)
+        return lambda *_args, **_kwargs: None
+
+    execution: SimpleNamespace = SimpleNamespace(
+        ready=False,
+        _sealed=True,
+        _chunk_graph_entries={},
+        _vllm_config=None,
+        _graph_runtime=_graph_runtime(),
+        transition=object(),
+        reserve_chunk_graph_cells=lambda _cells: None,
+        _record_memory_diagnostic=lambda *_args, **_kwargs: None,
+        publish_chunk_graphs=lambda entries: execution._chunk_graph_entries.update(entries),
+        _discard=lambda: None,
+    )
+    decoder = SimpleNamespace(
+        execution_tier=lambda _n: tier, uncaptured_decode_fn=lambda **_kw: object(), decode_fn=lambda **_kw: object()
+    )
+    monkeypatch.setattr(graph, "capture_chunk_bucket", capture)
+    binding = graph.ExactChunkGraphBinding(core, config, execution, decoder, [population])
+    binding.warmup(torch.device("cpu"))
+    assert observed == [population]
+
+
+@torch.inference_mode()
 def test_chunk_binding_resolution_failure_precedes_resident_gather(monkeypatch):
     core, env, _state, _args = _fixture(31)
 
