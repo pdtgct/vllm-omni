@@ -661,8 +661,8 @@ class ResolvedEncoderExecution:
         if self.arm != "eager-graphed" or self._sealed or self._warmup_signatures or self._chunk_graph_cells:
             raise ValueError("CHUNK ownership requires an untouched native encoder domain")
         expected = {(g, n) for g in self.warmup_geometries for n in self.warmup_populations}
-        if not cells or not cells <= expected or any(g != 1 or n not in (31, 63) for g, n in cells):
-            raise ValueError("CHUNK pilot cells must be declared exact 160-ms populations 31/63")
+        if not cells or not cells <= expected or any(g != 1 or n not in (1, 31, 63) for g, n in cells):
+            raise ValueError("CHUNK pilot cells must be declared exact 160-ms populations 1/31/63")
         self._chunk_graph_cells = cells
 
     def publish_chunk_graphs(self, entries: dict[tuple[int, int], Any]) -> None:
