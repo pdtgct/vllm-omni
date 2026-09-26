@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -268,11 +268,17 @@ def run_persistent_state_profile(
                 )
 
                 native_profile_sink = NativeBurstProfileSink(max_tokens=native_handoff.max_tokens)
+            chunk_binding = getattr(model, "_chunk_bucket_binding", None) if ready_domain else None
+            profile_plan = invocation.plan
+            if chunk_binding is not None:
+                profile_plan = replace(
+                    profile_plan, execution_tier=model._decode_graph_binding.execution_tier(num_rows)
+                )
             return advance_model_rows(
                 model.core,
                 invocation.input_ids,
                 invocation.inputs_embeds,
-                invocation.plan,
+                profile_plan,
                 channel_pools=list(pools.channel),
                 time_pools=list(pools.convolution),
                 len_pools=list(pools.valid_length),
@@ -287,8 +293,11 @@ def run_persistent_state_profile(
                 endpoint_book_pool=pools.endpoint_book,
                 eou_token_id=_required_control(model.config, "eou_token_id"),
                 adapter=model._emission_adapter,
-                decode_resolver=_profile_decode_resolver(model),
+                decode_resolver=model._decode_resolver
+                if chunk_binding is not None
+                else _profile_decode_resolver(model),
                 encoder_transition=model._encoder_execution.transition,
+                bucket_transition=chunk_binding,
                 placeholder_id=_required_control(
                     model.config,
                     "audio_chunk_token_id",
@@ -296,7 +305,11 @@ def run_persistent_state_profile(
                 park_id=_required_control(model.config, "eos_token_id"),
                 commit_sink=None,
                 capture=False,
-                memory_profile=True,
+                # The final coexisting CHUNK inventory must execute its real
+                # decoder bindings. The pre-capture profile retains its original
+                # dense-eager admission flag and never claims graph coverage.
+                memory_profile=chunk_binding is None,
+                graph_covers_decode=chunk_binding is not None,
                 native_burst_handoff=native_profile_sink,
                 staging=None,
             )

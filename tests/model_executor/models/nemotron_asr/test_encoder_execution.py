@@ -2221,3 +2221,68 @@ def test_eager_graphed_native_profile_matches_unprepared_encoder(monkeypatch):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
     for family in ("channel", "time", "valid"):
         torch.testing.assert_close(getattr(caches[0], family), getattr(caches[1], family), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(monkeypatch):
+    import json
+
+    from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
+
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=31,
+        warmup_geometries=(1,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    binding = ExactChunkGraphBinding(
+        execution._core, object(), execution, SimpleNamespace(execution_tier=lambda _n: 32), [31]
+    )
+    shape = execution._geometry_shapes[1]
+
+    def arguments(population):
+        values = _graph_transition_args(population=population, mel_width=shape.mel_width, out_width=shape.out_width)
+        values[-1].remainder_(4)
+        return values
+
+    execution.warmup_domain(
+        expected_cells=tuple((1, n) for n in range(1, 32)),
+        invoke=lambda _geometry, population: execution.transition(*arguments(population)),
+    )
+    assert set(execution._graph_entries) == {(1, n) for n in range(1, 31)}
+    assert not execution.ready
+    assert not execution._pending_graph_entries
+    with pytest.raises(ValueError, match="inventory"):
+        execution.publish_chunk_graphs({})
+    assert not execution.ready
+    assert not execution._chunk_graph_entries
+
+    def replacement():
+        return None
+
+    setattr(replacement, "replay_count", 4)
+    execution.publish_chunk_graphs({(1, 31): replacement})
+    assert execution.ready
+    receipt = execution.ready_receipt()
+    assert receipt["captured_keys"] == [[1, n] for n in range(1, 31)]
+    assert receipt["chunk_graph_keys"] == [[1, 31]]
+    assert not set(execution._graph_entries) & set(execution._chunk_graph_entries)
+    assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == {(1, n) for n in range(1, 32)}
+    first = binding.receipt()
+    second = binding.receipt()
+    assert first == second == json.loads(json.dumps(first))
+    assert getattr(replacement, "replay_count") == 4
+    first["cells"][0]["successful_replays"] = 999
+    first["source_sha256"].clear()
+    assert binding.receipt() == second
+    execution.transition(*arguments(30))
+    # A reserved cell can never fall through to a second or lazily built encoder graph.
+    with pytest.raises(ValueError, match="not captured"):
+        execution.transition(*arguments(31))
+    execution._discard()
+    assert not execution.ready
+    assert not execution._chunk_graph_entries and not execution._graph_entries

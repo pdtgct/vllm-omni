@@ -619,6 +619,10 @@ class ResolvedEncoderExecution:
         default_factory=dict,
         repr=False,
     )
+    # Experimental CHUNK capture owns these exact cells instead of a second
+    # standalone encoder graph/cache bank. Entries publish only as a full set.
+    _chunk_graph_cells: frozenset[tuple[int, int]] = field(default_factory=frozenset, repr=False)
+    _chunk_graph_entries: dict[tuple[int, int], Any] = field(default_factory=dict, repr=False)
     _staging_cell: tuple[int, int] | None = field(default=None, repr=False)
     _pending_graph_entries: dict[tuple[int, int], _EncoderGraphEntry] = field(
         default_factory=dict,
@@ -638,13 +642,38 @@ class ResolvedEncoderExecution:
             expected = {
                 (geometry, population) for geometry in self.warmup_geometries for population in self.warmup_populations
             }
-            return self._sealed and set(self._graph_entries) == expected and not self._failed
+            encoder_keys, chunk_keys = set(self._graph_entries), set(self._chunk_graph_entries)
+            return (
+                self._sealed
+                and encoder_keys == expected - self._chunk_graph_cells
+                and chunk_keys == self._chunk_graph_cells
+                and not self._failed
+            )
         return self._sealed and not self._failed
 
     @property
     def cell_active(self) -> bool:
         """Whether product-owned startup code authorized the current call."""
         return self._active_cell is not None
+
+    def reserve_chunk_graph_cells(self, cells: frozenset[tuple[int, int]]) -> None:
+        """Partition the startup inventory before any model warmup or capture."""
+        if self.arm != "eager-graphed" or self._sealed or self._warmup_signatures or self._chunk_graph_cells:
+            raise ValueError("CHUNK ownership requires an untouched native encoder domain")
+        expected = {(g, n) for g in self.warmup_geometries for n in self.warmup_populations}
+        if not cells or not cells <= expected or any(g != 1 or n not in (31, 63) for g, n in cells):
+            raise ValueError("CHUNK pilot cells must be declared exact 160-ms populations 31/63")
+        self._chunk_graph_cells = cells
+
+    def publish_chunk_graphs(self, entries: dict[tuple[int, int], Any]) -> None:
+        """Publish the entire replacement inventory after successful capture."""
+        self._raise_if_failed()
+        if not self._sealed or set(entries) != self._chunk_graph_cells or self._chunk_graph_entries:
+            raise ValueError("CHUNK capture inventory differs from its startup reservation")
+        if set(entries) & set(self._graph_entries) or not all(callable(value) for value in entries.values()):
+            raise ValueError("CHUNK and encoder graph owners overlap or are malformed")
+        self._assert_model_state()
+        self._chunk_graph_entries = dict(entries)
 
     def warmup_cell(
         self,
@@ -727,6 +756,13 @@ class ResolvedEncoderExecution:
         cell = (int(geometry), int(population))
         try:
             self._assert_model_state()
+            if cell in self._chunk_graph_cells:
+                # The whole CHUNK transition owns this cell. Its binding checks
+                # the complete gathered input signature before staging; there
+                # is deliberately no standalone encoder replay to count here.
+                result = invoke()
+                self._assert_model_state()
+                return result
             before = self._invocations
             result = self._invoke_declared_cell(cell=cell, invoke=invoke)
             if self._invocations != before + 1 or self._last_signature != self._warmup_signatures.get(cell):
@@ -767,6 +803,7 @@ class ResolvedEncoderExecution:
         self._profile_signature = None
         self._allowed_signatures = frozenset()
         self._graph_entries.clear()
+        self._chunk_graph_entries.clear()
         self._pending_graph_entries.clear()
         self._staging_cell = None
 
@@ -1138,6 +1175,7 @@ class ResolvedEncoderExecution:
             raise ValueError("encoder graph capture requires a sealed static domain")
         if self._graph_entries or self._pending_graph_entries:
             raise ValueError("graphed encoder capture was repeated")
+        cells = tuple(cell for cell in cells if cell not in self._chunk_graph_cells)
         runtime = self._graph_runtime
         device = self._runner_device
         if runtime is None or device is None:
@@ -1329,6 +1367,9 @@ class ResolvedEncoderExecution:
         }
         if self.arm in _GRAPHED_ARMS:
             receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
+        if self._chunk_graph_cells:
+            receipt["chunk_graph_keys"] = [list(cell) for cell in sorted(self._chunk_graph_entries)]
+            receipt["reserved_chunk_graph_keys"] = [list(cell) for cell in sorted(self._chunk_graph_cells)]
         if self._population_bucketing:
             receipt["population_bucketing"] = "powers_of_two_plus_exact_cap"
         if self._memory_diagnostics:
