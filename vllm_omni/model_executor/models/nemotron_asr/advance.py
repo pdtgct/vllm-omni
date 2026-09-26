@@ -2084,6 +2084,173 @@ def _validated_result(
 
 
 @dataclass(frozen=True)
+class ChunkBucketResult:
+    """Scratch transition outputs; counter status is merged after endpointing."""
+
+    batch: ChunkBatch
+    result: AdvanceResult
+    counter_invariant_bad: torch.Tensor
+    counter_delta_bad: torch.Tensor
+
+
+def advance_chunk_bucket(
+    core: NemotronASRCore,
+    env: torch.Tensor,
+    state: SessionStateBatch,
+    *,
+    geometry: int,
+    admitted_prompt: torch.Tensor,
+    incoming_status: torch.Tensor,
+    queue_capacity: int,
+    decode_fn: RnntDecodeFn,
+    encoder_transition: EncoderTransition | None = None,
+    capture: bool = False,
+    capture_geometry: Any | None = None,
+) -> ChunkBucketResult:
+    """Execute one already-gathered CHUNK bucket without resident writes.
+
+    Endpointing stays with the outer transaction. The unconditional counter
+    invariant and unmasked delta predicates are returned separately so the
+    latter still use the clean-row mask AFTER endpoint status is composed.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import encoder_geometry_shape
+    from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+        CTR_COMMITTED_MEL_FRAMES,
+        CTR_EXPECTED_CHUNK_SEQUENCE,
+        CTR_FINALIZED,
+        CTR_TOTAL_VALID_SAMPLES,
+        MEL_TAIL_FRAMES,
+    )
+    from vllm_omni.model_executor.models.nemotron_asr.manifests import ADMISSION_EPOCH_MODULUS_MS, CADENCES
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import MAX_SYMBOLS_PER_STEP
+
+    g, capture_on, cap = geometry, capture, queue_capacity
+    lookaheads = [right for _, right in CADENCES.values()]
+    hop = int(core.featurizer.hop_length)
+    cadence = 8 * (lookaheads[g] + 1)
+    s_g = cadence * hop
+    blank = int(core.blank_id)
+    adm_prompt_b = admitted_prompt
+    if capture_on and capture_geometry is None:
+        capture_geometry = encoder_geometry_shape(core, g)
+    old_counters = state.frontend_counters.clone()
+    hdr = env[:, :ENVELOPE_HEADER_SLOTS]
+    final_col = hdr[:, ENV_FINAL_TAIL]
+    valid_col = hdr[:, ENV_VALID_SAMPLES]
+    env_bad = hdr[:, ENV_VERSION] != ENVELOPE_VERSION
+    env_bad |= (hdr != hdr.trunc()).any(dim=1)
+    env_bad |= (final_col != 0) & (final_col != 1)
+    env_bad |= valid_col > s_g
+    env_bad |= (final_col == 0) & (valid_col != s_g)
+    admission_col = hdr[:, ENV_ADMISSION_MS_MOD]
+    env_bad |= (admission_col < 0) | (admission_col >= ADMISSION_EPOCH_MODULUS_MS)
+    tail = env[:, ENVELOPE_HEADER_SLOTS + s_g :]
+    if tail.shape[1]:
+        env_bad |= (tail != 0).any(dim=1)
+    prompt_mm = hdr[:, ENV_PROMPT_INDEX].long() != adm_prompt_b
+    incoming = (
+        incoming_status
+        | env_bad.to(torch.int32) * ROW_STATUS_ENVELOPE
+        | prompt_mm.to(torch.int32) * ROW_STATUS_PROMPT_MISMATCH
+    )
+    batch = ChunkBatch(
+        samples=env[:, ENVELOPE_HEADER_SLOTS : ENVELOPE_HEADER_SLOTS + s_g],
+        valid_samples=valid_col.long(),
+        geometry_id=hdr[:, ENV_GEOMETRY_ID].long(),
+        final_tail=final_col != 0,
+        # Conditioning uses the ADMITTED authority (PORT-LID-003
+        # as amended); the envelope prompt was cross-checked above.
+        prompt_index=adm_prompt_b,
+        chunk_sequence=hdr[:, ENV_CHUNK_SEQUENCE].long(),
+    )
+    result = advance_session(
+        core,
+        batch,
+        state,
+        geometry=g,
+        decode_fn=decode_fn,
+        encoder_transition=encoder_transition,
+        capture=capture_on,
+        row_status=incoming,
+    )
+    next_counters = state.frontend_counters
+    if capture_on:
+        committed_delta = (
+            next_counters[:, CTR_COMMITTED_MEL_FRAMES] - old_counters[:, CTR_COMMITTED_MEL_FRAMES]
+        ).clamp(min=0)
+        session_first = batch.chunk_sequence == 0
+        capture_mel_lengths = torch.where(
+            committed_delta > 0,
+            committed_delta
+            + torch.where(
+                session_first,
+                torch.zeros_like(committed_delta),
+                torch.full_like(committed_delta, MEL_TAIL_FRAMES),
+            ),
+            torch.zeros_like(committed_delta),
+        )
+        capture_drop = torch.where(
+            session_first,
+            torch.zeros_like(committed_delta),
+            torch.full_like(committed_delta, PRE_ENCODE_DROP),
+        )
+        capture_encoder_lengths = torch.where(
+            committed_delta > 0,
+            torch.clamp(
+                core.encoder.pre_encode.output_lengths(capture_mel_lengths) - capture_drop,
+                min=0,
+            ),
+            torch.zeros_like(committed_delta),
+        )
+    result = _validated_result(
+        result,
+        incoming=incoming,
+        blank_id=blank,
+        queue_capacity=cap,
+        geometry_bound=(lookaheads[g] + 1) * MAX_SYMBOLS_PER_STEP,
+        capture=capture_on,
+        expected_capture=(
+            (
+                int(env.shape[0]),
+                int(state.mel_tail.shape[1]),
+                capture_geometry.mel_width,
+            ),
+            (
+                int(env.shape[0]),
+                capture_geometry.out_width,
+                int(state.channel[0].shape[2]),
+            ),
+            state.channel[0].dtype,
+        )
+        if capture_geometry is not None
+        else None,
+        expected_capture_lengths=(
+            capture_mel_lengths,
+            capture_encoder_lengths,
+        )
+        if capture_on
+        else None,
+    )
+    counter_invariant_bad = _counter_invariant_rows(
+        state.frontend_counters,
+        raw_tail_capacity=int(state.raw_tail.shape[1]),
+        mel_tail_capacity=int(state.mel_tail.shape[2]),
+        hop_length=hop,
+        n_fft=int(core.featurizer.n_fft),
+        cadence_frames=torch.full_like(state.frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE], cadence),
+    )
+    counter_delta_bad = (
+        (state.frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] != old_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] + 1)
+        | (
+            state.frontend_counters[:, CTR_TOTAL_VALID_SAMPLES] - old_counters[:, CTR_TOTAL_VALID_SAMPLES]
+            != batch.valid_samples
+        )
+        | (state.frontend_counters[:, CTR_FINALIZED] != batch.final_tail.to(torch.int64))
+    )
+    return ChunkBucketResult(batch, result, counter_invariant_bad, counter_delta_bad)
+
+
+@dataclass(frozen=True)
 class _ScatterDescriptor:
     pool: torch.Tensor
     scratch: torch.Tensor
@@ -2242,6 +2409,7 @@ def advance_model_rows(
     adapter: EmissionAdapter,
     decode_resolver: DecodeResolver,
     encoder_transition: EncoderTransition | None = None,
+    bucket_transition: Callable[..., ChunkBucketResult] | None = None,
     placeholder_id: int,
     park_id: int,
     commit_sink: CommitSink | None = None,
@@ -2294,6 +2462,11 @@ def advance_model_rows(
     scatters unless its emission result can be returned. Transition
     kernels never mutate resident pages directly.
 
+    ``bucket_transition`` is an optional startup-bound experimental executor
+    for already-gathered CHUNK scratch. The default uses the same canonical
+    tensor helper eagerly. It never owns resident gathers, endpoint processing,
+    adapter execution, reservations, or scatter.
+
     Host staging (PORT-PERF-001): ``staging`` is optional reusable
     pinned H2D buffering (:class:`HostStaging`) for the once-per-call
     composed-index, fresh-row, and control vectors; ``None`` keeps
@@ -2320,14 +2493,9 @@ def advance_model_rows(
         encoder_geometry_shape,
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
-        CTR_COMMITTED_MEL_FRAMES,
-        CTR_EXPECTED_CHUNK_SEQUENCE,
         CTR_FINALIZED,
-        CTR_TOTAL_VALID_SAMPLES,
-        MEL_TAIL_FRAMES,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
-        ADMISSION_EPOCH_MODULUS_MS,
         CADENCES,
     )
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
@@ -2700,36 +2868,8 @@ def advance_model_rows(
         if ENVELOPE_HEADER_SLOTS + s_g > hidden:
             raise ValueError(f"carrier width {hidden} cannot hold geometry {g}'s {s_g}-sample cadence")
         env = inputs_embeds.index_select(0, rows_dev)
-        hdr = env[:, :ENVELOPE_HEADER_SLOTS]
-        final_col = hdr[:, ENV_FINAL_TAIL]
-        valid_col = hdr[:, ENV_VALID_SAMPLES]
-        env_bad = hdr[:, ENV_VERSION] != ENVELOPE_VERSION
-        env_bad |= (hdr != hdr.trunc()).any(dim=1)
-        env_bad |= (final_col != 0) & (final_col != 1)
-        env_bad |= valid_col > s_g
-        env_bad |= (final_col == 0) & (valid_col != s_g)
-        admission_col = hdr[:, ENV_ADMISSION_MS_MOD]
-        env_bad |= (admission_col < 0) | (admission_col >= ADMISSION_EPOCH_MODULUS_MS)
-        tail = env[:, ENVELOPE_HEADER_SLOTS + s_g :]
-        if tail.shape[1]:
-            env_bad |= (tail != 0).any(dim=1)
         adm_prompt_b = admitted_prompt_dev.index_select(0, rows_dev)
-        prompt_mm = hdr[:, ENV_PROMPT_INDEX].long() != adm_prompt_b
-        incoming = (
-            status.index_select(0, rows_dev)
-            | env_bad.to(torch.int32) * ROW_STATUS_ENVELOPE
-            | prompt_mm.to(torch.int32) * ROW_STATUS_PROMPT_MISMATCH
-        )
-        batch = ChunkBatch(
-            samples=env[:, ENVELOPE_HEADER_SLOTS : ENVELOPE_HEADER_SLOTS + s_g],
-            valid_samples=valid_col.long(),
-            geometry_id=hdr[:, ENV_GEOMETRY_ID].long(),
-            final_tail=final_col != 0,
-            # Conditioning uses the ADMITTED authority (PORT-LID-003
-            # as amended); the envelope prompt was cross-checked above.
-            prompt_index=adm_prompt_b,
-            chunk_sequence=hdr[:, ENV_CHUNK_SEQUENCE].long(),
-        )
+        incoming = status.index_select(0, rows_dev)
         state = SessionStateBatch(
             raw_tail=_gather_initialized_rows(frontend_raw_pool, blocks_dev, fresh_bucket),
             mel_tail=_gather_initialized_rows(frontend_mel_pool, blocks_dev, fresh_bucket),
@@ -2741,74 +2881,41 @@ def advance_model_rows(
             c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
-        result = advance_session(
+        transition = advance_chunk_bucket if bucket_transition is None else bucket_transition
+        bucket = transition(
             core,
-            batch,
+            env,
             state,
             geometry=g,
+            admitted_prompt=adm_prompt_b,
+            incoming_status=incoming,
+            queue_capacity=cap,
             decode_fn=resolved.decode_fn,
             encoder_transition=encoder_transition,
             capture=capture_on,
-            row_status=incoming,
+            capture_geometry=capture_geometry,
         )
-        old_counters = counters_small.index_select(0, rows_dev)
-        next_counters = state.frontend_counters
-        committed_delta = (
-            next_counters[:, CTR_COMMITTED_MEL_FRAMES] - old_counters[:, CTR_COMMITTED_MEL_FRAMES]
-        ).clamp(min=0)
-        session_first = batch.chunk_sequence == 0
-        capture_mel_lengths = torch.where(
-            committed_delta > 0,
-            committed_delta
-            + torch.where(
-                session_first,
-                torch.zeros_like(committed_delta),
-                torch.full_like(committed_delta, MEL_TAIL_FRAMES),
-            ),
-            torch.zeros_like(committed_delta),
-        )
-        capture_drop = torch.where(
-            session_first,
-            torch.zeros_like(committed_delta),
-            torch.full_like(committed_delta, PRE_ENCODE_DROP),
-        )
-        capture_encoder_lengths = torch.where(
-            committed_delta > 0,
-            torch.clamp(
-                core.encoder.pre_encode.output_lengths(capture_mel_lengths) - capture_drop,
-                min=0,
-            ),
-            torch.zeros_like(committed_delta),
-        )
-        result = _validated_result(
+        if not isinstance(bucket, ChunkBucketResult):
+            raise TypeError("bucket transition must return ChunkBucketResult")
+        batch, result = bucket.batch, bucket.result
+        # Keep structural rejection on every invocation, including graph
+        # replay; capture-time metadata validation alone is insufficient.
+        _validate_result_structure(
             result,
-            incoming=incoming,
-            blank_id=blank,
-            queue_capacity=cap,
-            geometry_bound=(lookaheads[g] + 1) * MAX_SYMBOLS_PER_STEP,
+            rows=int(rows_dev.shape[0]),
+            device=device,
             capture=capture_on,
             expected_capture=(
-                (
-                    int(rows_dev.shape[0]),
-                    int(state.mel_tail.shape[1]),
-                    capture_geometry.mel_width,
-                ),
-                (
-                    int(rows_dev.shape[0]),
-                    capture_geometry.out_width,
-                    int(state.channel[0].shape[2]),
-                ),
+                (int(rows_dev.shape[0]), int(state.mel_tail.shape[1]), capture_geometry.mel_width),
+                (int(rows_dev.shape[0]), capture_geometry.out_width, int(state.channel[0].shape[2])),
                 state.channel[0].dtype,
             )
             if capture_geometry is not None
             else None,
-            expected_capture_lengths=(
-                capture_mel_lengths,
-                capture_encoder_lengths,
-            )
-            if capture_on
-            else None,
         )
+        for predicate in (bucket.counter_invariant_bad, bucket.counter_delta_bad):
+            if predicate.shape != (rows_dev.shape[0],) or predicate.dtype != torch.bool or predicate.device != device:
+                raise ValueError("bucket counter predicates differ from the row contract")
         endpoint_transition = None
         if endpoint_enabled:
             from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
@@ -2862,25 +2969,9 @@ def advance_model_rows(
             )
         assert result.row_status is not None
         rs = result.row_status
-        counter_bad = _counter_invariant_rows(
-            next_counters,
-            raw_tail_capacity=int(state.raw_tail.shape[1]),
-            mel_tail_capacity=int(state.mel_tail.shape[2]),
-            hop_length=hop,
-            n_fft=int(core.featurizer.n_fft),
-            cadence_frames=torch.full_like(
-                next_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE],
-                cadence,
-            ),
-        )
-        clean = rs == 0
-        counter_bad |= clean & (
-            next_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] != old_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] + 1
-        )
-        counter_bad |= clean & (
-            next_counters[:, CTR_TOTAL_VALID_SAMPLES] - old_counters[:, CTR_TOTAL_VALID_SAMPLES] != batch.valid_samples
-        )
-        counter_bad |= clean & (next_counters[:, CTR_FINALIZED] != batch.final_tail.to(torch.int64))
+        # Endpoint overflow changes the clean-row mask. Apply delta failures
+        # here, never in the earlier captured bucket computation.
+        counter_bad = bucket.counter_invariant_bad | ((rs == 0) & bucket.counter_delta_bad)
         rs |= counter_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
         result = AdvanceResult(
             token_ids=result.token_ids,
