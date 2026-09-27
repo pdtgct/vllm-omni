@@ -363,6 +363,8 @@ def _call(
     graph_covers_decode: bool = False,
     memory_profile: bool = False,
     staging: Any = None,
+    bucket_transition: Any = None,
+    native_burst_handoff: Any = None,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = advance.make_mrv1_adapter(
@@ -384,6 +386,8 @@ def _call(
         graph_covers_decode=graph_covers_decode,
         memory_profile=memory_profile,
         staging=staging,
+        bucket_transition=bucket_transition,
+        native_burst_handoff=native_burst_handoff,
         **pools,
     )
     return out
@@ -3536,3 +3540,124 @@ def test_gather_zero_rows_preserves_empty_layout() -> None:
     assert gathered.dtype == pool.dtype
     assert gathered.device == pool.device
     assert gathered.is_contiguous()
+
+
+@torch.inference_mode()
+def _assert_native_burst_transaction(
+    core: Any,
+    replay_pools: Pools,
+    native_pools: Pools,
+    carrier: torch.Tensor,
+    plan: Any,
+    *,
+    handoff: Any,
+    epoch: int,
+    resolver: Any = None,
+    bucket_transition: Any = None,
+    failed_rows: tuple[int, ...] = (),
+) -> Any:
+    """Reuse the compatibility drain as the ordered native payload/state oracle."""
+    device = carrier.device
+    count = carrier.shape[0]
+    blocks = [binding.block_id for binding in plan.bindings]
+    kwargs = dict(resolver=resolver, bucket_transition=bucket_transition)
+    sink, native_sink = _CommitRecorder(), _CommitRecorder()
+    output = _call(
+        core,
+        replay_pools,
+        torch.full((count,), PLACEHOLDER_ID, device=device),
+        carrier,
+        plan,
+        commit_sink=sink,
+        **kwargs,
+    )
+    expected = [[token] for token in _decision(output)]
+    # Drain only rows that have not reached PARK, preserving each row's identity.
+    # A finite queue bounds the oracle even if a broken replay never parks.
+    for _ in range(CAP + 1):
+        active = [i for i, tokens in enumerate(expected) if tokens[-1] != PARK_ID]
+        if not active:
+            break
+        output = _call(
+            core,
+            replay_pools,
+            torch.tensor([expected[i][-1] for i in active], device=device),
+            torch.zeros(len(active), CARRIER_HIDDEN, device=device),
+            _plan(
+                decodes=[blocks[i] for i in active],
+                num_pool_blocks=plan.num_pool_blocks,
+                geometries=[int(plan.geometry_id[i]) for i in active],
+                prompts=[int(plan.prompt_index[i]) for i in active],
+                request_ids=tuple(plan.request_ids[i] for i in active),
+                generations=[int(plan.admission_generation[i]) for i in active],
+            ),
+            commit_sink=sink,
+            **kwargs,
+        )
+        assert not torch.count_nonzero(sink.staged[-1])
+        for i, token in zip(active, _decision(output), strict=True):
+            expected[i].append(token)
+    assert all(tokens[-1] == PARK_ID for tokens in expected), "compatibility drain did not park"
+    assert any(len(tokens) > 1 for tokens in expected), "fixture must emit labels before PARK"
+    # Nonidentity scheduler indices change with the row order on later calls.
+    mapping = [block - 1 for block in blocks]
+    batch = SimpleNamespace(req_ids=list(plan.request_ids), idx_mapping_np=mapping)
+    handoff.prepare(
+        SimpleNamespace(
+            epoch=epoch,
+            req_ids=plan.request_ids,
+            input_batch=batch,
+            bindings=tuple(
+                SimpleNamespace(
+                    request_id=b.request_id,
+                    generation=b.admission_generation,
+                    slot_id=b.block_id,
+                )
+                for b in plan.bindings
+            ),
+            block_ids=tuple((block,) for block in blocks),
+            req_states=SimpleNamespace(req_id_to_index=dict(zip(plan.request_ids, mapping, strict=True))),
+        )
+    )
+    _call(
+        core,
+        native_pools,
+        torch.full((count,), PLACEHOLDER_ID, device=device),
+        carrier,
+        plan,
+        commit_sink=native_sink,
+        native_burst_handoff=handoff,
+        **kwargs,
+    )
+    payload = handoff.consume(batch)
+    torch.testing.assert_close(payload.row_status, sink.staged[0], atol=0, rtol=0)
+    torch.testing.assert_close(native_sink.staged[0], sink.staged[0], atol=0, rtol=0)
+    assert tuple(payload.row_status.nonzero().flatten().tolist()) == failed_rows
+    for row, tokens in enumerate(expected):
+        length = int(payload.num_sampled[row])
+        assert length == len(tokens)
+        assert payload.sampled_token_ids[row, :length].tolist() == tokens
+        assert torch.all(payload.sampled_token_ids[row, length:] == -1)
+        assert tokens.count(PARK_ID) == 1
+    _assert_pools_equal(native_pools, replay_pools)
+    return payload
+
+
+@torch.inference_mode()
+def test_experimental_native_burst_transaction_matches_all_replayed_pools() -> None:
+    # Recovered native transaction oracle, retained independently of CHUNK capture.
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff
+
+    core = _tiny_core(seed=1)
+    torch.manual_seed(5)
+    carrier = _envelope(torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
+    replay_pools = _fresh_pools()
+    _assert_native_burst_transaction(
+        core,
+        replay_pools,
+        _clone_pools(replay_pools),
+        carrier,
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        handoff=NativeBurstHandoff(max_tokens=142),
+        epoch=1,
+    )

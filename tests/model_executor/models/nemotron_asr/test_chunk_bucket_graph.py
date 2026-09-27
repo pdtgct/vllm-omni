@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU boundary/ownership checks; real CUDA replay remains a separate gate."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from test_advance_model_rows_local import (
     CARRIER_HIDDEN,
     PARK_ID,
     PLACEHOLDER_ID,
+    _assert_native_burst_transaction,
     _assert_pools_equal,
     _clone_pools,
     _CommitRecorder,
@@ -406,3 +409,173 @@ def test_endpoint_overflow_masks_only_delta_predicate(monkeypatch):
     assert int(status[1]) == advance.ROW_STATUS_DECODE_INVARIANT | advance.ROW_STATUS_BOOK_INVARIANT
     assert torch.all(status[2:] == advance.ROW_STATUS_BOOK_INVARIANT)
     _assert_pools_equal(pools, before)
+
+
+@torch.inference_mode()
+def _run_chunk_native_handoff(population, *, device="cpu", runtime=None, vllm_config=None):
+    """Tiny transaction oracle; a caller-supplied runtime enables real CUDA capture.
+
+    This checks handoff composition, not trained numerical qualification or the
+    standalone native encoder inventory used by fallback serving cells.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
+    from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff
+
+    device = torch.device(device)
+    if runtime is None:
+        assert device.type == "cpu", "CUDA requires the actual platform graph runtime"
+        runtime = _graph_runtime()
+    core = _tiny_core(seed=1)
+    for module in vars(core).values():
+        if isinstance(module, torch.nn.Module):
+            module.to(device)
+    tier = 1 if population == 1 else population + 1
+    decoder = DenseGraphBinding(
+        decode_fn=rnnt.decode_dense_masked_frames,
+        predictor=core.predictor,
+        joint=core.joint,
+        vllm_config=vllm_config,
+        frame_widths=(None, 2),
+        tiers=(1, 2) if population == 1 else (tier,),
+        encoder_hidden=32,
+        predictor_layers=2,
+        predictor_hidden=16,
+        blank_id=core.blank_id,
+        runtime=runtime,
+    )
+    decoder.warmup(device, torch.float32)
+    # Use the real serving resolver and captured CHUNK callable; the small
+    # fixture supplies only the sealed inventory fields that they consume.
+    execution = SimpleNamespace(
+        ready=True,
+        transition=None,
+        _chunk_graph_entries={},
+        reserve_chunk_graph_cells=lambda _cells: None,
+    )
+    binding = ExactChunkGraphBinding(core, None, execution, decoder, [population])
+    state = advance.SessionStateBatch(
+        **{
+            name: [t.to(device) for t in value] if isinstance(value, list) else value.to(device)
+            for name, value in vars(_fresh_state(population)).items()
+        }
+    )
+    env = torch.stack([_envelope(torch.zeros(2560), final=False, seq=0, geometry=1) for _ in range(population)])
+    execution._chunk_graph_entries[(1, population)] = capture_chunk_bucket(
+        core,
+        env.to(device),
+        state,
+        geometry=1,
+        admitted_prompt=torch.zeros(population, dtype=torch.long, device=device),
+        incoming_status=torch.zeros(population, dtype=torch.int32, device=device),
+        queue_capacity=48,
+        vllm_config=vllm_config,
+        runtime=runtime,
+        capture_decode_fn=decoder.uncaptured_decode_fn(geometry=1, tier=tier),
+        admitted_decode_fn=decoder.decode_fn(geometry=1, tier=tier),
+        decoder_tier=tier,
+    )
+
+    def resolve(request):
+        return advance.ResolvedDecode(
+            arm="dense-graphed",
+            decode_fn=decoder.decode_fn(
+                geometry=request.geometry, tier=decoder.execution_tier(request.execution_batch_size)
+            ),
+        )
+
+    replay_pools = {
+        name: [t.to(device) for t in value] if isinstance(value, list) else value.to(device)
+        for name, value in _fresh_pools(population + 2).items()
+    }
+    native_pools = _clone_pools(replay_pools)
+    if device.type == "cuda":
+        advance.warmup_advance_model_rows_scatter(**replay_pools)
+        advance.warmup_advance_model_rows_scatter(**native_pools)
+    handoff = NativeBurstHandoff(max_tokens=22)
+    sequences = {}
+    retained = []
+    receipts = []
+    torch.manual_seed(5)
+    for step, blocks in enumerate(
+        (
+            list(range(1, population + 1)),
+            list(range(population + 1, 0, -1)),
+            list(range(1, population + 1)),
+        )
+    ):
+        final = step == 2
+        prompts = [(block - 1) % 4 for block in blocks]
+        carrier = torch.stack(
+            [
+                _envelope(
+                    torch.randn(1920 if final else 2560) * 0.01,
+                    final=final,
+                    seq=sequences.get(block, 0),
+                    geometry=1,
+                    prompt=prompt,
+                )
+                for block, prompt in zip(blocks, prompts, strict=True)
+            ]
+        ).to(device)
+        plan = _plan(
+            prefills=blocks,
+            has_initial=[block in sequences for block in blocks],
+            num_pool_blocks=population + 2,
+            geometries=[1] * len(blocks),
+            prompts=prompts,
+            request_ids=tuple(f"session-{block}" for block in blocks),
+            generations=[1] * len(blocks),
+        )
+        failed = (0,) if final and population > 1 else ()
+        if failed:
+            carrier[0, advance.ENV_PROMPT_INDEX] = (prompts[0] + 1) % 4
+        payload = _assert_native_burst_transaction(
+            core,
+            replay_pools,
+            native_pools,
+            carrier,
+            plan,
+            handoff=handoff,
+            epoch=step + 1,
+            resolver=resolve,
+            bucket_transition=binding,
+            failed_rows=failed,
+        )
+        # Later calls reuse both CHUNK-owned and fallback decoder scratch.
+        tensors = (payload.sampled_token_ids, payload.num_sampled, payload.row_status, payload.queue, payload.book)
+        for previous, copies in retained:
+            for actual, expected in zip(previous, copies, strict=True):
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        retained.append((tensors, tuple(t.clone() for t in tensors)))
+        receipts.append(
+            dict(
+                population=len(blocks),
+                final=final,
+                fresh_rows=sum(block not in sequences for block in blocks),
+                block_order=blocks,
+                counts_including_park=payload.num_sampled.tolist(),
+                row_status=payload.row_status.tolist(),
+                token_ids=[payload.sampled_token_ids[i, : int(n)].tolist() for i, n in enumerate(payload.num_sampled)],
+            )
+        )
+        for block in blocks:
+            sequences[block] = sequences.get(block, 0) + 1
+    emitted = {token for step in receipts for tokens in step["token_ids"] for token in tokens if token != PARK_ID}
+    assert len(emitted) > 1, "fixture must distinguish label order, not just repeated labels"
+    receipt = binding.receipt()
+    assert receipt["cells"][0]["successful_replays"] == 4
+    assert receipt["fallbacks"] == [{"geometry": 1, "encoder_population": population + 1, "successful_calls": 2}]
+    return dict(
+        selected_population=population,
+        transactions=receipts,
+        chunk_binding=receipt,
+        all_replayed_pools_equal=True,
+        retained_outputs_unchanged=True,
+        scope="Random tiny fixture, handoff composition only; not trained qualification or serving",
+    )
+
+
+@pytest.mark.parametrize("population", [1, 31, 63])
+def test_chunk_native_handoff_matches_replay_through_population_changes(population):
+    _run_chunk_native_handoff(population)
