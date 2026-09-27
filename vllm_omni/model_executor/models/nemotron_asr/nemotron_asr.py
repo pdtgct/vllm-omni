@@ -451,11 +451,10 @@ class NemotronASRForRNNT(nn.Module):
             from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
             from vllm_omni.model_executor.models.nemotron_asr.native_burst import validate_native_burst_config
 
-            # Reuse the existing initial-profile configuration guard only.
-            # This does not enable native burst; shared decoder scratch requires
-            # synchronous, non-speculative single-device worker execution.
-            if native_burst_enabled:
-                raise ValueError("CHUNK serving pilot requires native burst disabled")
+            # CHUNK capture and optional native output handoff share the
+            # synchronous, non-speculative single-device 160-ms profile.
+            # Native projection remains outside capture and owns its payload;
+            # neither opt-in changes the recurrent arithmetic or decoder tiers.
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._chunk_bucket_binding = ExactChunkGraphBinding(
                 self.core, hf_config, self._encoder_execution, self._decode_graph_binding, chunk_populations

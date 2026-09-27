@@ -726,3 +726,90 @@ def test_chunk_final_profile_uses_sealed_decoder_tier_and_live_graph_route(monke
         model, num_rows=31, device=torch.device("cpu"), geometry_id=1, ready_domain=True
     )
     assert calls == [True]
+
+
+@pytest.fixture
+def chunk_constructor(monkeypatch):
+    """Keep real constructor/profile guards while avoiding model allocation."""
+    module = _model_module()
+    hf_config = _config(decode_dispatch_arm="dense-graphed")
+    hf_config.supported_num_lookahead_tokens = [1]
+    hf_config.chunk_bucket_graph_populations = [1, 31, 63]
+    hf_config.experimental_native_burst = True
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config, dtype=torch.float32, logits_processors=[]),
+        scheduler_config=SimpleNamespace(max_num_seqs=128, async_scheduling=False),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_expert_parallel=False,
+        ),
+    )
+    reserved = []
+    execution = SimpleNamespace(reserve_chunk_graph_cells=reserved.append)
+    monkeypatch.setattr(
+        module, "NemotronASRCore", lambda **_kw: SimpleNamespace(blank_id=13_087, predictor=object(), joint=object())
+    )
+    monkeypatch.setattr(module, "PersistentStateLayerBase", lambda *_args, **_kw: object())
+    monkeypatch.setattr(module, "build_encoder_execution", lambda *_args, **_kw: execution)
+    return config, reserved
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("populations", [[], [1, 31, 63]])
+def test_chunk_native_constructor_admits_independent_opt_ins(chunk_constructor, native, populations):
+    config, reserved = chunk_constructor
+    config.model_config.hf_config.experimental_native_burst = native
+    config.model_config.hf_config.chunk_bucket_graph_populations = populations
+
+    model = _model_class()(vllm_config=config)
+
+    assert (model._native_burst_handoff is not None) is native
+    assert (model._chunk_bucket_binding is not None) is bool(populations)
+    assert reserved == ([frozenset((1, n) for n in populations)] if populations else [])
+    if native:
+        from vllm_omni.model_executor.models.nemotron_asr.native_burst import native_burst_token_budget
+
+        assert model._native_burst_handoff.max_tokens == native_burst_token_budget(config.model_config.hf_config)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "section, field, value, error",
+    [
+        ("scheduler_config", "async_scheduling", True, "synchronous"),
+        (None, "speculative_config", object(), "synchronous"),
+        *[
+            ("parallel_config", field, 2, "single-device")
+            for field in (
+                "pipeline_parallel_size",
+                "tensor_parallel_size",
+                "data_parallel_size",
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            )
+        ],
+        ("parallel_config", "enable_expert_parallel", True, "single-device"),
+        ("model_config", "logits_processors", [object()], "synchronous"),
+        ("hf_config", "supported_num_lookahead_tokens", [1, 6], "160-ms"),
+        ("hf_config", "decode_dispatch_arm", "dense-eager", "dense graph decoder"),
+        ("hf_config", "chunk_bucket_graph_populations", [32], "distinct populations"),
+        ("hf_config", "chunk_bucket_graph_populations", [1, 1], "distinct populations"),
+    ],
+)
+def test_chunk_native_constructor_preserves_profile_rejections(chunk_constructor, native, section, field, value, error):
+    config, reserved = chunk_constructor
+    config.model_config.hf_config.experimental_native_burst = native
+    target = (
+        config.model_config.hf_config if section == "hf_config" else getattr(config, section) if section else config
+    )
+    setattr(target, field, value)
+
+    with pytest.raises(ValueError, match=error):
+        _model_class()(vllm_config=config)
+
+    assert reserved == []
