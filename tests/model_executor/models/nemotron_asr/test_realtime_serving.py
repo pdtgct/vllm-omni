@@ -306,6 +306,7 @@ def test_compute_logits_reads_rows_by_batch_position() -> None:
     )
 
     model = object.__new__(NemotronASRForRNNT)  # seam only; no __init__
+    object.__setattr__(model, "_native_burst_handoff", None)
     hidden = torch.zeros(3, 32, dtype=torch.float32)
     ids = torch.tensor([11, 22, 33], dtype=torch.long)
     write_decision_carrier(hidden, ids)
