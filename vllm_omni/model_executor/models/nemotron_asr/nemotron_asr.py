@@ -1020,6 +1020,11 @@ class NemotronASRForRNNT(nn.Module):
         sampling_metadata: Any = None,
     ) -> torch.Tensor:
         del sampling_metadata
+        if self._native_burst_handoff is not None:
+            # NativeBurstSampler consumes the owned receipt, not logit values;
+            # dummy sampling only needs the device. Admission excludes other
+            # logits consumers, so retain a view without compatibility work.
+            return hidden_states[:, :1]
         from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
             forced_logits_rows,
             read_decision_carrier,
