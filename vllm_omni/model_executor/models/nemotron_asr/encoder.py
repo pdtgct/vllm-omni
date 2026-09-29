@@ -32,6 +32,11 @@ from vllm_omni.model_executor.models.nemotron_asr.masks import (
 )
 
 _LOG_BASE = 10000.0
+_CONV1D_CALL = nn.Conv1d.__call__
+_CONV1D_CALL_IMPL = nn.Conv1d._call_impl
+_CONV1D_WRAPPED_CALL_IMPL = nn.Conv1d._wrapped_call_impl
+_CONV1D_FORWARD = nn.Conv1d.forward
+_CONV1D_CONV_FORWARD = nn.Conv1d._conv_forward
 
 
 def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
@@ -579,6 +584,58 @@ def _stream_attention(
     return attn.linear_out(out), new_cache
 
 
+def _stream_pointwise_linear(module: nn.Conv1d, x: torch.Tensor) -> bool:
+    """Lower only stock CUDA FP32 inference pointwise convolutions.
+
+    Calling a module is observable through hooks and overrides; retain that
+    call for customized modules, autocast, and every other execution context.
+    """
+    if (
+        torch.compiler.is_compiling()
+        or type(module) is not nn.Conv1d
+        or module.training
+        or torch.is_grad_enabled()
+        or torch.is_autocast_enabled()
+        or type(x) is not torch.Tensor
+        or x.device.type != "cuda"
+        or x.dtype != torch.float32
+        or x.numel() == 0
+    ):
+        return False
+    if (
+        module.kernel_size != (1,)
+        or module.stride != (1,)
+        or module.padding != (0,)
+        or module.dilation != (1,)
+        or module.groups != 1
+        or module.padding_mode != "zeros"
+        or module.bias is not None
+        or type(module.weight) is not nn.Parameter
+        or tuple(module.weight.shape) != (module.out_channels, module.in_channels, 1)
+        or module.weight.dtype != x.dtype
+        or module.weight.device != x.device
+        or nn.Conv1d.__call__ is not _CONV1D_CALL
+        or nn.Conv1d._call_impl is not _CONV1D_CALL_IMPL
+        or nn.Conv1d._wrapped_call_impl is not _CONV1D_WRAPPED_CALL_IMPL
+        or nn.Conv1d.forward is not _CONV1D_FORWARD
+        or nn.Conv1d._conv_forward is not _CONV1D_CONV_FORWARD
+        or any(name in module.__dict__ for name in ("forward", "_conv_forward", "_call_impl", "_wrapped_call_impl"))
+        or module._compiled_call_impl is not None
+    ):
+        return False
+    hooks = nn.modules.module
+    return not (
+        module._forward_hooks
+        or module._forward_pre_hooks
+        or module._backward_hooks
+        or module._backward_pre_hooks
+        or hooks._global_forward_hooks
+        or hooks._global_forward_pre_hooks
+        or hooks._global_backward_hooks
+        or hooks._global_backward_pre_hooks
+    )
+
+
 def _stream_conv(
     layer: ConformerLayer,
     x: torch.Tensor,
@@ -596,9 +653,12 @@ def _stream_conv(
     """
     conv = layer.conv
     batch, frames, width = x.shape
-    y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
-    y = conv.pointwise_conv1(y)
-    y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
+    if not layer.training and not conv.training and _stream_pointwise_linear(conv.pointwise_conv1, x):
+        y = nn.functional.linear(x, conv.pointwise_conv1.weight.squeeze(-1)).transpose(1, 2).contiguous()
+    else:
+        y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
+        y = conv.pointwise_conv1(y)
+        y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
     y = torch.nn.functional.glu(y, dim=1)
     # conv_state axis: read-cast to compute dtype, write-cast back.
     padded = torch.cat([cache.to(y.dtype), y], dim=-1)
@@ -609,6 +669,8 @@ def _stream_conv(
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
+    if not layer.training and not conv.training and _stream_pointwise_linear(conv.pointwise_conv2, y):
+        return nn.functional.linear(y.transpose(1, 2), conv.pointwise_conv2.weight.squeeze(-1)), new_cache
     return conv.pointwise_conv2(y).transpose(1, 2), new_cache
 
 
