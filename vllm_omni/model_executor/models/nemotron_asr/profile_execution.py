@@ -244,6 +244,9 @@ def run_persistent_state_profile(
         )
         pools = invocation.pools
         native_handoff = getattr(model, "_native_burst_handoff", None)
+        native_emission = getattr(native_handoff, "emission_execution", None)
+        if native_emission is not None:
+            native_emission.warmup(device)
         if device.type == "cuda":
             warmup_advance_model_rows_scatter(
                 channel_pools=list(pools.channel),
@@ -267,7 +270,9 @@ def run_persistent_state_profile(
                     NativeBurstProfileSink,
                 )
 
-                native_profile_sink = NativeBurstProfileSink(max_tokens=native_handoff.max_tokens)
+                native_profile_sink = NativeBurstProfileSink(
+                    max_tokens=native_handoff.max_tokens, emission_execution=native_emission
+                )
             chunk_binding = getattr(model, "_chunk_bucket_binding", None) if ready_domain else None
             profile_plan = invocation.plan
             if chunk_binding is not None:

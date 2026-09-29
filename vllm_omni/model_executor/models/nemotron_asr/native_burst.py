@@ -73,6 +73,7 @@ class NativeBurstHandoff:
 
     def __init__(self, *, max_tokens: int = 142) -> None:
         self.max_tokens = max_tokens
+        self.emission_execution: Any | None = None
         self._dummy_park: int | None = None
         self._last_epoch = 0
         self._snapshot: Any = None
@@ -341,8 +342,9 @@ def validate_native_burst_history(request: Any, *, max_model_len: int, burst_tok
 class NativeBurstProfileSink:
     """Ephemeral profile-only reservation, with no live request authority."""
 
-    def __init__(self, *, max_tokens: int) -> None:
+    def __init__(self, *, max_tokens: int, emission_execution: Any | None = None) -> None:
         self.max_tokens = max_tokens
+        self.emission_execution = emission_execution
         self.payload: NativeBurstProjection | None = None
 
     def reserve(self, payload: NativeBurstProjection) -> Callable[[], None]:

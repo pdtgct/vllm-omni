@@ -408,6 +408,20 @@ class NemotronASRForRNNT(nn.Module):
             validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        from vllm_omni.model_executor.models.nemotron_asr.native_emission_execution import (
+            build_native_emission_execution,
+        )
+
+        self._native_emission_execution = build_native_emission_execution(
+            hf_config,
+            maximum_population=self._max_num_seqs,
+            park_id=hf_config.eos_token_id,
+            blank_id=self.core.blank_id,
+            max_tokens=self._native_burst_handoff.max_tokens if self._native_burst_handoff is not None else 0,
+        )
+        if self._native_emission_execution is not None:
+            assert self._native_burst_handoff is not None
+            self._native_burst_handoff.emission_execution = self._native_emission_execution
         served_geometry_ids = _served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
             self.core,
@@ -713,6 +727,9 @@ class NemotronASRForRNNT(nn.Module):
 
     def _require_execution_inventory_ready(self) -> None:
         """Validate complete model-owned inventory without creating allocations."""
+        native_emission = getattr(self, "_native_emission_execution", None)
+        if native_emission is not None and not native_emission.ready:
+            raise RuntimeError("native emission execution inventory is incomplete")
         if not self._encoder_execution.ready:
             raise RuntimeError("encoder execution inventory is incomplete")
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
@@ -750,6 +767,9 @@ class NemotronASRForRNNT(nn.Module):
         try:
             parameter = next(self.core.encoder.parameters())
             device = parameter.device
+            native_emission = getattr(self, "_native_emission_execution", None)
+            if native_emission is not None:
+                native_emission.warmup(device)
             warmup_static_encoder_execution(self, device=device)
             if self._decode_graph_binding is not None:
                 self._decode_graph_binding.warmup(device, parameter.dtype)
@@ -771,6 +791,14 @@ class NemotronASRForRNNT(nn.Module):
                 geometry_id=max(_served_geometry_ids(self.config)),
                 ready_domain=True,
             )
+            if native_emission is not None:
+                # Attest real transaction inputs, including alias/stride and
+                # inference metadata, against both startup-only specializations.
+                for population in native_emission.populations:
+                    run_persistent_state_profile(
+                        self, num_rows=population, device=device, geometry_id=1, ready_domain=True
+                    )
+                native_emission.require_profile_coverage()
             self._require_execution_inventory_ready()
         except Exception:
             self._execution_memory_failed = True
@@ -832,6 +860,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
+        native_emission = getattr(self, "_native_emission_execution", None)
+        if native_emission is not None:
+            receipt["native_emission"] = native_emission.receipt()
         return receipt
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:

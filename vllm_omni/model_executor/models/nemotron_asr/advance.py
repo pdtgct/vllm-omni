@@ -3258,20 +3258,39 @@ def advance_model_rows(
             projection.book,
             status.clone(),
         )
-        native_projection = finalize_native_burst(
-            source_projection,
-            context,
-            park_id=park_id,
-            blank_id=blank,
-        )
-        native_bad = native_burst_invariant_rows(
-            source_projection,
-            context,
-            native_projection,
-            park_id=park_id,
-            blank_id=blank,
-            eou_token_id=eou_token_id if endpoint_enabled else None,
-        )
+        native_execution = getattr(native_burst_handoff, "emission_execution", None)
+        if native_execution is None:
+            native_projection = finalize_native_burst(
+                source_projection,
+                context,
+                park_id=park_id,
+                blank_id=blank,
+            )
+            native_bad = native_burst_invariant_rows(
+                source_projection,
+                context,
+                native_projection,
+                park_id=park_id,
+                blank_id=blank,
+                eou_token_id=eou_token_id if endpoint_enabled else None,
+            )
+        else:
+            native_projection = native_execution.finalize(
+                source_projection,
+                context,
+                park_id=park_id,
+                blank_id=blank,
+                max_tokens=native_burst_handoff.max_tokens,
+            )
+            native_bad = native_execution.invariant_rows(
+                source_projection,
+                context,
+                native_projection,
+                park_id=park_id,
+                blank_id=blank,
+                eou_token_id=eou_token_id if endpoint_enabled else None,
+                max_tokens=native_burst_handoff.max_tokens,
+            )
         native_bad |= native_projection.num_sampled > native_burst_handoff.max_tokens
         status |= native_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
         native_projection.sampled_token_ids.masked_fill_(native_bad.unsqueeze(1), -1)
