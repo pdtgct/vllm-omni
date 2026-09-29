@@ -3661,3 +3661,64 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools() -> N
         handoff=NativeBurstHandoff(max_tokens=142),
         epoch=1,
     )
+
+
+# @spec PORT-STATE-008, PORT-ADV-004
+def test_group_metadata_failure_precedes_every_store_and_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    preparations = 0
+
+    def fail_later_group(*args: Any) -> None:
+        nonlocal preparations
+        preparations += 1
+        if preparations == 3:
+            raise ValueError("malformed later grouped metadata")
+
+    def forbidden_write(*args: Any) -> None:
+        raise AssertionError("store preceded group metadata validation")
+
+    monkeypatch.setattr(advance, "prepare_grouped_page_scatter", fail_later_group)
+    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", forbidden_write)
+    carrier = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0).unsqueeze(0)
+    with pytest.raises(ValueError, match="later grouped metadata"):
+        _call(core, pools, torch.tensor([PLACEHOLDER_ID]), carrier, _plan(prefills=[1]), commit_sink=sink)
+    assert preparations == 3
+    assert sink.log == []
+    _assert_pools_equal(pools, before)
+
+
+# @spec PORT-STATE-008, PORT-ADV-004
+def test_grouped_plan_preserves_all_fields_and_mixed_bucket_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise the real transaction's grouping/order on CPU, with the scalar
+    # primitive standing in for CUDA dispatch. CUDA byte parity is separate.
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    control = _clone_pools(pools)
+    reg = _envelope(torch.randn(REG_SAMPLES) * 0.01, final=False, seq=0, geometry=GEOM_REG)
+    fin = _envelope(torch.randn(FINAL_SAMPLES) * 0.01, final=True, seq=0, geometry=GEOM_FINAL)
+    plan = _plan(prefills=[1, 2], num_pool_blocks=4, geometries=[GEOM_REG, GEOM_FINAL])
+    inputs = torch.tensor([PLACEHOLDER_ID, PLACEHOLDER_ID])
+    carrier = torch.stack([reg, fin])
+    expected = _call(core, control, inputs, carrier, plan)
+    seen: list[tuple[int, int]] = []
+
+    def prepare(ps: Any, ss: Any, blocks: Any, status: Any) -> Any:
+        assert mods["state_scatter"]._group_layout_supported(ps, ss)
+        return mods["state_scatter"].PreparedScatterGroup(ps, ss, blocks, status)
+
+    def execute(group: Any) -> None:
+        seen.append((id(group.blocks), id(group.row_status)))
+        for p, s in zip(group.pools, group.scratches, strict=True):
+            mods["state_scatter"]._execute_masked_page_scatter_(p, s, group.blocks, group.row_status)
+
+    monkeypatch.setattr(advance, "prepare_grouped_page_scatter", prepare)
+    monkeypatch.setattr(advance, "_execute_grouped_page_scatter_", execute)
+    actual = _call(core, pools, inputs, carrier, plan)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_pools_equal(pools, control)
+    assert len(seen) == 6
+    assert len(set(seen[:3])) == len(set(seen[3:])) == 1
+    assert seen[0] != seen[3]

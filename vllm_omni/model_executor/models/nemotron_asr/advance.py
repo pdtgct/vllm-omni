@@ -48,8 +48,12 @@ import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 from vllm_omni.model_executor.models.nemotron_asr.state_scatter import (
+    PreparedScatterGroup,
+    _execute_grouped_page_scatter_,
     _execute_masked_page_scatter_,
+    prepare_grouped_page_scatter,
     validate_masked_page_scatter,
+    warmup_grouped_page_scatter,
     warmup_masked_page_scatter,
 )
 
@@ -2331,6 +2335,7 @@ def warmup_advance_model_rows_scatter(
         endpoint_history_pool=endpoint_history_pool,
         endpoint_book_pool=endpoint_book_pool,
     )
+    warm_scratches: dict[int, torch.Tensor] = {}
     for pool in pools:
         if pool.dim() < 1:
             raise ValueError("every resident pool must have a block dimension")
@@ -2340,6 +2345,9 @@ def warmup_advance_model_rows_scatter(
             device=pool.device,
         )
         warmup_masked_page_scatter(pool, scratch)
+        warm_scratches[id(pool)] = scratch
+    for family in (channel_pools, time_pools, len_pools):
+        warmup_grouped_page_scatter(list(family), [warm_scratches[id(pool)] for pool in family])
 
 
 # ---- PORT-OBS-008 batch-size sub-stat: consume-once extraction hook ----
@@ -3295,6 +3303,7 @@ def advance_model_rows(
         )
 
     scatter_ops: list[_ScatterDescriptor] = []
+    group_ranges: list[tuple[int, int]] = []
     for ex in executed:
         rows_dev = ex["rows_dev"]
         blocks = ex["blocks_dev"]
@@ -3307,9 +3316,14 @@ def advance_model_rows(
             (h_pool, st.h),
             (c_pool, st.c),
         ]
-        pairs += list(zip(channel_pools, st.channel, strict=True))
-        pairs += list(zip(time_pools, st.time, strict=True))
-        pairs += list(zip(len_pools, st.window_valid, strict=True))
+        for resident, source in (
+            (channel_pools, st.channel),
+            (time_pools, st.time),
+            (len_pools, st.window_valid),
+        ):
+            start = len(scatter_ops) + len(pairs)
+            pairs += list(zip(resident, source, strict=True))
+            group_ranges.append((start, len(resident)))
         for pool, scratch in pairs:
             scatter_ops.append(_ScatterDescriptor(pool, scratch, blocks, bucket_status))
     scatter_ops.extend(
@@ -3343,6 +3357,19 @@ def advance_model_rows(
     # descriptor may launch before every later descriptor is known good.
     for op in scatter_ops:
         validate_masked_page_scatter(op.pool, op.scratch, op.blocks, op.row_status)
+    grouped_ops: dict[int, PreparedScatterGroup] = {}
+    for start, count in group_ranges:
+        family_ops = scatter_ops[start : start + count]
+        if not family_ops:
+            continue
+        group = prepare_grouped_page_scatter(
+            [op.pool for op in family_ops],
+            [op.scratch for op in family_ops],
+            family_ops[0].blocks,
+            family_ops[0].row_status,
+        )
+        if group is not None:
+            grouped_ops[start] = group
 
     # ---- records + ONE composite reservation, still pre-commit ----
     records: list[CaptureRecord] = []
@@ -3421,8 +3448,7 @@ def advance_model_rows(
     # executor directly so no descriptor is re-validated here.
     with phase("port.scatter"):
         try:
-            for op in scatter_ops:
-                _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+            _execute_scatter_plan_(scatter_ops, grouped_ops)
         except BaseException:
             if cancel_reservation is not None:
                 cancel_reservation()
@@ -3433,3 +3459,21 @@ def advance_model_rows(
         if native_stage is not None:
             native_stage()
     return projection_rows
+
+
+# @spec PORT-ADV-004, PORT-STATE-008
+def _execute_scatter_plan_(
+    scatter_ops: list[_ScatterDescriptor],
+    grouped_ops: dict[int, PreparedScatterGroup],
+) -> None:
+    """Execute the fully prepared plan in its original descriptor order."""
+    index = 0
+    while index < len(scatter_ops):
+        group = grouped_ops.get(index)
+        if group is None:
+            op = scatter_ops[index]
+            _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+            index += 1
+        else:
+            _execute_grouped_page_scatter_(group)
+            index += group.count

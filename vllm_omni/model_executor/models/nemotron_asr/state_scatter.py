@@ -351,3 +351,249 @@ def masked_page_scatter_(
     """
     validate_masked_page_scatter(pool, scratch, block_ids, row_status)
     _execute_masked_page_scatter_(pool, scratch, block_ids, row_status)
+
+
+# Experimental A100 lane only: scalar qualification does not qualify this
+# new kernel. Promotion requires the separate real SM80 correctness, warmup
+# and complete-transaction gates; this isolated candidate is not a default
+# production selection and makes no claim for any other capability.
+_GROUPED_EXPERIMENTAL_CAPABILITIES: Final = frozenset(((8, 0),))
+_GROUPED_OP_NAME: Final = "nemotron_asr_grouped_page_scatter_"
+_GROUPED_OP_REGISTERED = False
+_GROUPED_WARMED_SPECIALIZATIONS: set[tuple[object, ...]] = set()
+
+
+class PreparedScatterGroup:
+    """Transaction-owned tensor arguments; never a shape-keyed pointer cache."""
+
+    def __init__(
+        self,
+        pools: list[torch.Tensor],
+        scratches: list[torch.Tensor],
+        blocks: torch.Tensor,
+        row_status: torch.Tensor,
+    ) -> None:
+        self.pools = pools
+        self.scratches = scratches
+        self.blocks = blocks
+        self.row_status = row_status
+        self.count = len(pools)
+
+
+if triton is not None and tl is not None:
+
+    @triton.jit(  # type: ignore[untyped-decorator]
+        do_not_specialize=["pools", "scratches", "block_ids", "row_status"],
+        do_not_specialize_on_alignment=["pools", "scratches", "block_ids", "row_status"],
+    )
+    def _grouped_page_scatter_kernel(  # type: ignore[no-untyped-def]
+        pools,
+        scratches,
+        block_ids,
+        row_status,
+        page_numel: tl.constexpr,
+        pool_stride_0: tl.constexpr,
+        scratch_stride_0: tl.constexpr,
+        block_size: tl.constexpr,
+        layers: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        tile = tl.program_id(1).to(tl.int64)
+        layer = tl.program_id(2)
+        status = tl.load(row_status + row)
+        if status != 0:
+            return
+        block = tl.load(block_ids + row).to(tl.int64)
+        offsets = tile * block_size + tl.arange(0, block_size).to(tl.int64)
+        mask = offsets < page_numel
+        for index in tl.static_range(layers):
+            if layer == index:
+                source = tl.load(scratches[index] + row * scratch_stride_0 + offsets, mask=mask)
+                tl.store(pools[index] + block * pool_stride_0 + offsets, source, mask=mask)
+
+
+def _page_intervals_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Conservative byte overlap, exact for equal-stride padded page views.
+
+    We prove all pages disjoint, stronger than just the current live pages,
+    without reading block ids. Tensor data_ptr includes its storage offset.
+    """
+    if left.device != right.device:
+        return False
+    return _intervals_overlap(_page_intervals(left), _page_intervals(right))
+
+
+def _page_intervals(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+    return (
+        tensor.data_ptr(),
+        _page_numel(tensor) * tensor.element_size(),
+        tensor.stride(0) * tensor.element_size(),
+        int(tensor.shape[0]),
+    )
+
+
+def _intervals_overlap(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> bool:
+    a, aw, astep, an = left
+    b, bw, bstep, bn = right
+    if an == 0 or bn == 0:
+        return False
+    if a + (an - 1) * astep + aw <= b or b + (bn - 1) * bstep + bw <= a:
+        return False
+    if astep != bstep:
+        return True  # Unsupported interleaving: retain ordered scalar semantics.
+    # Difference in page starts is b-a + (j-i)*step. An overlap exists
+    # precisely when -bw < difference < aw for an attainable j-i.
+    delta = b - a
+    low = max(-(an - 1), (-bw - delta) // astep + 1)
+    high = min(bn - 1, (aw - 1 - delta) // astep)
+    return low <= high
+
+
+def _group_layout_supported(pools: list[torch.Tensor], scratches: list[torch.Tensor]) -> bool:
+    if not 2 <= len(pools) <= 24 or len(pools) != len(scratches):
+        return False
+    pool, scratch = pools[0], scratches[0]
+    for p, s in zip(pools, scratches, strict=True):
+        if (
+            p.shape != pool.shape
+            or p.stride() != pool.stride()
+            or s.shape != scratch.shape
+            or s.stride() != scratch.stride()
+            or p.dtype != pool.dtype
+            or s.dtype != pool.dtype
+            or p.device != pool.device
+            or s.device != pool.device
+            or not _canonical_inner_layout(p)
+            or not _canonical_inner_layout(s)
+        ):
+            return False
+    destinations = [_page_intervals(p) for p in pools]
+    sources = [_page_intervals(s) for s in scratches]
+    for index, destination in enumerate(destinations):
+        if any(_intervals_overlap(destination, other) for other in destinations[index + 1 :]):
+            return False
+        if any(_intervals_overlap(destination, source) for source in sources):
+            return False
+    return True
+
+
+def _grouped_specialization(pools: list[torch.Tensor], scratches: list[torch.Tensor]) -> tuple[object, ...]:
+    # No pointer values or alignment classes: the kernel disables pointer
+    # specialization recursively, including every element of the tuples.
+    return (len(pools), tuple(pools[0].shape[1:]), *_cuda_specialization(pools[0], scratches[0]))
+
+
+def _cuda_grouped_scatter(
+    pools: list[torch.Tensor],
+    scratches: list[torch.Tensor],
+    block_ids: torch.Tensor,
+    row_status: torch.Tensor,
+) -> None:
+    assert triton is not None
+    rows = int(scratches[0].shape[0])
+    if rows == 0:
+        return
+    page_numel = _page_numel(pools[0])
+    block_size, num_warps = _launch_config(page_numel)
+    _grouped_page_scatter_kernel[(rows, triton.cdiv(page_numel, block_size), len(pools))](
+        tuple(pools),
+        tuple(scratches),
+        block_ids,
+        row_status,
+        page_numel=page_numel,
+        pool_stride_0=pools[0].stride(0),
+        scratch_stride_0=scratches[0].stride(0),
+        block_size=block_size,
+        layers=len(pools),
+        num_warps=num_warps,
+    )
+
+
+def _fake_grouped_scatter(
+    pools: list[torch.Tensor],
+    scratches: list[torch.Tensor],
+    block_ids: torch.Tensor,
+    row_status: torch.Tensor,
+) -> None:
+    del pools, scratches, block_ids, row_status
+
+
+def _ensure_grouped_op_registered() -> None:
+    global _GROUPED_OP_REGISTERED
+    if _GROUPED_OP_REGISTERED:
+        return
+    with _REGISTRATION_LOCK:
+        if _GROUPED_OP_REGISTERED:
+            return
+        if not hasattr(torch.ops.vllm, _GROUPED_OP_NAME):
+            from vllm.utils.torch_utils import direct_register_custom_op
+
+            direct_register_custom_op(
+                op_name=_GROUPED_OP_NAME,
+                op_func=_cuda_grouped_scatter,
+                mutates_args=["pools"],
+                fake_impl=_fake_grouped_scatter,
+            )
+        _GROUPED_OP_REGISTERED = True
+
+
+# @spec PORT-PERF-001, PORT-STATE-008
+def warmup_grouped_page_scatter(pools: list[torch.Tensor], scratches: list[torch.Tensor]) -> None:
+    """Compile the actual pool layout with dirty rows before readiness.
+
+    Only the isolated experimental SM80 lane is warmed. Compilation is not
+    hardware qualification: correctness and transaction gates remain required.
+    """
+    if not pools or pools[0].device.type != "cuda":
+        return
+    if torch.cuda.get_device_capability(pools[0].device) != (8, 0):
+        return
+    if not _group_layout_supported(pools, scratches):
+        return
+    blocks = torch.full((int(scratches[0].shape[0]),), -1, dtype=torch.int64, device=pools[0].device)
+    status = torch.ones_like(blocks, dtype=torch.int32)
+    for pool, scratch in zip(pools, scratches, strict=True):
+        _validate_masked_page_scatter(pool, scratch, blocks, status, require_cuda_warmup=False)
+    _ensure_grouped_op_registered()
+    signature = _grouped_specialization(pools, scratches)
+    with _WARMUP_LOCK:
+        if signature not in _GROUPED_WARMED_SPECIALIZATIONS:
+            _cuda_grouped_scatter(pools, scratches, blocks, status)
+            torch.accelerator.synchronize(pools[0].device)
+            _GROUPED_WARMED_SPECIALIZATIONS.add(signature)
+
+
+# @spec PORT-STATE-008
+def prepare_grouped_page_scatter(
+    pools: list[torch.Tensor],
+    scratches: list[torch.Tensor],
+    blocks: torch.Tensor,
+    row_status: torch.Tensor,
+) -> PreparedScatterGroup | None:
+    """Prepare already-validated descriptors before reservation; None is scalar.
+
+    No binding is cached. Grouping only replaces consecutive descriptors so
+    dependencies on earlier/later families preserve their original ordering.
+    """
+    if not pools or pools[0].device.type != "cuda":
+        return None
+    if torch.cuda.get_device_capability(pools[0].device) not in _GROUPED_EXPERIMENTAL_CAPABILITIES:
+        return None
+    if not _group_layout_supported(pools, scratches):
+        return None
+    if any(_page_intervals_overlap(pool, control) for pool in pools for control in (blocks, row_status)):
+        return None
+    if _grouped_specialization(pools, scratches) not in _GROUPED_WARMED_SPECIALIZATIONS:
+        raise ValueError("grouped scatter specialization was not warmed before serving")
+    if not _GROUPED_OP_REGISTERED:
+        raise ValueError("grouped scatter operation was not registered before serving")
+    group = PreparedScatterGroup(pools, scratches, blocks, row_status)
+    stream = torch.cuda.current_stream(pools[0].device)
+    for tensor in (*pools, *scratches, blocks, row_status):
+        tensor.record_stream(stream)
+    return group
+
+
+def _execute_grouped_page_scatter_(group: PreparedScatterGroup) -> None:
+    """Launch prepared tensor owners without validation, allocation or JIT."""
+    torch.ops.vllm.nemotron_asr_grouped_page_scatter_(group.pools, group.scratches, group.blocks, group.row_status)
