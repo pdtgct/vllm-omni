@@ -63,6 +63,7 @@ def test_cpu_dtype_and_grad_contexts_keep_module_calls():
         "grad",
         "double",
         "autocast",
+        "compiling",
         "global_hook",
     ],
 )
@@ -114,7 +115,11 @@ def test_cuda_stream_pointwise_matches_original_calls(custom, site, batch):
         handles.append(module.register_forward_hook(lambda *args: None))
     params = {name: (id(value), value.data_ptr(), value.clone()) for name, value in layer.named_parameters()}
     try:
-        with torch.set_grad_enabled(custom == "grad"), torch.autocast("cuda", enabled=custom == "autocast"):
+        with (
+            torch.set_grad_enabled(custom == "grad"),
+            torch.autocast("cuda", enabled=custom == "autocast"),
+            patch("torch.compiler.is_compiling", return_value=custom == "compiling"),
+        ):
             assert _stream_pointwise_linear(pointwise, x) is (custom == "none" and batch <= 2)
             actual, updated = _stream_conv(layer, x, cache, new_lengths=lengths)
             expected, expected_cache = _stream_conv(original, x, cache, new_lengths=lengths)
