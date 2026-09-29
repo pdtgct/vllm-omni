@@ -531,3 +531,112 @@ def test_stale_forced_generation_is_ignored_and_preserves_book() -> None:
 
     assert ignored is None
     assert book == before
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("rows", [1, 2, 7])
+@pytest.mark.parametrize("frame_width", [0, 2, 5])
+@pytest.mark.parametrize("book_dtype", [torch.int32, torch.int64, torch.float32])
+def test_disabled_tensor_observer_matches_generic_and_owns_every_output(rows, frame_width, book_dtype, device):
+    # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007, PORT-DEC-005
+    module = _module()
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    generator = torch.Generator().manual_seed(29)
+    for case in range(12):
+        history = torch.randint(0, 3, (rows, 12), generator=generator, dtype=torch.int32)
+        book = torch.tensor([[-3, 19, -7, 23, 4, 99]], dtype=book_dtype).repeat(rows, 1)
+        if book_dtype == torch.float32:
+            book += 0.75  # Preserve generic long->dtype roundtrips, including field 3.
+        if case % 3 != 1:
+            book[:, 2] = 0
+            book[:, 4] = 0
+        if case == 0:
+            book.zero_()
+        counts = torch.randint(-1, 4, (rows, frame_width), generator=generator, dtype=torch.int32)
+        lengths = torch.arange(rows, dtype=torch.int64) % (frame_width + 2) - 1
+        if case < 8:
+            lengths.fill_(frame_width)
+        threshold, residue = ((0, 0), (12, 0), (13, 0), (-1, 0), (0, -1), (2**63 - 1, 1))[case % 6]
+        kwargs = dict(
+            history=history,
+            book=book,
+            frame_emission_counts=counts,
+            valid_frame_lengths=lengths,
+            token_ids=torch.arange(rows * 3, dtype=torch.int32).reshape(rows, 3),
+            token_lengths=torch.arange(rows, dtype=torch.int32) - 1,
+            final_tail=torch.full((rows,), case == 6, dtype=torch.bool),
+            mode=torch.zeros(rows, dtype=torch.int64),
+            threshold_frames=torch.full((rows,), threshold, dtype=torch.int64),
+            residue_frames=torch.full((rows,), residue, dtype=torch.int64),
+            eou_token_id=999,
+            row_clean=torch.full((rows,), case != 7, dtype=torch.bool),
+        )
+        if case == 8:
+            kwargs["row_clean"][::2] = False
+            kwargs["final_tail"][1::2] = True
+        if case == 9:
+            kwargs["token_ids"] = torch.zeros(rows, 0, dtype=torch.int64)
+        kwargs = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in kwargs.items()}
+        before = {key: value.clone() for key, value in kwargs.items() if isinstance(value, torch.Tensor)}
+        expected = module.observe_chunk_tensors(**kwargs)
+        actual = module.observe_disabled_chunk_tensors(**kwargs)
+        for name in ("history", "book", "token_ids", "token_lengths", "is_eou", "overflow"):
+            output = getattr(actual, name)
+            torch.testing.assert_close(output, getattr(expected, name), atol=0, rtol=0)
+            if output.numel():
+                assert all(
+                    output.untyped_storage().data_ptr() != value.untyped_storage().data_ptr()
+                    for value in before.values()
+                    if value.numel()
+                )
+                assert all(
+                    output.untyped_storage().data_ptr() != value.untyped_storage().data_ptr()
+                    for value in kwargs.values()
+                    if isinstance(value, torch.Tensor) and value.numel()
+                )
+        for key, value in before.items():
+            torch.testing.assert_close(kwargs[key], value, atol=0, rtol=0)
+        held = {name: getattr(actual, name).clone() for name in vars(actual)}
+        module.observe_disabled_chunk_tensors(**kwargs)
+        for name, value in held.items():
+            torch.testing.assert_close(getattr(actual, name), value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "history",
+        "book",
+        "frame_emission_counts",
+        "valid_frame_lengths",
+        "token_ids",
+        "token_lengths",
+        "final_tail",
+        "mode",
+        "threshold_frames",
+        "residue_frames",
+        "row_clean",
+    ],
+)
+def test_disabled_tensor_observer_keeps_generic_shape_rejection(field):
+    # @spec PORT-SEG-002, PORT-SEG-007
+    module = _module()
+    kwargs = dict(
+        history=torch.zeros(2, 12, dtype=torch.int32),
+        book=torch.zeros(2, 6, dtype=torch.int32),
+        frame_emission_counts=torch.zeros(2, 2, dtype=torch.int32),
+        valid_frame_lengths=torch.zeros(2, dtype=torch.int64),
+        token_ids=torch.zeros(2, 3, dtype=torch.int32),
+        token_lengths=torch.zeros(2, dtype=torch.int32),
+        final_tail=torch.zeros(2, dtype=torch.bool),
+        mode=torch.zeros(2, dtype=torch.int64),
+        threshold_frames=torch.zeros(2, dtype=torch.int64),
+        residue_frames=torch.zeros(2, dtype=torch.int64),
+        eou_token_id=999,
+        row_clean=torch.ones(2, dtype=torch.bool),
+    )
+    kwargs[field] = torch.zeros(3) if field in ("history", "book") else kwargs[field][:1]
+    for observe in (module.observe_chunk_tensors, module.observe_disabled_chunk_tensors):
+        with pytest.raises(ValueError):
+            observe(**kwargs)

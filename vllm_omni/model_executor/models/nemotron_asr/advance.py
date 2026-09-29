@@ -2933,13 +2933,20 @@ def advance_model_rows(
         if endpoint_enabled:
             from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
                 observe_chunk_tensors,
+                observe_disabled_chunk_tensors,
             )
 
             if result.frame_emission_counts is None or result.frame_valid_lengths is None:
                 raise ValueError("selected decode arm does not expose frame-aligned endpoint symbols")
             assert endpoint_history is not None
             assert endpoint_book is not None
-            endpoint_transition = observe_chunk_tensors(
+            # Policy is validated CPU RowPlan metadata. Select using the actual
+            # bucket and upload that same vector, without reading device values.
+            bucket_mode_cpu = endpoint_mode_cpu.index_select(0, pos_t)
+            observe_endpoint = (
+                observe_disabled_chunk_tensors if bool((bucket_mode_cpu == 0).all()) else observe_chunk_tensors
+            )
+            endpoint_transition = observe_endpoint(
                 history=endpoint_history.index_select(0, rows_dev),
                 book=endpoint_book.index_select(0, rows_dev),
                 frame_emission_counts=result.frame_emission_counts,
@@ -2947,7 +2954,7 @@ def advance_model_rows(
                 token_ids=result.token_ids,
                 token_lengths=result.token_lengths,
                 final_tail=batch.final_tail.to(device),
-                mode=_h2d(endpoint_mode_cpu.index_select(0, pos_t), device),
+                mode=_h2d(bucket_mode_cpu, device),
                 threshold_frames=_h2d(endpoint_threshold_cpu.index_select(0, pos_t), device),
                 residue_frames=_h2d(endpoint_residue_cpu.index_select(0, pos_t), device),
                 eou_token_id=int(eou_token_id),

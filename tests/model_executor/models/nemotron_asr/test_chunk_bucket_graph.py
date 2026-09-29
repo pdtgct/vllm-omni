@@ -362,7 +362,8 @@ def test_full_turn_timing_fixture_uses_valid_checkpoint():
 
 
 @torch.inference_mode()
-def test_endpoint_overflow_masks_only_delta_predicate(monkeypatch):
+@pytest.mark.parametrize("mode", [0, 1])
+def test_endpoint_overflow_masks_only_delta_predicate(monkeypatch, mode):
     from dataclasses import replace
 
     from vllm_omni.model_executor.models.nemotron_asr import endpointing
@@ -384,18 +385,21 @@ def test_endpoint_overflow_masks_only_delta_predicate(monkeypatch):
             bucket, counter_invariant_bad=invariant, counter_delta_bad=torch.ones_like(bucket.counter_delta_bad)
         )
 
-    monkeypatch.setattr(endpointing, "observe_chunk_tensors", overflow)
+    monkeypatch.setattr(endpointing, "observe_chunk_tensors" if mode else "observe_disabled_chunk_tensors", overflow)
     pools = _fresh_pools(33)
+    pools["endpoint_history_pool"] = torch.full((33, 8), 2, dtype=torch.int32)
+    pools["endpoint_book_pool"] = torch.full((33, 6), 7, dtype=torch.int32)
     before = _clone_pools(pools)
     sink = _CommitRecorder()
     advance.advance_model_rows(
         core,
         torch.full((32,), PLACEHOLDER_ID, dtype=torch.long),
         env,
-        _plan(prefills=list(range(1, 33)), num_pool_blocks=33, geometries=[1] * 32),
+        replace(
+            _plan(prefills=list(range(1, 33)), num_pool_blocks=33, geometries=[1] * 32),
+            endpoint_mode=torch.full((32,), mode, dtype=torch.int64),
+        ),
         **pools,
-        endpoint_history_pool=torch.zeros(33, 8, dtype=torch.int32),
-        endpoint_book_pool=torch.zeros(33, 6, dtype=torch.int32),
         eou_token_id=core.blank_id + 3,
         adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
         decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
@@ -579,3 +583,77 @@ def _run_chunk_native_handoff(population, *, device="cpu", runtime=None, vllm_co
 @pytest.mark.parametrize("population", [1, 31, 63])
 def test_chunk_native_handoff_matches_replay_through_population_changes(population):
     _run_chunk_native_handoff(population)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "modes,geometries,expected_calls",
+    [
+        ([0], [1], [("disabled", 1)]),
+        ([0, 0], [1, 1], [("disabled", 2)]),
+        ([1, 1], [1, 1], [("generic", 2)]),
+        ([0, 1], [1, 1], [("generic", 2)]),
+        ([1, 0, 0], [0, 1, 1], [("generic", 1), ("disabled", 2)]),
+    ],
+)
+def test_endpoint_selection_uses_actual_cpu_bucket_and_preserves_atomic_pools(
+    monkeypatch, modes, geometries, expected_calls
+):
+    # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
+    from dataclasses import replace
+
+    from vllm_omni.model_executor.models.nemotron_asr import endpointing
+
+    population = len(modes)
+    core = _tiny_core(seed=29)
+    env = torch.stack(
+        [
+            _envelope(torch.randn(1280 if geometry == 0 else 2560), final=False, seq=0, geometry=geometry)
+            for geometry in geometries
+        ]
+    )
+    pools = _fresh_pools(population + 1)
+    pools["endpoint_history_pool"] = torch.zeros(population + 1, 12, dtype=torch.int32)
+    pools["endpoint_book_pool"] = torch.zeros(population + 1, 6, dtype=torch.int32)
+    reference_pools = _clone_pools(pools)
+    plan = replace(
+        _plan(prefills=list(range(1, population + 1)), num_pool_blocks=population + 1, geometries=geometries),
+        endpoint_mode=torch.tensor(modes, dtype=torch.int64),
+    )
+    generic = endpointing.observe_chunk_tensors
+    disabled = endpointing.observe_disabled_chunk_tensors
+    calls = []
+
+    def checked(which, fn, **kwargs):
+        calls.append((which, kwargs["mode"].numel()))
+        if which == "disabled":
+            assert torch.all(kwargs["mode"] == 0)
+        before = {key: value.clone() for key, value in kwargs.items() if isinstance(value, torch.Tensor)}
+        actual, expected = fn(**kwargs), generic(**kwargs)
+        for name in vars(actual):
+            torch.testing.assert_close(getattr(actual, name), getattr(expected, name), atol=0, rtol=0)
+        for key, value in before.items():
+            torch.testing.assert_close(kwargs[key], value, atol=0, rtol=0)
+        return actual
+
+    monkeypatch.setattr(
+        endpointing, "observe_disabled_chunk_tensors", lambda **kwargs: checked("disabled", disabled, **kwargs)
+    )
+    monkeypatch.setattr(endpointing, "observe_chunk_tensors", lambda **kwargs: checked("generic", generic, **kwargs))
+    kwargs = dict(
+        eou_token_id=core.blank_id + 3,
+        adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
+        decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+    )
+    ids = torch.full((population,), PLACEHOLDER_ID, dtype=torch.long)
+    sink, reference_sink = _CommitRecorder(), _CommitRecorder()
+    actual = advance.advance_model_rows(core, ids, env, plan, **pools, **kwargs, commit_sink=sink)
+    assert calls == expected_calls
+    monkeypatch.setattr(endpointing, "observe_disabled_chunk_tensors", generic)
+    monkeypatch.setattr(endpointing, "observe_chunk_tensors", generic)
+    expected = advance.advance_model_rows(core, ids, env, plan, **reference_pools, **kwargs, commit_sink=reference_sink)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(sink.staged[0], reference_sink.staged[0], atol=0, rtol=0)
+    _assert_pools_equal(pools, reference_pools)

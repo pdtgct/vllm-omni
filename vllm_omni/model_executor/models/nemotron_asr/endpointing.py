@@ -231,6 +231,83 @@ def apply_forced_eou_tensors(
 
 
 # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
+def observe_disabled_chunk_tensors(
+    *,
+    history: torch.Tensor,
+    book: torch.Tensor,
+    frame_emission_counts: torch.Tensor,
+    valid_frame_lengths: torch.Tensor,
+    token_ids: torch.Tensor,
+    token_lengths: torch.Tensor,
+    final_tail: torch.Tensor,
+    mode: torch.Tensor,
+    threshold_frames: torch.Tensor,
+    residue_frames: torch.Tensor,
+    eou_token_id: int,
+    row_clean: torch.Tensor,
+) -> TensorEndpointTransition:
+    """Internal specialization for a validated all-disabled CHUNK bucket.
+
+    Only the CPU RowPlan bucket selector in ``advance_model_rows`` selects
+    this path; it uploads the same all-zero mode vector passed here. Keep
+    standalone, mixed and enabled calls on :func:`observe_chunk_tensors`.
+    Disabled endpointing still tracks segment output for a later forced EOU.
+    """
+
+    if history.dim() != 2 or book.dim() != 2 or book.shape[1] != 6:
+        raise ValueError("endpoint resident tensors have invalid shape")
+    rows, capacity = history.shape
+    frame_rows, frame_width = frame_emission_counts.shape
+    if frame_rows != rows or tuple(valid_frame_lengths.shape) != (rows,):
+        raise ValueError("endpoint frame tensors have invalid shape")
+    if tuple(token_lengths.shape) != (rows,) or token_ids.shape[0] != rows:
+        raise ValueError("endpoint token tensors have invalid shape")
+    if any(
+        tuple(value.shape) != (rows,)
+        for value in (
+            final_tail,
+            mode,
+            threshold_frames,
+            residue_frames,
+            row_clean,
+        )
+    ):
+        raise ValueError("endpoint policy tensors have invalid shape")
+
+    valid_policy = (
+        ((mode == 0) | (mode == 1))
+        & (threshold_frames >= 0)
+        & (residue_frames >= 0)
+        & (threshold_frames + residue_frames <= capacity)
+    )
+    frames = torch.arange(frame_width, device=frame_emission_counts.device)
+    observed_output = ((frames.unsqueeze(0) < valid_frame_lengths.unsqueeze(1)) & (frame_emission_counts > 0)).any(
+        dim=1
+    ) & (row_clean & ~final_tail & valid_policy)
+
+    next_book = book.clone()
+    # Retain the generic observer's integer roundtrip and flag normalization,
+    # including noncanonical resident values. Slot five is untouched.
+    next_book[:, 0] = next_book[:, 0].long().to(next_book.dtype)
+    next_book[:, 1] = next_book[:, 1].long().to(next_book.dtype)
+    next_book[:, 2] = ((next_book[:, 2] != 0) | observed_output).to(next_book.dtype)
+    next_book[:, 3] = next_book[:, 3].long().to(next_book.dtype)
+    next_book[:, 4] = ((next_book[:, 4] != 0) | observed_output).to(next_book.dtype)
+    label_width = int(token_ids.shape[1])
+    next_tokens = torch.zeros(rows, label_width + 1, dtype=token_ids.dtype, device=token_ids.device)
+    if label_width:
+        next_tokens[:, :label_width] = token_ids
+    return TensorEndpointTransition(
+        history=history.clone(),
+        book=next_book,
+        token_ids=next_tokens,
+        token_lengths=token_lengths.clone(),
+        is_eou=torch.zeros(rows, dtype=torch.bool, device=history.device),
+        overflow=~valid_policy,
+    )
+
+
+# @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
 def observe_chunk_tensors(
     *,
     history: torch.Tensor,
