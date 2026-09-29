@@ -121,7 +121,12 @@ def test_cuda_stream_pointwise_matches_original_calls(custom, site):
         torch.testing.assert_close(updated, expected_cache, atol=5e-5, rtol=5e-5)
         assert actual.shape == expected.shape
         assert actual.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
-        assert torch.equal(updated[0], cache[0])
+        if custom == "autocast":
+            # The original path casts cache through the autocast compute dtype;
+            # fallback must preserve that result, including its rounding.
+            assert torch.equal(updated, expected_cache)
+        else:
+            assert torch.equal(updated[0], cache[0])
         for name, value in layer.named_parameters():
             identity, pointer, before = params[name]
             assert (id(value), value.data_ptr()) == (identity, pointer)
