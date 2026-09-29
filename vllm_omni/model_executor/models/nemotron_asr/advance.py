@@ -1056,6 +1056,252 @@ def _mrv1_projection_invariant_rows(
     return bad
 
 
+def _validate_emission_projection(
+    projection: EmissionProjection,
+    context: EmissionContext,
+    *,
+    hidden: int,
+    rows_dtype: torch.dtype,
+) -> None:
+    """Host metadata boundary, including every graph replay before commit."""
+    queue, book = context.queue, context.book
+    n_real, device = int(context.roles.shape[0]), queue.device
+    # ---- every conversion + shape/dtype validation, pre-commit ----
+    if (
+        tuple(projection.rows.shape) != (n_real, hidden)
+        or projection.rows.dtype != rows_dtype
+        or projection.rows.device != device
+        or not projection.rows.is_contiguous()
+    ):
+        raise ValueError(
+            "adapter returned rows shaped "
+            f"{tuple(projection.rows.shape)}/{projection.rows.dtype}, "
+            f"expected {(n_real, hidden)}/{rows_dtype}"
+        )
+    if (
+        tuple(projection.queue.shape) != tuple(queue.shape)
+        or projection.queue.dtype != queue.dtype
+        or projection.queue.device != device
+        or tuple(projection.book.shape) != tuple(book.shape)
+        or projection.book.dtype != book.dtype
+        or projection.book.device != device
+    ):
+        raise ValueError("adapter returned queue/book scratch with a different shape or dtype than the resident pools")
+    if (
+        projection.row_status.device != device
+        or projection.row_status.dtype != torch.int32
+        or tuple(projection.row_status.shape) != (n_real,)
+        or not projection.row_status.is_contiguous()
+    ):
+        raise ValueError("adapter row_status must be device-local int32 shaped (N,)")
+
+
+def _project_and_validate_emission(
+    merged: AdvanceResult,
+    context: EmissionContext,
+    *,
+    adapter: EmissionAdapter,
+    hidden: int,
+    rows_dtype: torch.dtype,
+    park_id: int,
+    blank_id: int,
+    plan_geometry: torch.Tensor,
+    endpoint_book: torch.Tensor | None = None,
+    eou_token_id: int | None = None,
+) -> tuple[EmissionProjection, torch.Tensor, torch.Tensor | None]:
+    """Pure shared emission transaction; inputs remain the independent oracle.
+
+    No resident mutation, reservation, output publication or native finalization
+    belongs here. Graph replay uses this same algebra and owns escaped results.
+    """
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    roles, queue = context.roles, context.queue
+    status = context.row_status
+    admitted_prompt_dev, plan_geom_dev = context.prompt_index, plan_geometry
+    cap = queue.shape[1]
+    device, blank = queue.device, blank_id
+    endpoint_enabled = endpoint_book is not None
+    slot = torch.arange(cap, device=device).unsqueeze(0)
+    # The adapter is an extension seam, not transaction authority. Give it
+    # independent writable snapshots and retain ``merged``/``context`` as the
+    # immutable semantic oracle. Otherwise an in-place adapter could clear a
+    # status bit or rewrite replay/FLUSH scratch before validation.
+    adapter_result = AdvanceResult(
+        token_ids=merged.token_ids.clone(),
+        token_lengths=merged.token_lengths.clone(),
+        row_status=merged.row_status.clone() if merged.row_status is not None else None,
+    )
+    adapter_context = EmissionContext(
+        roles=context.roles.clone(),
+        input_ids=context.input_ids.clone(),
+        chunk_rows=context.chunk_rows.clone(),
+        queue=context.queue.clone(),
+        book=context.book.clone(),
+        prompt_index=context.prompt_index.clone(),
+        row_status=context.row_status.clone(),
+    )
+    projection = adapter(adapter_result, adapter_context)
+
+    # Forced endpoint is a model control, not an acoustic CHUNK and not a
+    # final FLUSH.  It is admitted only on a drained live session above.
+    # Resolve its endpoint book and one-token replay transaction here so
+    # both books join the outer transaction's single atomic scatter.
+    if endpoint_enabled:
+        from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
+            apply_forced_eou_tensors,
+        )
+
+        assert endpoint_book is not None
+        assert eou_token_id is not None
+        forced_clean = (roles == ROLE_EOU) & (projection.row_status == 0)
+        forced_transition = apply_forced_eou_tensors(
+            book=endpoint_book,
+            selected_rows=forced_clean,
+        )
+        endpoint_book = forced_transition.book
+        emit_eou = forced_transition.is_eou
+        if cap <= 0:
+            raise ValueError("forced endpoint requires a replay queue slot")
+
+        forced_queue = torch.zeros_like(projection.queue)
+        forced_queue[:, 0] = torch.where(
+            emit_eou,
+            torch.full_like(forced_queue[:, 0], int(eou_token_id)),
+            forced_queue[:, 0],
+        )
+        queue_out = torch.where(
+            forced_clean.unsqueeze(1),
+            forced_queue,
+            projection.queue,
+        )
+        book_out = projection.book.clone()
+        book_out[:, QUEUE_HEAD] = torch.where(
+            forced_clean,
+            emit_eou.to(book_out.dtype),
+            book_out[:, QUEUE_HEAD],
+        )
+        book_out[:, QUEUE_LEN] = torch.where(
+            forced_clean,
+            emit_eou.to(book_out.dtype),
+            book_out[:, QUEUE_LEN],
+        )
+        book_out[:, BOOK_PENDING_ECHO] = torch.where(
+            forced_clean,
+            emit_eou.to(book_out.dtype),
+            book_out[:, BOOK_PENDING_ECHO],
+        )
+        book_out[:, BOOK_EXPECTED_LABEL] = torch.where(
+            forced_clean,
+            torch.where(
+                emit_eou,
+                torch.full_like(book_out[:, BOOK_EXPECTED_LABEL], int(eou_token_id)),
+                torch.zeros_like(book_out[:, BOOK_EXPECTED_LABEL]),
+            ),
+            book_out[:, BOOK_EXPECTED_LABEL],
+        )
+        rows_out = projection.rows.clone()
+        if hidden:
+            rows_out[:, 0] = torch.where(
+                forced_clean,
+                torch.where(
+                    emit_eou,
+                    torch.full_like(rows_out[:, 0], int(eou_token_id)),
+                    torch.full_like(rows_out[:, 0], park_id),
+                ),
+                rows_out[:, 0],
+            )
+        projection = EmissionProjection(
+            rows=rows_out,
+            queue=queue_out,
+            book=book_out,
+            row_status=projection.row_status,
+        )
+
+    _validate_emission_projection(projection, context, hidden=hidden, rows_dtype=rows_dtype)
+
+    # Validate the adapter's proposed persistent book before it can
+    # become resident. Any defect is a row-tier masked park/no-store.
+    pbook = projection.book
+    phead = pbook[:, QUEUE_HEAD].long()
+    plen = pbook[:, QUEUE_LEN].long()
+    ppend_col = pbook[:, BOOK_PENDING_ECHO]
+    ppend = ppend_col == 1
+    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
+    plast = pbook[:, QUEUE_LAST_LABEL].long()
+    premaining = plen - phead
+    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        proposed_queue_value_valid |= projection.queue == int(eou_token_id)
+    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
+    proposed_prior_emitted = (
+        projection.queue.gather(
+            1,
+            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_queue_last = (
+        projection.queue.gather(
+            1,
+            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_tail_is_eou = torch.zeros_like(ppend)
+    proposed_expected_is_eou = torch.zeros_like(ppend)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
+        proposed_expected_is_eou = pexpected == int(eou_token_id)
+    proposed_bad = (
+        (phead < 0)
+        | (phead > plen)
+        | (plen > cap)
+        | ((ppend_col != 0) & (ppend_col != 1))
+        | (plast < 0)
+        | (plast > blank)
+        | (pexpected < 0)
+        | ((pexpected > blank) & (~proposed_expected_is_eou))
+        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
+        | proposed_queued_bad
+        | (ppend & (phead < 1))
+        | (ppend & (pexpected != proposed_prior_emitted))
+        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
+        | ((premaining > 0) & (~ppend))
+        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
+        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
+    )
+    incoming_adapter_status = status
+    lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
+    status = incoming_adapter_status | projection.row_status
+    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+    projection_bad = _mrv1_projection_invariant_rows(
+        merged,
+        context,
+        projection,
+        status,
+        park_id=park_id,
+        blank_id=blank,
+        eou_token_id=eou_token_id if endpoint_enabled else None,
+    )
+    status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    return projection, status, endpoint_book
+
+
 # @spec PORT-ADV-001, PORT-ADV-004
 def advance_session(
     core: NemotronASRCore,
@@ -2418,6 +2664,7 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    emission_binding: Any | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -3050,201 +3297,21 @@ def advance_model_rows(
         prompt_index=admitted_prompt_dev,
         row_status=status,
     )
-    # The adapter is an extension seam, not transaction authority. Give it
-    # independent writable snapshots and retain ``merged``/``context`` as the
-    # immutable semantic oracle. Otherwise an in-place adapter could clear a
-    # status bit or rewrite replay/FLUSH scratch before validation.
-    adapter_result = AdvanceResult(
-        token_ids=merged.token_ids.clone(),
-        token_lengths=merged.token_lengths.clone(),
-        row_status=merged.row_status.clone() if merged.row_status is not None else None,
-    )
-    adapter_context = EmissionContext(
-        roles=context.roles.clone(),
-        input_ids=context.input_ids.clone(),
-        chunk_rows=context.chunk_rows.clone(),
-        queue=context.queue.clone(),
-        book=context.book.clone(),
-        prompt_index=context.prompt_index.clone(),
-        row_status=context.row_status.clone(),
-    )
-    projection = adapter(adapter_result, adapter_context)
-
-    # Forced endpoint is a model control, not an acoustic CHUNK and not a
-    # final FLUSH.  It is admitted only on a drained live session above.
-    # Resolve its endpoint book and one-token replay transaction here so
-    # both books join the outer transaction's single atomic scatter.
-    if endpoint_enabled:
-        from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
-            apply_forced_eou_tensors,
-        )
-
-        assert endpoint_book is not None
-        assert eou_token_id is not None
-        forced_clean = (roles == ROLE_EOU) & (projection.row_status == 0)
-        forced_transition = apply_forced_eou_tensors(
-            book=endpoint_book,
-            selected_rows=forced_clean,
-        )
-        endpoint_book = forced_transition.book
-        emit_eou = forced_transition.is_eou
-        if cap <= 0:
-            raise ValueError("forced endpoint requires a replay queue slot")
-
-        forced_queue = torch.zeros_like(projection.queue)
-        forced_queue[:, 0] = torch.where(
-            emit_eou,
-            torch.full_like(forced_queue[:, 0], int(eou_token_id)),
-            forced_queue[:, 0],
-        )
-        queue_out = torch.where(
-            forced_clean.unsqueeze(1),
-            forced_queue,
-            projection.queue,
-        )
-        book_out = projection.book.clone()
-        book_out[:, QUEUE_HEAD] = torch.where(
-            forced_clean,
-            emit_eou.to(book_out.dtype),
-            book_out[:, QUEUE_HEAD],
-        )
-        book_out[:, QUEUE_LEN] = torch.where(
-            forced_clean,
-            emit_eou.to(book_out.dtype),
-            book_out[:, QUEUE_LEN],
-        )
-        book_out[:, BOOK_PENDING_ECHO] = torch.where(
-            forced_clean,
-            emit_eou.to(book_out.dtype),
-            book_out[:, BOOK_PENDING_ECHO],
-        )
-        book_out[:, BOOK_EXPECTED_LABEL] = torch.where(
-            forced_clean,
-            torch.where(
-                emit_eou,
-                torch.full_like(book_out[:, BOOK_EXPECTED_LABEL], int(eou_token_id)),
-                torch.zeros_like(book_out[:, BOOK_EXPECTED_LABEL]),
-            ),
-            book_out[:, BOOK_EXPECTED_LABEL],
-        )
-        rows_out = projection.rows.clone()
-        if hidden:
-            rows_out[:, 0] = torch.where(
-                forced_clean,
-                torch.where(
-                    emit_eou,
-                    torch.full_like(rows_out[:, 0], int(eou_token_id)),
-                    torch.full_like(rows_out[:, 0], park_id),
-                ),
-                rows_out[:, 0],
-            )
-        projection = EmissionProjection(
-            rows=rows_out,
-            queue=queue_out,
-            book=book_out,
-            row_status=projection.row_status,
-        )
-
-    # ---- every conversion + shape/dtype validation, pre-commit ----
-    if (
-        tuple(projection.rows.shape) != (n_real, hidden)
-        or projection.rows.dtype != inputs_embeds.dtype
-        or projection.rows.device != device
-        or not projection.rows.is_contiguous()
-    ):
-        raise ValueError(
-            "adapter returned rows shaped "
-            f"{tuple(projection.rows.shape)}/{projection.rows.dtype}, "
-            f"expected {(n_real, hidden)}/{inputs_embeds.dtype}"
-        )
-    if (
-        tuple(projection.queue.shape) != tuple(queue.shape)
-        or projection.queue.dtype != queue_pool.dtype
-        or projection.queue.device != device
-        or tuple(projection.book.shape) != tuple(book.shape)
-        or projection.book.dtype != book_pool.dtype
-        or projection.book.device != device
-    ):
-        raise ValueError("adapter returned queue/book scratch with a different shape or dtype than the resident pools")
-    if (
-        projection.row_status.device != device
-        or projection.row_status.dtype != torch.int32
-        or tuple(projection.row_status.shape) != (n_real,)
-        or not projection.row_status.is_contiguous()
-    ):
-        raise ValueError("adapter row_status must be device-local int32 shaped (N,)")
-
-    # Validate the adapter's proposed persistent book before it can
-    # become resident. Any defect is a row-tier masked park/no-store.
-    pbook = projection.book
-    phead = pbook[:, QUEUE_HEAD].long()
-    plen = pbook[:, QUEUE_LEN].long()
-    ppend_col = pbook[:, BOOK_PENDING_ECHO]
-    ppend = ppend_col == 1
-    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
-    plast = pbook[:, QUEUE_LAST_LABEL].long()
-    premaining = plen - phead
-    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_queue_value_valid |= projection.queue == int(eou_token_id)
-    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
-    proposed_prior_emitted = (
-        projection.queue.gather(
-            1,
-            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    proposed_queue_last = (
-        projection.queue.gather(
-            1,
-            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    proposed_tail_is_eou = torch.zeros_like(ppend)
-    proposed_expected_is_eou = torch.zeros_like(ppend)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
-        proposed_expected_is_eou = pexpected == int(eou_token_id)
-    proposed_bad = (
-        (phead < 0)
-        | (phead > plen)
-        | (plen > cap)
-        | ((ppend_col != 0) & (ppend_col != 1))
-        | (plast < 0)
-        | (plast > blank)
-        | (pexpected < 0)
-        | ((pexpected > blank) & (~proposed_expected_is_eou))
-        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
-        | proposed_queued_bad
-        | (ppend & (phead < 1))
-        | (ppend & (pexpected != proposed_prior_emitted))
-        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
-        | ((premaining > 0) & (~ppend))
-        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
-        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
-    )
-    incoming_adapter_status = status
-    lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
-    status = incoming_adapter_status | projection.row_status
-    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
-    projection_bad = _mrv1_projection_invariant_rows(
+    project = _project_and_validate_emission if emission_binding is None else emission_binding.project
+    projection, status, endpoint_book = project(
         merged,
         context,
-        projection,
-        status,
+        adapter=adapter,
+        hidden=hidden,
+        rows_dtype=inputs_embeds.dtype,
         park_id=park_id,
         blank_id=blank,
+        plan_geometry=plan_geom_dev,
+        endpoint_book=endpoint_book,
         eou_token_id=eou_token_id if endpoint_enabled else None,
     )
-    status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    if emission_binding is not None:
+        _validate_emission_projection(projection, context, hidden=hidden, rows_dtype=inputs_embeds.dtype)
     native_stage: Callable[[], None] | None = None
     if native_burst_handoff is not None:
         from vllm_omni.model_executor.models.nemotron_asr.native_burst import (

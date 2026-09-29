@@ -293,6 +293,7 @@ def run_persistent_state_profile(
                 endpoint_book_pool=pools.endpoint_book,
                 eou_token_id=_required_control(model.config, "eou_token_id"),
                 adapter=model._emission_adapter,
+                emission_binding=getattr(model, "_emission_graph_binding", None) if ready_domain else None,
                 decode_resolver=model._decode_resolver
                 if chunk_binding is not None
                 else _profile_decode_resolver(model),

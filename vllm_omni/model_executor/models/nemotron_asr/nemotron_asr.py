@@ -439,6 +439,35 @@ class NemotronASRForRNNT(nn.Module):
                 predictor_hidden=int(hf_config.pred_hidden),
                 blank_id=int(self.core.blank_id),
             )
+        self._emission_graph_binding = None
+        emission_graph = getattr(hf_config, "experimental_emission_graph", False)
+        if not isinstance(emission_graph, bool):
+            raise ValueError("experimental_emission_graph must be a boolean")
+        if emission_graph:
+            from vllm_omni.model_executor.models.nemotron_asr.emission_graph import EmissionGraphBinding
+            from vllm_omni.model_executor.models.nemotron_asr.manifests import SESSION_LIMITS
+            from vllm_omni.model_executor.models.nemotron_asr.rnnt import MAX_SYMBOLS_PER_STEP
+
+            if self._decode_graph_binding is None:
+                raise ValueError("experimental emission graph requires the sealed dense-graphed decoder")
+            # Endpoint observation always appends one control column, including
+            # policy-disabled rows. Match the merged result, not raw decoder K.
+            widths = tuple(
+                (right + 1) * MAX_SYMBOLS_PER_STEP + 1
+                for index, (_left, right) in enumerate(CADENCES.values())
+                if index in set(served_geometry_ids)
+            )
+            self._emission_graph_binding = EmissionGraphBinding(
+                hidden_size=int(hf_config.hidden_size),
+                park_id=int(hf_config.eos_token_id),
+                blank_id=int(self.core.blank_id),
+                queue_capacity=int(SESSION_LIMITS["queue_capacity"]),
+                token_widths=widths,
+                maximum_population=self._max_num_seqs,
+                eou_token_id=int(hf_config.eou_token_id),
+                vllm_config=vllm_config,
+            )
+            self._emission_adapter = self._emission_graph_binding.adapter
         self._decode_resolver = build_decode_resolver(
             hf_config,
             graph_binding=self._decode_graph_binding,
@@ -718,6 +747,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None and not chunk_binding.ready:
             raise RuntimeError("CHUNK execution inventory is incomplete")
+        emission_binding = getattr(self, "_emission_graph_binding", None)
+        if emission_binding is not None and not emission_binding.ready:
+            raise RuntimeError("emission execution inventory is incomplete")
         binding = self._decode_graph_binding
         if binding is None:
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
@@ -756,6 +788,9 @@ class NemotronASRForRNNT(nn.Module):
             chunk_binding = getattr(self, "_chunk_bucket_binding", None)
             if chunk_binding is not None:
                 chunk_binding.warmup(device)
+            emission_binding = getattr(self, "_emission_graph_binding", None)
+            if emission_binding is not None:
+                emission_binding.warmup(device)
             self._require_execution_inventory_ready()
             # All retained graph buffers must coexist with this temporary
             # transaction so the profiler sees their combined high-water mark.
@@ -832,6 +867,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
+        emission_binding = getattr(self, "_emission_graph_binding", None)
+        if emission_binding is not None:
+            receipt["emission"] = emission_binding.receipt()
         return receipt
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
@@ -992,6 +1030,7 @@ class NemotronASRForRNNT(nn.Module):
                 endpoint_book_pool=pools.endpoint_book,
                 eou_token_id=int(self.config.eou_token_id),
                 adapter=self._emission_adapter,
+                emission_binding=getattr(self, "_emission_graph_binding", None),
                 decode_resolver=self._decode_resolver,
                 encoder_transition=self._encoder_execution.transition,
                 bucket_transition=getattr(self, "_chunk_bucket_binding", None),
