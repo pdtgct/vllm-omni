@@ -585,8 +585,9 @@ def _stream_attention(
 
 
 def _stream_pointwise_linear(module: nn.Conv1d, x: torch.Tensor) -> bool:
-    """Lower only stock CUDA FP32 inference pointwise convolutions.
+    """Lower stock CUDA FP32 inference pointwise convolutions at batch <= 2.
 
+    Larger encoder batches retain the original convolution arithmetic.
     Calling a module is observable through hooks and overrides; retain that
     call for customized modules, autocast, and every other execution context.
     """
@@ -597,6 +598,7 @@ def _stream_pointwise_linear(module: nn.Conv1d, x: torch.Tensor) -> bool:
         or torch.is_grad_enabled()
         or torch.is_autocast_enabled()
         or type(x) is not torch.Tensor
+        or x.shape[0] > 2
         or x.device.type != "cuda"
         or x.dtype != torch.float32
         or x.numel() == 0

@@ -18,14 +18,14 @@ from vllm_omni.model_executor.models.nemotron_asr.encoder import (
 pytestmark = [pytest.mark.core_model]
 
 
-def layer_inputs(device="cpu", dtype=torch.float32):
+def layer_inputs(device="cpu", dtype=torch.float32, batch=3):
     torch.manual_seed(61)
     layer = ConformerLayer(d_model=16, d_ff=32, n_heads=4, conv_kernel=5, conv_norm_type="layer_norm")
     layer = layer.to(device=device, dtype=dtype).eval()
     # Noncontiguous caller input, mixed logical lengths, and independent cache.
-    x = torch.randn(3, 16, 4, device=device, dtype=dtype).transpose(1, 2)
-    cache = torch.randn(3, 16, 4, device=device, dtype=dtype)
-    lengths = torch.tensor([0, 1, 4], device=device)
+    x = torch.randn(batch, 16, 4, device=device, dtype=dtype).transpose(1, 2)
+    cache = torch.randn(batch, 16, 4, device=device, dtype=dtype)
+    lengths = torch.tensor(([0, 1, 4] * ((batch + 2) // 3))[:batch], device=device)
     return layer, x, cache, lengths
 
 
@@ -66,9 +66,10 @@ def test_cpu_dtype_and_grad_contexts_keep_module_calls():
         "global_hook",
     ],
 )
+@pytest.mark.parametrize("batch", [1, 2, 3])
 @pytest.mark.parametrize("site", ["pointwise_conv1", "pointwise_conv2"])
-def test_cuda_stream_pointwise_matches_original_calls(custom, site):
-    layer, x, cache, lengths = layer_inputs("cuda")
+def test_cuda_stream_pointwise_matches_original_calls(custom, site, batch):
+    layer, x, cache, lengths = layer_inputs("cuda", batch=batch)
     original = copy.deepcopy(layer)
     handles, seen = [], []
     pointwise = getattr(layer.conv, site)
@@ -114,7 +115,7 @@ def test_cuda_stream_pointwise_matches_original_calls(custom, site):
     params = {name: (id(value), value.data_ptr(), value.clone()) for name, value in layer.named_parameters()}
     try:
         with torch.set_grad_enabled(custom == "grad"), torch.autocast("cuda", enabled=custom == "autocast"):
-            assert _stream_pointwise_linear(pointwise, x) is (custom == "none")
+            assert _stream_pointwise_linear(pointwise, x) is (custom == "none" and batch <= 2)
             actual, updated = _stream_conv(layer, x, cache, new_lengths=lengths)
             expected, expected_cache = _stream_conv(original, x, cache, new_lengths=lengths)
         torch.testing.assert_close(actual, expected, atol=5e-5, rtol=5e-5)
@@ -165,3 +166,36 @@ def test_compilation_retains_original_calls():
     layer, x, _, _ = layer_inputs()
     with torch.no_grad(), patch("torch.compiler.is_compiling", return_value=True):
         assert not _stream_pointwise_linear(layer.conv.pointwise_conv1, x)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch", [3, 4, 31, 32, 63, 64])
+def test_large_population_rejects_lowering_before_device_checks(batch):
+    # Host shape alone excludes both sites, before any backend/context check.
+    # This does not claim that CPU execution exercises CUDA kernels.
+    layer, x, _, _ = layer_inputs(batch=batch)
+    with torch.no_grad(), patch.object(torch.Tensor, "device", new_callable=property):
+        for module in (layer.conv.pointwise_conv1, layer.conv.pointwise_conv2):
+            assert not _stream_pointwise_linear(module, x)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pointwise path")
+@pytest.mark.parametrize("batch", [3, 31, 32, 63, 64])
+def test_large_population_exact_original_arithmetic(batch):
+    layer, x, cache, lengths = layer_inputs("cuda", batch=batch)
+    original = copy.deepcopy(layer)
+    handles = [
+        m.register_forward_hook(lambda *args: None)
+        for m in (original.conv.pointwise_conv1, original.conv.pointwise_conv2)
+    ]
+    try:
+        with torch.no_grad():
+            for module in (layer.conv.pointwise_conv1, layer.conv.pointwise_conv2):
+                assert not _stream_pointwise_linear(module, x)
+            actual, updated = _stream_conv(layer, x, cache, new_lengths=lengths)
+            expected, expected_cache = _stream_conv(original, x, cache, new_lengths=lengths)
+        assert torch.equal(actual, expected)
+        assert torch.equal(updated, expected_cache)
+    finally:
+        for handle in handles:
+            handle.remove()
