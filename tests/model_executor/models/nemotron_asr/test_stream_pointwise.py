@@ -169,7 +169,7 @@ def test_compilation_retains_original_calls():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("batch", [3, 4, 31, 32, 63, 64])
+@pytest.mark.parametrize("batch", [3, 4, 31, 32, 63, 64, 128])
 def test_large_population_rejects_lowering_before_device_checks(batch):
     # Host shape alone excludes both sites, before any backend/context check.
     # This does not claim that CPU execution exercises CUDA kernels.
@@ -180,7 +180,7 @@ def test_large_population_rejects_lowering_before_device_checks(batch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pointwise path")
-@pytest.mark.parametrize("batch", [3, 31, 32, 63, 64])
+@pytest.mark.parametrize("batch", [3, 31, 32, 63, 64, 128])
 def test_large_population_exact_original_arithmetic(batch):
     layer, x, cache, lengths = layer_inputs("cuda", batch=batch)
     original = copy.deepcopy(layer)
