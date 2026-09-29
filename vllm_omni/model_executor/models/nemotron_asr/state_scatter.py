@@ -383,12 +383,60 @@ class PreparedScatterGroup:
 if triton is not None and tl is not None:
 
     @triton.jit(  # type: ignore[untyped-decorator]
-        do_not_specialize=["pools", "scratches", "block_ids", "row_status"],
-        do_not_specialize_on_alignment=["pools", "scratches", "block_ids", "row_status"],
+        # Triton 3.7 tuple specialization resets nested flags. Keep all 48
+        # tensor pointers plus both control pointers flat at the JIT boundary.
+        do_not_specialize=list(range(50)),
+        do_not_specialize_on_alignment=list(range(50)),
     )
     def _grouped_page_scatter_kernel(  # type: ignore[no-untyped-def]
-        pools,
-        scratches,
+        pool_0,
+        pool_1,
+        pool_2,
+        pool_3,
+        pool_4,
+        pool_5,
+        pool_6,
+        pool_7,
+        pool_8,
+        pool_9,
+        pool_10,
+        pool_11,
+        pool_12,
+        pool_13,
+        pool_14,
+        pool_15,
+        pool_16,
+        pool_17,
+        pool_18,
+        pool_19,
+        pool_20,
+        pool_21,
+        pool_22,
+        pool_23,
+        scratch_0,
+        scratch_1,
+        scratch_2,
+        scratch_3,
+        scratch_4,
+        scratch_5,
+        scratch_6,
+        scratch_7,
+        scratch_8,
+        scratch_9,
+        scratch_10,
+        scratch_11,
+        scratch_12,
+        scratch_13,
+        scratch_14,
+        scratch_15,
+        scratch_16,
+        scratch_17,
+        scratch_18,
+        scratch_19,
+        scratch_20,
+        scratch_21,
+        scratch_22,
+        scratch_23,
         block_ids,
         row_status,
         page_numel: tl.constexpr,
@@ -397,6 +445,60 @@ if triton is not None and tl is not None:
         block_size: tl.constexpr,
         layers: tl.constexpr,
     ):
+        # These tuples exist inside Triton IR, never in runtime argument
+        # specialization. Unused padded pointers are outside static_range.
+        pools = (
+            pool_0,
+            pool_1,
+            pool_2,
+            pool_3,
+            pool_4,
+            pool_5,
+            pool_6,
+            pool_7,
+            pool_8,
+            pool_9,
+            pool_10,
+            pool_11,
+            pool_12,
+            pool_13,
+            pool_14,
+            pool_15,
+            pool_16,
+            pool_17,
+            pool_18,
+            pool_19,
+            pool_20,
+            pool_21,
+            pool_22,
+            pool_23,
+        )
+        scratches = (
+            scratch_0,
+            scratch_1,
+            scratch_2,
+            scratch_3,
+            scratch_4,
+            scratch_5,
+            scratch_6,
+            scratch_7,
+            scratch_8,
+            scratch_9,
+            scratch_10,
+            scratch_11,
+            scratch_12,
+            scratch_13,
+            scratch_14,
+            scratch_15,
+            scratch_16,
+            scratch_17,
+            scratch_18,
+            scratch_19,
+            scratch_20,
+            scratch_21,
+            scratch_22,
+            scratch_23,
+        )
         row = tl.program_id(0).to(tl.int64)
         tile = tl.program_id(1).to(tl.int64)
         layer = tl.program_id(2)
@@ -478,8 +580,8 @@ def _group_layout_supported(pools: list[torch.Tensor], scratches: list[torch.Ten
 
 
 def _grouped_specialization(pools: list[torch.Tensor], scratches: list[torch.Tensor]) -> tuple[object, ...]:
-    # No pointer values or alignment classes: the kernel disables pointer
-    # specialization recursively, including every element of the tuples.
+    # No pointer values or alignment classes: all pointers are flat JIT
+    # arguments with specialization disabled individually.
     return (len(pools), tuple(pools[0].shape[1:]), *_cuda_specialization(pools[0], scratches[0]))
 
 
@@ -495,9 +597,14 @@ def _cuda_grouped_scatter(
         return
     page_numel = _page_numel(pools[0])
     block_size, num_warps = _launch_config(page_numel)
+    # Fixed flat signature avoids Triton's recursive tuple specialization.
+    # Fewer-layer fixtures repeat an owned pointer in unused argument slots;
+    # the constexpr layer count prevents those slots from issuing any store.
+    padded_pools = tuple(pools) + (pools[0],) * (24 - len(pools))
+    padded_scratches = tuple(scratches) + (scratches[0],) * (24 - len(scratches))
     _grouped_page_scatter_kernel[(rows, triton.cdiv(page_numel, block_size), len(pools))](
-        tuple(pools),
-        tuple(scratches),
+        *padded_pools,
+        *padded_scratches,
         block_ids,
         row_status,
         page_numel=page_numel,
