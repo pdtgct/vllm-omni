@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -93,6 +94,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._service_timing_enabled = self.log_stats and os.environ.get("VLLM_OMNI_SERVICE_TIMING") == "1"
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -301,6 +303,62 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    def add_request(self, request: Request) -> None:
+        # Observe the existing core queue seam without owning its policy. The
+        # arrival/append pair brackets core add_request on the engine thread.
+        if not getattr(self, "_service_timing_enabled", False):
+            super().add_request(request)
+            return
+        arrival_stamp_s = time.monotonic()
+        existing = self.requests.get(request.request_id)
+        trace = getattr(existing, "_omni_service_timing", None)
+        if trace is not None and not request.resumable:
+            # Core StreamingUpdate.from_request returns None for this exact
+            # terminal sentinel. It is not an ordinary input missing identity.
+            try:
+                trace.record_input_end(existing, arrival_stamp_s)
+            except Exception:
+                trace.valid = False
+            super().add_request(request)
+            return
+        identity = None
+        try:
+            info = deserialize_additional_information(getattr(request, "additional_information", None))
+            identity = (
+                trace.read_input_identity(info)
+                if trace is not None
+                else streaming_transport.engine_service_timing_identity(info)
+            )
+            if existing is None and request.resumable and identity is not None:
+                trace = streaming_transport.EngineServiceTimingTrace(request.request_id, identity)
+                request._omni_service_timing = trace
+            if trace is not None and identity is not None:
+                trace.record(
+                    existing or request,
+                    "update_arrival" if existing else "input_arrival",
+                    timestamp=arrival_stamp_s,
+                    identity=identity,
+                )
+        except Exception:
+            if trace is not None:
+                trace.valid = False
+        queue_depth = len(existing.streaming_queue or ()) if trace is not None and existing is not None else 0
+        super().add_request(request)
+        if (
+            trace is not None
+            and identity is not None
+            and existing is not None
+            and len(existing.streaming_queue or ()) > queue_depth
+        ):
+            streaming_transport.record_engine_service_timing(existing, "update_appended", identity=identity)
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        # Capture the completed unit before core may consume a queued update
+        # and advance the session generation. Terminal aborts are not parks.
+        if request.resumable and request.status == RequestStatus.FINISHED_STOPPED:
+            streaming_transport.record_engine_service_timing(request, "legal_park")
+        return super()._handle_stopped_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -331,6 +389,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        if getattr(self, "_service_timing_enabled", False):
+            self._service_timing_step = getattr(self, "_service_timing_step", 0) + 1
+            # One bounded record per step, carried by a scheduled traced
+            # request. Collect all companion traces to reconstruct coverage;
+            # steps containing only untraced requests are not represented.
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if getattr(request, "_omni_service_timing", None) is not None:
+                    streaming_transport.record_engine_service_timing(
+                        request,
+                        "schedule_batch",
+                        schedule_context={
+                            "step": self._service_timing_step,
+                            "num_scheduled_tokens": dict(scheduler_output.num_scheduled_tokens),
+                        },
+                    )
+                    break
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -814,6 +889,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stage 0.
         """
         req_id = session.request_id
+        trace = getattr(session, "_omni_service_timing", None)
+        if trace is not None:
+            try:
+                info = deserialize_additional_information(getattr(update, "additional_information", None))
+                trace.identity = trace.read_input_identity(info)
+                if trace.identity is None:
+                    # Missing/invalid identity must not inherit the previous
+                    # unit. Explicit FLUSH carries its own control identity.
+                    streaming_transport.record_engine_service_timing(session, "unattributed_update")
+            except Exception:
+                trace.identity = None
+                trace.valid = False
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Seed the stale share in SCHEDULED-token units (see the segment-stop
@@ -933,6 +1020,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+        streaming_transport.finish_engine_service_timing(request)
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 

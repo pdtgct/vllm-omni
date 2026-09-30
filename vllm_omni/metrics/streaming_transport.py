@@ -31,7 +31,11 @@ unimplemented — see each docstring's ``Raises``.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import socket
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -223,6 +227,30 @@ class ServiceTimingTrace:
         self.overflow = 0
         self.valid = True
         self.next_sequence = 0
+        self.engine_epoch: str | None = None
+        self.lease_generation: int | None = None
+
+    def input_identity(self, unit: Any, *, engine_epoch: str, lease_generation: int) -> str:
+        """Carry producer identity; ``None`` identifies the unsequenced FLUSH."""
+        if self.engine_epoch is not None and (self.engine_epoch, self.lease_generation) != (
+            engine_epoch,
+            lease_generation,
+        ):
+            self.valid = False
+            raise ValueError("service timing generation changed within a session")
+        self.engine_epoch = engine_epoch
+        self.lease_generation = lease_generation
+        return json.dumps(
+            dict(
+                session=self.session_key,
+                engine_epoch=engine_epoch,
+                lease_generation=lease_generation,
+                logical_sequence=None if unit is None else unit.logical_sequence,
+                carrier_sequence=None if unit is None else unit.carrier_sequence,
+                kind="flush" if unit is None else unit.kind,
+            ),
+            separators=(",", ":"),
+        )
 
     def _reserve(self) -> _ServiceTimingSlot | None:
         if self.count == self.capacity:
@@ -373,6 +401,10 @@ class ServiceTimingTrace:
         return dict(
             schema=1,
             session=self.session_key,
+            engine_epoch=self.engine_epoch,
+            lease_generation=self.lease_generation,
+            clock_host=socket.gethostname(),
+            process_id=os.getpid(),
             units=rows,
             time_unit="monotonic_seconds",
             capacity=self.capacity,
@@ -385,6 +417,168 @@ class ServiceTimingTrace:
             valid=self.valid and complete,
             end=True,
         )
+
+
+class EngineServiceTimingTrace:
+    """Bounded scheduler-side companion to ``ServiceTimingTrace``.
+
+    This records observations only. A schedule stamp is copied from the core
+    SCHEDULED admission event (schedule-call start), not GPU execution start.
+    Segment generation is
+    the scheduler's counter; producer logical/carrier sequences are independent.
+    Clocks may be joined only on a verified common host/monotonic clock domain.
+    Overflow or missing terminal records invalidate an engine timing analysis.
+    """
+
+    capacity = ServiceTimingTrace.capacity * 8
+
+    def __init__(self, request_id: str, identity: dict[str, Any]) -> None:
+        self.request_id = request_id
+        self.identity: dict[str, Any] | None = identity
+        self.session_identity = (identity["session"], identity["engine_epoch"], identity["lease_generation"])
+        self.events: list[dict[str, Any]] = []
+        self.overflow = 0
+        self.valid = True
+
+    def read_input_identity(self, info: dict[str, Any]) -> dict[str, Any] | None:
+        """Mark identity loss explicitly without changing the active unit."""
+        try:
+            identity = engine_service_timing_identity(info)
+        except Exception:
+            identity = None
+        if identity is None:
+            self.valid = False
+        return identity
+
+    def record_input_end(self, request: Any, timestamp: float) -> None:
+        """The core's non-resumable sentinel closes input without a unit."""
+        session, engine_epoch, lease_generation = self.session_identity
+        self.record(
+            request,
+            "input_end",
+            timestamp=timestamp,
+            identity=dict(
+                session=session,
+                engine_epoch=engine_epoch,
+                lease_generation=lease_generation,
+                logical_sequence=None,
+                carrier_sequence=None,
+                kind="input_end",
+            ),
+        )
+
+    def record(
+        self,
+        request: Any,
+        event: str,
+        *,
+        timestamp: float | None = None,
+        identity: dict[str, Any] | None = None,
+        schedule_context: dict[str, Any] | None = None,
+    ) -> None:
+        if len(self.events) == self.capacity:
+            self.overflow += 1
+            return
+        observed_identity = self.identity if identity is None else identity
+        if (
+            observed_identity is not None
+            and tuple(observed_identity[key] for key in ("session", "engine_epoch", "lease_generation"))
+            != self.session_identity
+        ):
+            self.valid = False
+        self.events.append(
+            dict(
+                event=event,
+                timestamp=time.monotonic() if timestamp is None else timestamp,
+                identity=observed_identity,
+                segment_generation=int(getattr(request, "_omni_segment_generation", 0)),
+                queue_depth=len(getattr(request, "streaming_queue", None) or ()),
+                schedule_context=schedule_context,
+            )
+        )
+
+    def finish(self, reason: str) -> dict[str, Any]:
+        return dict(
+            schema=1,
+            request_id=self.request_id,
+            clock_host=socket.gethostname(),
+            process_id=os.getpid(),
+            time_unit="monotonic_seconds",
+            events=self.events,
+            capacity=self.capacity,
+            count=len(self.events),
+            overflow=self.overflow,
+            reason=reason,
+            completion_scope="observations_only",
+            valid=self.valid and self.overflow == 0,
+            schedule_semantics="waiting_admission_at_schedule_call_start_not_gpu_start",
+            clock_join_requires="verified_common_monotonic_domain_or_bounded_offset",
+            end=True,
+        )
+
+
+def engine_service_timing_identity(info: dict[str, Any]) -> dict[str, Any] | None:
+    """Read a small explicit join key; never infer identity from queue order."""
+    raw = info.get("meta", {}).get("service_timing")
+    if not isinstance(raw, str) or len(raw) > 2048:
+        return None
+    identity = json.loads(raw)
+    if not isinstance(identity, dict) or set(identity) != {
+        "session",
+        "engine_epoch",
+        "lease_generation",
+        "logical_sequence",
+        "carrier_sequence",
+        "kind",
+    }:
+        return None
+    if not isinstance(identity["session"], str) or identity["kind"] not in (
+        "regular",
+        "final_tail",
+        "forced_eou",
+        "flush",
+    ):
+        return None
+    if not isinstance(identity["engine_epoch"], str):
+        return None
+    if type(identity["lease_generation"]) is not int or identity["lease_generation"] < 0:
+        return None
+    carrier = identity["carrier_sequence"]
+    if identity["kind"] == "flush":
+        return identity if identity["logical_sequence"] is None and carrier is None else None
+    if type(identity["logical_sequence"]) is not int or identity["logical_sequence"] < 0:
+        return None
+    if identity["kind"] == "forced_eou":
+        if carrier is not None:
+            return None
+    elif type(carrier) is not int or carrier != identity["logical_sequence"] % (2**24):
+        return None
+    return identity
+
+
+def record_engine_service_timing(request: Any, event: str, **kwargs: Any) -> None:
+    """Keep optional diagnostics out of scheduling and completion authority."""
+    trace = None
+    try:
+        trace = getattr(request, "_omni_service_timing", None)
+        if trace is not None:
+            trace.record(request, event, **kwargs)
+    except Exception:
+        if trace is not None:
+            try:
+                trace.valid = False
+            except Exception:
+                pass
+
+
+def finish_engine_service_timing(request: Any) -> None:
+    try:
+        trace = getattr(request, "_omni_service_timing", None)
+        if trace is not None:
+            request._omni_service_timing = None
+            _logger.info("Engine service timing trace %s", json.dumps(trace.finish(str(request.status))))
+    except Exception:
+        pass
 
 
 def observe_safely(observer_method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

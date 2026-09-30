@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -66,6 +67,198 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+def _timing_identity(sequence: int) -> dict:
+    return {
+        "session": "external-session",
+        "engine_epoch": "engine-epoch",
+        "lease_generation": 7,
+        "logical_sequence": sequence,
+        "carrier_sequence": sequence,
+        "kind": "regular",
+    }
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_engine_timing_update_arrival_does_not_change_core_queue_policy(monkeypatch, queued) -> None:
+    import json
+
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+
+    sched = _make_scheduler()
+    sched._service_timing_enabled = True
+    session = _make_request()
+    session.resumable = True
+    session.streaming_queue = deque()
+    session.status = RequestStatus.RUNNING if queued else RequestStatus.WAITING_FOR_STREAMING_REQ
+    session._omni_segment_generation = 4
+    session._omni_service_timing = EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    sched.requests = {session.request_id: session}
+    sched.num_waiting_for_streaming_input = 0 if queued else 1
+    waiting: list[object] = []
+    monkeypatch.setattr(sched, "_enqueue_waiting_request", waiting.append)
+    incoming = _make_request()
+    incoming.resumable = True
+    incoming.additional_information = {"meta": {"service_timing": json.dumps(_timing_identity(1))}}
+    sched.add_request(incoming)
+
+    trace = session._omni_service_timing
+    assert [event["event"] for event in trace.events] == (
+        ["update_arrival", "update_appended"] if queued else ["update_arrival"]
+    )
+    assert trace.events[0]["identity"] == _timing_identity(1)
+    assert len(session.streaming_queue) == int(queued)
+    assert session._omni_segment_generation == (4 if queued else 5)
+    assert trace.identity == _timing_identity(0 if queued else 1)
+
+
+def test_engine_timing_park_precedes_queued_update_generation_and_schedule(monkeypatch) -> None:
+    import json
+
+    from vllm.v1.engine import EngineCoreEventType
+
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+
+    sched = _make_scheduler()
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED
+    session._omni_segment_generation = 4
+    trace = EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    session._omni_service_timing = trace
+    update = _make_update()
+    update.additional_information = {"meta": {"service_timing": json.dumps(_timing_identity(1))}}
+    session.streaming_queue = deque([update])
+    waiting: list[object] = []
+    monkeypatch.setattr(sched, "_enqueue_waiting_request", waiting.append)
+
+    assert sched._handle_stopped_request(session) is False
+    assert waiting == [session] and not session.streaming_queue
+    session.record_event(EngineCoreEventType.SCHEDULED, 42.25)
+    assert [(event["event"], event["segment_generation"]) for event in trace.events] == [
+        ("legal_park", 4),
+        ("scheduled", 5),
+    ]
+    assert trace.events[0]["identity"] == _timing_identity(0)
+    assert trace.events[1]["identity"] == _timing_identity(1)
+    assert trace.events[1]["timestamp"] == session.events[-1].timestamp == 42.25
+
+
+def test_engine_timing_disabled_preserves_core_add_request(monkeypatch) -> None:
+    sched = _make_scheduler()
+    calls = []
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "add_request", lambda self, request: calls.append(request))
+    request = _make_request()
+    sched.add_request(request)
+    assert calls == [request]
+    assert not hasattr(request, "_omni_service_timing")
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize(
+    "info",
+    [None, {"meta": {"service_timing": '{"session":"incomplete"}'}}],
+    ids=["missing", "malformed-present"],
+)
+def test_engine_timing_invalid_update_identity_does_not_change_core_policy(monkeypatch, queued, info) -> None:
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+
+    sched = _make_scheduler()
+    sched._service_timing_enabled = True
+    session = _make_request()
+    session.resumable = True
+    session.streaming_queue = deque()
+    session.status = RequestStatus.RUNNING if queued else RequestStatus.WAITING_FOR_STREAMING_REQ
+    trace = EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    session._omni_service_timing = trace
+    sched.requests = {session.request_id: session}
+    sched.num_waiting_for_streaming_input = 0 if queued else 1
+    monkeypatch.setattr(sched, "_enqueue_waiting_request", lambda request: None)
+    incoming = _make_request()
+    incoming.resumable = True
+    incoming.additional_information = info
+
+    sched.add_request(incoming)
+
+    assert trace.valid is False
+    assert len(session.streaming_queue) == int(queued)
+    assert getattr(session, "_omni_segment_generation", 0) == (0 if queued else 1)
+    assert trace.identity == (_timing_identity(0) if queued else None)
+
+
+@pytest.mark.parametrize("kind", ["flush", "input_end"])
+def test_engine_timing_explicit_controls_remain_valid(monkeypatch, kind) -> None:
+    import json
+
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+
+    sched = _make_scheduler()
+    sched._service_timing_enabled = True
+    session = _make_request()
+    session.resumable = True
+    session.streaming_queue = deque()
+    session.status = RequestStatus.RUNNING if kind == "input_end" else RequestStatus.WAITING_FOR_STREAMING_REQ
+    trace = EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    session._omni_service_timing = trace
+    sched.requests = {session.request_id: session}
+    sched.num_waiting_for_streaming_input = 0 if kind == "input_end" else 1
+    monkeypatch.setattr(sched, "_enqueue_waiting_request", lambda request: None)
+    incoming = _make_request()
+    incoming.resumable = kind == "flush"
+    control = {**_timing_identity(0), "kind": kind, "logical_sequence": None, "carrier_sequence": None}
+    incoming.additional_information = {"meta": {"service_timing": json.dumps(control)}} if kind == "flush" else None
+
+    sched.add_request(incoming)
+
+    assert trace.valid is True
+    assert trace.events[-1]["identity"] == control
+    if kind == "flush":
+        assert trace.identity == control and not session.streaming_queue
+    else:
+        assert trace.identity == _timing_identity(0)
+        assert list(session.streaming_queue) == [None]
+
+
+def test_engine_timing_batch_context_preserves_scheduling_output(monkeypatch) -> None:
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+
+    sched = _make_scheduler()
+    sched._service_timing_enabled = True
+    session = _make_request()
+    trace = EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    session._omni_service_timing = trace
+    sched.requests = {session.request_id: session}
+    sched.waiting = []
+    output = SimpleNamespace(num_scheduled_tokens={session.request_id: 1, "other": 3})
+    calls = []
+
+    def schedule(self, throttle_prefills=False):
+        calls.append(throttle_prefills)
+        return output
+
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "schedule", schedule)
+    for name in (
+        "_drop_aborted_queued_requests",
+        "_process_pending_omni_inputs",
+        "_resync_streaming_input_counter",
+        "_restore_omni_wait_queues",
+        "_postprocess_omni_schedule_output",
+    ):
+        monkeypatch.setattr(sched, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(sched, "_should_defer_waiting_admission", lambda: False)
+    monkeypatch.setattr(sched, "get_finished_requests_needing_kv_transfer", lambda: {})
+    monkeypatch.setattr(sched, "_wrap_omni_scheduler_output", lambda value, **kwargs: value)
+
+    assert sched.schedule(throttle_prefills=True) is output
+    assert calls == [True]
+    assert trace.events[0]["schedule_context"] == {
+        "step": 1,
+        "num_scheduled_tokens": {session.request_id: 1, "other": 3},
+    }
+    sched._service_timing_enabled = False
+    assert sched.schedule() is output
+    assert calls == [True, False] and len(trace.events) == 1
 
 
 def _make_talker_adapter(

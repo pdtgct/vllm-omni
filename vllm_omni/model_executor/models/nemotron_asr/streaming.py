@@ -222,6 +222,17 @@ async def buffer_stream(
                         authority.observed_eligibility_ns,
                         submitted_ns,
                     )
+                    input_identity = getattr(timing, "input_identity", None)
+                    if input_identity is not None:
+                        rendered["additional_information"] = {
+                            "meta": {
+                                "service_timing": input_identity(
+                                    unit,
+                                    engine_epoch=authority.engine_epoch,
+                                    lease_generation=authority.lease_generation,
+                                )
+                            }
+                        }
                 except Exception:
                     try:
                         timing.valid = False
@@ -289,7 +300,24 @@ async def buffer_stream(
     # without guaranteeing a model step. PORT therefore submits its
     # model-level FLUSH explicitly, after the final-tail transaction
     # has committed at legal park.
-    yield {"prompt_token_ids": [session.flush_token_id]}
+    flush_prompt: dict[str, Any] = {"prompt_token_ids": [session.flush_token_id]}
+    if timing is not None:
+        try:
+            input_identity = getattr(timing, "input_identity", None)
+            if input_identity is not None:
+                flush_prompt["additional_information"] = {
+                    "meta": {
+                        "service_timing": input_identity(
+                            None, engine_epoch=authority.engine_epoch, lease_generation=authority.lease_generation
+                        )
+                    }
+                }
+        except Exception:
+            try:
+                timing.valid = False
+            except Exception:
+                pass
+    yield flush_prompt
     # The generic AsyncOmni end marker is queued only after this
     # model-level barrier has itself committed. Otherwise a lifecycle
     # close could overtake an accepted-but-unprocessed FLUSH.

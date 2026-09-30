@@ -63,6 +63,7 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
+    service_timing: str
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
@@ -175,6 +176,7 @@ class IdsStruct(_StructBase):
 
 
 class MetaStruct(_StructBase):
+    service_timing: str | None = None
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None

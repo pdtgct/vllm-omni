@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -58,6 +59,16 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+
+    def record_event(self, event_type: EngineCoreEventType, timestamp: float | None = None) -> None:
+        super().record_event(event_type, timestamp)
+        if event_type == EngineCoreEventType.SCHEDULED:
+            trace = getattr(self, "_omni_service_timing", None)
+            if trace is not None:
+                try:
+                    trace.record(self, "scheduled", timestamp=self.events[-1].timestamp)
+                except Exception:
+                    trace.valid = False
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
