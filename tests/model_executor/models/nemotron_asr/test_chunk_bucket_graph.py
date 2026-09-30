@@ -45,7 +45,9 @@ def _fixture(population=32):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32), (63, 64)])
+@pytest.mark.parametrize(
+    "population,tier", [(1, 1), (2, 2), (16, 16), (31, 32), (32, 32), (33, 64), (63, 64), (64, 64)]
+)
 def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outputs(population, tier):
     from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
 
@@ -106,6 +108,13 @@ def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outpu
         decoder_tier=tier,
     )
     assert set(encoder_populations) == {population}
+    initial = tuple(t.clone() for t in _state_tensors(state))
+    for overrides in ({"decode_fn": object()}, {"encoder_transition": object()}):
+        call_args = dict(args, decode_fn=graph_decode, encoder_transition=encoder_binding) | overrides
+        with pytest.raises(ValueError, match="captured cell"):
+            transition(core, env, state, **call_args)
+    for actual, expected in zip(_state_tensors(state), initial, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     held, held_copy = None, ()
     for step in range(3):
         env[:, advance.ENV_CHUNK_SEQUENCE] = step
@@ -156,14 +165,17 @@ def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outpu
 
 
 @pytest.mark.parametrize("tier", [None, 2])
-def test_single_chunk_requires_existing_sealed_decoder_tier(tier):
-    core, env, state, args = _fixture(1)
+@pytest.mark.parametrize("population", [1, 2, 16, 33, 63])
+def test_single_chunk_requires_existing_sealed_decoder_tier(population, tier):
+    core, env, state, args = _fixture(population)
     with pytest.raises(ValueError, match="decoder"):
         capture_chunk_bucket(core, env, state, **args, vllm_config=None, decoder_tier=tier)
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32), (63, 64)])
+@pytest.mark.parametrize(
+    "population,tier", [(1, 1), (2, 2), (16, 16), (31, 32), (32, 32), (33, 64), (63, 64), (64, 64)]
+)
 def test_chunk_warmup_scratch_matches_real_gather_layout(monkeypatch, population, tier):
     from types import SimpleNamespace
 

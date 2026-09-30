@@ -2225,7 +2225,7 @@ def test_eager_graphed_native_profile_matches_unprepared_encoder(monkeypatch):
 
 @pytest.mark.cpu
 @torch.inference_mode()
-@pytest.mark.parametrize("population,tier", [(1, 1), (31, 32)])
+@pytest.mark.parametrize("population,tier", [(1, 1), (2, 2), (16, 16), (31, 32)])
 def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(monkeypatch, population, tier):
     import json
 
@@ -2286,4 +2286,126 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
         execution.transition(*arguments(population))
     execution._discard()
     assert not execution.ready
+    assert not execution._chunk_graph_entries and not execution._graph_entries
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("populations", [[], [True], [1.0], ["2"], [0], [-1], [2, 2], [65], None, {2}])
+def test_chunk_population_config_rejects_invalid_or_undeclared_values(populations):
+    from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
+    from vllm_omni.model_executor.models.nemotron_asr.decode_graph import execution_tiers
+
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=64,
+        warmup_geometries=(1,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    decoder = SimpleNamespace(execution_tier=lambda n: next(t for t in execution_tiers(128) if t >= n))
+    with pytest.raises(ValueError, match="CHUNK"):
+        ExactChunkGraphBinding(execution._core, object(), execution, decoder, populations)
+    assert not execution._chunk_graph_cells
+    assert not execution._graph_entries
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "cells",
+    [frozenset({(1, True)}), frozenset({(1, 2.0)}), frozenset({(0, 2)}), frozenset({(1, 0)}), frozenset({(1, 65)})],
+)
+def test_chunk_reservation_rejects_invalid_or_undeclared_cells(cells):
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=64,
+        warmup_geometries=(1,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    with pytest.raises(ValueError, match="CHUNK"):
+        execution.reserve_chunk_graph_cells(cells)
+    assert not execution._chunk_graph_cells
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("populations", [(1, 31, 63), tuple(range(1, 65))])
+def test_chunk_population_domain_partitions_full_inventory_and_preserves_fallback(monkeypatch, populations):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph
+    from vllm_omni.model_executor.models.nemotron_asr.decode_graph import execution_tiers
+
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=128,
+        warmup_geometries=(1,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    tiers = execution_tiers(128)
+    decode_fns = {tier: object() for tier in tiers}
+    decoder = SimpleNamespace(
+        execution_tier=lambda n: next(t for t in tiers if t >= n),
+        decode_fn=lambda *, geometry, tier: decode_fns[tier],
+    )
+    binding = chunk_bucket_graph.ExactChunkGraphBinding(execution._core, object(), execution, decoder, populations)
+    shape = execution._geometry_shapes[1]
+
+    def arguments(n):
+        values = _graph_transition_args(population=n, mel_width=shape.mel_width, out_width=shape.out_width)
+        values[-1].remainder_(4)
+        return values
+
+    cells = {(1, n) for n in range(1, 129)}
+    selected = {(1, n) for n in populations}
+    execution.warmup_domain(
+        expected_cells=tuple(sorted(cells)),
+        invoke=lambda _geometry, n: execution.transition(*arguments(n)),
+    )
+    assert set(execution._graph_entries) == cells - selected
+    assert not binding.ready
+    with pytest.raises(ValueError, match="incomplete"):
+        binding.resolve(
+            geometry=1, population=65, decode_fn=decode_fns[128], encoder_transition=execution.transition, capture=False
+        )
+    with pytest.raises(ValueError, match="inventory"):
+        execution.publish_chunk_graphs({(1, populations[0]): lambda: None})
+
+    def replacement():
+        return None
+
+    setattr(replacement, "replay_count", 0)
+    execution.publish_chunk_graphs(dict.fromkeys(selected, replacement))
+    assert binding.ready
+    assert len(execution._graph_entries) == 128 - len(populations)
+    assert len(execution._chunk_graph_entries) == len(populations)
+    assert len(tiers) == 8
+    assert set(execution._graph_entries).isdisjoint(execution._chunk_graph_entries)
+    assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == cells
+    for n in populations:
+        args = dict(
+            geometry=1,
+            population=n,
+            decode_fn=decode_fns[decoder.execution_tier(n)],
+            encoder_transition=execution.transition,
+            capture=False,
+        )
+        assert binding.resolve(**args) is replacement
+        with pytest.raises(ValueError, match="sealed serving binding"):
+            binding.resolve(**(args | {"decode_fn": object()}))
+    for n in (65, 128):
+        execution.transition(*arguments(n))
+        fallback = binding.resolve(
+            geometry=1, population=n, decode_fn=decode_fns[128], encoder_transition=execution.transition, capture=False
+        )
+        assert fallback == binding._fallback
+    with pytest.raises(ValueError, match="not captured"):
+        execution.transition(*arguments(1))
+    with pytest.raises(ValueError, match="untouched"):
+        execution.reserve_chunk_graph_cells(frozenset({(1, 65)}))
+    execution._discard()
+    assert not binding.ready
     assert not execution._chunk_graph_entries and not execution._graph_entries
