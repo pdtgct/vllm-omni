@@ -17,7 +17,7 @@ import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import Lock, RLock, get_ident
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar, cast
 
 import torch
@@ -405,6 +405,200 @@ def _copy_cache_storage_(
             destination_tensor.copy_(source_tensor)
 
 
+def _storage_range(tensor: torch.Tensor) -> tuple[str, int, int]:
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr()
+    return str(tensor.device), start, start + storage.nbytes()
+
+
+def _check_scratch_allocation(device: torch.device) -> None:
+    # Startup only: live cache banks must never be graph-pool intermediates.
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        raise ValueError("encoder graph scratch must be allocated outside CUDA capture")
+
+
+def _validate_scratch_storage(storage: EncoderCacheStorage, others: tuple[torch.Tensor, ...]) -> None:
+    """Reject overlapping backing allocations, including offset/disjoint views.
+
+    Cache buffers are allocated BEFORE capture and kept alive by their entries;
+    the graph allocator therefore cannot recycle them as pooled intermediates.
+    Check all explicit inputs/outputs as well, including shared decoder storage.
+    Other tensors may alias each other; no cache allocation may alias anything.
+    """
+    ranges = [(*_storage_range(tensor), True) for family in storage for tensor in family]
+    ranges.extend((*_storage_range(tensor), False) for tensor in others)
+    device, occupied_end, cache_end = "", 0, 0
+    for current_device, start, end, is_cache in sorted(ranges):
+        if start == end:
+            continue
+        if current_device != device:
+            device, occupied_end, cache_end = current_device, 0, 0
+        if start < cache_end or (is_cache and start < occupied_end):
+            raise ValueError("encoder graph scratch backing storage aliases another tensor")
+        occupied_end = max(occupied_end, end)
+        if is_cache:
+            cache_end = max(cache_end, end)
+
+
+def _validate_gather_destination(pool: torch.Tensor, destination: torch.Tensor, rows: int) -> None:
+    shape = (rows, *pool.shape[1:])
+    strides: list[int] = []
+    stride = 1
+    for size in reversed(shape):
+        strides.append(stride)
+        stride *= max(1, size)
+    if (
+        tuple(destination.shape) != shape
+        or destination.dtype != pool.dtype
+        or destination.device != pool.device
+        or destination.layout != torch.strided
+        or not destination.is_contiguous()
+        or tuple(destination.stride()) != tuple(reversed(strides))
+        or destination.storage_offset() != 0
+    ):
+        raise ValueError("encoder gather destination differs from resident row layout")
+    _validate_scratch_storage(EncoderCacheStorage((destination,), (), ()), (pool,))
+
+
+def _scratch_stream(device: torch.device) -> Any:
+    return None if device.type == "cpu" else torch.accelerator.current_stream(device)
+
+
+@dataclass(frozen=True, eq=False)
+class _EncoderScratchBorrow:
+    """Private capability minted by one encoder inventory's active transaction."""
+
+    transaction: object
+    entry: object
+    key: tuple[int, int]
+    storage: EncoderCacheStorage
+    signature: tuple[tuple[TensorSignature, ...], ...]
+    ranges: tuple[tuple[str, int, int], ...]
+
+
+class _EncoderScratch:
+    """Serialize encoder cache borrowing with ordinary replay in one inventory.
+
+    A host release does NOT imply device completion. Buffers stay alive with the
+    captured entry; all subsequent use must enqueue on the same stream, behind
+    the transaction's last consumer (including scatter or an aborted replay).
+    No events, waits, synchronization, or cross-stream execution are introduced.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._transaction: object | None = None
+        self._thread: int | None = None
+        self._device: torch.device | None = None
+        self._stream: Any = None
+        self._stream_bound = False
+        self._borrows: dict[_EncoderScratchBorrow, bool] = {}
+
+    @contextmanager
+    def hold(self, device: torch.device) -> Generator[object, None, None]:
+        if not self._lock.acquire(blocking=False):
+            raise ValueError("encoder scratch transaction is already active (overlapping or reentrant use)")
+        try:
+            stream = _scratch_stream(device)
+            if self._stream_bound and (device != self._device or stream != self._stream):
+                raise ValueError("encoder scratch requires its existing serialized stream")
+            self._device, self._stream, self._stream_bound = device, stream, True
+            transaction = object()
+            self._transaction, self._thread = transaction, get_ident()
+            yield transaction
+            self.check(transaction)
+        finally:
+            self._borrows.clear()
+            self._transaction, self._thread = None, None
+            self._lock.release()
+
+    def check(self, transaction: object) -> None:
+        if transaction is not self._transaction or self._thread != get_ident():
+            raise ValueError("stale encoder scratch transaction capability")
+        assert self._device is not None
+        if _scratch_stream(self._device) != self._stream:
+            raise ValueError("encoder scratch consumer changed the serialized stream")
+
+    def borrow(
+        self,
+        transaction: object,
+        entry: object,
+        key: tuple[int, int],
+        storage: EncoderCacheStorage,
+        pools: EncoderCacheStorage,
+        resident: tuple[torch.Tensor, ...],
+    ) -> _EncoderScratchBorrow:
+        self.check(transaction)
+        if not torch.is_inference_mode_enabled():
+            raise ValueError("encoder scratch borrowing requires serving inference mode")
+        if storage.channel[0].device.type not in {"cpu", "cuda"}:
+            raise ValueError("private encoder scratch borrowing requires CUDA or the CPU test runtime")
+        if any(item.entry is entry or item.key == key for item in self._borrows):
+            raise ValueError("encoder scratch cell already has an active borrow")
+        if any(len(left) != len(right) for left, right in zip(storage, pools, strict=True)):
+            raise ValueError("encoder scratch cache families differ from resident pools")
+        for family, pool_family in zip(storage, pools, strict=True):
+            for tensor, pool in zip(family, pool_family, strict=True):
+                _validate_gather_destination(pool, tensor, key[1])
+        held = tuple(tensor for borrow in self._borrows for family in borrow.storage for tensor in family)
+        _validate_scratch_storage(storage, (*resident, *held))
+        borrow = _EncoderScratchBorrow(
+            transaction,
+            entry,
+            key,
+            storage,
+            _cache_storage_signature(storage),
+            tuple(_storage_range(tensor) for family in storage for tensor in family),
+        )
+        self._borrows[borrow] = False
+        return borrow
+
+    def check_borrow(
+        self,
+        borrow: _EncoderScratchBorrow,
+        entry: object,
+        key: tuple[int, int],
+        storage: EncoderCacheStorage,
+        *,
+        consume: bool = False,
+    ) -> None:
+        self.check(borrow.transaction)
+        if borrow not in self._borrows or borrow.entry is not entry or borrow.key != key:
+            raise ValueError("encoder scratch capability belongs to another execution cell")
+        if (
+            any(
+                len(left) != len(right) or any(a is not b for a, b in zip(left, right, strict=True))
+                for left, right in zip(storage, borrow.storage, strict=True)
+            )
+            or _cache_storage_signature(storage) != borrow.signature
+            or tuple(_storage_range(tensor) for family in storage for tensor in family) != borrow.ranges
+        ):
+            raise ValueError("encoder scratch capability does not authorize this cache storage")
+        if self._borrows[borrow]:
+            raise ValueError("encoder scratch capability already used for replay")
+        if consume:
+            self._borrows[borrow] = True
+
+    @contextmanager
+    def replay(
+        self,
+        borrow: _EncoderScratchBorrow | None,
+        entry: object,
+        key: tuple[int, int],
+        storage: EncoderCacheStorage,
+    ) -> Generator[None, None, None]:
+        if borrow is None:
+            if storage.channel[0].device.type not in {"cpu", "cuda"}:
+                yield
+                return
+            with self.hold(storage.channel[0].device):
+                yield
+        else:
+            self.check_borrow(borrow, entry, key, storage, consume=True)
+            yield
+            self.check(borrow.transaction)
+
+
 def _population_capture_tiers(maximum: int) -> tuple[int, ...]:
     """Return the bounded dense-graph capture domain for an opt-in bucketed arm."""
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
@@ -534,9 +728,27 @@ class _EncoderGraphEntry:
     conditioned: torch.Tensor
     descriptor: Any
     wrapper: Any
+    captured_storage: EncoderCacheStorage | None = None
+    captured_ranges: tuple[tuple[str, int, int], ...] = ()
 
     def cache_storage(self) -> EncoderCacheStorage:
         return _cache_storage(self.caches)
+
+    def checked_borrow_storage(self) -> EncoderCacheStorage:
+        storage = self.cache_storage()
+        if _cache_storage_signature(storage) != self.storage_signature:
+            raise ValueError("encoder scratch storage signature changed")
+        if (
+            self.captured_storage is None
+            or any(
+                a is not b
+                for left, right in zip(storage, self.captured_storage, strict=True)
+                for a, b in zip(left, right, strict=True)
+            )
+            or tuple(_storage_range(t) for family in storage for t in family) != self.captured_ranges
+        ):
+            raise ValueError("encoder scratch storage changed since capture")
+        return storage
 
     def output_tuple(self) -> tuple[torch.Tensor, ...]:
         storage = self.cache_storage()
@@ -632,6 +844,80 @@ class ResolvedEncoderExecution:
         default_factory=list,
         repr=False,
     )
+    _scratch: _EncoderScratch = field(default_factory=_EncoderScratch, repr=False)
+
+    def _validate_scratch_inventory(
+        self,
+        entries: dict[tuple[int, int], _EncoderGraphEntry] | None = None,
+        *,
+        chunks: dict[tuple[int, int], Any] | None = None,
+        others: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        if self.arm != "eager-graphed":
+            return
+        storages = []
+        tensors = list(others)
+        for entry in (self._graph_entries if entries is None else entries).values():
+            storages.append(entry.cache_storage())
+            tensors.extend(
+                (entry.mel, entry.out_offsets, entry.out_lengths, entry.prompt_index, entry.raw, entry.conditioned)
+            )
+        for chunk in (self._chunk_graph_entries if chunks is None else chunks).values():
+            if getattr(chunk, "_encoder_scratch", None) is self._scratch:
+                storages.append(chunk._cache_storage)
+                tensors.extend(chunk._non_encoder_tensors)
+        storage = EncoderCacheStorage(*(tuple(t for item in storages for t in item[i]) for i in range(3)))
+        _validate_scratch_storage(storage, tuple(tensors))
+
+    def _borrow_cache(
+        self,
+        transaction: object,
+        cell: tuple[int, int],
+        pools: EncoderCacheStorage,
+        resident: tuple[torch.Tensor, ...],
+    ) -> _EncoderScratchBorrow:
+        if self.arm != "eager-graphed" or not self.ready or self.cell_active:
+            raise ValueError("encoder cache borrowing requires a ready eager-graphed execution")
+        entry = self._graph_entries.get(cell)
+        if entry is None or entry.key != cell or entry.signature.cache_type != _GATHERED_CACHE_TYPE:
+            raise ValueError("encoder scratch cell was not captured with the native gathered adapter")
+        storage = entry.checked_borrow_storage()
+        return self._scratch.borrow(transaction, entry, cell, storage, pools, resident)
+
+    def _borrowed_transition(
+        self,
+        borrow: _EncoderScratchBorrow,
+        mel: torch.Tensor,
+        caches: EncoderCaches,
+        out_offsets: torch.Tensor,
+        out_lengths: torch.Tensor,
+        out_width: int,
+        prompt_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.arm != "eager-graphed" or not self.ready or self.cell_active:
+            raise ValueError("borrowed encoder replay requires a ready eager-graphed execution")
+        # caches.valid may materialize a dtype conversion. Check ownership
+        # before computing the signature, which is not purely host metadata.
+        self._scratch.check(borrow.transaction)
+        entry = self._graph_entries.get(borrow.key)
+        if entry is None or mel.shape[0] != borrow.key[1] or type(caches) is not type(entry.caches):
+            raise ValueError("borrowed encoder signature differs from its captured cell")
+        self._scratch.check_borrow(borrow, entry, borrow.key, _cache_storage(caches))
+        signature = _encoder_signature(mel, caches, out_offsets, out_lengths, out_width, prompt_index)
+        if signature != entry.signature or signature not in self._allowed_signatures:
+            raise ValueError("borrowed encoder signature differs from its captured cell")
+        result = self._replay_graph_entry(
+            signature=signature,
+            mel=mel,
+            caches=caches,
+            out_offsets=out_offsets,
+            out_lengths=out_lengths,
+            prompt_index=prompt_index,
+            _borrow=borrow,
+        )
+        self._invocations += 1
+        self._last_signature = signature
+        return result
 
     @property
     def ready(self) -> bool:
@@ -673,6 +959,7 @@ class ResolvedEncoderExecution:
         if set(entries) & set(self._graph_entries) or not all(callable(value) for value in entries.values()):
             raise ValueError("CHUNK and encoder graph owners overlap or are malformed")
         self._assert_model_state()
+        self._validate_scratch_inventory(chunks=entries)
         self._chunk_graph_entries = dict(entries)
 
     def warmup_cell(
@@ -1005,6 +1292,8 @@ class ResolvedEncoderExecution:
         runtime = self._graph_runtime
         if run_transition is None or runtime is None or self._vllm_config is None:
             raise ValueError("graphed encoder runtime authority is unavailable")
+        if self.arm == "eager-graphed":
+            _check_scratch_allocation(mel.device)
         empty_like = getattr(caches, "empty_like", None)
         if not callable(empty_like):
             raise TypeError("graphed encoder caches require empty_like()")
@@ -1016,6 +1305,8 @@ class ResolvedEncoderExecution:
         caller_storage_signature = _cache_storage_signature(caller_storage)
         if _cache_storage_signature(stable_storage) != caller_storage_signature:
             raise ValueError("graphed encoder cache factory changed tensor layout")
+        if self.arm == "eager-graphed":
+            _validate_scratch_storage(stable_storage, tuple(tensor for family in caller_storage for tensor in family))
 
         stable_mel = torch.empty_like(mel)
         stable_offsets = torch.empty_like(out_offsets)
@@ -1071,6 +1362,8 @@ class ResolvedEncoderExecution:
             conditioned=torch.empty_like(conditioned),
             descriptor=descriptor,
             wrapper=None,
+            captured_storage=stable_storage,
+            captured_ranges=tuple(_storage_range(t) for family in stable_storage for t in family),
         )
 
         def run() -> tuple[torch.Tensor, ...]:
@@ -1201,6 +1494,7 @@ class ResolvedEncoderExecution:
                 if cell not in self._pending_graph_entries:
                     raise ValueError(f"encoder graph staging cell {cell} did not execute")
             self._record_memory_diagnostic(device, stage="after-staging")
+            self._validate_scratch_inventory(self._pending_graph_entries)
             self._assert_model_state()
 
             stage = "capture"
@@ -1269,6 +1563,7 @@ class ResolvedEncoderExecution:
         out_offsets: torch.Tensor,
         out_lengths: torch.Tensor,
         prompt_index: torch.Tensor,
+        _borrow: _EncoderScratchBorrow | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         matches = [entry for entry in self._graph_entries.values() if entry.signature == signature]
         if not matches:
@@ -1291,17 +1586,41 @@ class ResolvedEncoderExecution:
         runtime = self._graph_runtime
         if runtime is None:
             raise ValueError("graphed encoder runtime authority is unavailable")
-        with phase("port.encode.stage_in"):
-            entry.mel.copy_(mel)
-            _copy_cache_storage_(entry.cache_storage(), caller_storage)
-            entry.out_offsets.copy_(out_offsets)
-            entry.out_lengths.copy_(out_lengths)
-            entry.prompt_index.copy_(prompt_index)
-        with phase("port.encode.replay"):
-            self._call_graph_entry(entry, mode=runtime.graph_mode)
-        with phase("port.encode.stage_out"):
-            _copy_cache_storage_(caller_storage, entry.cache_storage())
-            return entry.raw.clone(), entry.conditioned.clone()
+        if _borrow is not None and self.arm != "eager-graphed":
+            raise ValueError("only eager-graphed replay may borrow encoder caches")
+        if _borrow is not None:
+            entry.checked_borrow_storage()
+        scope = (
+            self._scratch.replay(_borrow, entry, entry.key, caller_storage)
+            if self.arm == "eager-graphed"
+            else nullcontext()
+        )
+        with scope:
+            if self.arm == "eager-graphed":
+                caller_tensors = (mel, out_offsets, out_lengths, prompt_index)
+                if _borrow is None:
+                    caller_tensors += tuple(t for family in caller_storage for t in family)
+                graph_tensors = (
+                    entry.mel,
+                    entry.out_offsets,
+                    entry.out_lengths,
+                    entry.prompt_index,
+                    *entry.output_tuple(),
+                )
+                _validate_scratch_storage(EncoderCacheStorage(graph_tensors, (), ()), caller_tensors)
+            with phase("port.encode.stage_in"):
+                entry.mel.copy_(mel)
+                if _borrow is None:
+                    _copy_cache_storage_(entry.cache_storage(), caller_storage)
+                entry.out_offsets.copy_(out_offsets)
+                entry.out_lengths.copy_(out_lengths)
+                entry.prompt_index.copy_(prompt_index)
+            with phase("port.encode.replay"):
+                self._call_graph_entry(entry, mode=runtime.graph_mode)
+            with phase("port.encode.stage_out"):
+                if _borrow is None:
+                    _copy_cache_storage_(caller_storage, entry.cache_storage())
+                return entry.raw.clone(), entry.conditioned.clone()
 
     def _replay_bucketed_graph_entry(
         self,
@@ -1650,6 +1969,9 @@ def build_encoder_execution(
         return result
 
     execution.transition = guarded_transition
+    # Private discovery seam for the canonical outer transaction. Wrapping the
+    # public callable does not confer this authority on extension callables.
+    guarded_transition._encoder_execution = execution
     return execution
 
 

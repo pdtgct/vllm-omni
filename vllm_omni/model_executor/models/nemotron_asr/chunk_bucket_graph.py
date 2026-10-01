@@ -24,7 +24,18 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     advance_chunk_bucket,
 )
 from vllm_omni.model_executor.models.nemotron_asr.decode_graph import GraphRuntime, platform_graph_runtime
-from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import _tensor_signature
+from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
+    EncoderCacheStorage,
+    ResolvedEncoderExecution,
+    _cache_storage_signature,
+    _check_scratch_allocation,
+    _EncoderScratch,
+    _EncoderScratchBorrow,
+    _storage_range,
+    _tensor_signature,
+    _validate_gather_destination,
+    _validate_scratch_storage,
+)
 from vllm_omni.model_executor.models.nemotron_asr.manifests import CADENCES
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import decode_dense_masked_frames
 
@@ -115,20 +126,36 @@ def capture_chunk_bucket(
         raise ValueError("bucket graph requires unprepared native positional projections")
     runtime = runtime or platform_graph_runtime()
     sample_width = 8 * (list(CADENCES.values())[geometry][1] + 1) * int(core.featurizer.hop_length)
+    _check_scratch_allocation(env.device)
     static_env = env.clone()
     static_prompt = admitted_prompt.clone()
     static_status = incoming_status.clone()
     static_state = _clone_state(state)
     sources = (env, admitted_prompt, incoming_status, *_state_tensors(state))
     scratch = (static_env, static_prompt, static_status, *_state_tensors(static_state))
+    cache_storage = EncoderCacheStorage(
+        tuple(static_state.channel), tuple(static_state.time), tuple(static_state.window_valid)
+    )
+    cache_ids = {id(tensor) for family in cache_storage for tensor in family}
+    cache_signature = _cache_storage_signature(cache_storage)
+    cache_ranges = tuple(_storage_range(tensor) for family in cache_storage for tensor in family)
+    execution = getattr(admitted_encoder_transition, "_encoder_execution", None)
+    scratch_owner = (
+        execution._scratch
+        if isinstance(execution, ResolvedEncoderExecution)
+        and execution.arm == "eager-graphed"
+        and execution.transition is admitted_encoder_transition
+        else _EncoderScratch()
+    )
     signature = tuple(_tensor_signature(tensor) for tensor in sources)
     descriptor = runtime.descriptor_factory(population)
     result_type: Any = None
     owned: tuple[torch.Tensor, ...] = ()
 
-    def stage(values: tuple[torch.Tensor, ...]) -> None:
+    def stage(values: tuple[torch.Tensor, ...], *, borrowed: bool = False) -> None:
         for destination, source in zip(scratch, values, strict=True):
-            destination.copy_(source)
+            if not borrowed or id(destination) not in cache_ids:
+                destination.copy_(source)
 
     def body() -> tuple[torch.Tensor, ...]:
         bucket = advance_chunk_bucket(
@@ -161,6 +188,8 @@ def capture_chunk_bucket(
     )
     result_type = type(probe.result)
     owned = tuple(torch.empty_like(tensor) for tensor in _outputs(probe))
+    non_encoder_tensors = (*tuple(t for t in scratch if id(t) not in cache_ids), *owned)
+    _validate_scratch_storage(cache_storage, (*sources, *non_encoder_tensors))
     wrapper = runtime.wrapper_factory(body, vllm_config, runtime_mode=runtime.graph_mode)
 
     def call(mode: Any) -> tuple[torch.Tensor, ...]:
@@ -190,7 +219,8 @@ def capture_chunk_bucket(
         runtime.set_capture_enabled(False)
 
     @torch.inference_mode()
-    def transition(
+    def replay(
+        borrow: _EncoderScratchBorrow | None,
         actual_core: Any,
         actual_env: torch.Tensor,
         actual_state: SessionStateBatch,
@@ -216,14 +246,20 @@ def capture_chunk_bucket(
             or tuple(_tensor_signature(tensor) for tensor in values) != signature
         ):
             raise ValueError("bucket graph invocation differs from its captured cell")
-        scratch_storages = {tensor.untyped_storage().data_ptr() for tensor in scratch}
-        if any(tensor.untyped_storage().data_ptr() in scratch_storages for tensor in values):
-            raise ValueError("bucket caller aliases graph-owned scratch")
-        stage(values)
-        output = call(runtime.graph_mode)
-        for destination, source in zip(_state_tensors(actual_state), _state_tensors(static_state), strict=True):
-            destination.copy_(source)
-        escaped = tuple(tensor.clone() for tensor in output)
+        actual_storage = EncoderCacheStorage(
+            tuple(actual_state.channel), tuple(actual_state.time), tuple(actual_state.window_valid)
+        )
+        with scratch_owner.replay(borrow, transition, (geometry, population), actual_storage):
+            # Only the checked capability permits cache aliases. All other
+            # inputs, and every public call, retain general alias rejection.
+            checked_values = values if borrow is None else tuple(t for t in values if id(t) not in cache_ids)
+            _validate_scratch_storage(EncoderCacheStorage((*scratch, *owned), (), ()), checked_values)
+            stage(values, borrowed=borrow is not None)
+            output = call(runtime.graph_mode)
+            for destination, source in zip(_state_tensors(actual_state), _state_tensors(static_state), strict=True):
+                if borrow is None or id(source) not in cache_ids:
+                    destination.copy_(source)
+            escaped = tuple(tensor.clone() for tensor in output)
         result = result_type(
             token_ids=escaped[0],
             token_lengths=escaped[1],
@@ -245,8 +281,92 @@ def capture_chunk_bucket(
         transition.replay_count += 1
         return ChunkBucketResult(batch, result, escaped[11], escaped[12])
 
+    @torch.inference_mode()
+    def transition(
+        actual_core: Any,
+        actual_env: torch.Tensor,
+        actual_state: SessionStateBatch,
+        *,
+        geometry: int,
+        admitted_prompt: torch.Tensor,
+        incoming_status: torch.Tensor,
+        queue_capacity: int,
+        decode_fn: Any,
+        encoder_transition: Any = None,
+        capture: bool = False,
+        capture_geometry: Any | None = None,
+    ) -> ChunkBucketResult:
+        return replay(
+            None,
+            actual_core,
+            actual_env,
+            actual_state,
+            geometry=geometry,
+            admitted_prompt=admitted_prompt,
+            incoming_status=incoming_status,
+            queue_capacity=queue_capacity,
+            decode_fn=decode_fn,
+            encoder_transition=encoder_transition,
+            capture=capture,
+            capture_geometry=capture_geometry,
+        )
+
+    def check_borrow_binding(
+        actual_core: Any,
+        decode_fn: Any,
+        encoder_transition: Any,
+        capture: bool,
+        *,
+        env: torch.Tensor,
+        capacity: int,
+        state_pools: tuple[torch.Tensor, ...],
+    ) -> None:
+        if (
+            actual_core is not core
+            or decode_fn is not admitted_decode_fn
+            or encoder_transition is not admitted_encoder_transition
+            or capture
+            or capacity != frozen_capacity
+        ):
+            raise ValueError("borrowed CHUNK binding differs from its captured cell")
+        _validate_gather_destination(env, static_env, population)
+        for pool, destination in zip(
+            state_pools,
+            (
+                static_state.raw_tail,
+                static_state.mel_tail,
+                static_state.frontend_counters,
+                static_state.h,
+                static_state.c,
+            ),
+            strict=True,
+        ):
+            _validate_gather_destination(pool, destination, population)
+
+    def borrow_cache(
+        transaction: object,
+        cell: tuple[int, int],
+        pools: EncoderCacheStorage,
+        resident: tuple[torch.Tensor, ...],
+    ) -> _EncoderScratchBorrow:
+        if cell != (geometry, population):
+            raise ValueError("borrowed CHUNK cache differs from its captured cell")
+        if (
+            _cache_storage_signature(cache_storage) != cache_signature
+            or tuple(_storage_range(tensor) for family in cache_storage for tensor in family) != cache_ranges
+        ):
+            raise ValueError("CHUNK encoder cache storage changed since capture")
+        return scratch_owner.borrow(transaction, transition, cell, cache_storage, pools, resident)
+
     frozen_capacity = queue_capacity
     transition.replay_count = 0
+    transition._encoder_scratch = scratch_owner
+    transition._borrow_entry = transition
+    transition._cache_storage = cache_storage
+    transition._non_encoder_tensors = non_encoder_tensors
+    transition._borrow_cache = borrow_cache
+    transition._check_borrow_binding = check_borrow_binding
+    transition._borrowed_transition = replay
     return transition
 
 
@@ -351,6 +471,16 @@ class ExactChunkGraphBinding:
                 self._encoder._record_memory_diagnostic(device, stage="after-chunk-capture", key=(geometry, population))
                 del state, pools, invocation
             self._encoder.publish_chunk_graphs(pending)
+            # CHUNK intentionally shares decoder workspace with split decode;
+            # none of those inputs, outputs, or views may back encoder caches.
+            self._encoder._validate_scratch_inventory(
+                others=tuple(
+                    value
+                    for entry in self._decoder._entries.values()
+                    for value in vars(entry).values()
+                    if isinstance(value, torch.Tensor)
+                )
+            )
             self._encoder._record_memory_diagnostic(device, stage="after-complete-mixed-inventory")
         except Exception:
             self._encoder._discard()

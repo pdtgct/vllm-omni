@@ -175,14 +175,20 @@ def _clone_pools(pools: Pools) -> Pools:
     return {k: [t.clone() for t in v] if isinstance(v, list) else v.clone() for k, v in pools.items()}
 
 
-def _assert_pools_equal(a: Pools, b: Pools) -> None:
+def _assert_pools_equal(a: Pools, b: Pools, *, raw_bytes: bool = False) -> None:
+    def equal(left: torch.Tensor, right: torch.Tensor) -> None:
+        if raw_bytes:
+            assert torch.equal(left.contiguous().view(torch.uint8), right.contiguous().view(torch.uint8))
+        else:
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+
     for key in a:
         av, bv = a[key], b[key]
         if isinstance(av, list):
             for at, bt in zip(av, bv, strict=True):
-                torch.testing.assert_close(at, bt, rtol=0, atol=0)
+                equal(at, bt)
         else:
-            torch.testing.assert_close(av, bv, rtol=0, atol=0)
+            equal(av, bv)
 
 
 def _plan(
@@ -3536,3 +3542,344 @@ def test_gather_zero_rows_preserves_empty_layout() -> None:
     assert gathered.dtype == pool.dtype
     assert gathered.device == pool.device
     assert gathered.is_contiguous()
+
+
+@pytest.mark.parametrize("fresh", [[False, False, False], [True, False, True], [True, True, True]])
+def test_gather_into_graph_scratch_reads_only_continuing_rows(fresh, monkeypatch):
+    pool = torch.full((5, 3, 4), float("nan"))
+    blocks = torch.tensor([4, 1, 3])
+    fresh = torch.tensor(fresh)
+    for row, block in enumerate(blocks.tolist()):
+        if not fresh[row]:
+            pool[block].fill_(block)
+    destination = torch.full((3, 3, 4), -999.0)
+    reads = []
+    original_method = torch.Tensor.index_select
+    original_function = torch.index_select
+
+    def method(tensor, dim, index):
+        if tensor is pool:
+            reads.extend(index.tolist())
+        return original_method(tensor, dim, index)
+
+    def function(tensor, dim, index, *, out=None):
+        if tensor is pool:
+            reads.extend(index.tolist())
+            assert out is destination
+        return original_function(tensor, dim, index, out=out)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", method)
+    monkeypatch.setattr(torch, "index_select", function)
+    actual = advance._gather_initialized_rows(pool, blocks, fresh, destination=destination)
+    assert actual is destination
+    assert reads == blocks[~fresh].tolist()
+    for row, block in enumerate(blocks.tolist()):
+        assert torch.equal(actual[row], torch.full((3, 4), 0.0 if fresh[row] else float(block)))
+    assert not torch.signbit(actual[fresh]).any()
+
+
+@pytest.mark.parametrize("defect", ["shape", "dtype", "layout", "alias"])
+def test_gather_destination_defect_precedes_resident_reads(defect, monkeypatch):
+    pool = torch.ones(5, 3, 4)
+    destination = {
+        "shape": torch.zeros(2, 3, 4),
+        "dtype": torch.zeros(3, 3, 4, dtype=torch.float64),
+        "layout": torch.zeros(3, 4, 3).transpose(1, 2),
+        "alias": pool[1:4],
+    }[defect]
+    monkeypatch.setattr(torch, "index_select", lambda *_args, **_kwargs: pytest.fail("invalid destination read pool"))
+    with pytest.raises(ValueError, match="destination|alias"):
+        advance._gather_initialized_rows(
+            pool, torch.tensor([4, 1, 3]), torch.zeros(3, dtype=torch.bool), destination=destination
+        )
+
+
+@pytest.fixture(scope="module")
+def native_scratch_domain():
+    from test_advance_session_local import _fresh_state
+    from test_encoder_execution import _graph_runtime
+
+    execution_module = mods["encoder_execution"]
+    with torch.inference_mode():
+        core = _tiny_core()
+        core.policy = SimpleNamespace(dtype_for=lambda _name: torch.float32)
+        execution = execution_module.build_encoder_execution(
+            core,
+            SimpleNamespace(encoder_execution_arm="eager-graphed", att_context_left=WINDOW),
+            maximum_population=64,
+            warmup_geometries=(0, 1),
+            vllm_config=object(),
+            graph_runtime=_graph_runtime(),
+        )
+
+        def invoke(geometry, population):
+            shape = execution._geometry_shapes[geometry]
+            return execution.transition(
+                torch.zeros(population, FEAT, shape.mel_width),
+                advance._GatheredCaches(_fresh_state(population)),
+                torch.zeros(population, dtype=torch.long),
+                torch.full((population,), shape.out_width, dtype=torch.long),
+                shape.out_width,
+                torch.zeros(population, dtype=torch.long),
+            )
+
+        execution.warmup_domain(expected_cells=tuple((g, n) for g in (0, 1) for n in range(1, 65)), invoke=invoke)
+    return core, execution
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("population", [1, 2, 31, 32, 63, 64])
+def test_native_transaction_direct_gather_matches_public_staging_at_measured_populations(
+    native_scratch_domain, population, monkeypatch
+):
+    core, execution = native_scratch_domain
+    pools = _sentinel_pools(population + 1)
+    reference = _clone_pools(pools)
+    env = torch.stack([_envelope(torch.randn(2560), final=False, seq=0, geometry=1) for _ in range(population)])
+    if population > 1:
+        env[-1, advance.ENV_PROMPT_INDEX] = 1  # failed fresh row must retain its page
+    plan = _plan(prefills=list(range(1, population + 1)), num_pool_blocks=population + 1, geometries=[1] * population)
+    kwargs = dict(
+        adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
+        decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+    )
+    copies = []
+    original_copy = mods["encoder_execution"]._copy_cache_storage_
+
+    def copied(*args):
+        copies.append(True)
+        return original_copy(*args)
+
+    monkeypatch.setattr(mods["encoder_execution"], "_copy_cache_storage_", copied)
+    ids = torch.full((population,), PLACEHOLDER_ID, dtype=torch.long)
+    # Exercise the unchanged public API as the CPU staging oracle. A wrapped
+    # extension does not acquire the private transaction capability.
+    expected = advance.advance_model_rows(
+        core, ids, env, plan, **reference, **kwargs, encoder_transition=lambda *args: execution.transition(*args)
+    )
+    assert len(copies) == 2
+    copies.clear()
+    destinations = []
+    original_gather = advance._gather_initialized_rows
+
+    def gathered(*args, **kwargs):
+        destination = kwargs.get("destination")
+        if destination is not None:
+            destinations.append(destination)
+        return original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(advance, "_gather_initialized_rows", gathered)
+    original_scatter = advance._execute_masked_page_scatter_
+
+    def scatter(*args):
+        with pytest.raises(ValueError, match="active"):
+            with execution._scratch.hold(torch.device("cpu")):
+                pass
+        return original_scatter(*args)
+
+    monkeypatch.setattr(advance, "_execute_masked_page_scatter_", scatter)
+    sink = _CommitRecorder()
+    actual = advance.advance_model_rows(
+        core, ids, env, plan, **pools, **kwargs, encoder_transition=execution.transition, commit_sink=sink
+    )
+    assert copies == []
+    assert len(destinations) == 3 * N_LAYERS
+    assert len(sink.plans) == 1 and len(sink.staged) == 1
+    assert torch.count_nonzero(sink.staged[0][: population - 1 if population > 1 else 1]) == 0
+    if population > 1:
+        assert sink.staged[0][-1] != 0
+    assert torch.equal(actual, expected)
+    _assert_pools_equal(pools, reference, raw_bytes=True)
+    assert execution.ready
+
+
+@torch.inference_mode()
+def test_native_borrow_survives_later_geometry_and_mixed_fresh_checkpoint(native_scratch_domain, monkeypatch):
+    core, execution = native_scratch_domain
+    pools = _fresh_pools(4)
+    kwargs = dict(
+        adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
+        decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        encoder_transition=execution.transition,
+    )
+    ids = torch.full((3,), PLACEHOLDER_ID, dtype=torch.long)
+    env = torch.stack(
+        [
+            _envelope(torch.randn(1280), final=False, seq=0, geometry=0),
+            _envelope(torch.randn(2560), final=False, seq=0, geometry=1),
+            _envelope(torch.randn(1280), final=False, seq=0, geometry=0),
+        ]
+    )
+    plan = _plan(prefills=[1, 2, 3], num_pool_blocks=4, geometries=[0, 1, 0], deadlines=[1, 2, 1])
+    advance.advance_model_rows(core, ids, env, plan, **pools, **kwargs)
+    # The next checkpoint is drained, retaining the last emitted label and
+    # predictor state; block 3 is recycled for a newly admitted row.
+    pools["book_pool"][:, _BOOK["queue_head"]] = pools["book_pool"][:, _BOOK["queue_length"]]
+    pools["book_pool"][:, _BOOK["pending_echo"]] = 0
+    pools["book_pool"][:, _BOOK["expected_label"]] = 0
+    for value in pools.values():
+        for tensor in value if isinstance(value, list) else [value]:
+            tensor[3].fill_(12345)
+    reference = _clone_pools(pools)
+    env[:2, advance.ENV_CHUNK_SEQUENCE] = 1
+    plan = _plan(
+        prefills=[1, 2, 3],
+        num_pool_blocks=4,
+        geometries=[0, 1, 0],
+        has_initial=[True, True, False],
+        deadlines=[1, 2, 1],
+    )
+    expected = advance.advance_model_rows(
+        core,
+        ids,
+        env,
+        plan,
+        **reference,
+        **(kwargs | {"encoder_transition": lambda *args: execution.transition(*args)}),
+    )
+    saved: list[tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]] = []
+    original = execution._borrowed_transition
+
+    def transition(borrow, *args):
+        if saved:
+            old_storage, snapshots = saved[0]
+            assert all(torch.equal(t, snapshot) for t, snapshot in zip(old_storage, snapshots, strict=True))
+        result = original(borrow, *args)
+        tensors = tuple(t for family in borrow.storage for t in family)
+        saved.append((tensors, tuple(t.clone() for t in tensors)))
+        return result
+
+    monkeypatch.setattr(execution, "_borrowed_transition", transition)
+    sink = _CommitRecorder()
+    actual = advance.advance_model_rows(core, ids, env, plan, **pools, **kwargs, commit_sink=sink)
+    assert len(saved) == 2
+    assert torch.count_nonzero(sink.staged[0]) == 0
+    assert torch.equal(actual, expected)
+    _assert_pools_equal(pools, reference, raw_bytes=True)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("failure", ["compute", "adapter", "descriptor", "reserve", "reentry"])
+def test_native_borrow_failure_preserves_resident_and_recovers(native_scratch_domain, monkeypatch, failure):
+    core, execution = native_scratch_domain
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    ids = torch.tensor([PLACEHOLDER_ID])
+    env = _envelope(torch.randn(2560), final=False, seq=0, geometry=1).unsqueeze(0)
+    plan = _plan(prefills=[1], geometries=[1])
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id)
+    kwargs = dict(
+        adapter=adapter,
+        decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        encoder_transition=execution.transition,
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected failure")
+
+    with monkeypatch.context() as patch:
+        candidate = dict(kwargs)
+        if failure == "compute":
+            patch.setattr(execution, "_call_graph_entry", fail)
+        elif failure == "adapter":
+            candidate["adapter"] = fail
+        elif failure == "descriptor":
+            validate = advance.validate_masked_page_scatter
+            descriptors = []
+
+            def fail_late(*args):
+                descriptors.append(True)
+                if len(descriptors) == 10:
+                    fail()
+                validate(*args)
+
+            patch.setattr(advance, "validate_masked_page_scatter", fail_late)
+        elif failure == "reserve":
+            candidate["commit_sink"] = _CommitRecorder(fail_reserve=True)
+        else:
+
+            def reenter(result, context):
+                advance.advance_model_rows(core, ids, env, plan, **pools, **kwargs)
+                return adapter(result, context)
+
+            candidate["adapter"] = reenter
+        with pytest.raises((RuntimeError, ValueError), match="failure|capacity|active"):
+            advance.advance_model_rows(core, ids, env, plan, **pools, **candidate)
+    _assert_pools_equal(pools, before, raw_bytes=True)
+    assert execution.ready
+    advance.advance_model_rows(core, ids, env, plan, **pools, **kwargs)
+    assert not torch.equal(pools["channel_pools"][0][1], before["channel_pools"][0][1])
+
+
+@torch.inference_mode()
+def test_native_borrow_rejects_later_cache_layout_before_any_resident_read(native_scratch_domain, monkeypatch):
+    core, execution = native_scratch_domain
+    pools = _fresh_pools()
+    pools["time_pools"][-1] = torch.zeros(3, D_MODEL, KERNEL)  # later family, wrong signature
+    monkeypatch.setattr(
+        advance, "_gather_initialized_rows", lambda *_args, **_kwargs: pytest.fail("invalid cache signature read state")
+    )
+    with pytest.raises(ValueError, match="destination"):
+        advance.advance_model_rows(
+            core,
+            torch.tensor([PLACEHOLDER_ID]),
+            _envelope(torch.randn(2560), final=False, seq=0, geometry=1).unsqueeze(0),
+            _plan(prefills=[1], geometries=[1]),
+            **pools,
+            adapter=_refuse_adapter,
+            decode_resolver=_fixed_resolver(),
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            encoder_transition=execution.transition,
+        )
+    assert execution.ready
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("seam", ["decoder", "adapter"])
+def test_native_borrow_preserves_independent_extension_oracles(native_scratch_domain, seam):
+    core, execution = native_scratch_domain
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    env = _envelope(torch.randn(2560), final=False, seq=0, geometry=1).unsqueeze(0)
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id)
+    decoder = rnnt.decode_dense_masked_frames
+    if seam == "adapter":
+        env[0, advance.ENV_VERSION] = 99
+
+        def mutate_adapter(result, context):
+            result.row_status.zero_()
+            context.row_status.zero_()
+            return adapter(result, context)
+
+        selected_adapter = mutate_adapter
+    else:
+        selected_adapter = adapter
+
+        def decoder(frames, lengths, predictor, joint, state):
+            state.h.add_(1)  # no emission may change predictor state
+            return torch.zeros(1, 1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32), state
+
+    sink = _CommitRecorder()
+    actual = advance.advance_model_rows(
+        core,
+        torch.tensor([PLACEHOLDER_ID]),
+        env,
+        _plan(prefills=[1], geometries=[1]),
+        **pools,
+        adapter=selected_adapter,
+        decode_resolver=_fixed_resolver(decoder),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        encoder_transition=execution.transition,
+        commit_sink=sink,
+    )
+    assert _decision(actual) == [PARK_ID]
+    assert sink.staged[0][0] != 0
+    _assert_pools_equal(pools, before, raw_bytes=True)

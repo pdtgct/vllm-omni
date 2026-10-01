@@ -36,6 +36,255 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.core_model]
 
 
+def _borrow_args(population=2, base=7.0):
+    from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
+
+    mel, caches, offsets, lengths, width, prompt = _graph_transition_args(population=population, base=base)
+    storage = caches.graph_storage()
+    gathered = _GatheredCaches._from_tensors(
+        channel=storage.channel, time=storage.time, valid=storage.valid, left_context=caches.left_context
+    )
+    return mel, gathered, offsets, lengths, width, prompt
+
+
+def _borrow_execution(monkeypatch, arm="eager-graphed"):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config(arm),
+        maximum_population=2,
+        warmup_geometries=(0,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    execution.warmup_domain(
+        expected_cells=((0, 1), (0, 2)),
+        invoke=lambda _g, population: execution.transition(*_borrow_args(population)),
+    )
+    return execution
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_private_encoder_borrow_omits_both_copies_and_rejects_stale_reentrant_cross_key(monkeypatch):
+    from dataclasses import FrozenInstanceError
+
+    from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
+
+    execution = _borrow_execution(monkeypatch)
+    args = _borrow_args()
+    expected = _borrow_args()
+    expected_output = execution.transition(*expected)
+    pools = args[1].graph_storage()
+    copies = []
+    original = encoder_execution_module._copy_cache_storage_
+
+    def copied(*args):
+        copies.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(encoder_execution_module, "_copy_cache_storage_", copied)
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        borrow = execution._borrow_cache(transaction, (0, 2), pools, tuple(t for family in pools for t in family))
+        with pytest.raises(FrozenInstanceError):
+            borrow.key = (0, 1)
+        for dst_family, src_family in zip(borrow.storage, pools, strict=True):
+            for dst, src in zip(dst_family, src_family, strict=True):
+                dst.copy_(src)
+        caches = _GatheredCaches._from_tensors(
+            channel=borrow.storage.channel, time=borrow.storage.time, valid=borrow.storage.valid, left_context=56
+        )
+        borrowed_args = (args[0], caches, *args[2:])
+        with pytest.raises(ValueError, match="active|overlap|reentrant"):
+            execution._borrow_cache(transaction, (0, 2), pools, ())
+        with pytest.raises(ValueError, match="active|overlap|reentrant"):
+            execution.transition(*_borrow_args(1))
+        with pytest.raises(ValueError, match="cell|signature"):
+            execution._borrowed_transition(borrow, *_borrow_args(1))
+        with pytest.raises(ValueError, match="capability|storage"):
+            execution._borrowed_transition(borrow, *args)
+        with pytest.raises(ValueError, match="capability"):
+            execution._borrowed_transition(replace(borrow), *borrowed_args)
+        actual = execution._borrowed_transition(borrow, *borrowed_args)
+        assert copies == []
+        for left, right in zip(actual, expected_output, strict=True):
+            assert torch.equal(left, right)
+        for left_family, right_family in zip(borrow.storage, expected[1].graph_storage(), strict=True):
+            assert all(torch.equal(left, right) for left, right in zip(left_family, right_family, strict=True))
+        with monkeypatch.context() as patch:
+
+            def forbidden_replay_valid(_caches):
+                pytest.fail("used capability read graph cache contents")
+
+            patch.setattr(_GatheredCaches, "valid", property(forbidden_replay_valid))
+            with pytest.raises(ValueError, match="used|replay"):
+                execution._borrowed_transition(borrow, *borrowed_args)
+        held = tuple(t.clone() for t in actual)
+    # The valid property converts int32 storage to int64. Even that device
+    # read must occur only AFTER a live capability has been checked.
+    with monkeypatch.context() as patch:
+
+        def forbidden_valid(_caches):
+            pytest.fail("stale capability read graph cache contents")
+
+        patch.setattr(_GatheredCaches, "valid", property(forbidden_valid))
+        with pytest.raises(ValueError, match="stale|capability"):
+            execution._borrowed_transition(borrow, *borrowed_args)
+    execution.transition(*_borrow_args(base=19.0))
+    assert len(copies) == 2
+    assert all(torch.equal(left, right) for left, right in zip(actual, held, strict=True))
+    assert execution.ready
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_encoder_borrow_rejects_foreign_execution_thread_and_changed_capture_storage(monkeypatch):
+    from threading import Thread
+
+    execution = _borrow_execution(monkeypatch)
+    other = _borrow_execution(monkeypatch)
+    pools = _borrow_args()[1].graph_storage()
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        borrow = execution._borrow_cache(transaction, (0, 2), pools, ())
+        with pytest.raises(ValueError, match="stale|capability"):
+            other._scratch.check_borrow(borrow, borrow.entry, borrow.key, borrow.storage)
+        failures = []
+
+        def foreign_thread():
+            try:
+                execution._scratch.check(transaction)
+            except ValueError as error:
+                failures.append(str(error))
+
+        thread = Thread(target=foreign_thread)
+        thread.start()
+        thread.join()
+        assert len(failures) == 1 and "capability" in failures[0]
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        with pytest.raises(ValueError, match="stale|capability"):
+            execution._scratch.check_borrow(borrow, borrow.entry, borrow.key, borrow.storage)
+        entry = execution._graph_entries[(0, 2)]
+        old = entry.caches.channel._views[0]
+        entry.caches.channel._views[0] = old.clone()
+        with pytest.raises(ValueError, match="changed since capture"):
+            execution._borrow_cache(transaction, (0, 2), pools, ())
+        entry.caches.channel._views[0] = old
+        execution._borrow_cache(transaction, (0, 2), pools, ())
+    assert execution.ready
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+def test_public_encoder_keeps_caller_owned_copyback_and_dense_is_ineligible(monkeypatch, arm):
+    execution = _borrow_execution(monkeypatch, arm)
+    args = _borrow_args()
+    copies = []
+    original = encoder_execution_module._copy_cache_storage_
+
+    def copied(*args):
+        copies.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(encoder_execution_module, "_copy_cache_storage_", copied)
+    execution.transition(*args)
+    assert len(copies) == 2
+    if arm == "dense-graphed":
+        with execution._scratch.hold(torch.device("cpu")) as transaction:
+            with pytest.raises(ValueError, match="eager-graphed"):
+                execution._borrow_cache(transaction, (0, 2), args[1].graph_storage(), ())
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_encoder_borrow_rejects_backing_views_and_recovers_after_exception(monkeypatch):
+    execution = _borrow_execution(monkeypatch)
+    args = _borrow_args()
+    pools = args[1].graph_storage()
+    entry = execution._graph_entries[(0, 2)]
+    view = entry.cache_storage().channel[0][1:]
+    assert view.data_ptr() != entry.cache_storage().channel[0].data_ptr()
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        with pytest.raises(ValueError, match="alias|overlap"):
+            execution._borrow_cache(transaction, (0, 2), pools, (view,))
+    with pytest.raises(RuntimeError, match="compute failure"):
+        with execution._scratch.hold(torch.device("cpu")) as transaction:
+            execution._borrow_cache(transaction, (0, 2), pools, ())
+            raise RuntimeError("compute failure")
+    execution.transition(*args)
+    assert execution.ready
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_encoder_scratch_checks_cross_entry_and_decoder_backing_aliases(monkeypatch):
+    execution = _borrow_execution(monkeypatch)
+    entry = execution._graph_entries[(0, 2)]
+    storage = entry.cache_storage()
+    # A different data pointer/key is insufficient: the view shares backing.
+    decoder_view = storage.channel[0][1:]
+    with pytest.raises(ValueError, match="alias|overlap"):
+        encoder_execution_module._validate_scratch_storage(storage, (decoder_view,))
+    other = execution._graph_entries[(0, 1)]
+    other.caches.channel._views[0] = decoder_view
+    with pytest.raises(ValueError, match="alias|overlap"):
+        execution._validate_scratch_inventory()
+
+
+@pytest.mark.cpu
+def test_encoder_scratch_rejects_overlapping_distinct_storage_wrappers():
+    allocation = bytearray(128)
+    cache = torch.frombuffer(allocation, dtype=torch.float32, count=16)
+    overlapping = torch.frombuffer(allocation, dtype=torch.float32, count=8, offset=16)
+    assert cache.untyped_storage().data_ptr() != overlapping.untyped_storage().data_ptr()
+    storage = encoder_execution_module.EncoderCacheStorage((cache,), (), ())
+    with pytest.raises(ValueError, match="alias"):
+        encoder_execution_module._validate_scratch_storage(storage, (overlapping,))
+
+
+@pytest.mark.cpu
+def test_encoder_scratch_cannot_be_allocated_in_capture_pool(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(ValueError, match="outside.*capture"):
+        encoder_execution_module._check_scratch_allocation(torch.device("cuda"))
+    encoder_execution_module._check_scratch_allocation(torch.device("cpu"))
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_encoder_scratch_orders_last_consumer_before_reuse_without_synchronizing(monkeypatch):
+    execution = _borrow_execution(monkeypatch)
+    # Host model of two CUDA streams: retain queued operations until drained.
+    stream = ["serial"]
+    monkeypatch.setattr(encoder_execution_module, "_scratch_stream", lambda _device: stream[0])
+    pending = []
+    observed = []
+    pools = _borrow_args()[1].graph_storage()
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        borrow = execution._borrow_cache(transaction, (0, 2), pools, ())
+        tensor = borrow.storage.channel[0]
+        pending.append(lambda: tensor.fill_(17))
+        pending.append(lambda: observed.append(tensor.clone()))  # commit's final queued read
+        with pytest.raises(ValueError, match="active|overlap|reentrant"):
+            with execution._scratch.hold(torch.device("cpu")):
+                pass
+    stream[0] = "other"
+    with pytest.raises(ValueError, match="stream"):
+        with execution._scratch.hold(torch.device("cpu")):
+            pass
+    stream[0] = "serial"
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        second = execution._borrow_cache(transaction, (0, 2), pools, ())
+        pending.append(lambda: second.storage.channel[0].fill_(23))
+    assert observed == []  # release did not synchronize or claim completion
+    for operation in pending:
+        operation()
+    assert torch.all(observed[0] == 17)
+    assert torch.all(tensor == 23)
+    assert execution.ready
+
+
 @pytest.fixture(scope="function")
 def isolated_dynamo_cache() -> Generator[None, None, None]:
     """Keep each real-Dynamo test's complete compile/capture domain isolated."""
@@ -1604,13 +1853,28 @@ def test_dense_graphed_model_drift_during_capture_discards_readiness(
     assert execution.ready_receipt()["captured_keys"] == []
 
 
+def _real_cuda_graph_runtime(device: torch.device) -> GraphRuntime:
+    @contextmanager
+    def capture_stream(_device: torch.device) -> Any:
+        # Use the real platform wrapper without a distributed worker process.
+        current = torch.cuda.current_stream(device)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            yield
+        current.wait_stream(stream)
+
+    return replace(platform_graph_runtime(), capture_context=capture_stream)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA capture")
 @torch.inference_mode()
-@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+@pytest.mark.parametrize("arm,borrowed", [("dense-graphed", False), ("eager-graphed", False), ("eager-graphed", True)])
 def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     monkeypatch: pytest.MonkeyPatch,
     arm: str,
+    borrowed: bool,
     isolated_dynamo_cache: None,
 ) -> None:
     # @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
@@ -1642,18 +1906,7 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     core.cuda().eval()
     device = torch.device("cuda", torch.accelerator.current_device_index())
 
-    @contextmanager
-    def capture_stream(_device: torch.device) -> Any:
-        # Exercise the actual platform wrapper without requiring a distributed
-        # worker process for the tiny encoder discriminator.
-        current = torch.cuda.current_stream(device)
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(current)
-        with torch.cuda.stream(stream):
-            yield
-        current.wait_stream(stream)
-
-    runtime = replace(platform_graph_runtime(), capture_context=capture_stream)
+    runtime = _real_cuda_graph_runtime(device)
     execution = build_encoder_execution(
         core,
         _dense_graphed_config(arm),
@@ -1732,7 +1985,30 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
                 expected_args = args(geometry, population, base=0.25 + variant, variant=variant)
                 before = tuple(t.clone() for family in actual_args[1].graph_storage() for t in family)
                 expected_outputs = compiled(*expected_args)
-                actual_outputs = execution.transition(*actual_args)
+                if borrowed:
+                    storage = actual_args[1].graph_storage()
+                    with execution._scratch.hold(device) as transaction:
+                        borrow = execution._borrow_cache(
+                            transaction, (geometry, population), storage, tuple(t for family in storage for t in family)
+                        )
+                        for destinations, sources in zip(borrow.storage, storage, strict=True):
+                            for destination, source in zip(destinations, sources, strict=True):
+                                torch.index_select(source, 0, torch.arange(population, device=device), out=destination)
+                        caches = _GatheredCaches._from_tensors(
+                            channel=borrow.storage.channel,
+                            time=borrow.storage.time,
+                            valid=borrow.storage.valid,
+                            left_context=56,
+                        )
+                        actual_outputs = execution._borrowed_transition(
+                            borrow, actual_args[0], caches, *actual_args[2:]
+                        )
+                        # Stand in for the resident commit, queued before release.
+                        for destinations, sources in zip(storage, borrow.storage, strict=True):
+                            for destination, source in zip(destinations, sources, strict=True):
+                                destination.copy_(source)
+                else:
+                    actual_outputs = execution.transition(*actual_args)
                 for actual, expected in zip(actual_outputs, expected_outputs, strict=True):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 actual_state = tuple(t for family in actual_args[1].graph_storage() for t in family)
