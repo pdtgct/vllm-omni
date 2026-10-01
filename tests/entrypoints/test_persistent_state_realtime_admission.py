@@ -179,6 +179,90 @@ def _require_standard_update(websocket: _WebSocket) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+async def test_native_timing_records_successor_ready_while_predecessor_waits_for_park(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native appends preaccept audio independently of the parked renderer."""
+    import time
+    from unittest.mock import MagicMock
+
+    from tests.inputs.test_preprocess import _Renderer
+    from vllm_omni.inputs.preprocess import omni_renderer_cls
+    from vllm_omni.metrics.streaming import PrometheusStreamingObserver
+    from vllm_omni.metrics.streaming_transport import engine_service_timing_identity
+    from vllm_omni.model_executor.models.nemotron_asr.session import NemotronRealtimeSession
+    from vllm_omni.model_executor.models.nemotron_asr.streaming import buffer_stream
+
+    monkeypatch.setenv("VLLM_OMNI_SERVICE_TIMING", "1")
+    observer = PrometheusStreamingObserver(MagicMock(_log_stats=True))
+    session = NemotronRealtimeSession.from_model_config(
+        SimpleNamespace(
+            eos_token_id=13088,
+            audio_chunk_token_id=13089,
+            prompt_dictionary={"auto": 101},
+            num_prompts=128,
+        ),
+        cadence="160ms",
+        observer=observer,
+        session_key="native-timing-witness",
+        engine_epoch="test-epoch",
+        lease_generation=7,
+    )
+    connection, websocket, _ = _connection()
+    connection._nemotron_session = session
+    connection._is_model_validated = True
+    # Reuse the real Omni/upstream render pipeline fixture. Only expensive
+    # multimodal processing is mocked; parsing and metadata routing are real.
+    connection.serving.model_config = SimpleNamespace(is_encoder_decoder=False)
+    connection.serving.model_cls = SimpleNamespace(buffer_realtime_audio=buffer_stream)
+    connection.serving.renderer = omni_renderer_cls(_Renderer)()
+    held_generation = asyncio.create_task(asyncio.Event().wait())
+    connection.generation_task = held_generation
+    parks: asyncio.Queue[list[int]] = asyncio.Queue()
+    controls = connection._native_audio_controls()
+    rendered = connection._transcribe_nemotron_realtime(controls, parks)
+    pending = None
+    audio = base64.b64encode(b"\x01\x00" * session.geometry.chunk_samples).decode()
+    event = {"type": "input_audio_buffer.append", "audio": audio}
+    try:
+        await connection.handle_event(event)
+        first = await asyncio.wait_for(anext(rendered), timeout=1)
+        predecessor = session.accepted_audio.in_flight_unit
+        assert predecessor is not None and predecessor.logical_sequence == 0
+        identity = engine_service_timing_identity(first.prompt["additional_information"])
+        assert identity is not None
+        assert identity["logical_sequence"] == 0 and identity["lease_generation"] == 7
+
+        # Resume generation until its park wait. No park token is delivered.
+        pending = asyncio.create_task(anext(rendered))
+        await asyncio.sleep(0)
+        assert not pending.done()
+        await connection.handle_event(event)
+
+        assert session.accepted_audio.in_flight_unit is predecessor
+        (successor,) = session.accepted_audio.ready_units
+        assert successor.logical_sequence == 1
+        trace = observer.service_timing(session.session_key)
+        assert trace is not None and trace.valid and trace.count == 2
+        first_slot, next_slot = trace.slots[:2]
+        assert first_slot.s_ns is not None and first_slot.p is None
+        assert next_slot.r == successor.ready_at_ns / 1e9
+        assert next_slot.r <= time.monotonic()
+        assert next_slot.s_ns is None and next_slot.p is None
+        assert not pending.done() and parks.empty()
+        assert not [message for message in websocket.sent if message.get("type") == "error"]
+    finally:
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        held_generation.cancel()
+        await asyncio.gather(held_generation, return_exceptions=True)
+        await rendered.aclose()
+        await controls.aclose()
+        await connection._cancel_session_lifecycle_timeout()
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
 async def test_connection_entry_arms_the_total_unadmitted_lifetime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
