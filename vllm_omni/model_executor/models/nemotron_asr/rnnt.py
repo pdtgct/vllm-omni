@@ -77,6 +77,93 @@ class Predictor(nn.Module):
             hidden_size=pred_hidden,
             num_layers=pred_rnn_layers,
         )
+        self.register_buffer("_input_projection_table", None, persistent=False)
+        self._input_projection_sources: tuple[tuple[int, int, torch.device, torch.dtype], ...] | None = None
+
+    @property
+    def input_projection_table_enabled(self) -> bool:
+        """Whether this instance explicitly admitted the experimental table."""
+        return self._input_projection_table is not None
+
+    def invalidate_input_projection_table(self) -> None:
+        """Restore the original predictor path; recreate any captured graphs."""
+        self._input_projection_table = None
+        self._input_projection_sources = None
+
+    def __getstate__(self):
+        # A deepcopy used as an experimental control must recover the original
+        # path. Derived tensors must not travel in serialized module artifacts.
+        state = super().__getstate__().copy()
+        state["_buffers"] = dict(state["_buffers"], _input_projection_table=None)
+        state["_input_projection_sources"] = None
+        return state
+
+    def _apply(self, fn, recurse: bool = True):
+        self.invalidate_input_projection_table()
+        return super()._apply(fn, recurse=recurse)
+
+    def train(self, mode: bool = True) -> "Predictor":
+        if mode:
+            self.invalidate_input_projection_table()
+        return super().train(mode)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        self.invalidate_input_projection_table()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def _projection_source_signature(self) -> tuple[tuple[int, int, torch.device, torch.dtype], ...]:
+        # Inference-created parameters have no version counters. Refuse them
+        # rather than silently accepting a cache whose mutations are invisible.
+        try:
+            return tuple(
+                (id(weight), weight._version, weight.device, weight.dtype)
+                for weight in (self.embed.weight, self.rnn.weight_ih_l0)
+            )
+        except RuntimeError as error:
+            raise ValueError("input projection table requires versioned parameters") from error
+
+    def _check_projection_inference(self) -> None:
+        if self.training or torch.is_grad_enabled():
+            raise ValueError("input projection table requires frozen inference")
+        if torch.is_autocast_enabled(self.embed.weight.device.type):
+            raise ValueError("input projection table does not support autocast")
+
+    def prepare_input_projection_table(self) -> None:
+        """Explicitly admit the default-off FP32 predictor experiment.
+
+        Call after final weights/device/dtype and eval(), under no_grad or
+        inference_mode, before graph capture. The table holds only E @ W_ih.T;
+        biases remain in their original addition order. Vocabulary-wide GEMM
+        rounding can differ from per-batch GEMM and requires numerical gates.
+        Preparation and execution must retain the experiment's fixed FP32,
+        TF32-off policy (highest float32 matmul precision, CUDA matmul and
+        cuDNN allow_tf32 both false); this method does not change global flags.
+
+        Copies and checkpoint exports omit this derived table. Device/dtype,
+        training and checkpoint transitions invalidate it. Ordinary in-place
+        mutations are checked at Python step entry; .data writes are unsupported.
+        Graph replay bypasses Python: weights and this admission must stay frozen
+        for the graph's lifetime. Recreate graphs after any mutation/invalidation.
+        """
+        self._check_projection_inference()
+        embedding, weight = self.embed.weight, self.rnn.weight_ih_l0
+        if embedding.dtype != torch.float32 or weight.dtype != torch.float32:
+            raise ValueError("input projection table requires float32 weights")
+        if embedding.device != weight.device:
+            raise ValueError("input projection table weights must share a device")
+        sources = self._projection_source_signature()
+        if self._input_projection_table is not None:
+            if self._input_projection_sources != sources:
+                raise RuntimeError("input projection sources changed; invalidate and recreate graphs")
+            return
+        # Publish only after allocation and computation succeed.
+        table = embedding @ weight.t()
+        self._input_projection_table = table
+        self._input_projection_sources = sources
 
     def step(
         self,
@@ -84,7 +171,16 @@ class Predictor(nn.Module):
         state: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """One prediction step from the previous label."""
-        return self.rnn.step(self.embed(labels), state)
+        table = self._input_projection_table
+        if table is None:
+            return self.rnn.step(self.embed(labels), state)
+        self._check_projection_inference()
+        if self._input_projection_sources != self._projection_source_signature():
+            raise RuntimeError("input projection sources changed; invalidate and recreate graphs")
+        if any(value.dtype != torch.float32 or value.device != table.device for value in state):
+            raise ValueError("input projection table requires float32 state on the table device")
+        projection = torch.nn.functional.embedding(labels, table)
+        return self.rnn.step(projection, state, first_layer_input_projection=projection)
 
 
 class Joint(nn.Module):

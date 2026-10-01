@@ -65,6 +65,8 @@ class ManualLSTM(nn.Module):
         self,
         x: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor],
+        *,
+        first_layer_input_projection: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Advance one timestep.
 
@@ -72,6 +74,8 @@ class ManualLSTM(nn.Module):
             x: ``(batch, input_size)`` input, any compute dtype.
             state: ``(h, c)`` each ``(num_layers, batch, hidden)``; their
                 dtype is the recurrent-state dtype and is preserved.
+            first_layer_input_projection: Optional precomputed ``x @ W_ih.T``
+                for layer zero, without bias; ``x`` is unused in that layer.
 
         Returns:
             Top-layer output ``(batch, hidden)`` in the state dtype, and
@@ -88,7 +92,12 @@ class ManualLSTM(nn.Module):
             w_hh = self.get_parameter(f"weight_hh_l{layer}").to(state_dtype)
             b_ih = self.get_parameter(f"bias_ih_l{layer}").to(state_dtype)
             b_hh = self.get_parameter(f"bias_hh_l{layer}").to(state_dtype)
-            gates = layer_input @ w_ih.t() + b_ih + h[layer] @ w_hh.t() + b_hh
+            input_projection = (
+                first_layer_input_projection
+                if layer == 0 and first_layer_input_projection is not None
+                else layer_input @ w_ih.t()
+            )
+            gates = input_projection + b_ih + h[layer] @ w_hh.t() + b_hh
             i_gate = torch.sigmoid(gates[:, 0 * hidden : 1 * hidden])
             f_gate = torch.sigmoid(gates[:, 1 * hidden : 2 * hidden])
             g_gate = torch.tanh(gates[:, 2 * hidden : 3 * hidden])
