@@ -240,3 +240,90 @@ def test_frame_aligned_decode_matches_existing_flattened_dense_contract() -> Non
     torch.testing.assert_close(result.state.h, legacy_state.h)
     torch.testing.assert_close(result.state.c, legacy_state.c)
     torch.testing.assert_close(result.state.last_label, legacy_state.last_label)
+
+
+@pytest.mark.parametrize("frames,max_symbols", [(0, 1), (1, 0), (1, 1), (1, 3), (3, 1), (3, 10)])
+@pytest.mark.parametrize("blank", [False, True])
+def test_dense_terminal_lookahead_is_unused(monkeypatch, frames: int, max_symbols: int, blank: bool) -> None:
+    """Keep exact greedy state while omitting one unconsumed prediction."""
+    predictor, joint = _nets(seed=31)
+    predictor.eval()
+    joint.eval()
+    with torch.inference_mode():
+        joint.joint_net[1].bias[predictor.blank_id] = 100.0 if blank else -100.0
+        encoded = torch.randn(1, frames, _HID)
+        initial = _fresh_state(predictor)
+        expected_state = initial
+        expected_tokens: list[int] = []
+        expected_counts = []
+        expected_final = []
+        for frame in range(frames):
+            emitted, expected_state = greedy_decode_chunk(
+                encoded[0, frame : frame + 1], predictor, joint, expected_state, max_symbols=max_symbols
+            )
+            expected_tokens.extend(emitted)
+            expected_counts.append(len(emitted))
+            expected_final.append(emitted[-1] if emitted else predictor.blank_id)
+
+        step = predictor.step
+        calls = []
+
+        def counted_step(labels, state):
+            calls.append(labels.shape)
+            return step(labels, state)
+
+        monkeypatch.setattr(predictor, "step", counted_step)
+        result = _frame_decode_fn()(encoded, torch.tensor([frames]), predictor, joint, initial, max_symbols=max_symbols)
+
+        assert len(calls) == max(1, frames * max_symbols)
+        assert result.token_lengths.tolist() == [len(expected_tokens)]
+        assert result.token_ids[0, : len(expected_tokens)].tolist() == expected_tokens
+        assert result.frame_emission_counts.tolist() == [expected_counts]
+        assert result.frame_final_labels.tolist() == [expected_final]
+        for actual, expected in (
+            (result.state.h, expected_state.h),
+            (result.state.c, expected_state.c),
+            (result.state.last_label, expected_state.last_label),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_dense_terminal_lookahead_preserves_mixed_length_recurrence() -> None:
+    """An extra masked frame exposes the former lookahead without committing it."""
+    predictor, joint = _nets(seed=67)
+    predictor.eval()
+    joint.eval()
+    state = DecodeState(
+        h=torch.randn(2, 3, _HID),
+        c=torch.randn(2, 3, _HID),
+        last_label=torch.tensor([2, predictor.blank_id, 4]),
+    )
+    lengths = torch.tensor([0, 1, 3])
+    with torch.inference_mode():
+        for blank in (False, True, False):
+            joint.joint_net[1].bias[predictor.blank_id] = 100.0 if blank else -100.0
+            encoded = torch.randn(3, 3, _HID)
+            initial = DecodeState(state.h.clone(), state.c.clone(), state.last_label.clone())
+            result = _frame_decode_fn()(encoded, lengths, predictor, joint, state, max_symbols=3)
+            padded = _frame_decode_fn()(
+                torch.cat((encoded, torch.zeros(3, 1, _HID)), dim=1),
+                lengths,
+                predictor,
+                joint,
+                state,
+                max_symbols=3,
+            )
+            for actual, expected in (
+                (result.token_ids, padded.token_ids[:, :9]),
+                (result.token_lengths, padded.token_lengths),
+                (result.frame_emission_counts, padded.frame_emission_counts[:, :3]),
+                (result.frame_final_labels, padded.frame_final_labels[:, :3]),
+                (result.state.h, padded.state.h),
+                (result.state.c, padded.state.c),
+                (result.state.last_label, padded.state.last_label),
+                (state.h, initial.h),
+                (state.c, initial.c),
+                (state.last_label, initial.last_label),
+            ):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            state = result.state

@@ -425,7 +425,7 @@ def decode_dense_masked_frames(
             joint.enc(frame.to(joint.enc.weight.dtype)) if type(joint) is Joint and max_symbols > 0 else None
         )
         active = t < enc_lengths
-        for _ in range(max_symbols):
+        for symbol in range(max_symbols):
             if projected_frame is None:
                 logits = joint.logits(frame, pred_out)
             else:
@@ -455,10 +455,14 @@ def decode_dense_masked_frames(
             # only; blank never advances the predictor.
             h = torch.where(gate, pred_h, h)
             c = torch.where(gate, pred_c, c)
-            new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
-            pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
-            pred_h = torch.where(gate, new_h, pred_h)
-            pred_c = torch.where(gate, new_c, pred_c)
+            # The final prediction has no consumer: returned state was
+            # committed above. Shape/loop indices keep this branch static
+            # during graph capture without reading device-side activity.
+            if t + 1 < t_pad or symbol + 1 < max_symbols:
+                new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
+                pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
+                pred_h = torch.where(gate, new_h, pred_h)
+                pred_c = torch.where(gate, new_c, pred_c)
             active = emit
     return FrameAlignedDecode(
         token_ids=token_ids,
