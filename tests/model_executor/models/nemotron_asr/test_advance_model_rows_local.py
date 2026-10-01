@@ -3842,6 +3842,42 @@ def test_native_borrow_rejects_later_cache_layout_before_any_resident_read(nativ
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mutation", ["set", "resize", "stride", "data"])
+def test_native_borrow_rejects_same_object_mutation_before_resident_read(native_scratch_domain, monkeypatch, mutation):
+    from test_encoder_execution import _mutate_scratch_tensor
+
+    core, execution = native_scratch_domain
+    pools = _sentinel_pools()
+    before = _clone_pools(pools)
+    tensor = execution._graph_entries[(1, 1)].cache_storage().time[-1]
+    original = tensor.detach()
+    try:
+        _mutate_scratch_tensor(tensor, mutation)
+        monkeypatch.setattr(
+            advance,
+            "_gather_initialized_rows",
+            lambda *_args, **_kwargs: pytest.fail("mutated scratch read resident state"),
+        )
+        with pytest.raises(ValueError, match="storage|signature"):
+            advance.advance_model_rows(
+                core,
+                torch.tensor([PLACEHOLDER_ID]),
+                _envelope(torch.randn(2560), final=False, seq=0, geometry=1).unsqueeze(0),
+                _plan(prefills=[1], geometries=[1]),
+                **pools,
+                adapter=_refuse_adapter,
+                decode_resolver=_fixed_resolver(),
+                placeholder_id=PLACEHOLDER_ID,
+                park_id=PARK_ID,
+                encoder_transition=execution.transition,
+            )
+        _assert_pools_equal(pools, before, raw_bytes=True)
+    finally:
+        tensor.set_(original)
+    assert execution.ready
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("seam", ["decoder", "adapter"])
 def test_native_borrow_preserves_independent_extension_oracles(native_scratch_domain, seam):
     core, execution = native_scratch_domain

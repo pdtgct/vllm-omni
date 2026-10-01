@@ -467,6 +467,41 @@ def test_chunk_capability_rejects_public_alias_stale_and_foreign_capture():
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mutation", ["set", "resize", "stride", "data"])
+@pytest.mark.parametrize("boundary", ["borrow", "replay"])
+def test_chunk_borrow_checks_same_object_mutation(monkeypatch, mutation, boundary):
+    from test_encoder_execution import _mutate_scratch_tensor
+
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import EncoderCacheStorage
+
+    core, env, state, args = _fixture(32)
+    transition = capture_chunk_bucket(core, env, state, **args, vllm_config=None, runtime=_graph_runtime())
+    pools = EncoderCacheStorage(tuple(state.channel), tuple(state.time), tuple(state.window_valid))
+    resident = tuple(t for family in pools for t in family)
+    before = tuple(t.clone() for t in resident)
+    tensor = transition._cache_storage.channel[0]
+    original_identity = id(tensor)
+    with transition._encoder_scratch.hold(torch.device("cpu")) as transaction:
+        if boundary == "replay":
+            borrow = transition._borrow_cache(transaction, (1, 32), pools, resident)
+            state.channel, state.time, state.window_valid = map(list, borrow.storage)
+        _mutate_scratch_tensor(tensor, mutation)
+        monkeypatch.setattr(
+            torch.Tensor, "copy_", lambda *_args, **_kwargs: pytest.fail("mutated scratch staged CHUNK graph inputs")
+        )
+        with pytest.raises(ValueError, match="storage|cell"):
+            if boundary == "borrow":
+                transition._borrow_cache(transaction, (1, 32), pools, resident)
+            else:
+                transition._borrowed_transition(
+                    borrow, core, env, state, **args, decode_fn=rnnt.decode_dense_masked_frames
+                )
+        assert id(tensor) == original_identity
+    assert transition.replay_count == 0
+    assert all(torch.equal(left, right) for left, right in zip(resident, before, strict=True))
+
+
+@torch.inference_mode()
 def test_wrapped_chunk_extension_keeps_public_copy_path(monkeypatch):
     from functools import wraps
 

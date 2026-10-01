@@ -411,6 +411,24 @@ def _storage_range(tensor: torch.Tensor) -> tuple[str, int, int]:
     return str(tensor.device), start, start + storage.nbytes()
 
 
+def _scratch_metadata(
+    storage: EncoderCacheStorage,
+) -> tuple[tuple[tuple[TensorSignature, ...], ...], tuple[tuple[str, int, int], ...]]:
+    """Read one boundary's actual signatures and backing ranges together."""
+    signatures = []
+    ranges = []
+    for family in storage:
+        family_signatures = []
+        for tensor in family:
+            signature = _tensor_signature(tensor)
+            backing = tensor.untyped_storage()
+            start = backing.data_ptr()
+            family_signatures.append(signature)
+            ranges.append((signature.device, start, start + backing.nbytes()))
+        signatures.append(tuple(family_signatures))
+    return tuple(signatures), tuple(ranges)
+
+
 def _check_scratch_allocation(device: torch.device) -> None:
     # Startup only: live cache banks must never be graph-pool intermediates.
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -427,6 +445,10 @@ def _validate_scratch_storage(storage: EncoderCacheStorage, others: tuple[torch.
     """
     ranges = [(*_storage_range(tensor), True) for family in storage for tensor in family]
     ranges.extend((*_storage_range(tensor), False) for tensor in others)
+    _validate_scratch_ranges(ranges)
+
+
+def _validate_scratch_ranges(ranges: list[tuple[str, int, int, bool]]) -> None:
     device, occupied_end, cache_end = "", 0, 0
     for current_device, start, end, is_cache in sorted(ranges):
         if start == end:
@@ -440,20 +462,25 @@ def _validate_scratch_storage(storage: EncoderCacheStorage, others: tuple[torch.
             cache_end = max(cache_end, end)
 
 
-def _validate_gather_destination(pool: torch.Tensor, destination: torch.Tensor, rows: int) -> None:
-    shape = (rows, *pool.shape[1:])
+def _row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     strides: list[int] = []
     stride = 1
     for size in reversed(shape):
         strides.append(stride)
         stride *= max(1, size)
+    return tuple(reversed(strides))
+
+
+def _validate_gather_destination(pool: torch.Tensor, destination: torch.Tensor, rows: int) -> None:
+    shape = (rows, *pool.shape[1:])
+    strides = _row_major_strides(shape)
     if (
         tuple(destination.shape) != shape
         or destination.dtype != pool.dtype
         or destination.device != pool.device
         or destination.layout != torch.strided
         or not destination.is_contiguous()
-        or tuple(destination.stride()) != tuple(reversed(strides))
+        or tuple(destination.stride()) != strides
         or destination.storage_offset() != 0
     ):
         raise ValueError("encoder gather destination differs from resident row layout")
@@ -537,18 +564,42 @@ class _EncoderScratch:
             raise ValueError("encoder scratch cell already has an active borrow")
         if any(len(left) != len(right) for left, right in zip(storage, pools, strict=True)):
             raise ValueError("encoder scratch cache families differ from resident pools")
-        for family, pool_family in zip(storage, pools, strict=True):
-            for tensor, pool in zip(family, pool_family, strict=True):
-                _validate_gather_destination(pool, tensor, key[1])
+        signature, ranges = _scratch_metadata(storage)
+        # Expected row-major strides depend only on the observed shape. Reuse
+        # that calculation within this boundary; actual tensor metadata is fresh.
+        row_strides: dict[tuple[int, ...], tuple[int, ...]] = {}
+        for family, pool_family, signatures in zip(storage, pools, signature, strict=True):
+            for tensor, pool, current in zip(family, pool_family, signatures, strict=True):
+                shape = (key[1], *pool.shape[1:])
+                strides = row_strides.get(shape)
+                if strides is None:
+                    strides = row_strides[shape] = _row_major_strides(shape)
+                if (
+                    current.shape != shape
+                    or current.dtype != str(pool.dtype)
+                    or current.device != str(pool.device)
+                    or current.layout != str(torch.strided)
+                    or not tensor.is_contiguous()
+                    or current.stride != strides
+                    or current.storage_offset != 0
+                ):
+                    raise ValueError("encoder gather destination differs from resident row layout")
         held = tuple(tensor for borrow in self._borrows for family in borrow.storage for tensor in family)
-        _validate_scratch_storage(storage, (*resident, *held))
+        # One fresh range snapshot covers every pool, resident tensor and held
+        # cache in this validation boundary. The same ranges become the borrow's
+        # expected values; check_borrow still reads actual storage on every use.
+        others = {id(tensor): tensor for family in pools for tensor in family}
+        others.update((id(tensor), tensor) for tensor in (*resident, *held))
+        checked_ranges = [(*item, True) for item in ranges]
+        checked_ranges.extend((*_storage_range(tensor), False) for tensor in others.values())
+        _validate_scratch_ranges(checked_ranges)
         borrow = _EncoderScratchBorrow(
             transaction,
             entry,
             key,
             storage,
-            _cache_storage_signature(storage),
-            tuple(_storage_range(tensor) for family in storage for tensor in family),
+            signature,
+            ranges,
         )
         self._borrows[borrow] = False
         return borrow
@@ -565,14 +616,13 @@ class _EncoderScratch:
         self.check(borrow.transaction)
         if borrow not in self._borrows or borrow.entry is not entry or borrow.key != key:
             raise ValueError("encoder scratch capability belongs to another execution cell")
-        if (
-            any(
-                len(left) != len(right) or any(a is not b for a, b in zip(left, right, strict=True))
-                for left, right in zip(storage, borrow.storage, strict=True)
-            )
-            or _cache_storage_signature(storage) != borrow.signature
-            or tuple(_storage_range(tensor) for family in storage for tensor in family) != borrow.ranges
+        if any(
+            len(left) != len(right) or any(a is not b for a, b in zip(left, right, strict=True))
+            for left, right in zip(storage, borrow.storage, strict=True)
         ):
+            raise ValueError("encoder scratch capability does not authorize this cache storage")
+        signature, ranges = _scratch_metadata(storage)
+        if signature != borrow.signature or ranges != borrow.ranges:
             raise ValueError("encoder scratch capability does not authorize this cache storage")
         if self._borrows[borrow]:
             raise ValueError("encoder scratch capability already used for replay")
@@ -736,7 +786,8 @@ class _EncoderGraphEntry:
 
     def checked_borrow_storage(self) -> EncoderCacheStorage:
         storage = self.cache_storage()
-        if _cache_storage_signature(storage) != self.storage_signature:
+        signature, ranges = _scratch_metadata(storage)
+        if signature != self.storage_signature:
             raise ValueError("encoder scratch storage signature changed")
         if (
             self.captured_storage is None
@@ -745,7 +796,7 @@ class _EncoderGraphEntry:
                 for left, right in zip(storage, self.captured_storage, strict=True)
                 for a, b in zip(left, right, strict=True)
             )
-            or tuple(_storage_range(t) for family in storage for t in family) != self.captured_ranges
+            or ranges != self.captured_ranges
         ):
             raise ValueError("encoder scratch storage changed since capture")
         return storage

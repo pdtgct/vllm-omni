@@ -174,6 +174,147 @@ def test_encoder_borrow_rejects_foreign_execution_thread_and_changed_capture_sto
     assert execution.ready
 
 
+def _mutate_scratch_tensor(tensor, mutation):
+    if mutation == "set":
+        tensor.set_(tensor.clone())
+    elif mutation == "resize":
+        tensor.resize_(tensor.numel())
+    elif mutation == "stride":
+        tensor.as_strided_(tuple(reversed(tensor.shape)), tuple(reversed(tensor.stride())))
+    else:
+        tensor.data = tensor.clone()
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("mutation", ["set", "resize", "stride", "data"])
+@pytest.mark.parametrize("boundary", ["borrow", "replay", "signature_callback"])
+def test_encoder_borrow_checks_same_object_mutation_at_each_boundary(monkeypatch, mutation, boundary):
+    from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
+
+    execution = _borrow_execution(monkeypatch)
+    args = _borrow_args()
+    pools = args[1].graph_storage()
+    resident = tuple(t for family in pools for t in family)
+    before = tuple(t.clone() for t in resident)
+    entry = execution._graph_entries[(0, 2)]
+    storage = entry.cache_storage()
+    tensor = storage.channel[0]
+    original_identity = id(tensor)
+
+    def forbidden_write(*_args, **_kwargs):
+        pytest.fail("invalid scratch reached graph staging or replay")
+
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        if boundary == "borrow":
+            _mutate_scratch_tensor(tensor, mutation)
+        else:
+            borrow = execution._borrow_cache(transaction, (0, 2), pools, resident)
+            caches = _GatheredCaches._from_tensors(
+                channel=storage.channel, time=storage.time, valid=storage.valid, left_context=56
+            )
+            if boundary == "replay":
+                _mutate_scratch_tensor(tensor, mutation)
+            else:
+                signature = encoder_execution_module._encoder_signature
+
+                def mutate_after_signature(*args):
+                    result = signature(*args)
+                    _mutate_scratch_tensor(tensor, mutation)
+                    return result
+
+                monkeypatch.setattr(encoder_execution_module, "_encoder_signature", mutate_after_signature)
+        monkeypatch.setattr(torch.Tensor, "copy_", forbidden_write)
+        monkeypatch.setattr(execution, "_call_graph_entry", forbidden_write)
+        with pytest.raises(ValueError, match="storage|signature"):
+            if boundary == "borrow":
+                execution._borrow_cache(transaction, (0, 2), pools, resident)
+            else:
+                execution._borrowed_transition(borrow, args[0], caches, *args[2:])
+        assert id(tensor) == original_identity
+    assert all(torch.equal(left, right) for left, right in zip(resident, before, strict=True))
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("boundary", ["before_signature", "after_signature"])
+def test_encoder_borrow_rejects_replaced_dictionary_entry(monkeypatch, boundary):
+    from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
+
+    execution = _borrow_execution(monkeypatch)
+    args = _borrow_args()
+    pools = args[1].graph_storage()
+    with execution._scratch.hold(torch.device("cpu")) as transaction:
+        borrow = execution._borrow_cache(transaction, (0, 2), pools, ())
+        caches = _GatheredCaches._from_tensors(
+            channel=borrow.storage.channel, time=borrow.storage.time, valid=borrow.storage.valid, left_context=56
+        )
+        original = execution._graph_entries[(0, 2)]
+
+        def replace_entry():
+            execution._graph_entries[(0, 2)] = replace(original)
+
+        if boundary == "before_signature":
+            replace_entry()
+        else:
+            signature = encoder_execution_module._encoder_signature
+
+            def replace_after_signature(*args):
+                result = signature(*args)
+                replace_entry()
+                return result
+
+            monkeypatch.setattr(encoder_execution_module, "_encoder_signature", replace_after_signature)
+        monkeypatch.setattr(
+            torch.Tensor, "copy_", lambda *_args, **_kwargs: pytest.fail("replaced entry staged graph inputs")
+        )
+        with pytest.raises(ValueError, match="cell"):
+            execution._borrowed_transition(borrow, args[0], caches, *args[2:])
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("alias", ["pool", "cross_pool", "offset_view", "storage_wrapper", "held"])
+def test_encoder_borrow_checks_complete_backing_ranges(monkeypatch, alias):
+    storage_type = encoder_execution_module.EncoderCacheStorage
+    owner = encoder_execution_module._EncoderScratch()
+    allocation = bytearray(128)
+    tensor = torch.frombuffer(allocation, dtype=torch.float32, count=16).reshape(2, 8)
+    storage = storage_type((tensor,), (torch.empty_like(tensor),), (torch.empty(2, 1, dtype=torch.int32),))
+    pools = storage_type(*(tuple(torch.empty_like(t) for t in family) for family in storage))
+    resident: tuple[torch.Tensor, ...] = ()
+    if alias == "pool":
+        pools = pools._replace(channel=(tensor,))
+    elif alias == "cross_pool":
+        pools = pools._replace(time=(tensor,))
+    elif alias == "offset_view":
+        resident = (tensor[1:],)
+    elif alias == "storage_wrapper":
+        resident = (torch.frombuffer(allocation, dtype=torch.float32, count=8, offset=16),)
+    with owner.hold(torch.device("cpu")) as transaction:
+        if alias == "held":
+            owner.borrow(transaction, object(), (0, 2), storage, pools, ())
+        with pytest.raises(ValueError, match="alias"):
+            owner.borrow(transaction, object(), (1, 2), storage, pools, resident)
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_encoder_borrow_rereads_held_storage_after_same_object_mutation():
+    storage_type = encoder_execution_module.EncoderCacheStorage
+    owner = encoder_execution_module._EncoderScratch()
+
+    def bank():
+        return storage_type((torch.empty(2, 8),), (torch.empty(2, 4),), (torch.empty(2, 1, dtype=torch.int32),))
+
+    first, second, pools = bank(), bank(), bank()
+    with owner.hold(torch.device("cpu")) as transaction:
+        owner.borrow(transaction, object(), (0, 2), first, pools, ())
+        first.channel[0].set_(second.channel[0])
+        with pytest.raises(ValueError, match="alias"):
+            owner.borrow(transaction, object(), (1, 2), second, pools, ())
+
+
 @pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
