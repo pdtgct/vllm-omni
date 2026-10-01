@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Feature-gated static encoder execution contracts."""
 
+from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -33,6 +34,16 @@ if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRCore
 
 pytestmark = [pytest.mark.core_model]
+
+
+@pytest.fixture(scope="function")
+def isolated_dynamo_cache() -> Generator[None, None, None]:
+    """Keep each real-Dynamo test's complete compile/capture domain isolated."""
+    torch._dynamo.reset()
+    try:
+        yield
+    finally:
+        torch._dynamo.reset()
 
 
 def build_encoder_execution(
@@ -1517,6 +1528,7 @@ def test_dense_graphed_incomplete_capture_discards_all_keys_and_fresh_start_reco
 @torch.inference_mode()
 def test_dense_graphed_real_dynamo_reuses_cache_adapter_guards_for_capture_staging(
     monkeypatch: pytest.MonkeyPatch,
+    isolated_dynamo_cache: None,
 ) -> None:
     # @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
     unique_graphs = 0
@@ -1599,6 +1611,7 @@ def test_dense_graphed_model_drift_during_capture_discards_readiness(
 def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     monkeypatch: pytest.MonkeyPatch,
     arm: str,
+    isolated_dynamo_cache: None,
 ) -> None:
     # @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
     from vllm.config import VllmConfig
@@ -1813,6 +1826,7 @@ def test_dense_graphed_review_population_one_rejects_noop_graph_replay(
 @torch.inference_mode()
 def test_dense_graphed_review_rejects_postseal_dynamo_recompile(
     monkeypatch: pytest.MonkeyPatch,
+    isolated_dynamo_cache: None,
 ) -> None:
     # @spec PORT-PERF-009, PORT-PERF-011
     core = _compiled_core()
