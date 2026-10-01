@@ -77,24 +77,34 @@ class Predictor(nn.Module):
             hidden_size=pred_hidden,
             num_layers=pred_rnn_layers,
         )
-        self.register_buffer("_input_projection_table", None, persistent=False)
+        self._input_projection_batch_sizes: tuple[int, ...] = ()
         self._input_projection_sources: tuple[tuple[int, int, torch.device, torch.dtype], ...] | None = None
 
     @property
     def input_projection_table_enabled(self) -> bool:
         """Whether this instance explicitly admitted the experimental table."""
-        return self._input_projection_table is not None
+        return bool(self._input_projection_batch_sizes)
+
+    @property
+    def input_projection_table_batch_sizes(self) -> tuple[int, ...]:
+        """Explicit execution batches admitted before graph capture."""
+        return self._input_projection_batch_sizes
 
     def invalidate_input_projection_table(self) -> None:
         """Restore the original predictor path; recreate any captured graphs."""
-        self._input_projection_table = None
+        for batch in self._input_projection_batch_sizes:
+            delattr(self, f"_input_projection_table_{batch}")
+        self._input_projection_batch_sizes = ()
         self._input_projection_sources = None
 
     def __getstate__(self):
         # A deepcopy used as an experimental control must recover the original
         # path. Derived tensors must not travel in serialized module artifacts.
         state = super().__getstate__().copy()
-        state["_buffers"] = dict(state["_buffers"], _input_projection_table=None)
+        names = {f"_input_projection_table_{batch}" for batch in self._input_projection_batch_sizes}
+        state["_buffers"] = {name: value for name, value in state["_buffers"].items() if name not in names}
+        state["_non_persistent_buffers_set"] = state["_non_persistent_buffers_set"] - names
+        state["_input_projection_batch_sizes"] = ()
         state["_input_projection_sources"] = None
         return state
 
@@ -132,38 +142,69 @@ class Predictor(nn.Module):
         if torch.is_autocast_enabled(self.embed.weight.device.type):
             raise ValueError("input projection table does not support autocast")
 
-    def prepare_input_projection_table(self) -> None:
-        """Explicitly admit the default-off FP32 predictor experiment.
+    def prepare_input_projection_table(self, *, batch_sizes: tuple[int, ...]) -> None:
+        """Admit explicit execution batches for the default-off FP32 experiment.
 
         Call after final weights/device/dtype and eval(), under no_grad or
-        inference_mode, before graph capture. The table holds only E @ W_ih.T;
-        biases remain in their original addition order. Vocabulary-wide GEMM
-        rounding can differ from per-batch GEMM and requires numerical gates.
+        inference_mode, before graph capture. Each batch B gets its own table:
+        every vocabulary slice is projected by a contiguous B-by-hidden GEMM,
+        including a zero-padded final slice. Biases keep their original order.
+        Matching GEMM shapes still requires the unchanged numerical gates.
         Preparation and execution must retain the experiment's fixed FP32,
         TF32-off policy (highest float32 matmul precision, CUDA matmul and
         cuDNN allow_tf32 both false); this method does not change global flags.
 
-        Copies and checkpoint exports omit this derived table. Device/dtype,
-        training and checkpoint transitions invalidate it. Ordinary in-place
-        mutations are checked at Python step entry; .data writes are unsupported.
-        Graph replay bypasses Python: weights and this admission must stay frozen
-        for the graph's lifetime. Recreate graphs after any mutation/invalidation.
+        The caller supplies a bounded startup inventory. Additional batches may
+        be prepared before capture; all additions publish together on success.
+        Forward never creates tables or falls back for an unprepared batch.
+        Copies and checkpoint exports omit all tables. Device/dtype, training
+        and checkpoint transitions invalidate them. Ordinary in-place mutations
+        are checked at Python entry; .data writes are unsupported. Graph replay
+        bypasses Python: weights and admission must stay frozen for the graph's
+        lifetime. Recreate graphs after any mutation/invalidation.
         """
         self._check_projection_inference()
+        if not batch_sizes or any(type(batch) is not int or batch <= 0 for batch in batch_sizes):
+            raise ValueError("input projection batch sizes must be explicit positive integers")
         embedding, weight = self.embed.weight, self.rnn.weight_ih_l0
         if embedding.dtype != torch.float32 or weight.dtype != torch.float32:
             raise ValueError("input projection table requires float32 weights")
         if embedding.device != weight.device:
             raise ValueError("input projection table weights must share a device")
         sources = self._projection_source_signature()
-        if self._input_projection_table is not None:
-            if self._input_projection_sources != sources:
-                raise RuntimeError("input projection sources changed; invalidate and recreate graphs")
+        if self._input_projection_batch_sizes and self._input_projection_sources != sources:
+            raise RuntimeError("input projection sources changed; invalidate and recreate graphs")
+        additions = sorted(set(batch_sizes) - set(self._input_projection_batch_sizes))
+        if not additions:
             return
-        # Publish only after allocation and computation succeed.
-        table = embedding @ weight.t()
-        self._input_projection_table = table
+        prepared: dict[int, torch.Tensor] = {}
+        rows = embedding.shape[0]
+        for batch in additions:
+            table = embedding.new_empty((rows, weight.shape[0]))
+            inputs = embedding.new_empty((batch, embedding.shape[1]))
+            for start in range(0, rows, batch):
+                count = min(batch, rows - start)
+                if count != batch:
+                    inputs.zero_()
+                inputs[:count].copy_(embedding[start : start + count])
+                projection = inputs @ weight.t()
+                table[start : start + count].copy_(projection[:count])
+            prepared[batch] = table
+        if self._projection_source_signature() != sources:
+            raise RuntimeError("input projection sources changed during preparation; recreate tables and graphs")
+        # Nothing is visible until every allocation/GEMM and source check passes.
+        registered: list[str] = []
+        try:
+            for batch, table in prepared.items():
+                name = f"_input_projection_table_{batch}"
+                self.register_buffer(name, table, persistent=False)
+                registered.append(name)
+        except Exception:
+            for name in registered:
+                delattr(self, name)
+            raise
         self._input_projection_sources = sources
+        self._input_projection_batch_sizes = tuple(sorted(set(self._input_projection_batch_sizes) | set(additions)))
 
     def step(
         self,
@@ -171,12 +212,15 @@ class Predictor(nn.Module):
         state: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """One prediction step from the previous label."""
-        table = self._input_projection_table
-        if table is None:
+        if not self._input_projection_batch_sizes:
             return self.rnn.step(self.embed(labels), state)
         self._check_projection_inference()
         if self._input_projection_sources != self._projection_source_signature():
             raise RuntimeError("input projection sources changed; invalidate and recreate graphs")
+        batch = labels.shape[0]
+        if batch not in self._input_projection_batch_sizes:
+            raise RuntimeError(f"input projection batch size {batch} was not prepared before execution")
+        table = getattr(self, f"_input_projection_table_{batch}")
         if any(value.dtype != torch.float32 or value.device != table.device for value in state):
             raise ValueError("input projection table requires float32 state on the table device")
         projection = torch.nn.functional.embedding(labels, table)

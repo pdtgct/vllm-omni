@@ -42,11 +42,11 @@ def fp32_no_tf32():
         torch.set_float32_matmul_precision(precision)
 
 
-def _predictors():
+def _predictors(batch_sizes):
     torch.manual_seed(71)
     candidate = Predictor(vocab_size=_VOCAB, pred_hidden=_HIDDEN, pred_rnn_layers=2).to("cuda").eval()
     candidate.embed.weight[candidate.blank_id].uniform_(-0.3, 0.3)
-    candidate.prepare_input_projection_table()
+    candidate.prepare_input_projection_table(batch_sizes=batch_sizes)
     baseline = copy.deepcopy(candidate)
     assert candidate.input_projection_table_enabled
     assert not baseline.input_projection_table_enabled
@@ -87,8 +87,8 @@ def _decode_fields(output):
 @pytest.mark.parametrize("batch", _TIERS)
 @torch.no_grad()
 def test_actual_predictor_geometry_exact_eager_and_replay(batch, fp32_no_tf32):
-    baseline, candidate = _predictors()
-    table = candidate._input_projection_table
+    baseline, candidate = _predictors((batch,))
+    table = getattr(candidate, f"_input_projection_table_{batch}")
     baseline_state = (torch.randn(2, batch, _HIDDEN, device="cuda"), torch.randn(2, batch, _HIDDEN, device="cuda"))
     eager_state = tuple(value.clone() for value in baseline_state)
     replay_state = tuple(value.clone() for value in baseline_state)
@@ -115,14 +115,14 @@ def test_actual_predictor_geometry_exact_eager_and_replay(batch, fp32_no_tf32):
         eager_state = eager[1]
         for carried, result in zip(replay_state, replay[1]):
             carried.copy_(result)
-        assert candidate._input_projection_table is table
+        assert getattr(candidate, f"_input_projection_table_{batch}") is table
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch", _TIERS)
 @torch.no_grad()
 def test_forced_cap_decoder_exact_seven_fields(batch, fp32_no_tf32):
-    baseline, candidate = _predictors()
+    baseline, candidate = _predictors((batch,))
     # Only the joint is constant. Predictor parameters and carried states stay
     # nonzero, so the cap fixture cannot conceal predictor GEMM rounding.
     joint = Joint(enc_hidden=2, pred_hidden=_HIDDEN, joint_hidden=2, vocab_size=_VOCAB).to("cuda").eval()
@@ -161,3 +161,43 @@ def test_forced_cap_decoder_exact_seven_fields(batch, fp32_no_tf32):
         replay_state.h.copy_(replay.state.h)
         replay_state.c.copy_(replay.state.c)
         replay_state.last_label.copy_(replay.state.last_label)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_all_tables_and_graphs_retain_independent_state_after_all_captures(fp32_no_tf32):
+    baseline, candidate = _predictors(_TIERS)
+    assert candidate.input_projection_table_batch_sizes == _TIERS
+    tables = {batch: getattr(candidate, f"_input_projection_table_{batch}") for batch in _TIERS}
+    captures = []
+    for batch in _TIERS:
+        labels = _labels(batch, 0)
+        baseline_state = (torch.randn(2, batch, _HIDDEN, device="cuda"), torch.randn(2, batch, _HIDDEN, device="cuda"))
+        replay_state = tuple(value.clone() for value in baseline_state)
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            for _ in range(3):
+                candidate.step(labels, replay_state)
+        torch.cuda.current_stream().wait_stream(warmup)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay = candidate.step(labels, replay_state)
+        captures.append((batch, labels, baseline_state, replay_state, graph, replay))
+    # All tables, captured graphs, inputs and outputs remain alive together.
+    # Replaying early keys now detects storage reused by later preparations or
+    # captures. Each key and arm advances only its own independently held state.
+    for step in (1, 2):
+        for batch, labels, baseline_state, replay_state, graph, replay in captures:
+            labels.copy_(_labels(batch, step))
+            expected = baseline.step(labels, baseline_state)
+            graph.replay()
+            for name, reference in _predictor_fields(expected).items():
+                _exact(
+                    f"all captures tier={batch} step={step} replay {name}", _predictor_fields(replay)[name], reference
+                )
+            for carried, result in zip(baseline_state, expected[1]):
+                carried.copy_(result)
+            for carried, result in zip(replay_state, replay[1]):
+                carried.copy_(result)
+            assert getattr(candidate, f"_input_projection_table_{batch}") is tables[batch]
