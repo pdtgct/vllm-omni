@@ -169,7 +169,7 @@ def test_eager_oracle_does_not_compile_or_require_cuda():
     state = _state(1)
     args = (torch.ones(1, 1, 1), torch.ones(1, dtype=torch.long), _CountingPredictor(), _ThresholdJoint(), state)
     _equal(decoder(*args), decode_dense_masked_frames(*args))
-    assert decoder._compiled is None
+    assert decoder._device is None
     with pytest.raises(ValueError, match="requires CUDA"):
         decoder.prepare(torch.device("cpu"))
     with pytest.raises(RuntimeError, match="not prepared"):
@@ -178,12 +178,8 @@ def test_eager_oracle_does_not_compile_or_require_cuda():
 
 
 def test_capture_owners_release_per_graph_buffers_independently():
-    class Compiled:
-        pass
-
     decoder = ConditionalTailDecoder()
-    compiled = Compiled()
-    decoder._compiled = compiled
+    decoder._device = torch.device("cuda", 0)
     with decoder.capture_scope() as first:
         tensor = torch.zeros(1)
         first.keep(tensor)
@@ -198,63 +194,8 @@ def test_capture_owners_release_per_graph_buffers_independently():
     del decoder, tensor, first
     gc.collect()
     assert first_ref() is None and tensor_ref() is None
-    assert second.compiled is compiled
+    assert second._graph is None
     second_ref = weakref.ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-
-
-def test_raw_if_body_failure_restores_parent_stream_and_propagates(monkeypatch):
-    from types import SimpleNamespace
-
-    from vllm_omni.model_executor.models.nemotron_asr.conditional_tail import ConditionalCapture
-
-    calls: list[tuple] = []
-
-    def completed(name, payload, result=(0,)):
-        calls.append((name, payload))
-        return result
-
-    parent, child = SimpleNamespace(cuda_stream=1), SimpleNamespace(cuda_stream=2)
-    runtime = SimpleNamespace(
-        cudaStreamCaptureStatus=SimpleNamespace(cudaStreamCaptureStatusActive="active"),
-        cudaStreamUpdateCaptureDependenciesFlags=SimpleNamespace(cudaStreamSetCaptureDependencies="set"),
-        cudaStreamCaptureMode=SimpleNamespace(cudaStreamCaptureModeThreadLocal="thread"),
-        cudaStreamGetCaptureInfo=lambda stream: (0, "active", 7, "parent-graph", ["prefix"]),
-        cudaGraphConditionalHandleCreate=lambda graph, value, flags: (0, 9),
-        cudaStreamUpdateCaptureDependencies=lambda *args: completed("dependencies", args),
-        cudaStreamBeginCaptureToGraph=lambda *args: completed("begin", args[0]),
-        cudaStreamEndCapture=lambda stream: completed("end", stream, (0, "body")),
-    )
-
-    def add_node(graph, dependencies, edge_data, count, params):
-        assert graph == "parent-graph" and dependencies == ["prefix"] and count == 1
-        assert params.conditional.type == "if" and params.conditional.size == 1
-        calls.append(("if",))
-        return 0, "if-node"
-
-    driver = SimpleNamespace(
-        CUgraphNodeParams=lambda: SimpleNamespace(conditional=SimpleNamespace(phGraph_out=["body"])),
-        CUgraphNodeType=SimpleNamespace(CU_GRAPH_NODE_TYPE_CONDITIONAL="conditional"),
-        CUgraphConditionalNodeType=SimpleNamespace(CU_GRAPH_COND_TYPE_IF="if"),
-        cuGraphAddNode=add_node,
-    )
-    compiled = SimpleNamespace(
-        driver=driver,
-        runtime=runtime,
-        context="context",
-        launch=lambda arguments, stream: calls.append(("predicate", stream.cuda_stream)),
-    )
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: parent)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda device: child)
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: calls.append(("stream", stream.cuda_stream)))
-    capture = ConditionalCapture(compiled)
-
-    def fail():
-        raise RuntimeError("body capture failed")
-
-    with pytest.raises(RuntimeError, match="body capture failed"):
-        capture.run_if(torch.ones(2, dtype=torch.bool), fail)
-    assert [call[0] for call in calls] == ["predicate", "if", "dependencies", "begin", "stream", "end", "stream"]
-    assert calls[-1] == ("stream", parent.cuda_stream)

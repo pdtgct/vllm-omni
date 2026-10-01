@@ -1,27 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Actual predicate-cache/graph-owner classes with CPU fake CUDA APIs.
+"""Actual native-IF owner and GC guard with a CPU fake of PyTorch's API.
 
-These tests prove bounded ownership and GC-state restoration. They do not
-identify the object behind the GPU capture segfault or replace CUDA validation.
+The fake records scope/ownership contracts, not CUDA allocator behavior. Real
+CUDA tests and broader earlier-key replay remain separate validation gates.
 """
 
 import gc
 import importlib
-import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
-from test_conditional_tail import _CountingPredictor, _ThresholdJoint
+from test_conditional_tail import _CountingPredictor, _state, _ThresholdJoint
 from test_decode_graph_binding import _runtime
 
-from vllm_omni.model_executor.models.nemotron_asr.conditional_tail import ConditionalCapture, ConditionalTailDecoder
+from vllm_omni.model_executor.models.nemotron_asr.conditional_tail import ConditionalTailDecoder
 from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -32,74 +31,46 @@ def cuda_api(monkeypatch):
     module = importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.conditional_tail")
     state = SimpleNamespace(
         device=0,
-        context_device=0,
-        visible_devices=2,
-        context=7,
-        context_id=101,
         capturing=False,
-        loads=0,
-        unloads=[],
-        programs=0,
-        destroys=0,
-        lookup_error=0,
-        destroy_error=0,
-        unload_error=0,
-        compile_hook=lambda: None,
+        stream="parent",
+        lookups=0,
+        calls=[],
+        predicates=[],
+        begin_error=None,
+        end_error=None,
+        module=module,
     )
 
-    def load(_ptx):
-        state.loads += 1
-        return 0, state.loads
+    class NativeGraph:
+        @staticmethod
+        def get_currently_capturing_graph():
+            state.lookups += 1
+            if not state.capturing:
+                raise RuntimeError("no current graph capture")
+            return state.graph
 
-    def unload(handle):
-        state.unloads.append((handle, state.capturing))
-        return (state.unload_error,)
+        def begin_capture_to_if_node(self, predicate):
+            state.calls.append("begin")
+            assert predicate.ndim == 0 and predicate.dtype == torch.bool
+            assert state.stream == "parent"
+            if state.begin_error:
+                raise RuntimeError(state.begin_error)
+            state.predicates.append(weakref.ref(predicate))
+            state.stream = "child"
 
-    def create(*_args):
-        state.programs += 1
-        return 0, state.programs
+        def end_capture_to_conditional_node(self):
+            state.calls.append("end")
+            if state.end_error:
+                raise RuntimeError(state.end_error)
+            assert state.stream == "child"
+            state.stream = "parent"
 
-    def destroy(program):
-        state.destroys += 1
-        return (state.destroy_error,)
-
-    def compile_program(*_args):
-        state.compile_hook()
-        return (0,)
-
-    driver = SimpleNamespace(
-        cuDeviceGetCount=lambda: (0, state.visible_devices),
-        cuCtxGetDevice=lambda: (0, state.context_device),
-        cuCtxGetCurrent=lambda: (0, state.context),
-        cuCtxGetId=lambda context: (0, state.context_id),
-        cuModuleLoadData=load,
-        cuModuleUnload=unload,
-        cuModuleGetFunction=lambda handle, name: (state.lookup_error, 42),
-    )
-    nvrtc = SimpleNamespace(
-        nvrtcCreateProgram=create,
-        nvrtcCompileProgram=compile_program,
-        nvrtcGetPTXSize=lambda program: (0, 16),
-        nvrtcGetPTX=lambda program, data: (0,),
-        nvrtcDestroyProgram=destroy,
-    )
-    cuda, bindings = ModuleType("cuda"), ModuleType("cuda.bindings")
-    bindings.__dict__.update(__version__="13.4.1", driver=driver, nvrtc=nvrtc, runtime=SimpleNamespace())
-    setattr(cuda, "bindings", bindings)
-    monkeypatch.setitem(sys.modules, "cuda", cuda)
-    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
-    monkeypatch.setattr(module, "_MODULE_CACHE", {})
+    state.graph = NativeGraph()
+    state.graph_class = NativeGraph
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", NativeGraph)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state.capturing)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: state.device)
-    real_empty = torch.empty
-
-    def cpu_empty(*args, **kwargs):
-        if "device" in kwargs and torch.device(kwargs["device"]).type == "cuda":
-            kwargs["device"] = "cpu"
-        return real_empty(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "empty", cpu_empty)
-    state.module = module
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
     return state
 
 
@@ -109,116 +80,115 @@ def _prepare():
     return decoder
 
 
-@pytest.mark.parametrize("workers", [1, 4])
-def test_actual_cache_loads_one_module_for_repeated_and_concurrent_prepares(cuda_api, workers):
-    ready = threading.Barrier(workers + 1)
-    compiling, release = threading.Event(), threading.Event()
-
-    def compile_hook():
-        compiling.set()
-        assert release.wait(5), "test did not release the compile witness"
-
-    def prepare():
-        ready.wait(5)
-        return _prepare()
-
-    cuda_api.compile_hook = compile_hook
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(prepare) for _ in range(workers)]
-        ready.wait(5)
-        assert compiling.wait(5)
-        release.set()
-        decoders = [future.result(timeout=5) for future in futures]
-    for decoder in decoders:
-        decoder.prepare(torch.device("cuda", 0))
-    assert cuda_api.loads == cuda_api.programs == cuda_api.destroys == 1
-    assert len({id(decoder._compiled) for decoder in decoders}) == 1
-    assert list(cuda_api.module._MODULE_CACHE) == [0]
-    assert cuda_api.unloads == []
-    owners = []
-    for decoder in decoders:
-        with decoder.capture_scope() as owner:
-            owner.keep(torch.zeros(1))
-            owners.append(owner)
-    assert len({id(owner.tensors) for owner in owners}) == workers
-    assert len({id(owner.nodes) for owner in owners}) == workers
-    assert len({id(owner.tensors[0]) for owner in owners}) == workers
-    assert all(owner.compiled is decoders[0]._compiled for owner in owners)
+def test_eager_path_never_prepares_or_invokes_native_api(cuda_api):
+    decoder = ConditionalTailDecoder()
+    output = decoder(
+        torch.ones(1, 1, 1), torch.ones(1, dtype=torch.long), _CountingPredictor(), _ThresholdJoint(), _state(1)
+    )
+    assert output.frame_emission_counts.tolist() == [[1]]
+    assert decoder._device is None and decoder._capture is None
+    assert cuda_api.lookups == 0 and cuda_api.calls == []
 
 
-@pytest.mark.parametrize("same_decoder", [False, True])
-def test_context_id_replacement_fails_even_when_handle_address_is_reused(cuda_api, same_decoder):
+def test_native_if_retains_fresh_scalar_and_one_parent_per_owner(cuda_api):
     decoder = _prepare()
-    cuda_api.context_id = 102  # Same opaque handle 7, new context generation.
-    target = decoder if same_decoder else ConditionalTailDecoder()
-    with pytest.raises(RuntimeError, match="context changed; restart"):
-        target.prepare(torch.device("cuda", 0))
-    assert cuda_api.loads == 1
-    assert cuda_api.module._MODULE_CACHE[0][0] == 101
+    with decoder.capture_scope() as owner:
+        cuda_api.capturing = True
+        for values in ([False, False], [False, True]):
+            active = torch.tensor(values)
+
+            def body():
+                assert cuda_api.stream == "child"
+                cuda_api.calls.append("body")
+
+            owner.run_if(active, body)
+            predicate = cuda_api.predicates[-1]()
+            assert predicate is not None and predicate.device == active.device
+            assert predicate.item() is any(values)
+            assert any(tensor is predicate for tensor in owner.tensors)
+            assert any(tensor is active for tensor in owner.tensors)
+            assert cuda_api.stream == "parent"
+        assert owner.if_nodes == 2 and owner._graph is cuda_api.graph
+        assert cuda_api.predicates[0]() is not cuda_api.predicates[1]()
+        assert cuda_api.calls == ["begin", "body", "end"] * 2
+        cuda_api.graph = cuda_api.graph_class()
+        with pytest.raises(RuntimeError, match="cannot cross parent graphs"):
+            owner.run_if(torch.ones(2, dtype=torch.bool), lambda: pytest.fail("wrong-parent body"))
+        assert owner.if_nodes == 2 and len(cuda_api.calls) == 6
 
 
-def test_cache_admits_only_one_slot_per_visible_device(cuda_api):
-    first = _prepare()
-    cuda_api.device = cuda_api.context_device = 1
-    cuda_api.context_id = 102
-    second = ConditionalTailDecoder()
-    second.prepare(torch.device("cuda", 1))
-    assert first._compiled is not second._compiled
-    assert set(cuda_api.module._MODULE_CACHE) == {0, 1}
-    cuda_api.device = cuda_api.context_device = 2
-    with pytest.raises(ValueError, match="not a visible CUDA ordinal"):
-        ConditionalTailDecoder().prepare(torch.device("cuda", 2))
-    assert cuda_api.loads == 2 and set(cuda_api.module._MODULE_CACHE) == {0, 1}
+@pytest.mark.parametrize("failure", ["lookup", "begin", "body", "body_and_end", "end"])
+def test_native_if_failures_propagate_without_duplicate_end_or_receipt(cuda_api, failure, caplog):
+    decoder = _prepare()
+    with decoder.capture_scope() as owner:
+        cuda_api.capturing = failure != "lookup"
+        cuda_api.begin_error = "begin failed" if failure == "begin" else None
+        cuda_api.end_error = "end failed" if failure in ("end", "body_and_end") else None
+
+        def body():
+            cuda_api.calls.append("body")
+            if failure in ("body", "body_and_end"):
+                raise ValueError("body failed")
+
+        error = ValueError if failure in ("body", "body_and_end") else RuntimeError
+        with pytest.raises(error, match="body failed" if error is ValueError else "failed|no current graph"):
+            owner.run_if(torch.ones(2, dtype=torch.bool), body)
+        assert owner.if_nodes == 0
+        if failure == "lookup":
+            assert cuda_api.calls == []
+        elif failure == "begin":
+            assert cuda_api.calls == ["begin"]
+        else:
+            assert cuda_api.calls == ["begin", "body", "end"]
+        if failure == "body":
+            assert cuda_api.stream == "parent"
+        if failure == "body_and_end":
+            assert "cleanup failed" in caplog.text and "end failed" in caplog.text
+    assert decoder._capture is None
 
 
-@pytest.mark.parametrize("failure,error", [("lookup_error", 17), ("destroy_error", 29)])
-def test_failed_load_cleans_module_and_poisoned_slot_prevents_another_attempt(cuda_api, failure, error):
-    setattr(cuda_api, failure, error)
-    with pytest.raises(RuntimeError, match=str(error)):
-        _prepare()
-    assert cuda_api.loads == cuda_api.destroys == 1
-    assert cuda_api.unloads == [(1, False)]
-    assert cuda_api.module._MODULE_CACHE == {0: (101, None)}
-    setattr(cuda_api, failure, 0)
-    with pytest.raises(RuntimeError, match="initialization previously failed; restart"):
-        _prepare()
-    assert cuda_api.loads == 1
+@pytest.mark.parametrize(
+    "missing", ["get_currently_capturing_graph", "begin_capture_to_if_node", "end_capture_to_conditional_node"]
+)
+def test_prepare_requires_each_native_capability_without_invoking_it(cuda_api, monkeypatch, missing):
+    monkeypatch.setattr(cuda_api.graph_class, missing, None)
+    decoder = ConditionalTailDecoder()
+    with pytest.raises(RuntimeError, match="native PyTorch 2.13 conditional graph API"):
+        decoder.prepare(torch.device("cuda", 0))
+    assert decoder._device is None and cuda_api.lookups == 0 and cuda_api.calls == []
 
 
-def test_failed_cleanup_preserves_initial_error_and_still_bounds_abandoned_modules(cuda_api, caplog):
-    cuda_api.lookup_error, cuda_api.unload_error = 17, 23
-    with pytest.raises(RuntimeError, match="17"):
-        _prepare()
-    assert "Module cleanup failed" in caplog.text and "23" in caplog.text
-    with pytest.raises(RuntimeError, match="initialization previously failed; restart"):
-        _prepare()
-    assert cuda_api.loads == 1 and cuda_api.unloads == [(1, False)]
+@pytest.mark.parametrize("cuda_version", [None, "12.3", "12.4", "13.0"])
+def test_prepare_checks_cuda_build_and_only_prepares_device_identity(cuda_api, monkeypatch, cuda_version):
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    decoder = ConditionalTailDecoder()
+    if cuda_version in (None, "12.3"):
+        with pytest.raises(RuntimeError, match="CUDA build of 12.4"):
+            decoder.prepare(torch.device("cuda", 0))
+        assert decoder._device is None
+    else:
+        decoder.prepare(torch.device("cuda"))
+        decoder.prepare(torch.device("cuda", 0))
+        assert decoder._device == torch.device("cuda", 0)
+    assert cuda_api.lookups == 0 and cuda_api.calls == []
 
 
-def test_prepare_guards_precede_cache_and_compilation(cuda_api):
+def test_prepare_rejects_capture_wrong_current_device_and_device_migration(cuda_api):
+    decoder = _prepare()
     cuda_api.capturing = True
     with pytest.raises(RuntimeError, match="before capture"):
-        _prepare()
+        decoder.prepare(torch.device("cuda", 0))
     cuda_api.capturing = False
     with pytest.raises(ValueError, match="current CUDA device"):
         ConditionalTailDecoder().prepare(torch.device("cuda", 1))
-    cuda_api.context_device = 1
-    with pytest.raises(ValueError, match="context belongs to another device"):
-        _prepare()
-    assert cuda_api.loads == 0 and cuda_api.module._MODULE_CACHE == {}
+    cuda_api.device = 1
+    with pytest.raises(ValueError, match="cannot cross CUDA devices"):
+        decoder.prepare(torch.device("cuda", 1))
+    assert cuda_api.lookups == 0 and cuda_api.calls == []
 
 
 @pytest.mark.parametrize("during_other_capture", [False, True])
-def test_actual_binding_cycle_releases_graph_owners_without_unloading_module(cuda_api, during_other_capture):
-    destroyed = []
-
-    class GraphWitness:
-        def __del__(self):
-            destroyed.append("graph")
-
-    class StreamWitness:
-        pass
-
+def test_actual_binding_cycle_releases_native_graph_owner_and_buffers(cuda_api, during_other_capture):
     decoder = _prepare()
     runtime = _runtime()
     binding = DenseGraphBinding(
@@ -234,41 +204,37 @@ def test_actual_binding_cycle_releases_graph_owners_without_unloading_module(cud
         blank_id=1,
         runtime=runtime,
     )
-    # Use the real factory and binding closures: no restatement of their cycle.
     entry = binding._new_entry(0, 1, device=torch.device("cpu"), dtype=torch.float32, runtime=runtime)
     binding._entries[(0, 1)] = entry
     binding._decode_fns[(0, 1)] = binding._bind_decode(entry, runtime)
-    owner = ConditionalCapture(decoder._compiled)
-    tensor, stream, graph = torch.zeros(1), StreamWitness(), GraphWitness()
-    owner.keep(tensor)
-    owner.nodes.append((stream,))
+    with decoder.capture_scope() as owner:
+        cuda_api.capturing = True
+        owner.run_if(torch.ones(2, dtype=torch.bool), lambda: None)
+    tensor, graph = owner.tensors[-1], cuda_api.graph
     entry.capture_resources = owner
     entry.wrapper.graph = graph
-    references = [weakref.ref(value) for value in (owner, tensor, stream, graph)]
-    compiled_ref = weakref.ref(decoder._compiled)
-    del binding, entry, owner, tensor, stream, graph, decoder
+    references = [weakref.ref(value) for value in (owner, tensor, graph)]
+    del binding, entry, owner, tensor, graph, decoder
+    cuda_api.graph = None
     cuda_api.capturing = during_other_capture
     gc.collect()
-    assert destroyed == ["graph"] and all(reference() is None for reference in references)
-    assert compiled_ref() is cuda_api.module._MODULE_CACHE[0][1]
-    assert cuda_api.unloads == []
-    # Retention is exactly the immutable context module, with no per-graph data.
-    assert not hasattr(compiled_ref(), "nodes") and not hasattr(compiled_ref(), "tensors")
+    assert all(reference() is None for reference in references)
 
 
-def test_failed_capture_releases_owner_but_preserves_usable_context_module(cuda_api):
+def test_failed_capture_releases_native_graph_owner_and_buffers(cuda_api):
     decoder = _prepare()
     with pytest.raises(RuntimeError, match="capture refused"):
         with decoder.capture_scope() as owner:
-            tensor = torch.zeros(1)
-            owner.keep(tensor)
-            owner_ref, tensor_ref = weakref.ref(owner), weakref.ref(tensor)
+            cuda_api.capturing = True
+            owner.run_if(torch.ones(2, dtype=torch.bool), lambda: None)
+            tensor = owner.tensors[-1]
+            owner_ref, tensor_ref, graph_ref = weakref.ref(owner), weakref.ref(tensor), weakref.ref(cuda_api.graph)
             raise RuntimeError("capture refused")
+    cuda_api.graph = None
     del owner, tensor
     gc.collect()
-    assert owner_ref() is None and tensor_ref() is None
-    assert decoder._capture is None and cuda_api.unloads == []
-    assert _prepare()._compiled is decoder._compiled
+    assert owner_ref() is None and tensor_ref() is None and graph_ref() is None
+    assert decoder._capture is None
 
 
 @pytest.mark.parametrize("initially_enabled", [False, True])
