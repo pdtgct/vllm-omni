@@ -212,6 +212,7 @@ class NemotronASRScheduler(OmniARScheduler):  # type: ignore[misc]
             if position.offset < 0 or position.offset >= max(1, len(prompt_token_ids)):
                 raise ValueError("multimodal feature position is outside the current prompt for the replacement prompt")
 
+        self._update_service_timing_identity(session, update)
         request_id = session.request_id
         self._new_prompt_len_snapshot[request_id] = len(prompt_token_ids)
         self._reset_streaming_session_replacement_state(session)

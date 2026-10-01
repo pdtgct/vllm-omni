@@ -876,6 +876,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return engine_core_outputs
 
+    def _update_service_timing_identity(self, session: Request, update: StreamingUpdate) -> None:
+        """Advance diagnostic identity for append and replacement policies."""
+        trace = getattr(session, "_omni_service_timing", None)
+        if trace is not None:
+            try:
+                info = deserialize_additional_information(getattr(update, "additional_information", None))
+                trace.identity = trace.read_input_identity(info)
+                if trace.identity is None:
+                    # Missing/invalid identity must not inherit the previous
+                    # unit. Explicit FLUSH carries its own control identity.
+                    streaming_transport.record_engine_service_timing(session, "unattributed_update")
+            except Exception:
+                trace.identity = None
+                trace.valid = False
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """Apply the next streaming update to a persistent session.
 
@@ -889,18 +904,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stage 0.
         """
         req_id = session.request_id
-        trace = getattr(session, "_omni_service_timing", None)
-        if trace is not None:
-            try:
-                info = deserialize_additional_information(getattr(update, "additional_information", None))
-                trace.identity = trace.read_input_identity(info)
-                if trace.identity is None:
-                    # Missing/invalid identity must not inherit the previous
-                    # unit. Explicit FLUSH carries its own control identity.
-                    streaming_transport.record_engine_service_timing(session, "unattributed_update")
-            except Exception:
-                trace.identity = None
-                trace.valid = False
+        self._update_service_timing_identity(session, update)
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Seed the stale share in SCHEDULED-token units (see the segment-stop

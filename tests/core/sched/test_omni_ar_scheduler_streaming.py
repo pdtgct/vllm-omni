@@ -32,8 +32,10 @@ from vllm_omni.core.sched.output import OmniNewRequestData
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
-    sched = OmniARScheduler.__new__(OmniARScheduler)
+def _make_scheduler(
+    *, stage_id: int = 0, session_mode: str = "turn", scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
+    sched = object.__new__(scheduler_cls)
     sched._new_prompt_len_snapshot = {}
     sched.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
@@ -236,6 +238,64 @@ def test_engine_timing_park_precedes_queued_update_generation_and_schedule(monke
     assert trace.events[0]["identity"] == _timing_identity(0)
     assert trace.events[1]["identity"] == _timing_identity(1)
     assert trace.events[1]["timestamp"] == session.events[-1].timestamp == 42.25
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["already-parked", "queued-at-stop"])
+@pytest.mark.parametrize("kind", ["regular", "flush", "malformed", "missing"])
+def test_nemotron_engine_timing_replacement_identity(monkeypatch, queued, kind) -> None:
+    import json
+
+    from vllm.v1.engine import EngineCoreEventType
+
+    from vllm_omni.metrics.streaming_transport import EngineServiceTimingTrace
+    from vllm_omni.model_executor.models.nemotron_asr.scheduler import NemotronASRScheduler
+
+    sched = _make_scheduler(scheduler_cls=NemotronASRScheduler)
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED if queued else RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = int(not queued)
+    session._omni_segment_generation = 4
+    predecessor = _timing_identity(0)
+    trace = EngineServiceTimingTrace(session.request_id, predecessor)
+    session._omni_service_timing = trace
+    binding = {"engine_epoch": "engine-epoch", "generation": 7}
+    session.additional_information = {"persistent_state_binding": binding}
+    update = _make_update()
+    successor = _timing_identity(1)
+    if kind == "flush":
+        successor.update(kind="flush", logical_sequence=None, carrier_sequence=None)
+    update.additional_information = (
+        None
+        if kind == "missing"
+        else {"meta": {"service_timing": "{" if kind == "malformed" else json.dumps(successor)}}
+    )
+    session.streaming_queue = deque([update]) if queued else deque()
+    waiting: list[Request] = []
+    monkeypatch.setattr(sched, "_enqueue_waiting_request", waiting.append)
+
+    if queued:
+        assert sched._handle_stopped_request(session) is False
+        assert trace.events[0]["event"] == "legal_park"
+        assert trace.events[0]["identity"] == predecessor
+        assert trace.events[0]["segment_generation"] == 4
+    else:
+        sched._update_request_as_session(session, update)
+    session.record_event(EngineCoreEventType.SCHEDULED, 42.25)
+    session.status = RequestStatus.FINISHED_STOPPED
+    assert sched._handle_stopped_request(session) is False
+
+    expected = successor if kind in {"regular", "flush"} else None
+    assert trace.identity == expected
+    assert trace.valid is (expected is not None)
+    scheduled, parked = trace.events[-2:]
+    assert [event["event"] for event in (scheduled, parked)] == ["scheduled", "legal_park"]
+    assert all(event["identity"] == expected for event in (scheduled, parked))
+    assert all(event["segment_generation"] == 5 for event in (scheduled, parked))
+    assert scheduled["timestamp"] == 42.25
+    assert session.additional_information["persistent_state_binding"] == binding
+    assert session.prompt_token_ids == [10, 20] and not session.streaming_queue
+    assert sched.num_waiting_for_streaming_input == 1
 
 
 def test_engine_timing_disabled_preserves_core_add_request(monkeypatch) -> None:
