@@ -177,13 +177,13 @@ def test_eager_oracle_does_not_compile_or_require_cuda():
             pass
 
 
-def test_capture_owners_release_buffers_and_keep_shared_module_until_last_owner():
+def test_capture_owners_release_per_graph_buffers_independently():
     class Compiled:
         pass
 
     decoder = ConditionalTailDecoder()
-    decoder._compiled = Compiled()
-    compiled_ref = weakref.ref(decoder._compiled)
+    compiled = Compiled()
+    decoder._compiled = compiled
     with decoder.capture_scope() as first:
         tensor = torch.zeros(1)
         first.keep(tensor)
@@ -198,10 +198,11 @@ def test_capture_owners_release_buffers_and_keep_shared_module_until_last_owner(
     del decoder, tensor, first
     gc.collect()
     assert first_ref() is None and tensor_ref() is None
-    assert compiled_ref() is not None
+    assert second.compiled is compiled
+    second_ref = weakref.ref(second)
     del second
     gc.collect()
-    assert compiled_ref() is None
+    assert second_ref() is None
 
 
 def test_raw_if_body_failure_restores_parent_stream_and_propagates(monkeypatch):

@@ -20,13 +20,23 @@ control flow here use one IF per frame, not the prototype's per-symbol WHILE.
 Tensor arithmetic follows this package's ``decode_dense_masked_frames``.
 
 Eager calls remain the dense preparation/oracle path. A capturing call requires
-an explicit graph owner; capture failures propagate. The owner retains module,
-stream, argument and merge-buffer references for that graph's lifetime.
+an explicit graph owner; capture failures propagate. Streams, arguments and
+merge buffers belong to that graph owner.
+
+The immutable predicate module has one cache slot per visible CUDA device for
+its PyTorch-managed primary context's lifetime. There is no GC unload callback:
+CUDA context/process destruction reclaims successful modules. Slots never hold
+graphs or their buffers. Context replacement, module reload and a failed first
+initialization require a worker restart; resetting a live PyTorch context is
+unsupported. A unique CUDA context ID detects replacement even if its address
+is reused. This trades fixed module/PTX/scalar-anchor retention per device for
+safe graph-independent code lifetime, not an accumulated capture history.
 """
 
 from __future__ import annotations
 
-import weakref
+import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -62,22 +72,11 @@ def _checked(result: tuple[Any, ...]) -> tuple[Any, ...]:
     return tuple(values)
 
 
-def _unload_module(driver: Any, context: Any, module: Any) -> None:
-    # Finalization never masks an earlier failure. There is no global module or
-    # buffer registry: graph owners keep this module alive until their release.
-    try:
-        _checked(driver.cuCtxPushCurrent(context))
-        try:
-            _checked(driver.cuModuleUnload(module))
-        finally:
-            _checked(driver.cuCtxPopCurrent())
-    except Exception:
-        # The CUDA context may already have been destroyed at process shutdown.
-        pass
+logger = logging.getLogger(__name__)
 
 
 class _CompiledCondition:
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, *, context: Any, context_id: int, anchor: torch.Tensor) -> None:
         # Lazy imports keep default-off and CPU/eager callers CUDA-independent.
         from cuda.bindings import __version__ as bindings_version
         from cuda.bindings import driver, nvrtc, runtime
@@ -85,31 +84,85 @@ class _CompiledCondition:
         if int(bindings_version.split(".")[0]) < 13:
             raise RuntimeError("conditional-tail capture requires CUDA Python bindings 13 or newer")
         self.driver, self.runtime = driver, runtime
-        # Establish the current primary context before loading driver code.
-        self._anchor = torch.empty((), device=device)
-        (self.context,) = _checked(driver.cuCtxGetCurrent())
+        self.context, self.context_id, self._anchor = context, context_id, anchor
         (program,) = _checked(nvrtc.nvrtcCreateProgram(_CONDITION_SOURCE.encode(), b"tail_if.cu", 0, [], []))
+        module = None
         try:
-            result = nvrtc.nvrtcCompileProgram(program, 0, [])
-            if int(result[0]):
-                (size,) = _checked(nvrtc.nvrtcGetProgramLogSize(program))
-                log = b" " * size
-                _checked(nvrtc.nvrtcGetProgramLog(program, log))
-                raise RuntimeError(f"conditional-tail NVRTC compile failed: {log.decode()}")
-            (size,) = _checked(nvrtc.nvrtcGetPTXSize(program))
-            ptx = b" " * size
-            _checked(nvrtc.nvrtcGetPTX(program, ptx))
-            self._ptx = np.frombuffer(ptx, dtype=np.uint8).copy()
-            (module,) = _checked(driver.cuModuleLoadData(self._ptx.ctypes.data))
-            self._finalizer = weakref.finalize(self, _unload_module, driver, self.context, module)
-            (self.kernel,) = _checked(driver.cuModuleGetFunction(module, b"condition"))
-        finally:
-            _checked(nvrtc.nvrtcDestroyProgram(program))
+            try:
+                result = nvrtc.nvrtcCompileProgram(program, 0, [])
+                if int(result[0]):
+                    (size,) = _checked(nvrtc.nvrtcGetProgramLogSize(program))
+                    log = b" " * size
+                    _checked(nvrtc.nvrtcGetProgramLog(program, log))
+                    raise RuntimeError(f"conditional-tail NVRTC compile failed: {log.decode()}")
+                (size,) = _checked(nvrtc.nvrtcGetPTXSize(program))
+                ptx = b" " * size
+                _checked(nvrtc.nvrtcGetPTX(program, ptx))
+                self._ptx = np.frombuffer(ptx, dtype=np.uint8).copy()
+                (module,) = _checked(driver.cuModuleLoadData(self._ptx.ctypes.data))
+                (self.kernel,) = _checked(driver.cuModuleGetFunction(module, b"condition"))
+            except BaseException:
+                try:
+                    _checked(nvrtc.nvrtcDestroyProgram(program))
+                except BaseException:
+                    logger.exception("NVRTC cleanup failed; conditional-tail device slot remains poisoned")
+                raise
+            else:
+                _checked(nvrtc.nvrtcDestroyProgram(program))
+        except BaseException:
+            # Preparation is outside capture. A failed construction is never
+            # cached as usable, and cannot abandon another module on a retry.
+            if module is not None:
+                try:
+                    _checked(driver.cuModuleUnload(module))
+                except BaseException:
+                    logger.exception("Module cleanup failed; conditional-tail device slot remains poisoned")
+            raise
+        self.module = module
 
     def launch(self, arguments: np.ndarray, stream: Any) -> None:
         _checked(
             self.driver.cuLaunchKernel(self.kernel, 1, 1, 1, 1, 1, 1, 0, stream.cuda_stream, arguments.ctypes.data, 0)
         )
+
+
+# One immutable slot per visible device; None poisons an unsuccessful first
+# construction. Keep no old-context list and no graph/owner references here.
+# CUDA documents cuCtxGetId as unique for the program lifetime and cuCtxDestroy
+# as reclaiming CUmodule/CUfunction resources:
+# https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html
+_MODULE_CACHE: dict[int, tuple[int, _CompiledCondition | None]] = {}
+_MODULE_CACHE_LOCK = threading.Lock()
+
+
+def _compiled_condition_for_device(device: torch.device) -> _CompiledCondition:
+    from cuda.bindings import driver
+
+    with _MODULE_CACHE_LOCK:
+        # Establish the current runtime context before querying/loading driver
+        # code. Only the first successful slot retains this scalar allocation.
+        anchor = torch.empty((), device=device)
+        (visible_devices,) = _checked(driver.cuDeviceGetCount())
+        ordinal = device.index
+        if ordinal is None or not 0 <= ordinal < int(visible_devices):
+            raise ValueError("conditional-tail device is not a visible CUDA ordinal")
+        (context_device,) = _checked(driver.cuCtxGetDevice())
+        if int(context_device) != ordinal:
+            raise ValueError("conditional-tail CUDA context belongs to another device")
+        (context,) = _checked(driver.cuCtxGetCurrent())
+        (context_id,) = _checked(driver.cuCtxGetId(context))
+        identity = int(context_id)
+        if ordinal in _MODULE_CACHE:
+            saved_identity, compiled = _MODULE_CACHE[ordinal]
+            if saved_identity != identity:
+                raise RuntimeError("conditional-tail CUDA context changed; restart the worker")
+            if compiled is None:
+                raise RuntimeError("conditional-tail initialization previously failed; restart the worker")
+            return compiled
+        _MODULE_CACHE[ordinal] = (identity, None)
+        compiled = _CompiledCondition(context=context, context_id=identity, anchor=anchor)
+        _MODULE_CACHE[ordinal] = (identity, compiled)
+        return compiled
 
 
 class ConditionalCapture:
@@ -299,9 +352,9 @@ class ConditionalTailDecoder:
             raise ValueError("conditional-tail preparation requires the current CUDA device")
         if self._device is not None and self._device != device:
             raise ValueError("conditional-tail decoder cannot cross CUDA devices")
-        if self._compiled is None:
-            self._compiled = _CompiledCondition(device)
-            self._device = device
+        # Validate live context identity even for an already prepared decoder.
+        self._compiled = _compiled_condition_for_device(device)
+        self._device = device
 
     @contextmanager
     def capture_scope(self) -> Iterator[ConditionalCapture]:
