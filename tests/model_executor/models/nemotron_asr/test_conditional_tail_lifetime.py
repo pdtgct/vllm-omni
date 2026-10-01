@@ -38,6 +38,9 @@ def cuda_api(monkeypatch):
         predicates=[],
         begin_error=None,
         end_error=None,
+        warmup_copies=[],
+        warmup_syncs=0,
+        warmup_error=None,
         module=module,
     )
 
@@ -71,6 +74,28 @@ def cuda_api(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state.capturing)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: state.device)
     monkeypatch.setattr(torch.version, "cuda", "13.0")
+    real_empty, real_foreach = torch.empty, torch._foreach_copy_
+
+    def cpu_empty(*args, **kwargs):
+        # CPU stand-in for prewarm resources, not proof of CUDA placement.
+        if "device" in kwargs and torch.device(kwargs["device"]).type == "cuda":
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    def foreach_copy(destinations, sources):
+        assert not state.capturing
+        state.warmup_copies.append((destinations[0].dtype, len(destinations)))
+        return real_foreach(destinations, sources)
+
+    def synchronize(device):
+        assert not state.capturing and device == torch.device("cuda", state.device)
+        state.warmup_syncs += 1
+        if state.warmup_error:
+            raise RuntimeError(state.warmup_error)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
+    monkeypatch.setattr(torch, "_foreach_copy_", foreach_copy)
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
     return state
 
 
@@ -88,6 +113,35 @@ def test_eager_path_never_prepares_or_invokes_native_api(cuda_api):
     assert output.frame_emission_counts.tolist() == [[1]]
     assert decoder._device is None and decoder._capture is None
     assert cuda_api.lookups == 0 and cuda_api.calls == []
+    assert cuda_api.warmup_copies == [] and cuda_api.warmup_syncs == 0
+
+
+def test_merge_prewarm_runs_both_dtypes_once_per_decoder_before_prepared(cuda_api):
+    decoder = _prepare()
+    decoder.prepare(torch.device("cuda", 0))
+    assert cuda_api.warmup_copies == [(torch.float32, 5), (torch.int64, 2)]
+    assert cuda_api.warmup_syncs == 1
+    other = _prepare()
+    assert other is not decoder and cuda_api.warmup_syncs == 2
+    assert cuda_api.warmup_copies == [(torch.float32, 5), (torch.int64, 2)] * 2
+
+
+def test_merge_prewarm_failure_does_not_mark_decoder_prepared(cuda_api):
+    decoder = ConditionalTailDecoder()
+    cuda_api.warmup_error = "prewarm synchronization failed"
+    with pytest.raises(RuntimeError, match="prewarm synchronization failed"):
+        decoder.prepare(torch.device("cuda", 0))
+    assert decoder._device is None
+    with pytest.raises(RuntimeError, match="not prepared"):
+        with decoder.capture_scope():
+            pytest.fail("failed prewarm was accepted")
+
+
+def test_merge_api_is_required_before_prewarm(cuda_api, monkeypatch):
+    monkeypatch.setattr(torch, "_foreach_copy_", None)
+    with pytest.raises(RuntimeError, match="requires torch._foreach_copy_"):
+        _prepare()
+    assert cuda_api.warmup_copies == [] and cuda_api.warmup_syncs == 0
 
 
 def test_native_if_retains_fresh_scalar_and_one_parent_per_owner(cuda_api):

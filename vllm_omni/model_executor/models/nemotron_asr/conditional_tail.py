@@ -24,13 +24,19 @@ version-sensitive; opt-in preparation requires all three and a CUDA build of
 
 PyTorch owns the conditional kernel, child stream and allocator capture routing.
 It rejects ``graph_capture_record_stream_reuse=True`` and RNG in a conditional
-body; these errors propagate without dense fallback. Each graph retains its predicate scalars and
-merge buffers. The scalar reduction adds a kernel relative to the previous
+body; these errors propagate without dense fallback. Each graph owner retains
+its predicate scalars and merge buffers. The scalar reduction adds a kernel relative to the previous
 custom predicate. Tensor arithmetic follows ``decode_dense_masked_frames``.
 
 Eager calls remain the dense preparation/oracle path. Capturing calls require
 an explicit graph owner. This is a distinct experimental candidate; native
 allocator routing has not been shown to explain the earlier replay failure.
+
+Tail merge copies use two dtype-homogeneous ``torch._foreach_copy_`` calls per
+frame. Metadata guards require a contiguous subset of the CUDA fast route in
+the same PyTorch commit's ``aten/src/ATen/native/cuda/ForeachBinaryOpList.cu``
+and ``aten/src/ATen/native/ForeachUtils.h``. Unsupported layouts or overlapping
+writes raise before either copy; no per-field fallback is provided.
 """
 
 from __future__ import annotations
@@ -53,6 +59,8 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
 )
 
 PREFIX_ATTEMPTS = 4
+_FLOAT_MERGES = (0, 1, 3, 4, 5)
+_INTEGER_MERGES = (2, 6)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +133,57 @@ class ConditionalCapture:
             self._if_nodes += 1
 
 
+def _copy_tail_merges(
+    destinations: tuple[torch.Tensor, ...], sources: tuple[torch.Tensor, ...], *, final_frame: bool
+) -> None:
+    """Copy disjoint merge buffers through the known foreach CUDA fast route.
+
+    CPU mathematical tests also use this operation; they prove copy semantics,
+    not CUDA launch counts. Validation reads metadata only and happens during
+    capture, before either dtype group can write a destination.
+    """
+    if len(destinations) != 7 or len(sources) != 7:
+        raise ValueError("conditional-tail merge requires seven fields")
+    groups = ((torch.float32, (0, 1) if final_frame else _FLOAT_MERGES), (torch.int64, _INTEGER_MERGES))
+    device = destinations[0].device
+    destination_ranges: list[tuple[int, int]] = []
+    source_ranges: list[tuple[int, int]] = []
+    for dtype, indices in groups:
+        for index in indices:
+            destination, source = destinations[index], sources[index]
+            for tensor in (destination, source):
+                if tensor.dtype != dtype or tensor.device != device or tensor.layout != torch.strided:
+                    raise ValueError("conditional-tail merge requires matching FP32/int64 fields on one device")
+                if not tensor.is_contiguous() or tensor.numel() == 0 or tensor.is_conj() or tensor.is_neg():
+                    raise ValueError("conditional-tail merge requires nonempty contiguous materialized fields")
+            if destination.shape != source.shape or destination.stride() != source.stride():
+                raise ValueError("conditional-tail merge requires matching pair shapes and strides")
+            for tensor, ranges in ((destination, destination_ranges), (source, source_ranges)):
+                start = tensor.data_ptr()
+                ranges.append((start, start + tensor.numel() * tensor.element_size()))
+    destination_ranges.sort()
+    if any(left[1] > right[0] for left, right in zip(destination_ranges, destination_ranges[1:])) or any(
+        destination[0] < source[1] and source[0] < destination[1]
+        for destination in destination_ranges
+        for source in source_ranges
+    ):
+        raise ValueError("conditional-tail merge destinations must be disjoint from each other and all sources")
+    for _, indices in groups:
+        torch._foreach_copy_([destinations[index] for index in indices], [sources[index] for index in indices])
+
+
+def _prewarm_tail_merges(device: torch.device) -> None:
+    # Both same-dtype paths are exercised once per decoder before graph capture.
+    # These temporary tensors do not become graph-owner or decoder state.
+    destinations = tuple(
+        torch.empty(1, dtype=torch.float32 if index in _FLOAT_MERGES else torch.int64, device=device)
+        for index in range(7)
+    )
+    sources = tuple(torch.zeros_like(tensor) for tensor in destinations)
+    _copy_tail_merges(destinations, sources, final_frame=False)
+    torch.accelerator.synchronize(device)
+
+
 def _decode_frames_with_if(
     enc_frames: torch.Tensor,
     enc_lengths: torch.Tensor,
@@ -194,10 +253,8 @@ def _decode_frames_with_if(
                 result = prefix
                 for symbol in range(PREFIX_ATTEMPTS, max_symbols):
                     result = attempt(result, symbol)
-                for index, (destination, source) in enumerate(zip(prefix[:7], result[:7], strict=True)):
-                    if index in (3, 4, 5) and t + 1 == t_pad:
-                        continue  # Final lookahead has no consumer.
-                    destination.copy_(source)
+                # Final-frame lookahead fields 3/4/5 have no consumer.
+                _copy_tail_merges(prefix[:7], result[:7], final_frame=t + 1 == t_pad)
                 capture.keep(*result)
 
             capture.run_if(prefix[-1], tail)
@@ -243,6 +300,10 @@ class ConditionalTailDecoder:
         cuda_version = torch.version.cuda
         if cuda_version is None or tuple(int(part) for part in cuda_version.split(".")[:2]) < (12, 4):
             raise RuntimeError("conditional-tail requires a PyTorch CUDA build of 12.4 or newer")
+        if not callable(getattr(torch, "_foreach_copy_", None)):
+            raise RuntimeError("conditional-tail requires torch._foreach_copy_")
+        if self._device is None:
+            _prewarm_tail_merges(device)
         self._device = device
 
     @contextmanager

@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.nemotron_asr.conditional_tail import (
+    ConditionalCapture,
     ConditionalTailDecoder,
+    _copy_tail_merges,
     _decode_frames_with_if,
 )
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
@@ -199,3 +201,146 @@ def test_capture_owners_release_per_graph_buffers_independently():
     del second
     gc.collect()
     assert second_ref() is None
+
+
+def _merge_fields(offset=0):
+    fields = []
+    for index in range(7):
+        shape = (3,) if index in (2, 6) else ((3, 4) if index == 3 else (2, 3, 4))
+        dtype = torch.int64 if index in (2, 6) else torch.float32
+        tensor = torch.full(shape, offset + index, dtype=dtype)
+        if dtype == torch.float32 and offset:
+            # Include signed zero, infinity and a NaN payload: compare raw bits.
+            tensor.view(torch.int32).flatten()[:3] = torch.tensor([-2147483648, 2139095040, 2143289635])
+        elif dtype == torch.int64 and offset:
+            tensor[0] = 2**60 + index
+        fields.append(tensor)
+    return tuple(fields)
+
+
+def _bits(tensor):
+    return tensor.view(torch.uint8).clone()
+
+
+@pytest.mark.parametrize("final_frame", [False, True])
+def test_grouped_merges_match_serial_copies_bitwise_and_preserve_sources(monkeypatch, final_frame):
+    destinations, sources = _merge_fields(), _merge_fields(100)
+    expected = tuple(tensor.clone() for tensor in destinations)
+    source_bits = tuple(_bits(tensor) for tensor in sources)
+    selected = (0, 1, 2, 6) if final_frame else range(7)
+    for index in selected:
+        expected[index].copy_(sources[index])
+    calls = []
+    foreach_copy = torch._foreach_copy_
+
+    def record(targets, values):
+        calls.append(
+            (targets[0].dtype, tuple(next(i for i, t in enumerate(destinations) if t is dst) for dst in targets))
+        )
+        return foreach_copy(targets, values)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", record)
+    _copy_tail_merges(destinations, sources, final_frame=final_frame)
+    assert calls == [(torch.float32, (0, 1) if final_frame else (0, 1, 3, 4, 5)), (torch.int64, (2, 6))]
+    assert all(torch.equal(_bits(actual), _bits(reference)) for actual, reference in zip(destinations, expected))
+    assert all(torch.equal(_bits(actual), before) for actual, before in zip(sources, source_bits))
+
+
+def test_two_frame_tail_uses_four_grouped_copy_calls_with_final_lookahead_excluded(monkeypatch):
+    calls = []
+    foreach_copy = torch._foreach_copy_
+
+    def record(targets, sources):
+        calls.append((targets[0].dtype, len(targets)))
+        return foreach_copy(targets, sources)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", record)
+    frames, lengths, state = torch.tensor([[[10.0], [20.0]]]), torch.tensor([2]), _state(1)
+    predictor, joint = _CountingPredictor(), _ThresholdJoint()
+    actual = _decode_frames_with_if(frames, lengths, predictor, joint, state, capture=_CPUBranch())
+    expected = decode_dense_masked_frames(frames, lengths, predictor, joint, state)
+    _equal(actual, expected)
+    assert actual.frame_emission_counts.tolist() == [[10, 10]]
+    assert calls == [(torch.float32, 5), (torch.int64, 2), (torch.float32, 2), (torch.int64, 2)]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "dtype",
+        "device",
+        "layout",
+        "noncontiguous",
+        "shape",
+        "stride",
+        "empty",
+        "negative_view",
+        "dest_alias",
+        "read_alias",
+        "cross_dtype_alias",
+    ],
+)
+def test_merge_metadata_and_write_aliases_fail_before_either_group_writes(monkeypatch, invalid):
+    destinations, sources = list(_merge_fields()), list(_merge_fields(100))
+    if invalid == "dtype":
+        sources[6] = sources[6].float()  # Bad second group must prevent first-group writes.
+    elif invalid == "device":
+        sources[6] = torch.empty(3, dtype=torch.int64, device="meta")
+    elif invalid == "layout":
+        sources[6] = sources[6].to_sparse()
+    elif invalid == "noncontiguous":
+        sources[0] = sources[0].transpose(0, 1)
+    elif invalid == "shape":
+        sources[6] = torch.zeros(4, dtype=torch.int64)
+    elif invalid == "stride":
+        destinations[2] = torch.zeros(1, 3, dtype=torch.int64)
+        sources[2] = torch.ones(3, dtype=torch.int64).as_strided((1, 3), (9, 1))
+        assert sources[2].is_contiguous()
+    elif invalid == "empty":
+        destinations[6] = sources[6] = torch.empty(0, dtype=torch.int64)
+    elif invalid == "negative_view":
+        sources[0] = torch._neg_view(sources[0])
+        assert sources[0].is_neg()
+    elif invalid == "cross_dtype_alias":
+        sources[6] = destinations[0].view(torch.int64).flatten()[:3]
+    else:
+        storage = torch.arange(48, dtype=torch.float32)
+        destinations[0] = storage[:24].view(2, 3, 4)
+        if invalid == "dest_alias":
+            destinations[1] = storage[12:36].view(2, 3, 4)
+        else:
+            sources[1] = storage[12:36].view(2, 3, 4)
+    before = tuple(_bits(tensor) for tensor in destinations)
+    monkeypatch.setattr(
+        torch, "_foreach_copy_", lambda *args: pytest.fail("copy ran before all metadata was validated")
+    )
+    with pytest.raises(ValueError, match="conditional-tail merge"):
+        _copy_tail_merges(tuple(destinations), tuple(sources), final_frame=False)
+    assert all(torch.equal(_bits(tensor), saved) for tensor, saved in zip(destinations, before))
+
+
+def test_merge_accepts_disjoint_storage_views_and_shared_read_only_source():
+    destinations, sources = list(_merge_fields()), list(_merge_fields(100))
+    storage = torch.arange(48, dtype=torch.float32)
+    destinations[0] = storage[:24].view(2, 3, 4)
+    sources[0] = sources[1] = storage[24:].view(2, 3, 4)
+    expected = tuple(_bits(tensor) for tensor in sources)
+    _copy_tail_merges(tuple(destinations), tuple(sources), final_frame=False)
+    assert all(torch.equal(_bits(tensor), saved) for tensor, saved in zip(destinations, expected))
+
+
+def test_grouped_merge_buffers_remain_independent_between_graph_owners():
+    first, second = ConditionalCapture(), ConditionalCapture()
+    first_buffers, second_buffers, sources = _merge_fields(), _merge_fields(200), _merge_fields(100)
+    first.keep(*first_buffers)
+    second.keep(*second_buffers)
+    second_before = tuple(_bits(tensor) for tensor in second_buffers)
+    _copy_tail_merges(first_buffers, sources, final_frame=False)
+    assert all(torch.equal(_bits(tensor), saved) for tensor, saved in zip(second_buffers, second_before))
+    first_ref, first_tensor_ref = weakref.ref(first), weakref.ref(first_buffers[0])
+    del first, first_buffers
+    gc.collect()
+    assert first_ref() is None and first_tensor_ref() is None
+    _copy_tail_merges(second_buffers, sources, final_frame=True)
+    assert torch.equal(_bits(second_buffers[0]), _bits(sources[0]))
+    assert torch.equal(_bits(second_buffers[3]), second_before[3])
