@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Actual predicate-cache/graph-owner classes with CPU fake CUDA APIs.
 
-These tests prove bounded ownership and cleanup ordering. They do not explain
-the unreproduced GPU capture segfault or replace real CUDA validation.
+These tests prove bounded ownership and GC-state restoration. They do not
+identify the object behind the GPU capture segfault or replace CUDA validation.
 """
 
 import gc
@@ -12,6 +12,8 @@ import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -267,3 +269,130 @@ def test_failed_capture_releases_owner_but_preserves_usable_context_module(cuda_
     assert owner_ref() is None and tensor_ref() is None
     assert decoder._capture is None and cuda_api.unloads == []
     assert _prepare()._compiled is decoder._compiled
+
+
+@pytest.mark.parametrize("initially_enabled", [False, True])
+def test_capture_scope_restores_gc_with_nested_scopes_and_rejected_overlap(cuda_api, initially_enabled):
+    original = gc.isenabled()
+    decoders = [_prepare(), _prepare()]
+    try:
+        (gc.enable if initially_enabled else gc.disable)()
+        with decoders[0].capture_scope():
+            assert not gc.isenabled()
+            with pytest.raises(RuntimeError, match="cannot overlap"):
+                with decoders[0].capture_scope():
+                    pytest.fail("same-decoder overlap was accepted")
+            with decoders[1].capture_scope():
+                assert not gc.isenabled()
+            assert not gc.isenabled()
+        assert gc.isenabled() is initially_enabled
+        assert cuda_api.module._CAPTURE_GC_USERS == 0
+    finally:
+        (gc.enable if original else gc.disable)()
+
+
+def test_unprepared_capture_does_not_change_gc_state(cuda_api):
+    original = gc.isenabled()
+    with pytest.raises(RuntimeError, match="not prepared"):
+        with ConditionalTailDecoder().capture_scope():
+            pytest.fail("unprepared capture was accepted")
+    assert gc.isenabled() is original
+    assert cuda_api.module._CAPTURE_GC_USERS == 0
+
+
+def test_overlapping_capture_scopes_restore_gc_after_last_thread_exits(cuda_api):
+    original = gc.isenabled()
+    first, second = _prepare(), _prepare()
+    entered, finish = threading.Event(), threading.Event()
+
+    def overlap():
+        with second.capture_scope():
+            entered.set()
+            assert finish.wait(timeout=5)
+            assert not gc.isenabled()
+
+    try:
+        gc.enable()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                with first.capture_scope():
+                    future = executor.submit(overlap)
+                    assert entered.wait(timeout=5)
+                    assert not gc.isenabled()
+                # The scope that originally disabled GC has already exited.
+                assert not gc.isenabled()
+            finally:
+                finish.set()
+            future.result(timeout=5)
+        assert gc.isenabled()
+        assert cuda_api.module._CAPTURE_GC_USERS == 0
+    finally:
+        finish.set()
+        (gc.enable if original else gc.disable)()
+
+
+@pytest.mark.parametrize("fail_capture_end", [False, True])
+@pytest.mark.parametrize("initially_enabled", [False, True])
+def test_binding_scope_protects_parent_capture_end_and_restores_gc(
+    cuda_api, monkeypatch, fail_capture_end, initially_enabled
+):
+    original = gc.isenabled()
+    decoder = _prepare()
+    monkeypatch.setattr(decoder, "prepare", lambda device: None)
+    phases = []
+    collect = gc.collect
+
+    @contextmanager
+    def parent_graph():
+        assert not gc.isenabled()
+        assert gc.collect is collect
+        gc.collect()  # Explicit pre-capture collection remains usable.
+        phases.append("begin")
+        try:
+            yield
+        finally:
+            assert not gc.isenabled()
+            phases.append("end")
+            if fail_capture_end:
+                raise RuntimeError("parent capture_end failed")
+
+    class Wrapper:
+        def __init__(self, run, *args, **kwargs):
+            self.run, self.calls = run, 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 2:
+                with parent_graph():
+                    return self.run()
+            assert gc.isenabled() is initially_enabled  # Eager and replay.
+            return self.run()
+
+    binding = DenseGraphBinding(
+        decode_fn=decoder,
+        predictor=_CountingPredictor(),
+        joint=_ThresholdJoint(),
+        vllm_config=None,
+        frame_widths=(1,),
+        tiers=(1,),
+        encoder_hidden=1,
+        predictor_layers=2,
+        predictor_hidden=1,
+        blank_id=1,
+        runtime=replace(_runtime(), wrapper_factory=Wrapper),
+    )
+    try:
+        (gc.enable if initially_enabled else gc.disable)()
+        if fail_capture_end:
+            with pytest.raises(RuntimeError, match="parent capture_end failed"):
+                binding.warmup(torch.device("cpu"), torch.float32)
+            assert binding.captured_keys == ()
+        else:
+            binding.warmup(torch.device("cpu"), torch.float32)
+            assert binding.captured_keys == ((0, 1),)
+        assert phases == ["begin", "end"]
+        assert gc.isenabled() is initially_enabled
+        assert decoder._capture is None
+        assert cuda_api.module._CAPTURE_GC_USERS == 0
+    finally:
+        (gc.enable if original else gc.disable)()

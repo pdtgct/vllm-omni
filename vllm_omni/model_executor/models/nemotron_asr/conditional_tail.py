@@ -35,6 +35,7 @@ safe graph-independent code lifetime, not an accumulated capture history.
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 from collections.abc import Callable, Iterator
@@ -133,6 +134,35 @@ class _CompiledCondition:
 # https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html
 _MODULE_CACHE: dict[int, tuple[int, _CompiledCondition | None]] = {}
 _MODULE_CACHE_LOCK = threading.Lock()
+
+
+_CAPTURE_GC_LOCK = threading.Lock()
+_CAPTURE_GC_USERS = 0
+_CAPTURE_GC_WAS_ENABLED = False
+
+
+@contextmanager
+def _defer_automatic_gc() -> Iterator[None]:
+    """Keep cyclic destruction outside the entire conditional graph capture.
+
+    The matching-runtime failure is sensitive to automatic GC; its exact
+    collected object is unknown. Explicit gc.collect remains available to the
+    graph wrapper before capture. Count overlapping scopes because GC state is
+    process-wide, and restore the caller's state only after the last one exits.
+    """
+    global _CAPTURE_GC_USERS, _CAPTURE_GC_WAS_ENABLED
+    with _CAPTURE_GC_LOCK:
+        if _CAPTURE_GC_USERS == 0:
+            _CAPTURE_GC_WAS_ENABLED = gc.isenabled()
+            gc.disable()
+        _CAPTURE_GC_USERS += 1
+    try:
+        yield
+    finally:
+        with _CAPTURE_GC_LOCK:
+            _CAPTURE_GC_USERS -= 1
+            if _CAPTURE_GC_USERS == 0 and _CAPTURE_GC_WAS_ENABLED:
+                gc.enable()
 
 
 def _compiled_condition_for_device(device: torch.device) -> _CompiledCondition:
@@ -362,12 +392,15 @@ class ConditionalTailDecoder:
             raise RuntimeError("conditional-tail decoder was not prepared before capture")
         if self._capture is not None:
             raise RuntimeError("conditional-tail capture scopes cannot overlap")
-        owner = ConditionalCapture(self._compiled)
-        self._capture = owner
-        try:
-            yield owner
-        finally:
-            self._capture = None
+        # The caller holds this scope across its graph wrapper call, including
+        # the enclosing graph's capture_end, not merely the IF child body.
+        with _defer_automatic_gc():
+            owner = ConditionalCapture(self._compiled)
+            self._capture = owner
+            try:
+                yield owner
+            finally:
+                self._capture = None
 
     def __call__(
         self,
