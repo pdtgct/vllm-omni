@@ -113,6 +113,99 @@ def test_engine_timing_update_arrival_does_not_change_core_queue_policy(monkeypa
     assert trace.identity == _timing_identity(0 if queued else 1)
 
 
+@pytest.mark.parametrize("kind", ["regular", "final_tail", "forced_eou", "flush"])
+def test_engine_timing_identity_survives_engine_request_codec(kind) -> None:
+    import json
+
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.engine import OmniEngineCoreRequest
+    from vllm_omni.engine.serialization import (
+        deserialize_additional_information,
+        serialize_additional_information,
+    )
+    from vllm_omni.metrics.streaming_transport import engine_service_timing_identity
+    from vllm_omni.request import OmniRequest
+
+    identity = {**_timing_identity(2**24 + 3), "kind": kind, "carrier_sequence": 3}
+    if kind in {"forced_eou", "flush"}:
+        identity["carrier_sequence"] = None
+    if kind == "flush":
+        identity["logical_sequence"] = None
+    wire = OmniEngineCoreRequest(
+        request_id="timing-codec",
+        prompt_token_ids=[123],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=1.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=True,
+        additional_information=serialize_additional_information({"meta": {"service_timing": json.dumps(identity)}}),
+    )
+    decoded = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(wire))
+    request = OmniRequest.from_engine_core_request(decoded, block_hasher=None)
+    update = StreamingUpdate.from_request(request)
+    assert update is not None
+    assert request.prompt_token_ids == [123]
+    for payload in (decoded.additional_information, request.additional_information, update.additional_information):
+        assert engine_service_timing_identity(deserialize_additional_information(payload)) == identity
+
+
+@pytest.mark.parametrize("termination", ["abort_running", "abort_parked", "input_end_parked"])
+def test_engine_timing_real_scheduler_terminal_cleanup(monkeypatch, termination) -> None:
+    import json
+
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
+    from vllm_omni.metrics import streaming_transport
+
+    sched = _make_scheduler()
+    sched._service_timing_enabled = True
+    sched.connector = None
+    sched._omits_kv_transfer_cache = {}
+    sched.finished_req_ids = set()
+    sched.finished_req_ids_dict = None
+    sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    session = _make_request()
+    session.resumable = True
+    session.streaming_queue = deque()
+    session._omni_service_timing = streaming_transport.EngineServiceTimingTrace(session.request_id, _timing_identity(0))
+    trace = session._omni_service_timing
+    sched.requests = {session.request_id: session}
+    parked = termination != "abort_running"
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ if parked else RequestStatus.RUNNING
+    sched.running = [] if parked else [session]
+    if parked:
+        sched.waiting.add_request(session)
+        sched.num_waiting_for_streaming_input = 1
+    else:
+        session.streaming_queue.append(_make_update())
+    records = []
+    monkeypatch.setattr(streaming_transport._logger, "info", lambda fmt, value: records.append(json.loads(value)))
+
+    if termination == "input_end_parked":
+        incoming = _make_request()
+        incoming.resumable = False
+        sched.add_request(incoming)
+    else:
+        sched.finish_requests(session.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert session.request_id not in sched.requests
+    assert not sched.running and not sched.waiting and not sched.skipped_waiting
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session._omni_service_timing is None
+    assert len(records) == 1 and records[0]["end"] is True and records[0]["valid"] is True
+    assert records[0]["reason"] == str(RequestStatus.FINISHED_ABORTED)
+    assert [event["event"] for event in trace.events] == (["input_end"] if termination == "input_end_parked" else [])
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.finish_requests(session.request_id, RequestStatus.FINISHED_ABORTED)
+    assert len(records) == 1
+
+
 def test_engine_timing_park_precedes_queued_update_generation_and_schedule(monkeypatch) -> None:
     import json
 
