@@ -149,8 +149,86 @@ def test_weight_names_follow_nemo_layout():
 from vllm_omni.model_executor.models.nemotron_asr.encoder import (  # noqa: E402
     StreamingCaches,
     _stream_attention,
+    _stream_attention_mask,
     stream_step,
 )
+
+
+def _original_attention(layer, x, cache, valid, new_lengths, pos_emb):
+    """Frozen8034 arithmetic, including its independent cache concatenation."""
+    attn = layer.self_attn
+    batch, frames, width = x.shape
+    capacity = cache.shape[1]
+    keys = torch.cat([cache.to(x.dtype), x], dim=1)
+    q = attn.linear_q(x).view(batch, frames, attn.h, attn.d_k)
+    k = attn.linear_k(keys).view(batch, capacity + frames, attn.h, attn.d_k).transpose(1, 2)
+    v = attn.linear_v(keys).view(batch, capacity + frames, attn.h, attn.d_k).transpose(1, 2)
+    p = attn.linear_pos(pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
+    q_u = (q + attn.pos_bias_u).transpose(1, 2)
+    q_v = (q + attn.pos_bias_v).transpose(1, 2)
+    bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
+    ac = torch.matmul(q_u, k.transpose(-2, -1))
+    scores = (ac + bd[:, :, :, : ac.size(-1)]) / attn.s_d_k
+    new_valid = torch.arange(frames).unsqueeze(0) < new_lengths.unsqueeze(1)
+    mask = _stream_attention_mask(valid, new_valid, capacity)
+    scores = scores.masked_fill(mask, -10000.0)
+    weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+    out = torch.matmul(weights, v).transpose(1, 2).reshape(batch, frames, width)
+    indices = (new_lengths.view(-1, 1) + torch.arange(capacity).unsqueeze(0)).unsqueeze(-1)
+    indices = indices.expand(batch, capacity, width)
+    advanced = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, indices)
+    return attn.linear_out(out), advanced
+
+
+@pytest.mark.parametrize(
+    "cache_dtype,input_dtype",
+    [
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_attention_cache_concat_reuse_matches_original_and_preserves_ownership(cache_dtype, input_dtype):
+    # @spec PORT-STATE-006 / PORT-STATE-021 / PORT-PREC-001 / PORT-PREC-005
+    enc = _tiny(att_context=(8, 1)).to(dtype=input_dtype)
+    layer = enc.layers[0]
+    torch.manual_seed(82)
+    cache = torch.randn(3, 8, 32, dtype=cache_dtype)
+    expected_cache = cache.clone()
+    valid = torch.tensor([8, 3, 0])
+    retained: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for step in range(12):
+            x = torch.randn(3, 2, 32, dtype=input_dtype)
+            lengths = torch.zeros(3, dtype=torch.long) if step == 3 else torch.tensor([0, 1, 2]).roll(step % 3)
+            new_valid = torch.arange(2).unsqueeze(0) < lengths.unsqueeze(1)
+            pos = enc.pos_enc(torch.zeros(1, 10, 32, dtype=input_dtype))
+            before_cache, before_x = cache.clone(), x.clone()
+            expected_out, expected_cache = _original_attention(layer, x, expected_cache, valid, lengths, pos)
+            actual_out, advanced = _stream_attention(
+                layer,
+                x,
+                cache=cache,
+                valid=valid,
+                pos_emb=pos,
+                new_valid=new_valid,
+                new_lengths=lengths,
+            )
+            assert torch.equal(actual_out, expected_out)
+            assert torch.equal(advanced, expected_cache)
+            assert advanced.dtype == cache_dtype
+            assert torch.equal(cache, before_cache) and torch.equal(x, before_x)
+            assert advanced.untyped_storage().data_ptr() != cache.untyped_storage().data_ptr()
+            assert advanced.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+            assert torch.equal(advanced[lengths == 0], cache[lengths == 0])
+            if cache_dtype == torch.float32:
+                assert torch.equal(advanced.view(torch.int32), expected_cache.view(torch.int32))
+            for held, snapshot in retained:
+                assert torch.equal(held, snapshot)
+            retained.append((advanced, advanced.clone()))
+            cache = advanced
+            valid = (valid + lengths).clamp(max=8)
 
 
 def _caches(batch: int, enc: FastConformerEncoder) -> StreamingCaches:

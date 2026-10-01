@@ -575,7 +575,8 @@ def _stream_attention(
     # bit-identical; gather indices never touch padded frames.
     if cache_indices is None:
         cache_indices = _stream_cache_indices(new_lengths, capacity).unsqueeze(-1).expand(b, capacity, keys.shape[2])
-    new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, cache_indices)
+    cache_source = keys if cache.dtype == x.dtype == torch.float32 else torch.cat([cache, x.to(cache.dtype)], dim=1)
+    new_cache = cache_source.gather(1, cache_indices)
     return attn.linear_out(out), new_cache
 
 
