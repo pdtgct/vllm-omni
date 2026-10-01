@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,6 +65,7 @@ class _GraphEntry:
     frame_final_labels: torch.Tensor
     descriptor: Any
     wrapper: Any
+    capture_resources: Any = None
 
     def output_tuple(self) -> tuple[torch.Tensor, ...]:
         return (
@@ -156,6 +157,15 @@ class DenseGraphBinding:
     @property
     def captured_keys(self) -> tuple[tuple[int, int], ...]:
         return tuple(sorted(self._entries))
+
+    @property
+    def conditional_capture_counts(self) -> dict[tuple[int, int], int]:
+        """Actual conditional nodes retained by each standalone decoder graph."""
+        return {
+            key: entry.capture_resources.if_nodes
+            for key, entry in self._entries.items()
+            if entry.capture_resources is not None
+        }
 
     def execution_tier(self, live_rows: int) -> int:
         for tier in self._tiers:
@@ -303,6 +313,10 @@ class DenseGraphBinding:
     def warmup(self, device: torch.device, dtype: torch.dtype) -> None:
         if self._entries:
             return
+        prepare = getattr(self._decode_fn, "prepare", None)
+        if prepare is not None:
+            prepare(device)
+        capture_scope = getattr(self._decode_fn, "capture_scope", nullcontext)
         runtime = self._runtime or platform_graph_runtime()
         pending = {
             (geometry, tier): self._new_entry(
@@ -321,11 +335,9 @@ class DenseGraphBinding:
             with torch.inference_mode(), runtime.capture_context(device):
                 for entry in pending.values():
                     eager = self._snapshot(self._call(entry, runtime, runtime.eager_mode))
-                    captured = self._call(
-                        entry,
-                        runtime,
-                        runtime.graph_mode,
-                    )
+                    with capture_scope() as resources:
+                        captured = self._call(entry, runtime, runtime.graph_mode)
+                        entry.capture_resources = resources
                     self._assert_equal(eager, captured)
                     replayed = self._call(
                         entry,
@@ -437,7 +449,14 @@ class DenseGraphBinding:
         key = (geometry, tier)
         if key not in self._entries or self._runtime is None:
             raise ValueError(f"uncaptured dense graph key geometry={geometry} tier={tier}")
-        return self._bind_decode(self._entries[key], self._runtime, captured=False)
+        decode = self._bind_decode(self._entries[key], self._runtime, captured=False)
+        # The enclosing CHUNK graph owns resources captured through this eager
+        # wrapper; they must not accumulate on the standalone decoder entry.
+        for name in ("prepare", "capture_scope"):
+            hook = getattr(self._decode_fn, name, None)
+            if hook is not None:
+                setattr(decode, name, hook)
+        return decode
 
     def decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
         """Return the startup-bound callable for one exact graph key."""

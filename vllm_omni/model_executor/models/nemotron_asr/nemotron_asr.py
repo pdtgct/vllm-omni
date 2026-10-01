@@ -20,6 +20,7 @@ actively by the replay-echo guard (PORT-DEC-005/007).
 """
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,7 @@ from vllm_omni.model_executor.models.nemotron_asr.processor import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
+    FrameAlignedDecode,
     Joint,
     Predictor,
     decode_dense_masked_frames,
@@ -417,6 +419,11 @@ class NemotronASRForRNNT(nn.Module):
             vllm_config=vllm_config,
         )
         self._decode_graph_binding = None
+        tail_if = getattr(hf_config, "experimental_rnnt_tail_if", False)
+        if not isinstance(tail_if, bool):
+            raise ValueError("experimental_rnnt_tail_if must be a boolean")
+        if tail_if and getattr(hf_config, "decode_dispatch_arm", None) != "dense-graphed":
+            raise ValueError("experimental_rnnt_tail_if requires dense-graphed decode")
         if getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed":
             from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
                 DenseGraphBinding,
@@ -424,8 +431,13 @@ class NemotronASRForRNNT(nn.Module):
             )
 
             served_geometry_set = set(served_geometry_ids)
+            frame_decoder: Callable[..., FrameAlignedDecode] = decode_dense_masked_frames
+            if tail_if:
+                from vllm_omni.model_executor.models.nemotron_asr.conditional_tail import ConditionalTailDecoder
+
+                frame_decoder = ConditionalTailDecoder()
             self._decode_graph_binding = DenseGraphBinding(
-                decode_fn=decode_dense_masked_frames,
+                decode_fn=frame_decoder,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
                 vllm_config=vllm_config,
@@ -830,6 +842,15 @@ class NemotronASRForRNNT(nn.Module):
             },
             "encoder": self._encoder_execution.ready_receipt(),
         }
+        conditional_counts = getattr(binding, "conditional_capture_counts", {})
+        if conditional_counts:
+            receipt["decode"]["conditional_tail_if"] = {
+                "prefix_attempts": 4,
+                "captures": [
+                    {"geometry": geometry, "tier": tier, "if_nodes": count}
+                    for (geometry, tier), count in sorted(conditional_counts.items())
+                ],
+            }
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()

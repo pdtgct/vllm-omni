@@ -12,6 +12,7 @@ import hashlib
 import os
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,10 @@ def capture_chunk_bucket(
     execute_decode = decode_dense_masked_frames if capture_decode_fn is None else capture_decode_fn
     if getattr(core.encoder, "_stream_relative_position_lengths", ()):
         raise ValueError("bucket graph requires unprepared native positional projections")
+    prepare = getattr(execute_decode, "prepare", None)
+    if prepare is not None:
+        prepare(env.device)
+    capture_scope = getattr(execute_decode, "capture_scope", nullcontext)
     runtime = runtime or platform_graph_runtime()
     sample_width = 8 * (list(CADENCES.values())[geometry][1] + 1) * int(core.featurizer.hop_length)
     static_env = env.clone()
@@ -181,7 +186,8 @@ def capture_chunk_bucket(
     try:
         with runtime.capture_context(env.device):
             stage(sources)
-            call(runtime.graph_mode)
+            with capture_scope() as capture_resources:
+                call(runtime.graph_mode)
         stage(sources)
         actual = call(runtime.graph_mode)
         for actual_tensor, expected in zip(
@@ -250,6 +256,8 @@ def capture_chunk_bucket(
 
     frozen_capacity = queue_capacity
     transition.replay_count = 0
+    if capture_resources is not None:
+        transition.capture_resources = capture_resources
     return transition
 
 
@@ -407,6 +415,11 @@ class ExactChunkGraphBinding:
                     "geometry": g,
                     "encoder_population": n,
                     "decoder_tier": self._decoder.execution_tier(n),
+                    **(
+                        {"conditional_if_nodes": entry.capture_resources.if_nodes}
+                        if hasattr(entry, "capture_resources")
+                        else {}
+                    ),
                     "successful_replays": entry.replay_count,
                 }
                 for (g, n), entry in sorted(self._encoder._chunk_graph_entries.items())
