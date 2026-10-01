@@ -833,14 +833,22 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
+        sink = getattr(self, "_commit_sink", None)
+        if sink is not None and sink.tail_observer is not None:
+            receipt["conditional_tail"] = sink.tail_observer.receipt()
         return receipt
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
+        # A positive HF-config bound opts into a separate diagnostic run.
+        # Leave conditional_tail_observer_max_invocations absent/zero for timings.
         if self._commit_sink is None:
             self._commit_sink = BoundedCommitSink(
                 self._registry,
                 max_rows=self._max_num_seqs,
                 device=device,
+                conditional_tail_max_invocations=int(
+                    getattr(self.config, "conditional_tail_observer_max_invocations", 0)
+                ),
             )
         return self._commit_sink
 
@@ -1116,6 +1124,7 @@ def build_decode_resolver(
                     tier=tier,
                 ),
                 override_reason="regional-graph-coverage",
+                execution_tier=tier,
             )
         if request.graph_covers_decode:
             raise ValueError("graph-covered decode requires the dense-graphed served arm")

@@ -561,6 +561,8 @@ class ResolvedDecode:
     arm: str
     decode_fn: RnntDecodeFn
     override_reason: str | None = None
+    # Actual padded decoder population; zero means an eager/unspecified tier.
+    execution_tier: int = 0
 
 
 #: The immutable startup-constructed dispatch seam: the transaction
@@ -2864,6 +2866,11 @@ def advance_model_rows(
 
     # ---- deadline-ordered buckets → fresh-aware gather → transition ----
     capture_on = capture
+    tail_observer = getattr(commit_sink, "tail_observer", None) if not memory_profile else None
+    if tail_observer is not None:
+        if getattr(commit_sink, "has_staged", False):
+            raise ValueError("collect the previous commit before reusing conditional-tail storage")
+        tail_observer.begin()
     executed: list[dict[str, Any]] = []
     for g, pos_t, resolved in bucket_pos:
         # Routed through ``staging`` by GEOMETRY: each geometry resolves
@@ -2911,6 +2918,17 @@ def advance_model_rows(
         if not isinstance(bucket, ChunkBucketResult):
             raise TypeError("bucket transition must return ChunkBucketResult")
         batch, result = bucket.batch, bucket.result
+        if tail_observer is not None:
+            tail_observer.observe(
+                rows=tuple(pos_t.tolist()),
+                geometry=g,
+                tier=resolved.execution_tier if resolved.arm == "dense-graphed" else int(pos_t.numel()),
+                arm=resolved.arm,
+                chunk_graph=g in bucket_transitions and bool(getattr(transition, "replay_count", 0)),
+                counts=result.frame_emission_counts,
+                lengths=result.frame_valid_lengths,
+                final_tail=batch.final_tail,
+            )
         # Keep structural rejection on every invocation, including graph
         # replay; capture-time metadata validation alone is insufficient.
         _validate_result_structure(

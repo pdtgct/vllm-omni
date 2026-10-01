@@ -120,6 +120,7 @@ class BoundedCommitSink:
         max_capture_rows: int = 0,
         max_capture_bytes: int = 0,
         device: torch.device | None = None,
+        conditional_tail_max_invocations: int = 0,
     ) -> None:
         if max_rows <= 0:
             raise ValueError("max_rows must be positive")
@@ -135,6 +136,18 @@ class BoundedCommitSink:
         self._staged: CommitPlan | None = None
         self._staged_records: tuple[CaptureRecord, ...] = ()
         self._staged_lease_ok = False
+        self.tail_observer = None
+        if conditional_tail_max_invocations:
+            from vllm_omni.model_executor.models.nemotron_asr.manifests import CADENCES
+            from vllm_omni.model_executor.models.nemotron_asr.rnnt import MAX_SYMBOLS_PER_STEP
+            from vllm_omni.model_executor.models.nemotron_asr.tail_observer import ConditionalTailObserver
+
+            self.tail_observer = ConditionalTailObserver(
+                max_invocations=conditional_tail_max_invocations,
+                device=device or torch.device("cpu"),
+                cadences=CADENCES,
+                max_symbols=MAX_SYMBOLS_PER_STEP,
+            )
 
     def reserve(self, plan: CommitPlan) -> CommitTicket:
         """Pre-commit composite admission (fallible by design)."""
@@ -203,6 +216,8 @@ class BoundedCommitSink:
     ) -> None:
         rows = len(plan.bindings)
         self._status_host[:rows].copy_(row_status, non_blocking=True)
+        if self.tail_observer is not None:
+            self.tail_observer.stage()
         if self._event is not None:
             self._event.record()
         # Stage-time lease REVALIDATION is a recorded fact, never a
@@ -238,6 +253,8 @@ class BoundedCommitSink:
             raise ValueError("no staged commit to collect")
         if self._event is not None:
             self._event.synchronize()
+        if self.tail_observer is not None:
+            self.tail_observer.collect()
         rows = len(plan.bindings)
         status = self._status_host[:rows].tolist()
         reports = [
