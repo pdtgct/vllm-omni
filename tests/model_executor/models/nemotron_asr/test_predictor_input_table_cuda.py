@@ -1,15 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA replay regression for the explicitly prepared predictor table."""
+"""Exact synthetic rejection tests before trained predictor-table admission.
+
+Run with pytest -x before loading checkpoint weights. Passing these tests does
+not replace protocol 2 or trained qualification. Every comparison is exact;
+the maximum absolute error in a failure is diagnostic, never a tolerance.
+"""
 
 import copy
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.nemotron_asr.rnnt import Predictor
+from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+    DecodeState,
+    Joint,
+    Predictor,
+    decode_dense_masked_frames,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+
+_TIERS = (1, 2, 4, 8, 16, 32, 64, 128)
+_VOCAB = 13087  # 13088 embedding rows including blank.
+_HIDDEN = 640
 
 
 @pytest.fixture
@@ -28,34 +42,122 @@ def fp32_no_tf32():
         torch.set_float32_matmul_precision(precision)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.no_grad()
-def test_prepared_table_replays_with_changed_labels_and_carried_state(fp32_no_tf32):
+def _predictors():
     torch.manual_seed(71)
-    candidate = Predictor(vocab_size=19, pred_hidden=16, pred_rnn_layers=2).to("cuda").eval()
-    candidate.embed.weight[candidate.blank_id].fill_(0.3)
+    candidate = Predictor(vocab_size=_VOCAB, pred_hidden=_HIDDEN, pred_rnn_layers=2).to("cuda").eval()
+    candidate.embed.weight[candidate.blank_id].uniform_(-0.3, 0.3)
     candidate.prepare_input_projection_table()
-    table = candidate._input_projection_table
     baseline = copy.deepcopy(candidate)
+    assert candidate.input_projection_table_enabled
     assert not baseline.input_projection_table_enabled
-    labels = torch.tensor([19, 0, 7, 19], device="cuda")
-    state = (torch.randn(2, 4, 16, device="cuda"), torch.randn(2, 4, 16, device="cuda"))
+    return baseline, candidate
+
+
+def _labels(batch, step):
+    patterns = ((_VOCAB,), (_VOCAB - 1,), (7, 0, _VOCAB, _VOCAB - 1, 640, 7))
+    pattern = torch.tensor(patterns[step], device="cuda", dtype=torch.long)
+    return pattern[torch.arange(batch, device="cuda") % len(pattern)]
+
+
+def _exact(name, actual, expected):
+    if not torch.equal(actual, expected):
+        count = int(torch.count_nonzero(actual != expected))
+        maximum = float((actual.to(torch.float64) - expected.to(torch.float64)).abs().max())
+        pytest.fail(f"{name}: unequal={count}/{actual.numel()}, max_abs={maximum:.9g}")
+
+
+def _predictor_fields(output):
+    value, (h, c) = output
+    return {"output": value, "h": h, "c": c}
+
+
+def _decode_fields(output):
+    return {
+        "token_ids": output.token_ids,
+        "token_lengths": output.token_lengths,
+        "h": output.state.h,
+        "c": output.state.c,
+        "last_label": output.state.last_label,
+        "frame_emission_counts": output.frame_emission_counts,
+        "frame_final_labels": output.frame_final_labels,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("batch", _TIERS)
+@torch.no_grad()
+def test_actual_predictor_geometry_exact_eager_and_replay(batch, fp32_no_tf32):
+    baseline, candidate = _predictors()
+    table = candidate._input_projection_table
+    baseline_state = (torch.randn(2, batch, _HIDDEN, device="cuda"), torch.randn(2, batch, _HIDDEN, device="cuda"))
+    eager_state = tuple(value.clone() for value in baseline_state)
+    replay_state = tuple(value.clone() for value in baseline_state)
+    labels = _labels(batch, 0)
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
         for _ in range(3):
-            candidate.step(labels, state)
+            candidate.step(labels, replay_state)
     torch.cuda.current_stream().wait_stream(warmup)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual, actual_state = candidate.step(labels, state)
-    for ids in ([19, 2, 8, 19], [3, 19, 3, 8], [0, 1, 18, 19]):
-        labels.copy_(torch.tensor(ids, device="cuda"))
-        expected, expected_state = baseline.step(labels, state)
+        replay = candidate.step(labels, replay_state)
+    for step in range(3):
+        labels.copy_(_labels(batch, step))
+        expected = baseline.step(labels, baseline_state)
+        eager = candidate.step(labels, eager_state)
         graph.replay()
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        for result, reference in zip(actual_state, expected_state):
-            torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-6)
-        for carried, result in zip(state, actual_state):
+        for name, reference in _predictor_fields(expected).items():
+            _exact(f"tier={batch} step={step} eager {name}", _predictor_fields(eager)[name], reference)
+            _exact(f"tier={batch} step={step} replay {name}", _predictor_fields(replay)[name], reference)
+        # Carry each arm's own result, never copy baseline results into candidate.
+        baseline_state = expected[1]
+        eager_state = eager[1]
+        for carried, result in zip(replay_state, replay[1]):
             carried.copy_(result)
         assert candidate._input_projection_table is table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("batch", _TIERS)
+@torch.no_grad()
+def test_forced_cap_decoder_exact_seven_fields(batch, fp32_no_tf32):
+    baseline, candidate = _predictors()
+    # Only the joint is constant. Predictor parameters and carried states stay
+    # nonzero, so the cap fixture cannot conceal predictor GEMM rounding.
+    joint = Joint(enc_hidden=2, pred_hidden=_HIDDEN, joint_hidden=2, vocab_size=_VOCAB).to("cuda").eval()
+    for parameter in joint.parameters():
+        parameter.zero_()
+    joint.joint_net[1].bias[_VOCAB - 1] = 1.0
+    frames = torch.randn(batch, 2, 2, device="cuda")
+    lengths = torch.arange(batch, device="cuda") % 3
+    lengths[0] = 2
+    baseline_state = DecodeState(
+        h=torch.randn(2, batch, _HIDDEN, device="cuda"),
+        c=torch.randn(2, batch, _HIDDEN, device="cuda"),
+        last_label=_labels(batch, 2),
+    )
+    eager_state = copy.deepcopy(baseline_state)
+    replay_state = copy.deepcopy(baseline_state)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            decode_dense_masked_frames(frames, lengths, candidate, joint, replay_state)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay = decode_dense_masked_frames(frames, lengths, candidate, joint, replay_state)
+    for step in range(2):
+        expected = decode_dense_masked_frames(frames, lengths, baseline, joint, baseline_state)
+        eager = decode_dense_masked_frames(frames, lengths, candidate, joint, eager_state)
+        graph.replay()
+        for name, reference in _decode_fields(expected).items():
+            _exact(f"tier={batch} chunk={step} eager {name}", _decode_fields(eager)[name], reference)
+            _exact(f"tier={batch} chunk={step} replay {name}", _decode_fields(replay)[name], reference)
+        _exact("forced cap token lengths", expected.token_lengths, (lengths * 10).to(torch.int32))
+        baseline_state = expected.state
+        eager_state = eager.state
+        replay_state.h.copy_(replay.state.h)
+        replay_state.c.copy_(replay.state.c)
+        replay_state.last_label.copy_(replay.state.last_label)
