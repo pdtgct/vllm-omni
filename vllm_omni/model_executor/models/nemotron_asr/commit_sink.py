@@ -133,7 +133,6 @@ class BoundedCommitSink:
         self._event: torch.cuda.Event | None = torch.cuda.Event() if self._cuda else None
         self._reserved: CommitPlan | None = None
         self._staged: CommitPlan | None = None
-        self._staged_records: tuple[CaptureRecord, ...] = ()
         self._staged_lease_ok = False
 
     def reserve(self, plan: CommitPlan) -> CommitTicket:
@@ -208,14 +207,12 @@ class BoundedCommitSink:
         # Stage-time lease REVALIDATION is a recorded fact, never a
         # raise: nothing may fail after resident state committed.
         self._staged_lease_ok = self._registry.lease_is_current(plan.bindings)
-        self._staged_records = plan.records
         self._staged = plan
         self._reserved = None
 
     def _release(self) -> None:
         self._reserved = None
         self._staged = None
-        self._staged_records = ()
         self._staged_lease_ok = False
 
     @property
@@ -248,8 +245,7 @@ class BoundedCommitSink:
             )
             for i, binding in enumerate(plan.bindings)
         ]
-        by_request = {report.request_id: report.row_status for report in reports}
-        committed = [record for record in self._staged_records if by_request.get(record.request_id, -1) == 0]
+        committed = [record for record in plan.records if status[record.row] == 0]
         lease_ok = self._staged_lease_ok
         self._release()
         return reports, committed, lease_ok

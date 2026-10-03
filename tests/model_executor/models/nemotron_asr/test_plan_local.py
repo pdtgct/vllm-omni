@@ -666,13 +666,15 @@ def test_sink_reserve_stage_collect_roundtrip() -> None:
     assert committed == [] and lease_ok
 
 
-def test_sink_exposes_only_status_clean_records() -> None:
+def test_sink_exposes_only_status_clean_records_at_sparse_plan_rows() -> None:
     registry = plan_mod.SessionRegistry()
     bindings = _bind(
         registry,
         [
             _row("a", 3, chunk=True, prior=False),
             _row("b", 4, chunk=True, prior=False),
+            _row("c", 5, chunk=True, prior=False),
+            _row("d", 6, chunk=True, prior=False),
         ],
     )
     sink = commit_sink_mod.BoundedCommitSink(
@@ -682,8 +684,8 @@ def test_sink_exposes_only_status_clean_records() -> None:
         max_capture_bytes=1 << 20,
     )
     records = [
-        _record("a", 3, 1, row=0),
         _record("b", 4, 2, row=1),
+        _record("d", 6, 4, row=3),
     ]
     commit_plan = advance.CommitPlan(
         bindings=tuple(bindings),
@@ -691,11 +693,14 @@ def test_sink_exposes_only_status_clean_records() -> None:
         records=tuple(records),
     )
     ticket = sink.reserve(commit_plan)
-    ticket.stage(torch.tensor([512, 0], dtype=torch.int32))
+    ticket.stage(torch.tensor([0, 512, 512, 0], dtype=torch.int32))
     reports, committed, lease_ok = sink.collect()
-    assert [r.row_status for r in reports] == [512, 0]
-    assert [r.request_id for r in committed] == ["b"]
+    assert [r.request_id for r in reports] == ["a", "b", "c", "d"]
+    assert [r.row_status for r in reports] == [0, 512, 512, 0]
+    assert committed == [records[1]]
     assert lease_ok
+    assert not sink.has_staged
+    sink.reserve(commit_plan).cancel()
 
 
 def _record(req: str, block: int, generation: int, *, row: int = 0) -> Any:
@@ -767,7 +772,16 @@ def test_sink_reserve_validates_lease_and_bounds() -> None:
         )
 
 
-def test_sink_reserve_rejects_capture_identity_drift() -> None:
+@pytest.mark.parametrize(
+    ("request_id", "rows", "message"),
+    [
+        ("other", (0,), "capture record identity"),
+        ("a", (-1,), "unique increasing plan rows"),
+        ("a", (1,), "unique increasing plan rows"),
+        ("a", (0, 0), "unique increasing plan rows"),
+    ],
+)
+def test_sink_reserve_rejects_malformed_capture_records(request_id: str, rows: tuple[int, ...], message: str) -> None:
     registry = plan_mod.SessionRegistry()
     [binding] = _bind(registry, [_row("a", 3, chunk=True, prior=False)])
     sink = commit_sink_mod.BoundedCommitSink(
@@ -776,13 +790,13 @@ def test_sink_reserve_rejects_capture_identity_drift() -> None:
         max_capture_rows=2,
         max_capture_bytes=1 << 20,
     )
-    bad = _record("other", 3, binding.admission_generation)
-    with pytest.raises(ValueError, match="capture record identity"):
+    bad = [_record(request_id, 3, binding.admission_generation, row=row) for row in rows]
+    with pytest.raises(ValueError, match=message):
         sink.reserve(
             advance.CommitPlan(
                 bindings=(binding,),
-                capture=advance.CapturePlan(rows=1, payload_bytes=_payload_bytes([bad])),
-                records=(bad,),
+                capture=advance.CapturePlan(rows=len(bad), payload_bytes=_payload_bytes(bad)),
+                records=tuple(bad),
             )
         )
 
