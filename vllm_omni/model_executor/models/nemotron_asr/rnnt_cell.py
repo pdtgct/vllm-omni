@@ -13,6 +13,24 @@ fp32-CUDA performance variant.
 
 import torch
 from torch import nn
+from vllm.triton_utils import HAS_TRITON
+
+from vllm_omni.model_executor.models.nemotron_asr.rnnt_cell_kernel import lstm_pointwise
+from vllm_omni.platforms import current_omni_platform
+
+
+def _use_fused_pointwise(h: torch.Tensor, c: torch.Tensor) -> bool:
+    # Keep autograd, autocast, other state precisions and other platforms on
+    # the original primitive path. No new user-facing precision policy.
+    return (
+        h.device.type == "cuda"
+        and h.dtype == c.dtype == torch.float32
+        and h.device == c.device
+        and HAS_TRITON
+        and current_omni_platform.is_cuda()
+        and not torch.is_grad_enabled()
+        and not torch.is_autocast_enabled("cuda")
+    )
 
 
 class ManualLSTM(nn.Module):
@@ -83,18 +101,26 @@ class ManualLSTM(nn.Module):
         next_h = []
         next_c = []
         hidden = self.hidden_size
+        fuse_pointwise = _use_fused_pointwise(h, c)
         for layer in range(self.num_layers):
             w_ih = self.get_parameter(f"weight_ih_l{layer}").to(state_dtype)
             w_hh = self.get_parameter(f"weight_hh_l{layer}").to(state_dtype)
             b_ih = self.get_parameter(f"bias_ih_l{layer}").to(state_dtype)
             b_hh = self.get_parameter(f"bias_hh_l{layer}").to(state_dtype)
-            gates = layer_input @ w_ih.t() + b_ih + h[layer] @ w_hh.t() + b_hh
-            i_gate = torch.sigmoid(gates[:, 0 * hidden : 1 * hidden])
-            f_gate = torch.sigmoid(gates[:, 1 * hidden : 2 * hidden])
-            g_gate = torch.tanh(gates[:, 2 * hidden : 3 * hidden])
-            o_gate = torch.sigmoid(gates[:, 3 * hidden : 4 * hidden])
-            c_next = f_gate * c[layer] + i_gate * g_gate
-            h_next = o_gate * torch.tanh(c_next)
+            if fuse_pointwise and b_ih.is_contiguous() and b_hh.is_contiguous():
+                # Full-B GEMMs, weight conversions and layer ordering are
+                # unchanged. Only the following pointwise region is fused.
+                input_mm = layer_input @ w_ih.t()
+                hidden_mm = h[layer] @ w_hh.t()
+                h_next, c_next = lstm_pointwise(input_mm, hidden_mm, b_ih, b_hh, c[layer])
+            else:
+                gates = layer_input @ w_ih.t() + b_ih + h[layer] @ w_hh.t() + b_hh
+                i_gate = torch.sigmoid(gates[:, 0 * hidden : 1 * hidden])
+                f_gate = torch.sigmoid(gates[:, 1 * hidden : 2 * hidden])
+                g_gate = torch.tanh(gates[:, 2 * hidden : 3 * hidden])
+                o_gate = torch.sigmoid(gates[:, 3 * hidden : 4 * hidden])
+                c_next = f_gate * c[layer] + i_gate * g_gate
+                h_next = o_gate * torch.tanh(c_next)
             next_h.append(h_next)
             next_c.append(c_next)
             layer_input = h_next
