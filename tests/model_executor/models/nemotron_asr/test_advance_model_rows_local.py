@@ -952,6 +952,188 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
     assert int(status.staged[0][0]) != 0
 
 
+@pytest.mark.parametrize(
+    "chunk,geometries,width,mutate",
+    [
+        ([False, False, False], [GEOM_REG] * 3, 2, False),
+        ([True, False, True], [GEOM_REG] * 3, 2, False),
+        ([True, False, True], [GEOM_REG] * 3, 0, False),
+        ([True, False, True], [GEOM_FINAL, GEOM_REG, GEOM_REG], 2, False),
+        ([True, False, True], [GEOM_REG] * 3, 2, True),
+    ],
+    ids=["zero-buckets", "one-bucket", "zero-tokens", "multiple-buckets", "mutating-adapter"],
+)
+def test_chunk_merge_preserves_oracle_and_outer_row_order(
+    monkeypatch: pytest.MonkeyPatch,
+    chunk: list[bool],
+    geometries: list[int],
+    width: int,
+    mutate: bool,
+) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools(num_blocks=4)
+    for block in range(1, 4):
+        _set_drained_book(pools, block, blank=core.blank_id)
+    _set_replay_book(pools, 2, queue=[7, 9], head=1, expected=7)
+    emitted: list[Any] = []
+    original_transition = advance.advance_chunk_bucket
+    original_validate = advance._mrv1_projection_invariant_rows
+    real_adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB)
+    adapter_snapshots: list[Any] = []
+
+    def decode(frames: Any, lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
+        batch = frames.shape[0]
+        tokens = torch.full((batch, width), 3, dtype=torch.int32)
+        token_lengths = torch.full((batch,), width, dtype=torch.int32)
+        next_label = torch.full_like(state.last_label, 3) if width else state.last_label
+        return tokens, token_lengths, replace(state, last_label=next_label.contiguous())
+
+    def transition(*args: Any, **kwargs: Any) -> Any:
+        result = original_transition(*args, **kwargs)
+        emitted.append(result.result)
+        return result
+
+    def adapter(result: Any, context: Any) -> Any:
+        adapter_snapshots.append((result, context))
+        if mutate:
+            result.token_ids.fill_(4)
+            result.token_lengths.fill_(1)
+            context.chunk_rows.zero_()
+        return real_adapter(result, context)
+
+    def validate(result: Any, context: Any, *args: Any, **kwargs: Any) -> Any:
+        expected_rows = [row for row, is_chunk in enumerate(chunk) if is_chunk]
+        assert context.chunk_rows.tolist() == expected_rows
+        assert result.token_ids.shape == (len(expected_rows), width if emitted else 0)
+        assert result.token_lengths.tolist() == [width] * len(expected_rows)
+        assert result.token_ids.dtype == result.token_lengths.dtype == torch.int32
+        assert result.token_ids.device == result.token_lengths.device == torch.device("cpu")
+        assert result.token_ids.is_contiguous() and result.token_lengths.is_contiguous()
+        if len(emitted) == 1:
+            assert result.token_ids is emitted[0].token_ids
+        adapter_result, adapter_context = adapter_snapshots[0]
+        assert adapter_result.token_ids is not result.token_ids
+        assert adapter_result.token_lengths is not result.token_lengths
+        assert adapter_context.chunk_rows is not context.chunk_rows
+        if width and emitted:
+            assert (result.token_ids == 3).all()
+        return original_validate(result, context, *args, **kwargs)
+
+    monkeypatch.setattr(advance, "advance_chunk_bucket", transition)
+    monkeypatch.setattr(advance, "_mrv1_projection_invariant_rows", validate)
+    plan = _plan(
+        prefills=[1, 2, 3],
+        has_initial=[not chunk[0], True, not chunk[2]],
+        num_pool_blocks=4,
+        chunk=chunk,
+        geometries=geometries,
+    )
+    embeds = torch.stack(
+        [
+            _envelope(
+                torch.zeros(FINAL_SAMPLES if geometry == GEOM_FINAL else REG_SAMPLES),
+                final=geometry == GEOM_FINAL,
+                seq=0,
+                geometry=geometry,
+            )
+            if is_chunk
+            else torch.zeros(CARRIER_HIDDEN)
+            for is_chunk, geometry in zip(chunk, geometries, strict=True)
+        ]
+    )
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID if chunk[0] else PARK_ID, 7, PLACEHOLDER_ID if chunk[2] else PARK_ID]),
+        embeds,
+        plan,
+        adapter=adapter,
+        resolver=_fixed_resolver(decode),
+        commit_sink=sink,
+    )
+    assert _decision(out) == [
+        PARK_ID if mutate or not chunk[0] or not width else 3,
+        9,
+        PARK_ID if mutate or not chunk[2] or not width else 3,
+    ]
+    if mutate:
+        assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+        assert int(sink.staged[0][2]) & advance.ROW_STATUS_DECODE_INVARIANT
+
+
+def test_single_bucket_merge_uses_endpoint_adjusted_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    pools["endpoint_history_pool"] = torch.zeros(3, 8, dtype=torch.int32)
+    pools["endpoint_book_pool"] = torch.zeros(3, 6, dtype=torch.int32)
+    eou = VOCAB + 1
+    original_transition = advance.advance_chunk_bucket
+    endpointing = importlib.import_module(f"{_BASE}.endpointing")
+    original_observe = endpointing.observe_chunk_tensors
+    adjusted: list[Any] = []
+
+    def decode(frames: Any, lengths: Any, predictor: Any, joint: Any, state: Any) -> Any:
+        return (
+            torch.tensor([[3]], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            replace(state, last_label=torch.full_like(state.last_label, 3)),
+        )
+
+    def transition(*args: Any, **kwargs: Any) -> Any:
+        bucket = original_transition(*args, **kwargs)
+        return replace(
+            bucket,
+            result=replace(
+                bucket.result,
+                frame_emission_counts=torch.tensor([[1, 0, 0, 0]], dtype=torch.int32),
+                frame_valid_lengths=torch.tensor([4], dtype=torch.int32),
+            ),
+        )
+
+    def observe(**kwargs: Any) -> Any:
+        output = original_observe(**kwargs)
+        adjusted.append(output)
+        return output
+
+    real = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB)
+
+    def adapter(result: Any, context: Any) -> Any:
+        assert result.token_ids.tolist() == [[3, eou]]
+        assert result.token_lengths.tolist() == [2]
+        assert result.row_status.tolist() == [0]
+        return real(result, context)
+
+    original_validate = advance._mrv1_projection_invariant_rows
+
+    def validate(result: Any, *args: Any, **kwargs: Any) -> Any:
+        assert result.token_ids is adjusted[0].token_ids
+        return original_validate(result, *args, **kwargs)
+
+    monkeypatch.setattr(advance, "advance_chunk_bucket", transition)
+    monkeypatch.setattr(endpointing, "observe_chunk_tensors", observe)
+    monkeypatch.setattr(advance, "_mrv1_projection_invariant_rows", validate)
+    out = advance.advance_model_rows(
+        core,
+        torch.tensor([PLACEHOLDER_ID]),
+        _envelope(torch.zeros(REG_SAMPLES), final=False, seq=0).unsqueeze(0),
+        replace(
+            _plan(prefills=[1]),
+            endpoint_mode=torch.tensor([1]),
+            endpoint_threshold_frames=torch.tensor([1]),
+            endpoint_residue_frames=torch.tensor([3]),
+        ),
+        adapter=adapter,
+        decode_resolver=_fixed_resolver(decode),
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        eou_token_id=eou,
+        **pools,
+    )
+    assert _decision(out) == [3]
+    assert pools["queue_pool"][1, :2].tolist() == [3, eou]
+
+
 def test_mixed_geometries_bucket_resolver_and_row_order(monkeypatch: pytest.MonkeyPatch) -> None:
     # Two CHUNK rows at different geometries plus one replay row in a
     # single call: per-geometry buckets, one resolver query per bucket

@@ -3037,24 +3037,33 @@ def advance_model_rows(
         )
 
     # ---- merged results + adapter projection (still fallible) ----
-    chunk_all_t = (
-        torch.cat([positions for _, positions, _ in bucket_pos]) if bucket_pos else torch.zeros(0, dtype=torch.long)
-    )
-    chunk_all_dev = _stage("chunk_all", chunk_all_t)
-    b_total = int(chunk_all_t.numel())
-    k_max = max(
-        (int(ex["result"].token_ids.shape[1]) for ex in executed),
-        default=0,
-    )
-    merged_ids = torch.zeros(b_total, k_max, dtype=torch.int32, device=device)
-    merged_len = torch.zeros(b_total, dtype=torch.int32, device=device)
-    row0 = 0
-    for ex in executed:
-        nb = int(ex["pos"].numel())
-        ids_b = ex["result"].token_ids
-        merged_ids[row0 : row0 + nb, : ids_b.shape[1]] = ids_b
-        merged_len[row0 : row0 + nb] = ex["result"].token_lengths
-        row0 += nb
+    if len(executed) == 1:
+        # The bucket's validated outputs remain valid through this transaction
+        # and already use final CHUNK order.  Keep them as the oracle; the
+        # adapter receives clones below.
+        chunk_all_dev = executed[0]["rows_dev"]
+        b_total = int(chunk_all_dev.shape[0])
+        merged_ids = executed[0]["result"].token_ids
+        merged_len = executed[0]["result"].token_lengths
+    else:
+        chunk_all_t = (
+            torch.cat([positions for _, positions, _ in bucket_pos]) if bucket_pos else torch.zeros(0, dtype=torch.long)
+        )
+        chunk_all_dev = _stage("chunk_all", chunk_all_t)
+        b_total = int(chunk_all_t.numel())
+        k_max = max(
+            (int(ex["result"].token_ids.shape[1]) for ex in executed),
+            default=0,
+        )
+        merged_ids = torch.zeros(b_total, k_max, dtype=torch.int32, device=device)
+        merged_len = torch.zeros(b_total, dtype=torch.int32, device=device)
+        row0 = 0
+        for ex in executed:
+            nb = int(ex["pos"].numel())
+            ids_b = ex["result"].token_ids
+            merged_ids[row0 : row0 + nb, : ids_b.shape[1]] = ids_b
+            merged_len[row0 : row0 + nb] = ex["result"].token_lengths
+            row0 += nb
     merged = AdvanceResult(
         token_ids=merged_ids,
         token_lengths=merged_len,
