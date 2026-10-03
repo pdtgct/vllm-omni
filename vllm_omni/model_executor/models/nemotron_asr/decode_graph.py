@@ -392,15 +392,15 @@ class DenseGraphBinding:
             ):
                 raise ValueError("dense graph runtime tensors differ from the captured device/dtype")
 
-            entry.enc_frames.zero_()
+            entry.enc_frames[live:].zero_()
             entry.enc_frames[:live].copy_(enc_frames)
-            entry.enc_lengths.zero_()
+            entry.enc_lengths[live:].zero_()
             entry.enc_lengths[:live].copy_(enc_lengths)
-            entry.h.zero_()
+            entry.h[:, live:].zero_()
             entry.h[:, :live].copy_(state.h)
-            entry.c.zero_()
+            entry.c[:, live:].zero_()
             entry.c[:, :live].copy_(state.c)
-            entry.last_label.fill_(self._blank_id)
+            entry.last_label[live:].fill_(self._blank_id)
             entry.last_label[:live].copy_(state.last_label)
             output = self._call(entry, runtime, runtime.graph_mode if captured else runtime.eager_mode)
             (
