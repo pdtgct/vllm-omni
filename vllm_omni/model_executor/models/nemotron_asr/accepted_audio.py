@@ -22,6 +22,7 @@ class AcceptedPiece:
     """Acknowledgement for one atomically accepted caller piece."""
 
     samples_accepted: int
+    newly_ready_units: tuple[ReadyAudioUnit, ...]
 
 
 @dataclass(frozen=True)
@@ -231,17 +232,21 @@ class AcceptedAudioAuthority:
             self._pieces.append(owned)
             self._residual_samples += sample_count
             self._accepted_samples += sample_count
+            newly_ready_units: list[ReadyAudioUnit] = []
             while self._residual_samples >= self.chunk_samples:
                 chunk = self._take_samples(self.chunk_samples)
-                self._ready.append(
-                    self._new_unit(
-                        "regular",
-                        chunk,
-                        ready_at_ns,
-                        admission_ms_mod,
-                    )
+                unit = self._new_unit(
+                    "regular",
+                    chunk,
+                    ready_at_ns,
+                    admission_ms_mod,
                 )
-            return AcceptedPiece(samples_accepted=sample_count)
+                self._ready.append(unit)
+                newly_ready_units.append(unit)
+            return AcceptedPiece(
+                samples_accepted=sample_count,
+                newly_ready_units=tuple(newly_ready_units),
+            )
 
     # @spec PORT-SEG-004, PORT-SESS-014
     def force_segment(self) -> None:

@@ -116,6 +116,42 @@ def test_authority_uses_segmented_fifo_not_repeated_full_concatenation() -> None
     assert "np.concatenate" not in source
 
 
+@pytest.mark.parametrize("count, unit_count", [(2, 0), (4, 1), (10, 2)])
+def test_accept_returns_exact_new_units_without_transferring_queue_ownership(count: int, unit_count: int) -> None:
+    authority = _authority(capacity_samples=32)
+    authority.accept(_samples(0, 4), accepted_at_ns=10, admission_ms_mod=20)
+    authority.force_segment()
+    prior = authority.ready_units
+
+    accepted = authority.accept(_samples(4, count), accepted_at_ns=30, admission_ms_mod=40)
+
+    assert accepted.samples_accepted == count
+    assert isinstance(accepted.newly_ready_units, tuple)
+    assert len(accepted.newly_ready_units) == unit_count
+    queued = authority.ready_units
+    assert all(unit is queued[index] for index, unit in enumerate(prior))
+    assert all(unit is queued[index + len(prior)] for index, unit in enumerate(accepted.newly_ready_units))
+    assert [unit.logical_sequence for unit in accepted.newly_ready_units] == list(range(2, 2 + unit_count))
+    for index, unit in enumerate(accepted.newly_ready_units):
+        assert unit.kind == "regular"
+        assert unit.ready_at_ns == 30
+        assert unit.admission_ms_mod == 40
+        np.testing.assert_array_equal(unit.samples, _samples(4 + index * 4, 4))
+
+
+def test_rejected_accept_returns_no_acknowledgement_and_preserves_ready_units() -> None:
+    authority = _authority(capacity_samples=4)
+    accepted = authority.accept(_samples(0, 4))
+    before = authority.snapshot()
+
+    with pytest.raises(ValueError, match="buffer_overflow"):
+        accepted = authority.accept(_samples(4, 4))
+
+    assert authority.snapshot() == before
+    assert len(authority.ready_units) == 1
+    assert authority.ready_units[0] is accepted.newly_ready_units[0]
+
+
 def test_packetization_does_not_change_cadence_units_or_final_tail() -> None:
     # @spec PORT-SESS-001 / PORT-SESS-003 / PORT-SESS-013
     waveform = _samples(0, 11)

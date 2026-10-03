@@ -246,21 +246,18 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        prior_sequences = {unit.logical_sequence for unit in authority.ready_units}
         if before_audio_accept is not None:
             before_audio_accept()
-        session.accept_audio(frame)
+        accepted = session.accept_audio(frame)
         if on_audio_accepted is not None:
             on_audio_accepted()
-        new_units = tuple(unit for unit in authority.ready_units if unit.logical_sequence not in prior_sequences)
         if ledger is not None:
-            for unit in new_units:
-                if unit.kind != "forced_eou":
-                    ledger.mint(
-                        final_tail=unit.kind == "final_tail",
-                        admission_ms_mod=unit.admission_ms_mod,
-                        handle=session.ready_handle(unit.logical_sequence),
-                    )
+            for unit in accepted.newly_ready_units:
+                ledger.mint(
+                    final_tail=False,
+                    admission_ms_mod=unit.admission_ms_mod,
+                    handle=session.ready_handle(unit.logical_sequence),
+                )
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
         async for rendered in dispatch_ready():

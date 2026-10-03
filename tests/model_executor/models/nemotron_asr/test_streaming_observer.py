@@ -320,6 +320,79 @@ def test_absent_observer_produces_baseline_behavior_with_zero_observer_traffic()
 
 
 # @spec PORT-OBS-003, PORT-OBS-004
+@pytest.mark.parametrize("callback_fails", [False, True])
+def test_accept_observes_only_its_new_units_once_even_when_callback_fails(callback_fails: bool) -> None:
+    class Observer(_RecordingObserver):
+        def unit_ready(self, **kwargs: Any) -> Any:
+            handle = super().unit_ready(**kwargs)
+            if callback_fails:
+                raise RuntimeError("observer failure")
+            return handle
+
+    observer = Observer()
+    session = _session(observer=observer)
+    prior = session.accept_audio(np.zeros(8_960, dtype=np.float32))
+    session.accepted_audio.force_segment()
+    observer.calls.clear()
+
+    residual = session.accept_audio(np.zeros(100, dtype=np.float32))
+    accepted = session.accept_audio(np.zeros(8_960 * 2 - 100, dtype=np.float32))
+
+    assert residual.newly_ready_units == ()
+    assert [unit.logical_sequence for unit in accepted.newly_ready_units] == [2, 3]
+    readies = [call for call in observer.calls if call[0] == "unit_ready"]
+    assert len(readies) == 2
+    for unit, call in zip(accepted.newly_ready_units, readies, strict=True):
+        assert call[1]["ready_stamp_s"] == unit.ready_at_ns / 1_000_000_000
+        assert (session.ready_handle(unit.logical_sequence) is None) == callback_fails
+    assert prior.newly_ready_units[0] is session.accepted_audio.ready_units[0]
+
+
+def test_streaming_mints_ordered_acceptance_delta_after_observer_handles(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        observer = _RecordingObserver()
+        session = _session(with_ledger=True, observer=observer)
+        session.accepted_audio.cadence_ns = 1
+        ledger = session.ledger
+        events: list[tuple[str, Any]] = []
+        original_mint = ledger.mint
+        original_ack = ledger.acknowledge_piece
+
+        def mint(**kwargs: Any) -> Any:
+            handle = kwargs["handle"]
+            assert handle is not None
+            assert any(handle is candidate for candidate in observer.outstanding(session.session_key))
+            ticket = original_mint(**kwargs)
+            events.append(("mint", (ticket.sequence, ticket.final_tail, handle)))
+            return ticket
+
+        def acknowledge(samples: int) -> Any:
+            receipt = original_ack(samples)
+            events.append(("ack", (samples, tuple(ticket.sequence for ticket in receipt.tickets))))
+            return receipt
+
+        monkeypatch.setattr(ledger, "mint", mint)
+        monkeypatch.setattr(ledger, "acknowledge_piece", acknowledge)
+        queue: asyncio.Queue = asyncio.Queue()
+        async for prompt in buffer_stream(_audio(100, 8_860, 17_920), queue, session):
+            if "multi_modal_data" in prompt:
+                ledger.complete_next(None)
+            queue.put_nowait([PARK_ID])
+
+        assert [(event, value[:2]) for event, value in events] == [
+            ("ack", (100, ())),
+            ("mint", (0, False)),
+            ("ack", (8_860, (0,))),
+            ("mint", (1, False)),
+            ("mint", (2, False)),
+            ("ack", (17_920, (1, 2))),
+            ("mint", (3, True)),
+        ]
+        assert len([call for call in observer.calls if call[0] == "unit_ready"]) == 4
+
+    _run(scenario())
+
+
 def test_regular_unit_ready_is_observed_at_cadence_completion() -> None:
     async def scenario() -> list[tuple[str, dict[str, Any]]]:
         fake = _RecordingObserver()
