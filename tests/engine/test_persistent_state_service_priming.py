@@ -463,3 +463,38 @@ def test_service_priming_rejects_memory_profile_markers(marker: str) -> None:
         assert service.resident == 0
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("dummy_run", ..., AttributeError),
+        ("completed_model_rows", ..., AttributeError),
+        ("elapsed_ns", "invalid", ValueError),
+        ("completed_model_rows", "invalid", ValueError),
+    ],
+)
+def test_malformed_provider_result_fails_normalization_and_releases_leases(
+    field: str, value: Any, error: type[Exception]
+) -> None:
+    """@spec PORT-PERF-005: no malformed provider result reaches compilation."""
+
+    async def scenario() -> None:
+        service = _PrimingService([])
+        result = dict(
+            completed_legal_parks=2, elapsed_ns=1, completed_model_rows=None, dummy_run=False, is_profile=False
+        )
+        if value is ...:
+            result.pop(field)
+        else:
+            result[field] = value
+
+        async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
+            return SimpleNamespace(**result)
+
+        with pytest.raises(error):
+            await _symbol("run_service_priming_round")(service=service, round_spec=_round(), execute=execute)
+        assert service.resident == 0
+        assert len([event for event in service.events if event[0] == "release"]) == 2
+
+    asyncio.run(scenario())

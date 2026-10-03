@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from typing import Any, NoReturn
 
@@ -138,8 +139,12 @@ class _Provider:
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize("scenario_id", ("ordinary", "forced_eou_then_chunk", "final_tail_then_flush"))
+@pytest.mark.parametrize("completed_model_rows", (None, 6))
 async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     monkeypatch: pytest.MonkeyPatch,
+    scenario_id: str,
+    completed_model_rows: int | None,
 ) -> None:
     """@spec ENV-MIG-012 / PORT-PERF-005/006 / PORT-INT-013."""
     module = _startup_module()
@@ -150,6 +155,18 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     engine = SimpleNamespace(model_config=model_config)
     provider = _Provider(events, runtime, model_config)
     profile = SimpleNamespace(compiled_demand=SimpleNamespace(intervals_ms=(80, 320, 560, 1120)))
+    observation = module.ServicePrimingObservation(
+        round_id="round-0",
+        service_interval_ms=320,
+        geometry_id=2,
+        active_population=2,
+        elapsed_ns=123_456,
+        completed_legal_parks=2 if scenario_id == "ordinary" else 4,
+        completed_model_rows=completed_model_rows,
+        tier_id="bulk",
+        post_jit=False,
+        scenario_id=scenario_id,
+    )
 
     class _Service:
         def __init__(self, stage_client: Any, **kwargs: Any) -> None:
@@ -186,7 +203,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     async def _prime(**kwargs: Any) -> Any:
         assert kwargs["service"].ready is False
         events.append("prime")
-        return SimpleNamespace(round_id="round-0")
+        return observation
 
     monkeypatch.setattr(module, "PersistentStateService", _Service)
 
@@ -208,7 +225,11 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     monkeypatch.setattr(module, "run_service_priming_round", _prime)
 
     def _compile(observations: Any, **kwargs: Any) -> Any:
-        del observations
+        assert len(observations) == 1
+        assert isinstance(observations[0], module.ServiceRoundExecution)
+        assert asdict(observations[0]) == {
+            key: value for key, value in asdict(observation).items() if key != "round_id"
+        }
         assert kwargs["admission_policy"] == runtime.admission_policy
         events.append("compile")
         return profile
@@ -238,6 +259,26 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         "validate",
         "seal",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("active_population", 0), ("elapsed_ns", 0), ("service_interval_ms", 0), ("geometry_id", -1), ("scenario_id", "")],
+)
+def test_priming_conversion_retains_service_round_validation(field: str, value: Any) -> None:
+    """@spec PORT-PERF-006: normalized observations still undergo compiler-input validation."""
+    module = _startup_module()
+    observation = module.ServicePrimingObservation(
+        round_id="round-0",
+        service_interval_ms=320,
+        geometry_id=2,
+        active_population=2,
+        elapsed_ns=1,
+        completed_legal_parks=2,
+        completed_model_rows=None,
+    )
+    with pytest.raises(ValueError):
+        module._service_executions([replace(observation, **{field: value})])
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]

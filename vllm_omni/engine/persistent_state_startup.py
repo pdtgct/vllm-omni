@@ -19,6 +19,7 @@ from vllm_omni.engine.persistent_state_capacity import (
     compile_provisional_service_profile,
 )
 from vllm_omni.engine.persistent_state_priming import (
+    ServicePrimingObservation,
     run_service_priming_round,
 )
 from vllm_omni.engine.persistent_state_service import PersistentStateService
@@ -129,26 +130,11 @@ def derive_admission_controller_config(
     )
 
 
-def _service_executions(observations: list[Any]) -> list[Any]:
+def _service_executions(observations: list[ServicePrimingObservation]) -> list[ServiceRoundExecution]:
     """Convert real priming observations to the arithmetic compiler input."""
 
-    converted: list[Any] = []
+    converted: list[ServiceRoundExecution] = []
     for observation in observations:
-        required = (
-            "tier_id",
-            "active_population",
-            "elapsed_ns",
-            "service_interval_ms",
-            "geometry_id",
-            "completed_legal_parks",
-            "completed_model_rows",
-            "post_jit",
-            "continuously_loaded",
-            "dummy_run",
-            "is_profile",
-        )
-        if not all(hasattr(observation, name) for name in required):
-            return observations
         converted.append(
             ServiceRoundExecution(
                 tier_id=str(observation.tier_id),
@@ -164,7 +150,7 @@ def _service_executions(observations: list[Any]) -> list[Any]:
                 continuously_loaded=bool(observation.continuously_loaded),
                 dummy_run=bool(observation.dummy_run),
                 is_profile=bool(observation.is_profile),
-                scenario_id=str(getattr(observation, "scenario_id", "ordinary")),
+                scenario_id=str(observation.scenario_id),
             )
         )
     return converted
@@ -241,8 +227,8 @@ async def prepare_persistent_state_service(
         )
         service.configure_bootstrap_intervals(plan.served_intervals_ms)
 
-        async def run_plan() -> list[Any]:
-            observations: list[Any] = []
+        async def run_plan() -> list[ServicePrimingObservation]:
+            observations: list[ServicePrimingObservation] = []
             for round_spec in plan.rounds:
 
                 async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
