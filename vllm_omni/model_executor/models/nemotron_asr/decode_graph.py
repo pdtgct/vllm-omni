@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -15,7 +16,9 @@ from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
     DecodeState,
     FrameAlignedDecode,
+    decode_dense_masked_frames,
 )
+from vllm_omni.model_executor.models.nemotron_asr.rnnt_selection import compile_dense_selections
 
 
 def execution_tiers(maximum: int) -> tuple[int, ...]:
@@ -139,7 +142,13 @@ class DenseGraphBinding:
             raise ValueError("decode graph requires at least one positive frame width")
         if not tiers or tuple(sorted(set(tiers))) != tiers or tiers[0] <= 0:
             raise ValueError("decode graph tiers must be positive and increasing")
-        self._decode_fn = decode_fn
+        # Compile only the native dense decoder's pure selections. Resolve once
+        # per binding; custom decoder protocols keep their existing signature.
+        self._decode_fn = (
+            partial(decode_fn, selections=compile_dense_selections())
+            if decode_fn is decode_dense_masked_frames
+            else decode_fn
+        )
         self._predictor = predictor
         self._joint = joint
         self._vllm_config = vllm_config

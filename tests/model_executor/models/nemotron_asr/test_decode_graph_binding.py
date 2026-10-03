@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,9 +17,77 @@ from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     DecodeState,
     FrameAlignedDecode,
+    Joint,
+    Predictor,
+    decode_dense_masked_frames,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_native_selection_compilation_is_binding_owned_and_warmed_before_capture(monkeypatch) -> None:
+    compilations = []
+    phase = {"mode": "none"}
+
+    def compile_selection(fn, **kwargs):
+        warmed: set[int] = set()
+        compilations.append((fn, kwargs, warmed))
+
+        def run(*args):
+            assert torch.is_inference_mode_enabled()
+            batch = args[-1].shape[1]
+            if phase["mode"] == "graph":
+                assert batch in warmed
+            else:
+                warmed.add(batch)
+            return fn(*args)
+
+        return run
+
+    monkeypatch.setattr(torch, "compile", compile_selection)
+    predictor = Predictor(vocab_size=3, pred_hidden=5, pred_rnn_layers=2).eval()
+    joint = Joint(enc_hidden=5, pred_hidden=5, joint_hidden=5, vocab_size=3).eval()
+    runtime = _runtime()
+
+    def context(_metadata, _config, *, cudagraph_runtime_mode, batch_descriptor):
+        phase["mode"] = cudagraph_runtime_mode
+        return nullcontext()
+
+    runtime = replace(runtime, forward_context=context)
+    for _ in range(2):
+        binding = DenseGraphBinding(
+            decode_fn=decode_dense_masked_frames,
+            predictor=predictor,
+            joint=joint,
+            vllm_config=object(),
+            frame_widths=(1, 2),
+            tiers=(1, 2, 4),
+            encoder_hidden=5,
+            predictor_layers=2,
+            predictor_hidden=5,
+            blank_id=3,
+            runtime=runtime,
+        )
+        resolved_decode = binding._decode_fn
+        observed = []
+
+        def observe(frames, lengths, observed_predictor, observed_joint, state):
+            observed.append(frames.shape[0])
+            return resolved_decode(frames, lengths, observed_predictor, observed_joint, state)
+
+        binding._decode_fn = observe
+        binding.warmup(torch.device("cpu"), torch.float32)
+        assert len(binding.captured_keys) == 6
+        assert set(observed) == {1, 2, 4}
+    assert len(compilations) == 4
+    for _fn, kwargs, warmed in compilations:
+        assert kwargs == {
+            "fullgraph": True,
+            "dynamic": False,
+            "isolate_recompiles": True,
+            "options": {"triton.cudagraphs": False},
+        }
+        assert warmed == {1, 2, 4}
 
 
 class _FakeWrapper:

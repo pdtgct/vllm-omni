@@ -26,6 +26,10 @@ from torch import nn
 from vllm_omni.model_executor.models.nemotron_asr.rnnt_cell import (
     ManualLSTM,
 )
+from vllm_omni.model_executor.models.nemotron_asr.rnnt_selection import (
+    EAGER_SELECTIONS,
+    DenseSelections,
+)
 
 MAX_SYMBOLS_PER_STEP = 10
 
@@ -392,6 +396,7 @@ def decode_dense_masked_frames(
     state: DecodeState,
     *,
     max_symbols: int = MAX_SYMBOLS_PER_STEP,
+    selections: DenseSelections = EAGER_SELECTIONS,
 ) -> FrameAlignedDecode:
     """Run dense decode and retain one final label per encoder frame."""
     batch, t_pad, _ = enc_frames.shape
@@ -453,12 +458,11 @@ def decode_dense_masked_frames(
             last_label = torch.where(emit, labels, last_label)
             # Commit the state that produced this pred_out, emitters
             # only; blank never advances the predictor.
-            h = torch.where(gate, pred_h, h)
-            c = torch.where(gate, pred_c, c)
+            h, c = selections.committed(gate, pred_h, h, pred_c, c)
             new_out, (new_h, new_c) = predictor.step(last_label, (h, c))
-            pred_out = torch.where(emit.unsqueeze(-1), new_out, pred_out)
-            pred_h = torch.where(gate, new_h, pred_h)
-            pred_c = torch.where(gate, new_c, pred_c)
+            pred_out, pred_h, pred_c = selections.predicted(
+                emit.unsqueeze(-1), gate, new_out, pred_out, new_h, pred_h, new_c, pred_c
+            )
             active = emit
     return FrameAlignedDecode(
         token_ids=token_ids,
