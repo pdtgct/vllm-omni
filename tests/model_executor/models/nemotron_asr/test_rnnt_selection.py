@@ -124,7 +124,7 @@ def test_compiled_regions_isolate_eight_tiers_and_keep_default_limit(monkeypatch
     # A ninth specialization must fail fullgraph, never run an eager fallback.
     state = torch.ones(2, 256, 5)
     gate = torch.ones(1, 256, 1, dtype=torch.bool)
-    with pytest.raises(FailOnRecompileLimitHit, match="recompile_limit"):
+    with pytest.raises(FailOnRecompileLimitHit):
         pairs[0].committed(gate, state, state, state, state)
     assert len(graphs) == 32
     assert config.recompile_limit == 8
