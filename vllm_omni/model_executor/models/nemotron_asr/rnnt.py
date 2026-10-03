@@ -32,7 +32,7 @@ MAX_SYMBOLS_PER_STEP = 10
 #: Bumped whenever either decode candidate's ALGORITHM changes —
 #: dispatch tables bind to this, not to a fork commit (an unrelated
 #: commit must not invalidate a table; an algorithm change must).
-DECODE_ALGO_REVISION = "decode-algo-v1"
+DECODE_ALGO_REVISION = "decode-algo-v2"
 
 
 @dataclass
@@ -347,8 +347,8 @@ def decode_dense_masked(
     previous trip emitted. Non-emitting rows pass through every
     ``torch.where`` untouched, so the extra trips the compact loop's
     compaction skips are exact no-ops here (the ``decode_chunk_paged``
-    masked-trip pattern). Token writes use gather/where/scatter with
-    one unique index per row — deterministic and sync-free. No
+    masked-trip pattern). Token output is compacted after the loop
+    with fixed-shape integer searches/gathers — deterministic and sync-free. No
     ``nonzero``, ``.item()``, ``.tolist()``, host booleans,
     data-dependent shapes, raises on device predicates, or device
     assertions anywhere (a fired CUDA assert corrupts the context —
@@ -401,22 +401,19 @@ def decode_dense_masked_frames(
     h = state.h.clone()
     c = state.c.clone()
     last_label = state.last_label.clone()
-    capacity = max(t_pad * max_symbols, 1)
-    token_ids = torch.zeros(batch, t_pad * max_symbols, dtype=torch.int32, device=device)
-    token_lengths = torch.zeros(batch, dtype=torch.long, device=device)
-    frame_emission_counts = torch.zeros(
-        batch,
-        t_pad,
-        dtype=torch.int32,
-        device=device,
-    )
-    frame_final_labels = torch.full(
-        (batch, t_pad),
-        blank,
-        dtype=torch.int32,
-        device=device,
-    )
+    capacity = t_pad * max_symbols
     pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
+    if capacity == 0:
+        return FrameAlignedDecode(
+            token_ids=torch.zeros(batch, capacity, dtype=torch.int32, device=device),
+            token_lengths=torch.zeros(batch, dtype=torch.int32, device=device),
+            state=DecodeState(h=h, c=c, last_label=last_label),
+            frame_emission_counts=torch.zeros(batch, t_pad, dtype=torch.int32, device=device),
+            frame_final_labels=torch.full((batch, t_pad), blank, dtype=torch.int32, device=device),
+        )
+    attempt_labels: list[torch.Tensor] = []
+    attempt_emits: list[torch.Tensor] = []
+    frame_last_labels: list[torch.Tensor] = []
     for t in range(t_pad):
         frame = enc_frames[:, t]
         # The encoder side is invariant across this frame's label attempts.
@@ -432,23 +429,9 @@ def decode_dense_masked_frames(
                 logits = joint.joint_net(projected_frame + joint.pred(pred_out.to(joint.enc.weight.dtype)))
             labels = logits.argmax(dim=-1)
             emit = active & (labels != blank)
-            idx = token_lengths.clamp(max=capacity - 1).unsqueeze(1)
-            token_ids.scatter_(
-                1,
-                idx,
-                torch.where(
-                    emit.unsqueeze(1),
-                    labels.unsqueeze(1).to(torch.int32),
-                    token_ids.gather(1, idx),
-                ),
-            )
-            token_lengths = token_lengths + emit.long()
-            frame_emission_counts[:, t] += emit.to(torch.int32)
-            frame_final_labels[:, t] = torch.where(
-                emit,
-                labels.to(torch.int32),
-                frame_final_labels[:, t],
-            )
+            # These are fresh tensors on each attempt, never updated in place.
+            attempt_labels.append(labels)
+            attempt_emits.append(emit)
             gate = emit.view(1, -1, 1)
             last_label = torch.where(emit, labels, last_label)
             # Commit the state that produced this pred_out, emitters
@@ -460,6 +443,23 @@ def decode_dense_masked_frames(
             pred_h = torch.where(gate, new_h, pred_h)
             pred_c = torch.where(gate, new_c, pred_c)
             active = emit
+        frame_last_labels.append(last_label)
+
+    # active = emit makes emissions a prefix within each frame. Keep the
+    # recurrent math above unchanged and compact only its integer outputs.
+    counts = torch.stack(attempt_emits, dim=1).reshape(batch, t_pad, max_symbols).sum(dim=2)
+    ends = counts.cumsum(dim=1)
+    starts = ends - counts
+    token_lengths = ends[:, -1]
+    positions = torch.arange(capacity, device=device).expand(batch, -1).contiguous()
+    # Right insertion skips repeated ends from blank/padded frames. Tail
+    # positions still need safe gather indices before they are zero-filled.
+    frames = torch.searchsorted(ends, positions, right=True).clamp(max=t_pad - 1)
+    slots = (frames * max_symbols + positions - starts.gather(1, frames)).clamp(min=0, max=capacity - 1)
+    labels_by_slot = torch.stack(attempt_labels, dim=1).to(torch.int32)
+    token_ids = torch.where(positions < token_lengths.unsqueeze(1), labels_by_slot.gather(1, slots), 0)
+    frame_emission_counts = counts.to(torch.int32)
+    frame_final_labels = torch.where(counts > 0, torch.stack(frame_last_labels, dim=1), blank).to(torch.int32)
     return FrameAlignedDecode(
         token_ids=token_ids,
         token_lengths=token_lengths.to(torch.int32),

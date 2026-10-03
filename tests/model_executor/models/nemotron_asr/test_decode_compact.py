@@ -17,6 +17,8 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.rnnt import Joint
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _PKG = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/nemotron_asr"
@@ -314,3 +316,167 @@ def test_manual_lstm_initializes_its_parameters() -> None:
     for name, param in lstm.named_parameters():
         assert bool(param.isfinite().all()), name
         assert float(param.abs().max()) <= bound, name
+
+
+def _dense_output_oracle(
+    enc: torch.Tensor, lengths: torch.Tensor, predictor: Any, joint: Any, state: Any, max_symbols: int
+) -> Any:
+    """Original dense recurrence with independent per-row Python output lists.
+
+    Keep the full-batch math and its call order: compact/per-row oracles can
+    change floating-point reductions. Only output bookkeeping runs on the host.
+    """
+    batch, frames, _ = enc.shape
+    lengths = lengths.clamp(min=0, max=frames)
+    h, c, last = state.h.clone(), state.c.clone(), state.last_label.clone()
+    tokens: list[list[int]] = [[] for _ in range(batch)]
+    counts = torch.zeros(batch, frames, dtype=torch.int32)
+    finals = torch.full((batch, frames), predictor.blank_id, dtype=torch.int32)
+    pred, (ph, pc) = predictor.step(last, (h, c))
+    for t in range(frames):
+        frame = enc[:, t]
+        projected = (
+            joint.enc(frame.to(joint.enc.weight.dtype)) if type(joint) is rnnt.Joint and max_symbols > 0 else None
+        )
+        active = t < lengths
+        for _ in range(max_symbols):
+            logits = (
+                joint.logits(frame, pred)
+                if projected is None
+                else joint.joint_net(projected + joint.pred(pred.to(joint.enc.weight.dtype)))
+            )
+            labels = logits.argmax(dim=-1)
+            emit = active & (labels != predictor.blank_id)
+            for row in range(batch):
+                if bool(emit[row]):
+                    tokens[row].append(int(labels[row]))
+                    counts[row, t] += 1
+                    finals[row, t] = labels[row]
+            gate = emit.view(1, -1, 1)
+            last = torch.where(emit, labels, last)
+            h = torch.where(gate, ph, h)
+            c = torch.where(gate, pc, c)
+            new_pred, (new_h, new_c) = predictor.step(last, (h, c))
+            pred = torch.where(emit.unsqueeze(-1), new_pred, pred)
+            ph = torch.where(gate, new_h, ph)
+            pc = torch.where(gate, new_c, pc)
+            active = emit
+    ids = torch.zeros(batch, frames * max_symbols, dtype=torch.int32)
+    for row, burst in enumerate(tokens):
+        ids[row, : len(burst)] = torch.tensor(burst, dtype=torch.int32)
+    return rnnt.FrameAlignedDecode(
+        token_ids=ids,
+        token_lengths=torch.tensor([len(burst) for burst in tokens], dtype=torch.int32),
+        state=rnnt.DecodeState(h=h, c=c, last_label=last),
+        frame_emission_counts=counts,
+        frame_final_labels=finals,
+    )
+
+
+def _decode_fields(result: Any) -> tuple[torch.Tensor, ...]:
+    return (
+        result.token_ids,
+        result.token_lengths,
+        result.state.h,
+        result.state.c,
+        result.state.last_label,
+        result.frame_emission_counts,
+        result.frame_final_labels,
+    )
+
+
+class _AttemptJoint(Joint):
+    """Custom joint whose successive attempts include emissions after blank."""
+
+    def __init__(self, labels: torch.Tensor) -> None:
+        super().__init__(enc_hidden=ENC, pred_hidden=PRED, joint_hidden=16, vocab_size=VOCAB)
+        self.labels = labels
+        self.calls = 0
+
+    def logits(self, enc_frame: torch.Tensor, pred_out: torch.Tensor) -> torch.Tensor:
+        labels = self.labels[self.calls % self.labels.shape[0]]
+        self.calls += 1
+        logits = enc_frame.new_full((enc_frame.shape[0], VOCAB + 1), -100.0)
+        return logits.scatter(1, labels.unsqueeze(1), 100.0)
+
+
+@pytest.mark.parametrize("frames", [0, 1, 2, 4])
+@pytest.mark.parametrize("max_symbols", [0, 1, 3, 10])
+@pytest.mark.parametrize("pattern", ["blank", "cap", "mixed"])
+def test_dense_outputs_match_independent_bookkeeping(
+    frames: int, max_symbols: int, pattern: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # @spec PORT-DEC-001, PORT-DEC-008, PORT-SEG-002, PORT-PREC-005
+    predictor, _ = _nets(33)
+    batch = 6
+    enc = torch.randn(batch, frames, ENC)
+    lengths = torch.tensor([frames + 2, frames, max(frames - 1, 0), 1, 0, -2])
+    # Non-blank attempts after the first blank MUST stay inactive. Include
+    # token zero, empty middle frames and saturated frames in the same row.
+    labels = torch.arange(frames * max_symbols * batch).reshape(frames, max_symbols, batch) % VOCAB
+    for t in range(frames):
+        for row in range(batch):
+            count = {"blank": 0, "cap": max_symbols, "mixed": (t + row) % (max_symbols + 1)}[pattern]
+            if count < max_symbols:
+                labels[t, count, row] = VOCAB
+    joint = _AttemptJoint(labels.reshape(frames * max_symbols, batch))
+    step_calls = 0
+    original_step = predictor.step
+
+    def counted_step(*args: Any) -> Any:
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(*args)
+
+    monkeypatch.setattr(predictor, "step", counted_step)
+    state = rnnt.DecodeState(
+        h=torch.randn(2, batch, PRED) * 0.2,
+        c=torch.randn(2, batch, PRED) * 0.2,
+        last_label=torch.tensor([0, 1, 4, VOCAB, 7, 9]),
+    )
+    retained: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for _ in range(3):
+            inputs = (enc, lengths, state.h, state.c, state.last_label)
+            snapshots = [value.clone() for value in inputs]
+            expected = _dense_output_oracle(enc, lengths, predictor, joint, state, max_symbols)
+            step_calls = 0
+            result = rnnt.decode_dense_masked_frames(enc, lengths, predictor, joint, state, max_symbols=max_symbols)
+            assert step_calls == 1 + frames * max_symbols
+            borrowed_storage = {value.untyped_storage().data_ptr() for value in inputs}
+            borrowed_storage.update(value.untyped_storage().data_ptr() for value, _ in retained)
+            for actual, reference in zip(_decode_fields(result), _decode_fields(expected)):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                if actual.numel():
+                    assert actual.untyped_storage().data_ptr() not in borrowed_storage
+                    borrowed_storage.add(actual.untyped_storage().data_ptr())
+            assert result.state.h.dtype == result.state.c.dtype == torch.float32
+            for value, snapshot in zip(inputs, snapshots):
+                torch.testing.assert_close(value, snapshot, rtol=0, atol=0)
+            for value, snapshot in retained:
+                torch.testing.assert_close(value, snapshot, rtol=0, atol=0)
+            retained.extend((value, value.clone()) for value in _decode_fields(result))
+            state = result.state
+    assert joint.calls == 6 * frames * max_symbols
+
+
+@pytest.mark.parametrize("frames,max_symbols", [(1, 1), (2, 10), (4, 3)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_dense_real_joint_preserves_exact_seven_fields(frames: int, max_symbols: int, dtype: torch.dtype) -> None:
+    # @spec PORT-DEC-001, PORT-DEC-008, PORT-SEG-002, PORT-PREC-005
+    predictor, joint = _nets(41)
+    joint.to(dtype)
+    enc = torch.randn(3, frames, ENC).to(dtype)
+    lengths = torch.tensor([frames, 1, 0])
+    state = rnnt.DecodeState(
+        h=torch.randn(2, 3, PRED) * 0.2,
+        c=torch.randn(2, 3, PRED) * 0.2,
+        last_label=torch.tensor([0, VOCAB, 7]),
+    )
+    with torch.no_grad():
+        for _ in range(3):
+            expected = _dense_output_oracle(enc, lengths, predictor, joint, state, max_symbols)
+            result = rnnt.decode_dense_masked_frames(enc, lengths, predictor, joint, state, max_symbols=max_symbols)
+            for actual, reference in zip(_decode_fields(result), _decode_fields(expected)):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            state = result.state
