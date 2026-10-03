@@ -952,7 +952,7 @@ def test_burst_then_drain_then_park_matches_reference() -> None:
     assert int(status.staged[0][0]) != 0
 
 
-def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
+def test_mixed_geometries_bucket_resolver_and_row_order(monkeypatch: pytest.MonkeyPatch) -> None:
     # Two CHUNK rows at different geometries plus one replay row in a
     # single call: per-geometry buckets, one resolver query per bucket
     # with ready_decode_buckets == 2, and the returned rows stay
@@ -961,6 +961,24 @@ def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
     pools = _fresh_pools(num_blocks=5)
     _set_replay_book(pools, 3, queue=[7, 9], head=1, expected=7)
     resolver = _RecordingResolver()
+    selections: list[Any] = []
+    gather_groups: list[list[torch.Tensor]] = []
+    original_prepare = advance._prepare_initialized_row_selection
+    original_gather = advance._gather_initialized_rows
+
+    def prepare(blocks: torch.Tensor, fresh: torch.Tensor) -> Any:
+        selection = original_prepare(blocks, fresh)
+        selections.append(selection)
+        gather_groups.append([])
+        return selection
+
+    def gather(pool: torch.Tensor, selection: Any) -> torch.Tensor:
+        assert selection is selections[-1]
+        gather_groups[-1].append(pool)
+        return original_gather(pool, selection)
+
+    monkeypatch.setattr(advance, "_prepare_initialized_row_selection", prepare)
+    monkeypatch.setattr(advance, "_gather_initialized_rows", gather)
     plan = _plan(
         decodes=[3],
         prefills=[1, 2],
@@ -984,6 +1002,14 @@ def test_mixed_geometries_bucket_resolver_and_row_order() -> None:
     embeds = torch.stack([torch.zeros(CARRIER_HIDDEN), reg, fin])
     out = _call(core, pools, input_ids, embeds, plan, resolver=resolver)
     assert len(resolver.requests) == 2
+    assert len(selections) == 1 + len(resolver.requests)
+    assert [len(group) for group in gather_groups] == [3, 4 + 3 * N_LAYERS, 4 + 3 * N_LAYERS]
+    assert all(
+        first is second
+        for first, second in zip(
+            gather_groups[0], [pools["book_pool"], pools["queue_pool"], pools["frontend_counter_pool"]], strict=True
+        )
+    )
     assert {r.geometry for r in resolver.requests} == {
         GEOM_REG,
         GEOM_FINAL,
@@ -3485,7 +3511,8 @@ def test_gather_continuing_rows_preserves_order_layout_and_isolation(noncontiguo
         assert not pool.is_contiguous()
     before = pool.clone()
     blocks = torch.tensor([4, 1, 3])
-    gathered = advance._gather_initialized_rows(pool, blocks, torch.zeros(3, dtype=torch.bool))
+    selection = advance._prepare_initialized_row_selection(blocks, torch.zeros(3, dtype=torch.bool))
+    gathered = advance._gather_initialized_rows(pool, selection)
     torch.testing.assert_close(gathered, torch.stack([before[4], before[1], before[3]]))
     assert gathered.is_contiguous()
     assert gathered.dtype == pool.dtype
@@ -3514,7 +3541,8 @@ def test_gather_fresh_poison_is_never_read(all_fresh: bool, monkeypatch: pytest.
         return original(tensor, dim, index)
 
     monkeypatch.setattr(torch.Tensor, "index_select", observed)
-    gathered = advance._gather_initialized_rows(pool, blocks, fresh)
+    selection = advance._prepare_initialized_row_selection(blocks, fresh)
+    gathered = advance._gather_initialized_rows(pool, selection)
     expected = torch.zeros((3, 3, 4))
     if not all_fresh:
         expected[1].fill_(7)
@@ -3529,10 +3557,77 @@ def test_gather_fresh_poison_is_never_read(all_fresh: bool, monkeypatch: pytest.
 
 def test_gather_zero_rows_preserves_empty_layout() -> None:
     pool = torch.full((5, 3, 4), float("nan"), dtype=torch.float64).transpose(1, 2)
-    gathered = advance._gather_initialized_rows(
-        pool, torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.bool)
+    selection = advance._prepare_initialized_row_selection(
+        torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.bool)
     )
+    gathered = advance._gather_initialized_rows(pool, selection)
     assert gathered.shape == (0, 4, 3)
     assert gathered.dtype == pool.dtype
     assert gathered.device == pool.device
     assert gathered.is_contiguous()
+
+
+# @spec PORT-STATE-003
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_prepared_gather_exhaustive_fresh_partitions(dtype: torch.dtype, noncontiguous: bool) -> None:
+    pool = torch.arange(72, dtype=dtype).reshape(6, 3, 4)
+    if noncontiguous:
+        pool = pool.transpose(1, 2)
+    before = pool.clone()
+    for rows in range(6):
+        blocks = torch.arange(5, 5 - rows, -1)
+        for mask in range(1 << rows):
+            fresh = torch.tensor([bool(mask & (1 << row)) for row in range(rows)], dtype=torch.bool)
+            selection = advance._prepare_initialized_row_selection(blocks, fresh)
+            continuing = (~fresh).nonzero(as_tuple=True)[0]
+            assert int(fresh.sum()) + continuing.numel() == rows
+            assert not fresh[continuing].any()
+            if continuing.numel() == rows and rows:
+                assert selection.continuing_blocks is blocks
+                assert selection.continuing_rows is None
+            elif continuing.numel():
+                torch.testing.assert_close(selection.continuing_rows, continuing)
+                torch.testing.assert_close(selection.continuing_blocks, blocks[continuing])
+            else:
+                assert selection.continuing_blocks is None
+                assert selection.continuing_rows is None
+            expected = torch.zeros((rows, *pool.shape[1:]), dtype=dtype)
+            for row in continuing.tolist():
+                expected[row] = before[blocks[row]]
+            first = advance._gather_initialized_rows(pool, selection)
+            second = advance._gather_initialized_rows(pool, selection)
+            torch.testing.assert_close(first, expected)
+            torch.testing.assert_close(second, expected)
+            assert first.dtype == pool.dtype and first.device == pool.device
+            assert first.is_contiguous() and second.is_contiguous()
+            first.fill_(-1)
+            torch.testing.assert_close(second, expected)
+            torch.testing.assert_close(pool, before)
+
+
+def test_prepared_mixed_selection_reuses_upload_and_block_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    uploads: list[torch.Tensor] = []
+    original_h2d = advance._h2d
+
+    def observed(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
+        uploads.append(cpu.clone())
+        return original_h2d(cpu, device)
+
+    monkeypatch.setattr(advance, "_h2d", observed)
+    blocks = torch.tensor([4, 1, 3, 2])
+    fresh = torch.tensor([True, False, True, False])
+    selection = advance._prepare_initialized_row_selection(blocks, fresh)
+    # Preparation owns the mixed group's selected IDs: later gathers cannot
+    # select blocks again or consult the caller's CPU freshness mask.
+    blocks.fill_(99)
+    fresh.fill_(True)
+    for dtype in (torch.float32, torch.int64):
+        pool = torch.arange(30, dtype=dtype).reshape(5, 2, 3)
+        gathered = advance._gather_initialized_rows(pool, selection)
+        expected = torch.zeros((4, 2, 3), dtype=dtype)
+        expected[1] = pool[1]
+        expected[3] = pool[2]
+        torch.testing.assert_close(gathered, expected)
+    assert len(uploads) == 1
+    torch.testing.assert_close(uploads[0], torch.tensor([1, 3]))

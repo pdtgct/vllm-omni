@@ -1823,25 +1823,44 @@ def _structural_preflight(plan: RowPlan, n_ids: int, n_embeds: int) -> torch.Ten
     return idx
 
 
-def _gather_initialized_rows(
-    pool: torch.Tensor,
+@dataclass(frozen=True)
+class _InitializedRowSelection:
+    """Read-only row metadata shared by a group's independent gathers."""
+
+    rows: int
+    continuing_blocks: torch.Tensor | None
+    continuing_rows: torch.Tensor | None = None
+
+
+def _prepare_initialized_row_selection(
     blocks: torch.Tensor,
     fresh_cpu: torch.Tensor,
-) -> torch.Tensor:
-    """Gather only continuing rows; fresh rows start as exact zero state."""
+) -> _InitializedRowSelection:
+    """Select continuing block IDs once, without reading resident state."""
     rows = int(blocks.shape[0])
     continuing_cpu = (~fresh_cpu).nonzero(as_tuple=True)[0]
     if rows and int(continuing_cpu.numel()) == rows:
+        return _InitializedRowSelection(rows, blocks)
+    if not int(continuing_cpu.numel()):
+        return _InitializedRowSelection(rows, None)
+    continuing = _h2d(continuing_cpu, blocks.device)
+    return _InitializedRowSelection(rows, blocks.index_select(0, continuing), continuing)
+
+
+def _gather_initialized_rows(
+    pool: torch.Tensor,
+    selection: _InitializedRowSelection,
+) -> torch.Tensor:
+    """Gather only continuing rows; fresh rows start as exact zero state."""
+    if selection.continuing_blocks is not None and selection.continuing_rows is None:
         # Keep the legacy zero-scratch layout contract explicit.
-        return pool.index_select(0, blocks).contiguous()
-    scratch = torch.zeros((rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
-    if int(continuing_cpu.numel()):
-        continuing = _h2d(continuing_cpu, pool.device)
-        continuing_blocks = blocks.index_select(0, continuing)
+        return pool.index_select(0, selection.continuing_blocks).contiguous()
+    scratch = torch.zeros((selection.rows, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
+    if selection.continuing_rows is not None:
         scratch.index_copy_(
             0,
-            continuing,
-            pool.index_select(0, continuing_blocks),
+            selection.continuing_rows,
+            pool.index_select(0, selection.continuing_blocks),
         )
     return scratch
 
@@ -2704,13 +2723,12 @@ def advance_model_rows(
     if int(fresh_local.numel()):
         fresh_pos_cpu = plan.num_decodes + fresh_local
         fresh_mask_cpu[fresh_pos_cpu] = True
-    book = _gather_initialized_rows(book_pool, didx, fresh_mask_cpu)
-    queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
-    counters_small = _gather_initialized_rows(frontend_counter_pool, didx, fresh_mask_cpu)
-    endpoint_history = (
-        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu) if endpoint_enabled else None
-    )
-    endpoint_book = _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu) if endpoint_enabled else None
+    all_rows_selection = _prepare_initialized_row_selection(didx, fresh_mask_cpu)
+    book = _gather_initialized_rows(book_pool, all_rows_selection)
+    queue = _gather_initialized_rows(queue_pool, all_rows_selection)
+    counters_small = _gather_initialized_rows(frontend_counter_pool, all_rows_selection)
+    endpoint_history = _gather_initialized_rows(endpoint_history_pool, all_rows_selection) if endpoint_enabled else None
+    endpoint_book = _gather_initialized_rows(endpoint_book_pool, all_rows_selection) if endpoint_enabled else None
     endpoint_mode_cpu = plan.endpoint_mode if plan.endpoint_mode.numel() else torch.zeros(n_real, dtype=torch.int64)
     endpoint_threshold_cpu = (
         plan.endpoint_threshold_frames
@@ -2883,15 +2901,16 @@ def advance_model_rows(
         env = inputs_embeds.index_select(0, rows_dev)
         adm_prompt_b = admitted_prompt_dev.index_select(0, rows_dev)
         incoming = status.index_select(0, rows_dev)
+        bucket_selection = _prepare_initialized_row_selection(blocks_dev, fresh_bucket)
         state = SessionStateBatch(
-            raw_tail=_gather_initialized_rows(frontend_raw_pool, blocks_dev, fresh_bucket),
-            mel_tail=_gather_initialized_rows(frontend_mel_pool, blocks_dev, fresh_bucket),
+            raw_tail=_gather_initialized_rows(frontend_raw_pool, bucket_selection),
+            mel_tail=_gather_initialized_rows(frontend_mel_pool, bucket_selection),
             frontend_counters=counters_small.index_select(0, rows_dev),
-            channel=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in channel_pools],
-            window_valid=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in len_pools],
-            time=[_gather_initialized_rows(pool, blocks_dev, fresh_bucket) for pool in time_pools],
-            h=_gather_initialized_rows(h_pool, blocks_dev, fresh_bucket),
-            c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
+            channel=[_gather_initialized_rows(pool, bucket_selection) for pool in channel_pools],
+            window_valid=[_gather_initialized_rows(pool, bucket_selection) for pool in len_pools],
+            time=[_gather_initialized_rows(pool, bucket_selection) for pool in time_pools],
+            h=_gather_initialized_rows(h_pool, bucket_selection),
+            c=_gather_initialized_rows(c_pool, bucket_selection),
             last_label=safe_last.index_select(0, rows_dev),
         )
         transition = bucket_transitions.get(g, advance_chunk_bucket if bucket_transition is None else bucket_transition)

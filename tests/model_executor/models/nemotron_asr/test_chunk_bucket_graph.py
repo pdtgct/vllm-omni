@@ -208,7 +208,8 @@ def test_chunk_warmup_scratch_matches_real_gather_layout(monkeypatch, population
     def capture(_core, _env, state, **_kwargs):
         for tensor, pool in zip(_state_tensors(state)[:-1], source_pools, strict=True):
             for fresh in (False, True):
-                gathered = advance._gather_initialized_rows(pool, rows, torch.full((population,), fresh))
+                selection = advance._prepare_initialized_row_selection(rows, torch.full((population,), fresh))
+                gathered = advance._gather_initialized_rows(pool, selection)
                 assert graph._tensor_signature(tensor) == graph._tensor_signature(gathered)
             assert torch.count_nonzero(tensor) == 0
             if population > 1:
