@@ -52,6 +52,46 @@ def _authority(
     )
 
 
+# @spec PORT-SESS-003, PORT-SESS-014
+@pytest.mark.parametrize("samples", [0, 3])
+def test_finalize_receipt_resolves_the_outstanding_tail_without_duplicate_state(samples: int) -> None:
+    authority = _authority()
+    if samples:
+        authority.accept(np.arange(samples, dtype=np.float32), accepted_at_ns=1)
+    created = authority.begin_finalize(finalize_at_ns=2, admission_ms_mod=3)
+    assert created.newly_created is True
+    assert created.unit is authority.ready_units[-1]
+    assert created.unit.kind == "final_tail"
+    assert created.unit.sample_count == samples
+    repeated = authority.begin_finalize(finalize_at_ns=9, admission_ms_mod=10)
+    assert repeated.newly_created is False
+    assert repeated.unit is created.unit
+    assert repeated.unit.ready_at_ns == 2
+    assert repeated.unit.admission_ms_mod == 3
+    assert authority.dispatch_next() is created.unit
+    inflight = authority.begin_finalize()
+    assert inflight.unit is created.unit
+    assert inflight.newly_created is False
+    authority.park(
+        request_id="request-a",
+        engine_epoch="epoch-a",
+        lease_generation=7,
+        logical_sequence=created.unit.logical_sequence,
+        carrier_sequence=created.unit.carrier_sequence,
+    )
+    parked = authority.begin_finalize()
+    assert parked.unit is None
+    assert parked.newly_created is False
+    authority.clear(RuntimeError("clear"))
+    cleared = authority.begin_finalize()
+    assert cleared.unit is None
+    assert cleared.newly_created is False
+    unfinalized = _authority()
+    unfinalized.clear(RuntimeError("clear"))
+    with pytest.raises(ValueError, match="cleared"):
+        unfinalized.begin_finalize()
+
+
 def _paced_authority(
     *,
     cadence_ns: int = 80,

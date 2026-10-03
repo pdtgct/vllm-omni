@@ -393,6 +393,55 @@ def test_streaming_mints_ordered_acceptance_delta_after_observer_handles(monkeyp
     _run(scenario())
 
 
+# @spec PORT-OBS-003, PORT-OBS-004, PORT-SESS-003
+@pytest.mark.parametrize("samples", [0, 100])
+@pytest.mark.parametrize("callback_fails", [False, True])
+def test_early_finalize_receipt_is_observed_and_minted_once(
+    monkeypatch: pytest.MonkeyPatch, samples: int, callback_fails: bool
+) -> None:
+    async def scenario() -> None:
+        observer = _RecordingObserver()
+        events: list[str] = []
+        original_ready = observer.unit_ready
+
+        def ready(**kwargs: Any) -> Any:
+            events.append("ready")
+            if callback_fails:
+                raise RuntimeError("observer failed")
+            return original_ready(**kwargs)
+
+        monkeypatch.setattr(observer, "unit_ready", ready)
+        session = _session(with_ledger=True, observer=observer)
+        if samples:
+            session.accept_audio(np.zeros(samples, dtype=np.float32))
+        first = session.begin_finalize(finalize_at_ns=2)
+        repeated = session.begin_finalize(finalize_at_ns=9)
+        assert first.newly_created is True
+        assert repeated.newly_created is False
+        assert first.unit is repeated.unit
+        assert events == ["ready"]
+        ledger = session.ledger
+        original_mint = ledger.mint
+
+        def mint(**kwargs: Any) -> Any:
+            assert kwargs["final_tail"] is True
+            assert kwargs["handle"] is session.ready_handle(first.unit.logical_sequence)
+            assert (kwargs["handle"] is None) == callback_fails
+            events.append("mint")
+            return original_mint(**kwargs)
+
+        monkeypatch.setattr(ledger, "mint", mint)
+        queue: asyncio.Queue = asyncio.Queue()
+        async for prompt in buffer_stream(_audio(), queue, session):
+            if "multi_modal_data" in prompt:
+                ledger.complete_next(None)
+            queue.put_nowait([PARK_ID])
+        # Preserve the ledger's direct-mint fallback when observation failed.
+        assert events == (["ready", "mint", "ready"] if callback_fails else ["ready", "mint"])
+
+    _run(scenario())
+
+
 def test_regular_unit_ready_is_observed_at_cadence_completion() -> None:
     async def scenario() -> list[tuple[str, dict[str, Any]]]:
         fake = _RecordingObserver()

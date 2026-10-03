@@ -42,6 +42,14 @@ class ReadyAudioUnit:
 
 
 @dataclass(frozen=True)
+class FinalizationReceipt:
+    """The authoritative outstanding final tail and its creation transition."""
+
+    unit: ReadyAudioUnit | None
+    newly_created: bool
+
+
+@dataclass(frozen=True)
 class AcceptedAudioSnapshot:
     """Conservation snapshot for diagnostics and tests."""
 
@@ -283,25 +291,23 @@ class AcceptedAudioAuthority:
         *,
         finalize_at_ns: int | None = None,
         admission_ms_mod: int | None = None,
-    ) -> None:
+    ) -> FinalizationReceipt:
         ready_at_ns = time.monotonic_ns() if finalize_at_ns is None else finalize_at_ns
         if admission_ms_mod is None:
             admission_ms_mod = int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS
         with self._lock:
+            if self._finalizing:
+                if self._ready:
+                    return FinalizationReceipt(self._ready[-1], False)
+                unit = self._in_flight
+                return FinalizationReceipt(unit if unit is not None and unit.kind == "final_tail" else None, False)
             if self._cleared:
                 raise ValueError("session is cleared")
-            if self._finalizing:
-                return
             self._finalizing = True
             tail = self._take_samples(self._residual_samples)
-            self._ready.append(
-                self._new_unit(
-                    "final_tail",
-                    tail,
-                    ready_at_ns,
-                    admission_ms_mod,
-                )
-            )
+            unit = self._new_unit("final_tail", tail, ready_at_ns, admission_ms_mod)
+            self._ready.append(unit)
+            return FinalizationReceipt(unit, True)
 
     # @spec PORT-SESS-001, PORT-SESS-013
     def dispatch_next(self, *, now_ns: int | None = None) -> ReadyAudioUnit | None:

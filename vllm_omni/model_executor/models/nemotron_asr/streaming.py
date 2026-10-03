@@ -266,13 +266,8 @@ async def buffer_stream(
     # residual is shorter than the frontend's minimum commit or is
     # exactly zero. The frontend owns the zero-frame decision; the
     # session transition still needs the final marker (PORT-SESS-003).
-    if not authority.snapshot().finalizing:
-        finalize_at_ns = None if final_tail_ready_stamp_s is None else int(final_tail_ready_stamp_s * 1_000_000_000)
-        session.begin_finalize(finalize_at_ns=finalize_at_ns)
-    final_tail = next(
-        (unit for unit in reversed(authority.ready_units) if unit.kind == "final_tail"),
-        None,
-    )
+    finalize_at_ns = None if final_tail_ready_stamp_s is None else int(final_tail_ready_stamp_s * 1_000_000_000)
+    final_tail = session.begin_finalize(finalize_at_ns=finalize_at_ns).unit
     if ledger is not None and final_tail is not None:
         ledger.mint(
             final_tail=True,

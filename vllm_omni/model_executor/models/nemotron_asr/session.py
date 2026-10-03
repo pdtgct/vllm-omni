@@ -40,6 +40,7 @@ from vllm_omni.metrics.streaming_transport import (
 from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import (
     AcceptedAudioAuthority,
     AcceptedPiece,
+    FinalizationReceipt,
     ReadyAudioUnit,
 )
 from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
@@ -934,16 +935,13 @@ class NemotronRealtimeSession:
             raise ValueError("endpointing controls are not configured")
         self._accepted_audio.force_segment()
 
-    def begin_finalize(self, *, finalize_at_ns: int | None = None) -> None:
+    def begin_finalize(self, *, finalize_at_ns: int | None = None) -> FinalizationReceipt:
         """Close audio acceptance and queue exactly one final tail."""
-        if self._accepted_audio.snapshot().finalizing:
-            return
-        prior_sequences = {unit.logical_sequence for unit in self._accepted_audio.ready_units}
-        self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
-        if self._observer is not None:
-            self._observe_ready_units(
-                tuple(unit for unit in self._accepted_audio.ready_units if unit.logical_sequence not in prior_sequences)
-            )
+        receipt = self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
+        if self._observer is not None and receipt.newly_created:
+            assert receipt.unit is not None
+            self._observe_ready_units((receipt.unit,))
+        return receipt
 
     def _observe_ready_units(self, units: tuple[ReadyAudioUnit, ...]) -> None:
         """Publish newly ready carrier units from the state authority."""
