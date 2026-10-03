@@ -1466,6 +1466,112 @@ def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> N
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("container", (None, list, tuple))
+def test_no_failed_releases_preserves_snapshot_bindings(container: Any) -> None:
+    """@spec PORT-STATE-022/023: ordinary handshakes do no release-recovery work."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _service(stage, _Clock())
+        service._inventory = dict(_SNAPSHOT_BASE)
+        bindings = None if container is None else container(({},))
+        snapshot = {} if container is None else {"bindings": bindings}
+        await service._reconcile_failed_releases(snapshot)
+        assert stage.release_calls == []
+        assert ("bindings" in snapshot) == (container is not None)
+        if container is not None:
+            assert snapshot["bindings"] is bindings
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", (None, "failure", "cancel"))
+def test_multiple_recovered_releases_preserve_survivors_and_resume_after_interruption(
+    interruption: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec PORT-STATE-014/022/023: exact retries free each retained lease once."""
+    from vllm_omni.engine.persistent_state_service import _ReleaseCommand
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        stage.snapshot_overrides.update(configured_limit=4, effective_capacity=4)
+        service = _service(stage, _Clock())
+        await _open_service(service)
+        leases = [await _reserve_with_interval(service, index) for index in range(1, 4)]
+        bindings = [dict(service._lease_payload(lease), terminal=True, claim_expires_at=0.0) for lease in leases]
+        orphan = dict(bindings[0], binding_token="orphan", session_key="lost")
+        stage.bindings = [bindings[2], bindings[1], orphan, bindings[0], bindings[2]]
+        stage.resident += 1
+        for index, lease in enumerate(leases[:2], 1):
+            service._mark_failed_release_interval(lease.binding_token)
+            service._failed_releases[lease.binding_token] = _ReleaseCommand(
+                operation_id=f"retry-{index}",
+                lease=lease,
+                reason="client_disconnect",
+                future=asyncio.get_running_loop().create_future(),
+            )
+        service.close_admission()
+        snapshot = stage._snapshot()
+        service._inventory = dict(snapshot)
+        utility = stage.call_utility_async
+        interrupted = False
+
+        async def interrupt_once(name: str, *args: Any) -> dict[str, Any]:
+            nonlocal interrupted
+            if (
+                interruption is not None
+                and not interrupted
+                and name == "persistent_state_release"
+                and args[0] == "retry-2"
+            ):
+                interrupted = True
+                if interruption == "cancel":
+                    stage.release_operation_ids.append(str(args[0]))
+                    stage.release_calls.append((str(args[2]), dict(args[1])))
+                    raise asyncio.CancelledError
+                stage.release_failures_remaining = 1
+            return await utility(name, *args)
+
+        monkeypatch.setattr(stage, "call_utility_async", interrupt_once)
+        if interruption is None:
+            await service._reconcile_failed_releases(snapshot)
+            assert snapshot["bindings"] == [bindings[2], orphan, bindings[2]]
+            await service._reconcile_orphan_bindings(snapshot)
+            expected_ids = ["retry-1", "retry-2", "orphan-orphan"]
+        else:
+            error = asyncio.CancelledError if interruption == "cancel" else PersistentStateServiceUnavailable
+            with pytest.raises(error):
+                await service._reconcile_failed_releases(snapshot)
+            assert list(service._failed_releases) == [leases[1].binding_token]
+            assert leases[0].binding_token not in service._live_leases
+            assert service._resident_interval_counts[560] == 2
+            assert service._failed_release_interval_counts[560] == 1
+            assert service._inventory["resident_count"] == 3
+            assert not service.ready
+            await service._perform_handshake(open_admission=True)
+            assert service.ready
+            expected_ids = ["retry-1", "retry-2", "retry-2", "orphan-orphan"]
+        assert stage.release_operation_ids == expected_ids
+        assert [reason for reason, _ in stage.release_calls] == [
+            *("client_disconnect" for _ in expected_ids[:-1]),
+            "orphan_reconciliation",
+        ]
+        assert stage.resident == 1
+        assert stage.bindings == [bindings[2], bindings[2]]
+        assert list(service._live_leases) == [leases[2].binding_token]
+        assert not service._failed_releases
+        assert service._failed_release_interval_counts[560] == 0
+        assert service._resident_interval_counts[560] == 1
+        assert service._inventory["execution_claims"] == 1
+        assert service._inventory["resident_count"] == 1
+        assert service._operations["retry-1"].result().operation_id == "retry-1"
+        assert service._operations["retry-2"].result().operation_id == "retry-2"
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
 # @spec PORT-STATE-014 / PORT-STATE-022
 def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
     """Repeated demotion keeps one clock and cannot postpone fatal exit."""

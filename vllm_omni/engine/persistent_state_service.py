@@ -1016,6 +1016,8 @@ class PersistentStateService:
         inventory = self._inventory
         if inventory is None:
             raise PersistentStateServiceUnavailable("persistent-state inventory is unavailable during release recovery")
+        if not self._failed_releases:
+            return
         bindings = {str(binding["binding_token"]): binding for binding in snapshot.get("bindings", ())}
         for token, command in tuple(self._failed_releases.items()):
             binding = bindings.get(token)
@@ -1048,9 +1050,10 @@ class PersistentStateService:
             self._failed_releases.pop(token, None)
             self._live_leases.pop(token, None)
             self._release_resident_interval(token)
-            snapshot["bindings"] = [
-                candidate for candidate in snapshot.get("bindings", ()) if str(candidate["binding_token"]) != token
-            ]
+            bindings.pop(token, None)
+        snapshot["bindings"] = [
+            candidate for candidate in snapshot.get("bindings", ()) if str(candidate["binding_token"]) in bindings
+        ]
 
     def _ensure_dispatcher(self) -> None:
         if self._dispatcher_task is None or self._dispatcher_task.done():
