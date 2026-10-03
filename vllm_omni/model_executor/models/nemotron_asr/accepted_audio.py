@@ -150,9 +150,8 @@ class AcceptedAudioAuthority:
             return self._eligibility_ns(self._ready[0])
 
     def _outstanding_samples(self) -> int:
-        ready = sum(unit.sample_count for unit in self._ready)
-        in_flight = 0 if self._in_flight is None else self._in_flight.sample_count
-        return self._residual_samples + ready + in_flight
+        """Return conserved sample credit while the caller holds the lock."""
+        return self._accepted_samples - self._parked_samples - self._cleared_samples
 
     def _new_unit(
         self,

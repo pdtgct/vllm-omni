@@ -79,6 +79,8 @@ def _samples(start: int, count: int) -> np.ndarray:
 
 def _snapshot(authority: Any) -> Any:
     snapshot = authority.snapshot()
+    with authority._lock:
+        assert authority._outstanding_samples() == snapshot.outstanding_samples
     assert snapshot.accepted_samples == (
         snapshot.parked_samples + snapshot.cleared_samples + snapshot.outstanding_samples
     )
@@ -86,6 +88,88 @@ def _snapshot(authority: Any) -> Any:
         snapshot.residual_samples + snapshot.ready_samples + snapshot.in_flight_samples
     )
     return snapshot
+
+
+@pytest.mark.parametrize("paced", [False, True])
+@pytest.mark.parametrize("residual_samples", [0, 1, 3])
+def test_credit_matches_locations_through_session_transitions(paced: bool, residual_samples: int) -> None:
+    # @spec PORT-SESS-001 / PORT-SESS-003 / PORT-SESS-013 / PORT-SESS-014 / PORT-SEG-004
+    capacity = 8 + residual_samples
+    authority = _paced_authority(capacity_samples=capacity) if paced else _authority(capacity_samples=capacity)
+    assert _snapshot(authority).outstanding_samples == 0
+
+    # Fill the exact capacity with both complete units and a possible residual.
+    authority.accept(_samples(0, 3), accepted_at_ns=100)
+    assert _snapshot(authority).outstanding_samples == 3
+    authority.accept(_samples(3, capacity - 3), accepted_at_ns=100)
+    full = _snapshot(authority)
+    assert full.outstanding_samples == capacity
+    with pytest.raises(ValueError, match="buffer_overflow"):
+        authority.accept(_samples(capacity, 1), accepted_at_ns=100)
+    assert _snapshot(authority) == full
+
+    authority.force_segment()
+    assert _snapshot(authority) == full
+    authority.force_segment()
+    assert _snapshot(authority) == full
+    first = authority.dispatch_next(now_ns=100)
+    assert first is not None
+    dispatched = _snapshot(authority)
+    assert dispatched.outstanding_samples == capacity
+    assert authority.dispatch_next(now_ns=100) is None
+    assert _snapshot(authority) == dispatched
+
+    with pytest.raises(ValueError, match="park identity"):
+        authority.park(
+            request_id="request-a",
+            engine_epoch="epoch-a",
+            lease_generation=8,
+            logical_sequence=first.logical_sequence,
+            carrier_sequence=first.carrier_sequence,
+        )
+    assert _snapshot(authority) == dispatched
+    if paced:
+        with pytest.raises(ValueError, match="before submission"):
+            _park_current(authority, first)
+        assert _snapshot(authority) == dispatched
+    authority.record_submission(first, submitted_at_ns=100)
+    assert _snapshot(authority) == dispatched
+    _park_current(authority, first)
+    parked = _snapshot(authority)
+    assert parked.outstanding_samples == capacity - 4
+    with pytest.raises(ValueError, match="no in-flight"):
+        _park_current(authority, first)
+    assert _snapshot(authority) == parked
+
+    # Only the matching park returns credit; that credit admits exactly one unit.
+    authority.accept(_samples(capacity, 4), accepted_at_ns=100)
+    assert _snapshot(authority).outstanding_samples == capacity
+    authority.begin_finalize(finalize_at_ns=100)
+    finalized = _snapshot(authority)
+    assert finalized.outstanding_samples == capacity
+    assert finalized.residual_samples == 0
+    authority.begin_finalize(finalize_at_ns=100)
+    assert _snapshot(authority) == finalized
+
+    for index, (kind, count) in enumerate(
+        [("regular", 4), ("forced_eou", 0), ("regular", 4), ("final_tail", residual_samples)], start=2
+    ):
+        before = _snapshot(authority)
+        unit = authority.dispatch_next(now_ns=index * 100)
+        assert unit is not None
+        assert (unit.kind, unit.sample_count) == (kind, count)
+        assert _snapshot(authority).outstanding_samples == before.outstanding_samples
+        authority.record_submission(unit, submitted_at_ns=index * 100)
+        assert _snapshot(authority).outstanding_samples == before.outstanding_samples
+        _park_current(authority, unit)
+        assert _snapshot(authority).outstanding_samples == before.outstanding_samples - count
+
+    assert _snapshot(authority).outstanding_samples == 0
+    authority.clear(RuntimeError("finished"))
+    cleared = _snapshot(authority)
+    assert cleared.cleared_samples == 0
+    authority.clear(RuntimeError("duplicate cleanup"))
+    assert _snapshot(authority) == cleared
 
 
 def _park_current(authority: Any, unit: Any) -> None:
@@ -432,7 +516,34 @@ def test_terminal_clear_conserves_samples_and_is_idempotent(location: str) -> No
     assert after.residual_samples == after.ready_samples == after.in_flight_samples == 0
 
     authority.clear(RuntimeError("duplicate cleanup"))
-    assert authority.snapshot() == after
+    assert _snapshot(authority) == after
+
+
+@pytest.mark.parametrize("parked_units", [0, 1])
+def test_clear_conserves_credit_across_all_locations_after_prior_parks(parked_units: int) -> None:
+    # @spec PORT-SESS-013
+    authority = _authority(capacity_samples=16)
+    authority.accept(_samples(0, 15), accepted_at_ns=1)
+    _snapshot(authority)
+    for _ in range(parked_units):
+        unit = authority.dispatch_next()
+        _snapshot(authority)
+        _park_current(authority, unit)
+        _snapshot(authority)
+    authority.dispatch_next()
+    before = _snapshot(authority)
+    assert before.residual_samples == 3
+    assert before.ready_samples > 0
+    assert before.in_flight_samples == 4
+    assert before.parked_samples == parked_units * 4
+
+    authority.clear(RuntimeError("client disconnected"))
+    after = _snapshot(authority)
+    assert after.cleared_samples == before.outstanding_samples
+    assert after.outstanding_samples == 0
+    assert after.parked_samples == before.parked_samples
+    authority.clear(RuntimeError("duplicate cleanup"))
+    assert _snapshot(authority) == after
 
 
 def test_forced_eou_is_zero_sample_ordered_barrier_and_preserves_residual() -> None:
