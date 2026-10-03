@@ -386,6 +386,127 @@ def test_service_projection_exports_the_exact_installed_derating() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("hard_cap", [False, True])
+def test_capacity_consumers_recompute_current_authority(hard_cap: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """@spec PORT-STATE-027 / PORT-OBS-012: each consumer sees current charges."""
+    from vllm_omni.engine import persistent_state_capacity as capacity
+
+    service = _recovering_service(_RecoveryStage(), _Clock())
+    service._inventory = dict(_SNAPSHOT_BASE)
+    if hard_cap:
+        service._startup_authority = capacity.HardCapAuthority(
+            served_intervals_ms=tuple(service._resident_interval_counts),
+            effective_state_slots=4,
+            configured_resident_limit=4,
+            max_num_seqs=4,
+            model_profile_id="profile-a",
+            service_profile_identity=None,
+            execution_environment_key="env-a",
+            precision_policy="fp32",
+        )
+    else:
+        service._compiled_service_profile = _compiled_admission_profile()
+    service._engine_epoch = "epoch-a"
+    service._install_admission_controller()
+    metrics: list[dict[str, Any]] = []
+    service._metrics_sink = SimpleNamespace(
+        observe_persistent_state_capacity=lambda *args, **kwargs: metrics.append(kwargs),
+        observe_persistent_state_slots=lambda *args: None,
+    )
+    project = capacity.project_fixed_dispatch_capacity
+    calls: list[dict[str, Any]] = []
+
+    def counted_project(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return project(**kwargs)
+
+    monkeypatch.setattr(capacity, "project_fixed_dispatch_capacity", counted_project)
+    for resident, submitted, committed, pending, ready in (
+        (0, 0, 0, 0, True),
+        (1, 0, 1, 0, True),
+        (1, 1, 1, 1, True),
+        (1, 1, 0, 1, False),
+        (0, 0, 0, 0, True),
+    ):
+        service._inventory["resident_count"] = resident
+        service._resident_interval_counts[1120] = resident
+        service._submitted_interval_counts[1120] = submitted
+        service._service_intervals = {str(i): 1120 for i in range(committed)}
+        service._pending_service_intervals = {str(i): 1120 for i in range(pending)}
+        service._ready = service._admission_open = ready
+        expected = (
+            project(
+                startup_authority=service._startup_authority,
+                state_resident=resident,
+                state_submitted=submitted,
+                execution_committed=committed,
+                execution_submitted=pending,
+                authority_open=ready,
+            )
+            if hard_cap
+            else project(
+                profile=service._compiled_service_profile,
+                inventory=service._inventory,
+                resident_counts_by_interval=service._resident_interval_counts,
+                submitted_counts_by_interval=service._submitted_interval_counts,
+                authority_open=ready,
+                admission_policy="profile",
+            )
+        )
+        previous_calls = len(calls)
+        assert service._project_capacity() == expected
+        dispatch = service._project_dispatch_capacity()
+        assert dispatch.hard_headroom == min(expected.hard_headroom, 1)
+        assert dispatch.dispatchable_headroom_by_interval == expected.dispatchable_by_interval
+        assert dispatch.authority == ("OPEN" if ready else "UNHANDSHAKED")
+        assert service._candidate_supported(1120) == expected.candidate_supported_by_interval[1120]
+        service._sync_service_projection()
+        assert len(calls) == previous_calls + 4
+        assert metrics[-1]["execution_claims"] == expected.execution_claims
+        assert metrics[-1]["headroom_by_cadence"]["1120"]["hard"] == expected.hard_headroom
+        if hard_cap:
+            assert "charged_demand" not in service._inventory
+            assert metrics[-1]["charged_demand"] is None
+            assert service._inventory["service_profile_identity"] is None
+            assert "nominal" not in metrics[-1]["headroom_by_cadence"]["1120"]
+        else:
+            assert isinstance(expected, capacity.FixedDispatchCapacity)
+            assert service._inventory["charged_demand"] == expected.charged_units / expected.service_budget_units
+            assert (
+                metrics[-1]["headroom_by_cadence"]["1120"]["nominal"] == expected.nominal_dispatchable_by_interval[1120]
+            )
+    if hard_cap:
+        service._compiled_service_profile = _compiled_admission_profile()
+        with pytest.raises(RuntimeError, match="profile authority produced hard-cap projection"):
+            service._sync_service_projection()
+    service.shutdown()
+
+
+@pytest.mark.parametrize("missing", range(1, 16))
+def test_capacity_consumers_keep_missing_authority_policies(missing: int) -> None:
+    """@spec PORT-STATE-027: incomplete startup keeps each caller's policy."""
+    service = _recovering_service(_RecoveryStage(), _Clock())
+    service._inventory = None if missing & 1 else dict(_SNAPSHOT_BASE)
+    service._compiled_service_profile = _compiled_admission_profile()
+    service._engine_epoch = "epoch-a"
+    service._install_admission_controller()
+    if missing & 2:
+        service._compiled_service_profile = None
+    if missing & 4:
+        service._admission_config = None
+    if missing & 8:
+        service._admission_controller = None
+    with pytest.raises(PersistentStateServiceUnavailable, match="admission capacity is not installed"):
+        service._project_dispatch_capacity()
+    assert service._candidate_supported(1120) == (not bool(missing & 7))
+    if missing & 2 and not missing & 13:
+        with pytest.raises(PersistentStateServiceUnavailable, match="startup authority is absent"):
+            service._sync_service_projection()
+    else:
+        service._sync_service_projection()
+    service.shutdown()
+
+
 def test_hard_cap_service_seals_static_authority_without_profile() -> None:
     """@spec PORT-STATE-026/027 / PORT-OBS-012: no profile or bypass."""
 
