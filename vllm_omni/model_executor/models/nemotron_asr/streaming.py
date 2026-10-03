@@ -246,21 +246,18 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        prior_sequences = {unit.logical_sequence for unit in authority.ready_units}
         if before_audio_accept is not None:
             before_audio_accept()
-        session.accept_audio(frame)
+        accepted = session.accept_audio(frame)
         if on_audio_accepted is not None:
             on_audio_accepted()
-        new_units = tuple(unit for unit in authority.ready_units if unit.logical_sequence not in prior_sequences)
         if ledger is not None:
-            for unit in new_units:
-                if unit.kind != "forced_eou":
-                    ledger.mint(
-                        final_tail=unit.kind == "final_tail",
-                        admission_ms_mod=unit.admission_ms_mod,
-                        handle=session.ready_handle(unit.logical_sequence),
-                    )
+            for unit in accepted.newly_ready_units:
+                ledger.mint(
+                    final_tail=False,
+                    admission_ms_mod=unit.admission_ms_mod,
+                    handle=session.ready_handle(unit.logical_sequence),
+                )
         if ledger is not None:
             ledger.acknowledge_piece(int(frame.shape[0]))
         async for rendered in dispatch_ready():
@@ -269,13 +266,8 @@ async def buffer_stream(
     # residual is shorter than the frontend's minimum commit or is
     # exactly zero. The frontend owns the zero-frame decision; the
     # session transition still needs the final marker (PORT-SESS-003).
-    if not authority.snapshot().finalizing:
-        finalize_at_ns = None if final_tail_ready_stamp_s is None else int(final_tail_ready_stamp_s * 1_000_000_000)
-        session.begin_finalize(finalize_at_ns=finalize_at_ns)
-    final_tail = next(
-        (unit for unit in reversed(authority.ready_units) if unit.kind == "final_tail"),
-        None,
-    )
+    finalize_at_ns = None if final_tail_ready_stamp_s is None else int(final_tail_ready_stamp_s * 1_000_000_000)
+    final_tail = session.begin_finalize(finalize_at_ns=finalize_at_ns).unit
     if ledger is not None and final_tail is not None:
         ledger.mint(
             final_tail=True,

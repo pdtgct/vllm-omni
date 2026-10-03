@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from typing import Any, NoReturn
 
@@ -138,8 +139,12 @@ class _Provider:
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize("scenario_id", ("ordinary", "forced_eou_then_chunk", "final_tail_then_flush"))
+@pytest.mark.parametrize("completed_model_rows", (None, 6))
 async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     monkeypatch: pytest.MonkeyPatch,
+    scenario_id: str,
+    completed_model_rows: int | None,
 ) -> None:
     """@spec ENV-MIG-012 / PORT-PERF-005/006 / PORT-INT-013."""
     module = _startup_module()
@@ -150,6 +155,18 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     engine = SimpleNamespace(model_config=model_config)
     provider = _Provider(events, runtime, model_config)
     profile = SimpleNamespace(compiled_demand=SimpleNamespace(intervals_ms=(80, 320, 560, 1120)))
+    observation = module.ServicePrimingObservation(
+        round_id="round-0",
+        service_interval_ms=320,
+        geometry_id=2,
+        active_population=2,
+        elapsed_ns=123_456,
+        completed_legal_parks=2 if scenario_id == "ordinary" else 4,
+        completed_model_rows=completed_model_rows,
+        tier_id="bulk",
+        post_jit=False,
+        scenario_id=scenario_id,
+    )
 
     class _Service:
         def __init__(self, stage_client: Any, **kwargs: Any) -> None:
@@ -186,7 +203,7 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     async def _prime(**kwargs: Any) -> Any:
         assert kwargs["service"].ready is False
         events.append("prime")
-        return SimpleNamespace(round_id="round-0")
+        return observation
 
     monkeypatch.setattr(module, "PersistentStateService", _Service)
 
@@ -208,7 +225,11 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
     monkeypatch.setattr(module, "run_service_priming_round", _prime)
 
     def _compile(observations: Any, **kwargs: Any) -> Any:
-        del observations
+        assert len(observations) == 1
+        assert isinstance(observations[0], module.ServiceRoundExecution)
+        assert asdict(observations[0]) == {
+            key: value for key, value in asdict(observation).items() if key != "round_id"
+        }
         assert kwargs["admission_policy"] == runtime.admission_policy
         events.append("compile")
         return profile
@@ -238,6 +259,26 @@ async def test_preparation_orders_bootstrap_priming_seal_and_installability(
         "validate",
         "seal",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("active_population", 0), ("elapsed_ns", 0), ("service_interval_ms", 0), ("geometry_id", -1), ("scenario_id", "")],
+)
+def test_priming_conversion_retains_service_round_validation(field: str, value: Any) -> None:
+    """@spec PORT-PERF-006: normalized observations still undergo compiler-input validation."""
+    module = _startup_module()
+    observation = module.ServicePrimingObservation(
+        round_id="round-0",
+        service_interval_ms=320,
+        geometry_id=2,
+        active_population=2,
+        elapsed_ns=1,
+        completed_legal_parks=2,
+        completed_model_rows=None,
+    )
+    with pytest.raises(ValueError):
+        module._service_executions([replace(observation, **{field: value})])
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
@@ -464,8 +505,15 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize(
+    "effective,configured,execution",
+    [(2, 4, 8), (4, 2, 8), (4, 4, 2), (1, 1, 1)],
+)
 async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     monkeypatch: pytest.MonkeyPatch,
+    effective: int,
+    configured: int,
+    execution: int,
 ) -> None:
     """@spec ENV-MIG-012 / PORT-PERF-005/006 / PORT-INT-013."""
     module = _startup_module()
@@ -496,6 +544,29 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     runtime.bootstrap_operation_budget = 0
     runtime.service_profile_identity = None
     runtime.profile_status = "not_measured"
+    inventory = _startup_inventory()
+    inventory.update(effective_capacity=effective, configured_limit=configured, execution_claim_ceiling=execution)
+    expected_config = module.derive_admission_controller_config(
+        runtime,
+        supported_intervals_ms=(80, 320, 560, 1_120),
+        hard_cap_capacity=min(effective, configured, execution),
+    )
+    expected_authority = module.derive_hard_cap_authority(
+        served_intervals_ms=(80, 320, 560, 1_120),
+        model_profile_id="profile-a",
+        execution_environment_key="env-a",
+        precision_policy="torch.float32",
+        schema_id="schema-a",
+        slot_bytes=6_314_936,
+        stage=0,
+        replica=0,
+        physical_capacity=5,
+        configured_limit=configured,
+        effective_capacity=effective,
+        max_num_seqs=execution,
+        safety_reserve=0,
+        controller_identity=repr(expected_config),
+    )
 
     class _HardCapProvider:
         def served_intervals_ms(self, *, model_config: Any) -> tuple[int, ...]:
@@ -516,7 +587,7 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
 
         async def bootstrap_handshake(self) -> dict[str, Any]:
             events.append("handshake")
-            return _startup_inventory()
+            return inventory
 
         def configure_bootstrap_intervals(self, intervals_ms: tuple[int, ...]) -> None:
             assert intervals_ms == (80, 320, 560, 1_120)
@@ -528,11 +599,10 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
             admission_config: Any,
             authority: Any,
         ) -> None:
-            assert admission_config == "hard-controller"
-            assert authority.policy == "hard_cap"
-            assert authority.service_profile_identity is None
-            assert authority.model_profile_id == "profile-a"
-            assert authority.served_intervals_ms == (80, 320, 560, 1_120)
+            assert admission_config == expected_config
+            assert authority == expected_authority
+            assert authority.controller_identity == repr(expected_config)
+            assert authority.hard_cap_envelope_sha256 == expected_authority.hard_cap_envelope_sha256
             events.append("seal-hard")
             self.ready = True
 
@@ -547,15 +617,17 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     monkeypatch.setattr(module, "PersistentStateService", _Service)
     monkeypatch.setattr(module, "run_service_priming_round", forbidden)
     monkeypatch.setattr(module, "compile_provisional_service_profile", forbidden)
+    derive_config = module.derive_admission_controller_config
+    derive_authority = module.derive_hard_cap_authority
+
+    def derive_once(function: Any, *args: Any, **kwargs: Any) -> Any:
+        events.append(function.__name__)
+        return function(*args, **kwargs)
+
     monkeypatch.setattr(
-        module,
-        "derive_admission_controller_config",
-        lambda value, **kwargs: (
-            "hard-controller"
-            if value is runtime and kwargs["supported_intervals_ms"] == (80, 320, 560, 1_120)
-            else _fail("PORT-STATE-027 hard-cap controller authority mismatch")
-        ),
+        module, "derive_admission_controller_config", lambda *a, **k: derive_once(derive_config, *a, **k)
     )
+    monkeypatch.setattr(module, "derive_hard_cap_authority", lambda **k: derive_once(derive_authority, **k))
 
     service = await prepare(
         engine_client=engine,
@@ -571,8 +643,49 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
         "handshake",
         "intervals",
         "configure",
+        "derive_admission_controller_config",
+        "derive_hard_cap_authority",
         "seal-hard",
     ]
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize("field", ("effective_capacity", "configured_limit", "execution_claim_ceiling"))
+@pytest.mark.parametrize("value", (0, -1, "invalid"))
+async def test_hard_cap_preparation_rejects_invalid_capacity_before_sealing(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    """@spec PORT-STATE-027 / PORT-INT-013: invalid capacity shuts startup down."""
+    module = _startup_module()
+    runtime = _runtime()
+    runtime.admission_policy = "hard_cap"
+    inventory = _startup_inventory()
+    inventory[field] = value
+    events: list[str] = []
+
+    class _Service:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def bootstrap_handshake(self) -> dict[str, Any]:
+            return inventory
+
+        def configure_bootstrap_intervals(self, intervals: tuple[int, ...]) -> None:
+            events.append("configure")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    monkeypatch.setattr(module, "PersistentStateService", _Service)
+    with pytest.raises(ValueError):
+        await module.prepare_persistent_state_service(
+            engine_client=SimpleNamespace(model_config=object()),
+            stage_client="stage",
+            runtime_config=runtime,
+            startup_provider=SimpleNamespace(served_intervals_ms=lambda **kwargs: (80, 320, 560, 1_120)),
+            host_fatal_callback=lambda error: None,
+        )
+    assert events == ["configure", "shutdown"]
 
 
 def test_nemotron_provider_resolves_hard_cap_intervals_without_a_priming_plan() -> None:

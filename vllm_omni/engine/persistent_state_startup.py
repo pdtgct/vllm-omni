@@ -19,6 +19,7 @@ from vllm_omni.engine.persistent_state_capacity import (
     compile_provisional_service_profile,
 )
 from vllm_omni.engine.persistent_state_priming import (
+    ServicePrimingObservation,
     run_service_priming_round,
 )
 from vllm_omni.engine.persistent_state_service import PersistentStateService
@@ -129,26 +130,11 @@ def derive_admission_controller_config(
     )
 
 
-def _service_executions(observations: list[Any]) -> list[Any]:
+def _service_executions(observations: list[ServicePrimingObservation]) -> list[ServiceRoundExecution]:
     """Convert real priming observations to the arithmetic compiler input."""
 
-    converted: list[Any] = []
+    converted: list[ServiceRoundExecution] = []
     for observation in observations:
-        required = (
-            "tier_id",
-            "active_population",
-            "elapsed_ns",
-            "service_interval_ms",
-            "geometry_id",
-            "completed_legal_parks",
-            "completed_model_rows",
-            "post_jit",
-            "continuously_loaded",
-            "dummy_run",
-            "is_profile",
-        )
-        if not all(hasattr(observation, name) for name in required):
-            return observations
         converted.append(
             ServiceRoundExecution(
                 tier_id=str(observation.tier_id),
@@ -164,7 +150,7 @@ def _service_executions(observations: list[Any]) -> list[Any]:
                 continuously_loaded=bool(observation.continuously_loaded),
                 dummy_run=bool(observation.dummy_run),
                 is_profile=bool(observation.is_profile),
-                scenario_id=str(getattr(observation, "scenario_id", "ordinary")),
+                scenario_id=str(observation.scenario_id),
             )
         )
     return converted
@@ -203,34 +189,15 @@ async def prepare_persistent_state_service(
         if runtime_config.admission_policy == "hard_cap":
             intervals = tuple(startup_provider.served_intervals_ms(model_config=engine_client.model_config))
             service.configure_bootstrap_intervals(intervals)
-            provisional_config = derive_admission_controller_config(
-                runtime_config,
-                supported_intervals_ms=intervals,
-            )
-            authority = derive_hard_cap_authority(
-                served_intervals_ms=intervals,
-                model_profile_id=str(inventory["profile_id"]),
-                execution_environment_key=str(inventory["execution_environment_key"]),
-                precision_policy=str(inventory["precision_policy"]),
-                schema_id=str(inventory["schema_id"]),
-                slot_bytes=int(inventory["slot_bytes"]),
-                stage=int(inventory.get("stage", 0)),
-                replica=int(inventory.get("replica", 0)),
-                physical_capacity=int(inventory["physical_capacity"]),
-                configured_limit=int(inventory["configured_limit"]),
-                effective_capacity=int(inventory["effective_capacity"]),
-                max_num_seqs=int(inventory["execution_claim_ceiling"]),
-                safety_reserve=int(inventory.get("safety_reserve", 0)),
-                controller_identity=repr(provisional_config),
+            hard_cap_capacity = min(
+                int(inventory["effective_capacity"]),
+                int(inventory["configured_limit"]),
+                int(inventory["execution_claim_ceiling"]),
             )
             admission_config = derive_admission_controller_config(
                 runtime_config,
                 supported_intervals_ms=intervals,
-                hard_cap_capacity=min(
-                    authority.effective_state_slots,
-                    authority.configured_resident_limit,
-                    authority.max_num_seqs,
-                ),
+                hard_cap_capacity=hard_cap_capacity,
             )
             authority = derive_hard_cap_authority(
                 served_intervals_ms=intervals,
@@ -260,8 +227,8 @@ async def prepare_persistent_state_service(
         )
         service.configure_bootstrap_intervals(plan.served_intervals_ms)
 
-        async def run_plan() -> list[Any]:
-            observations: list[Any] = []
+        async def run_plan() -> list[ServicePrimingObservation]:
+            observations: list[ServicePrimingObservation] = []
             for round_spec in plan.rounds:
 
                 async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:

@@ -18,7 +18,6 @@ _SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1_120)
 
 _SYMBOL_SPECS = {
     "OnePointServiceDemand": "PORT-STATE-025",
-    "PersistentStateAdmissionController": "PORT-STATE-025",
     "ServiceExecutionTier": "PORT-PERF-006",
     "ServiceProfileContext": "PORT-PERF-006",
     "ServiceRoundExecution": "PORT-PERF-006",
@@ -85,22 +84,6 @@ def _evaluate(**overrides: Any) -> Any:
     }
     values.update(overrides)
     return _symbol("evaluate_admission")(**values)
-
-
-def _controller(**overrides: Any) -> Any:
-    values: dict[str, Any] = {
-        "allocated_slots": 8,
-        "count_limit": 8,
-        "max_num_seqs": 8,
-        "service_budget": Fraction(1),
-        "demand_model": _symbol("OnePointServiceDemand")(
-            reference_interval_ms=320,
-            reference_demand=Fraction(1, 4),
-        ),
-        "transaction_duration_ms": lambda intervals: Fraction(40 * len(intervals)),
-    }
-    values.update(overrides)
-    return _symbol("PersistentStateAdmissionController")(**values)
 
 
 def test_logical_count_sizes_the_pool_downward_only() -> None:
@@ -872,36 +855,6 @@ def test_headroom_work_is_sublinear_in_capacity() -> None:
         "headroom may use fixed-cardinality arithmetic or logarithmic "
         "monotone search, never one evaluation/allocation per slot"
     )
-
-
-def test_execution_claim_and_demand_span_reserve_to_release() -> None:
-    """@spec PORT-STATE-004 / PORT-STATE-025: preconstruction and park stay charged."""
-
-    controller = _controller()
-    claim = controller.reserve("lease-a", service_interval_ms=320)
-
-    assert controller.snapshot.execution_claims == 1
-    assert controller.snapshot.charged_demand == Fraction(1, 4)
-    assert controller.snapshot.intervals_ms == (320,)
-    controller.park(claim)
-    assert controller.snapshot.execution_claims == 1
-    assert controller.snapshot.charged_demand == Fraction(1, 4)
-    controller.release(claim)
-    assert controller.snapshot.execution_claims == 0
-    assert controller.snapshot.charged_demand == Fraction(0)
-    assert controller.snapshot.intervals_ms == ()
-
-
-def test_duplicate_release_cannot_return_capacity_twice() -> None:
-    """@spec PORT-STATE-014 / PORT-STATE-025."""
-
-    controller = _controller()
-    claim = controller.reserve("lease-a", service_interval_ms=560)
-    controller.release(claim)
-    controller.release(claim)
-
-    assert controller.snapshot.execution_claims == 0
-    assert controller.snapshot.charged_demand == Fraction(0)
 
 
 def test_operator_count_never_enlarges_hard_headroom() -> None:

@@ -18,7 +18,10 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.persistent_state_capacity import FixedDispatchCapacity, HardCapDispatchCapacity
 
 StateLocation = Literal["resident", "offloaded", "absent"]
 
@@ -326,28 +329,20 @@ class PersistentStateService:
             jitter_secret=self._admission_jitter_secret,
         )
 
-    def _project_dispatch_capacity(self) -> Any:
-        controller = self._admission_controller
+    def _project_capacity(self) -> FixedDispatchCapacity | HardCapDispatchCapacity | None:
+        """Recompute the raw projection from current startup authority and charges."""
         inventory = self._inventory
         profile = self._compiled_service_profile
         authority = self._startup_authority
         admission_config = self._admission_config
-        if (
-            controller is None
-            or inventory is None
-            or (profile is None and authority is None)
-            or admission_config is None
-        ):
-            raise PersistentStateServiceUnavailable("persistent-state admission capacity is not installed")
-        from vllm_omni.engine.persistent_state_admission import (
-            AdmissionCapacity,
-        )
+        if inventory is None or (profile is None and authority is None) or admission_config is None:
+            return None
         from vllm_omni.engine.persistent_state_capacity import (
             project_fixed_dispatch_capacity,
         )
 
         if authority is not None:
-            projection = project_fixed_dispatch_capacity(
+            return project_fixed_dispatch_capacity(
                 startup_authority=authority,
                 state_resident=int(inventory["resident_count"]),
                 state_submitted=sum(self._submitted_interval_counts.values()),
@@ -355,15 +350,25 @@ class PersistentStateService:
                 execution_submitted=len(self._pending_service_intervals),
                 authority_open=self.ready,
             )
-        else:
-            projection = project_fixed_dispatch_capacity(
-                profile=profile,
-                inventory=inventory,
-                resident_counts_by_interval=self._resident_interval_counts,
-                submitted_counts_by_interval=self._submitted_interval_counts,
-                authority_open=self.ready,
-                admission_policy=admission_config.admission_policy,
-            )
+        return project_fixed_dispatch_capacity(
+            profile=profile,
+            inventory=inventory,
+            resident_counts_by_interval=self._resident_interval_counts,
+            submitted_counts_by_interval=self._submitted_interval_counts,
+            authority_open=self.ready,
+            admission_policy=admission_config.admission_policy,
+        )
+
+    def _project_dispatch_capacity(self) -> Any:
+        if self._admission_controller is None:
+            raise PersistentStateServiceUnavailable("persistent-state admission capacity is not installed")
+        projection = self._project_capacity()
+        if projection is None:
+            raise PersistentStateServiceUnavailable("persistent-state admission capacity is not installed")
+        from vllm_omni.engine.persistent_state_admission import (
+            AdmissionCapacity,
+        )
+
         return AdmissionCapacity(
             # One candidate per reactor turn makes every subsequent turn
             # re-read the just-installed provisional charge. J still bounds
@@ -375,34 +380,9 @@ class PersistentStateService:
         )
 
     def _candidate_supported(self, service_interval_ms: int) -> bool:
-        from vllm_omni.engine.persistent_state_capacity import (
-            project_fixed_dispatch_capacity,
-        )
-
-        inventory = self._inventory
-        profile = self._compiled_service_profile
-        authority = self._startup_authority
-        admission_config = self._admission_config
-        if inventory is None or (profile is None and authority is None) or admission_config is None:
+        projection = self._project_capacity()
+        if projection is None:
             return False
-        if authority is not None:
-            projection = project_fixed_dispatch_capacity(
-                startup_authority=authority,
-                state_resident=int(inventory["resident_count"]),
-                state_submitted=sum(self._submitted_interval_counts.values()),
-                execution_committed=len(self._service_intervals),
-                execution_submitted=len(self._pending_service_intervals),
-                authority_open=self.ready,
-            )
-        else:
-            projection = project_fixed_dispatch_capacity(
-                profile=profile,
-                inventory=inventory,
-                resident_counts_by_interval=self._resident_interval_counts,
-                submitted_counts_by_interval=self._submitted_interval_counts,
-                authority_open=self.ready,
-                admission_policy=admission_config.admission_policy,
-            )
         return bool(
             projection.candidate_supported_by_interval.get(
                 service_interval_ms,
@@ -797,28 +777,10 @@ class PersistentStateService:
         if controller is not None and admission_config is not None:
             from vllm_omni.engine.persistent_state_capacity import (
                 FixedDispatchCapacity,
-                project_fixed_dispatch_capacity,
             )
 
-            if authority is not None:
-                projection = project_fixed_dispatch_capacity(
-                    startup_authority=authority,
-                    state_resident=int(inventory["resident_count"]),
-                    state_submitted=sum(self._submitted_interval_counts.values()),
-                    execution_committed=len(self._service_intervals),
-                    execution_submitted=len(self._pending_service_intervals),
-                    authority_open=self.ready,
-                )
-            elif profile is not None:
-                projection = project_fixed_dispatch_capacity(
-                    profile=profile,
-                    inventory=inventory,
-                    resident_counts_by_interval=self._resident_interval_counts,
-                    submitted_counts_by_interval=self._submitted_interval_counts,
-                    authority_open=self.ready,
-                    admission_policy=admission_config.admission_policy,
-                )
-            else:
+            projection = self._project_capacity()
+            if projection is None:
                 raise PersistentStateServiceUnavailable("persistent-state startup authority is absent")
             inventory["execution_claims"] = projection.execution_claims
             if profile is not None:
@@ -1054,6 +1016,8 @@ class PersistentStateService:
         inventory = self._inventory
         if inventory is None:
             raise PersistentStateServiceUnavailable("persistent-state inventory is unavailable during release recovery")
+        if not self._failed_releases:
+            return
         bindings = {str(binding["binding_token"]): binding for binding in snapshot.get("bindings", ())}
         for token, command in tuple(self._failed_releases.items()):
             binding = bindings.get(token)
@@ -1086,9 +1050,10 @@ class PersistentStateService:
             self._failed_releases.pop(token, None)
             self._live_leases.pop(token, None)
             self._release_resident_interval(token)
-            snapshot["bindings"] = [
-                candidate for candidate in snapshot.get("bindings", ()) if str(candidate["binding_token"]) != token
-            ]
+            bindings.pop(token, None)
+        snapshot["bindings"] = [
+            candidate for candidate in snapshot.get("bindings", ()) if str(candidate["binding_token"]) in bindings
+        ]
 
     def _ensure_dispatcher(self) -> None:
         if self._dispatcher_task is None or self._dispatcher_task.done():

@@ -40,6 +40,8 @@ from vllm_omni.metrics.streaming_transport import (
 from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import (
     AcceptedAudioAuthority,
     AcceptedPiece,
+    FinalizationReceipt,
+    ReadyAudioUnit,
 )
 from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
     validate_prompt_dictionary,
@@ -908,7 +910,6 @@ class NemotronRealtimeSession:
 
     def accept_audio(self, samples: Any) -> AcceptedPiece:
         """Atomically accept one whole application-audio piece."""
-        prior_sequences = {unit.logical_sequence for unit in self._accepted_audio.ready_units}
         try:
             # Measured at the call site rather than inside the authority:
             # the span then includes any wait for the authority's lock,
@@ -925,7 +926,7 @@ class NemotronRealtimeSession:
                 cadence_ms=cadence_ms_label(self._geometry.cadence),
                 seconds=accepted.samples_accepted / _SAMPLE_RATE_HZ,
             )
-            self._observe_new_ready_units(prior_sequences)
+            self._observe_ready_units(accepted.newly_ready_units)
         return accepted
 
     def force_segment(self) -> None:
@@ -934,20 +935,19 @@ class NemotronRealtimeSession:
             raise ValueError("endpointing controls are not configured")
         self._accepted_audio.force_segment()
 
-    def begin_finalize(self, *, finalize_at_ns: int | None = None) -> None:
+    def begin_finalize(self, *, finalize_at_ns: int | None = None) -> FinalizationReceipt:
         """Close audio acceptance and queue exactly one final tail."""
-        if self._accepted_audio.snapshot().finalizing:
-            return
-        prior_sequences = {unit.logical_sequence for unit in self._accepted_audio.ready_units}
-        self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
-        if self._observer is not None:
-            self._observe_new_ready_units(prior_sequences)
+        receipt = self._accepted_audio.begin_finalize(finalize_at_ns=finalize_at_ns)
+        if self._observer is not None and receipt.newly_created:
+            assert receipt.unit is not None
+            self._observe_ready_units((receipt.unit,))
+        return receipt
 
-    def _observe_new_ready_units(self, prior_sequences: set[int]) -> None:
+    def _observe_ready_units(self, units: tuple[ReadyAudioUnit, ...]) -> None:
         """Publish newly ready carrier units from the state authority."""
         assert self._observer is not None
-        for unit in self._accepted_audio.ready_units:
-            if unit.logical_sequence in prior_sequences or unit.kind == "forced_eou":
+        for unit in units:
+            if unit.kind == "forced_eou":
                 continue
             handle = observe_safely(
                 self._observer.unit_ready,

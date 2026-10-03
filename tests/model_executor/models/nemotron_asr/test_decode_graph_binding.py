@@ -193,6 +193,75 @@ def test_runtime_pads_with_zero_lengths_and_returns_only_live_rows() -> None:
 
 
 # @spec PORT-PERF-004
+@torch.inference_mode()
+@pytest.mark.parametrize("captured", [True, False])
+def test_staging_resets_poisoned_padding_when_live_population_changes(captured: bool) -> None:
+    calls, decode = _decode_calls()
+    binding = DenseGraphBinding(
+        decode_fn=decode,
+        predictor=object(),
+        joint=object(),
+        vllm_config=object(),
+        frame_widths=(2,),
+        tiers=(4,),
+        encoder_hidden=3,
+        predictor_layers=2,
+        predictor_hidden=5,
+        blank_id=7,
+        runtime=_runtime(),
+    )
+    binding.warmup(torch.device("cpu"), torch.float32)
+    bound_decode = (
+        binding.decode_fn(geometry=0, tier=4) if captured else binding.uncaptured_decode_fn(geometry=0, tier=4)
+    )
+    entry = binding._entries[(0, 4)]
+    for step, live in enumerate((3, 1, 2, 4, 3)):
+        # Poison the whole workspace, including rows that change ownership
+        # between successive live populations.
+        entry.enc_frames.fill_(float("nan"))
+        entry.enc_lengths.fill_(99)
+        entry.h.fill_(float("nan"))
+        entry.c.fill_(float("nan"))
+        entry.last_label.fill_(999999)
+        frames = torch.arange(live * 6, dtype=torch.float32).reshape(live, 2, 3) + step
+        lengths = torch.arange(live, dtype=torch.int64) % 2 + 1
+        state = DecodeState(
+            h=torch.arange(2 * live * 5, dtype=torch.float32).reshape(2, live, 5) + step,
+            c=torch.arange(2 * live * 5, dtype=torch.float32).reshape(2, live, 5) - step,
+            last_label=torch.arange(live, dtype=torch.int64) + step,
+        )
+        result = bound_decode(frames, lengths, object(), object(), state)
+
+        for staged, supplied in (
+            (entry.enc_frames[:live], frames),
+            (entry.enc_lengths[:live], lengths),
+            (entry.h[:, :live], state.h),
+            (entry.c[:, :live], state.c),
+            (entry.last_label[:live], state.last_label),
+        ):
+            torch.testing.assert_close(staged, supplied, atol=0, rtol=0)
+        for padding in (entry.enc_frames[live:], entry.enc_lengths[live:], entry.h[:, live:], entry.c[:, live:]):
+            assert torch.count_nonzero(padding) == 0
+        assert torch.all(entry.last_label[live:] == 7)
+        assert calls[-1].tolist() == lengths.tolist() + [0] * (4 - live)
+        torch.testing.assert_close(result.state.h, state.h + 1, atol=0, rtol=0)
+        torch.testing.assert_close(result.state.c, state.c + 2, atol=0, rtol=0)
+        torch.testing.assert_close(result.state.last_label, state.last_label + 3, atol=0, rtol=0)
+        for output, storage, expected_shape in (
+            (result.token_ids, entry.token_ids, (live, 20)),
+            (result.token_lengths, entry.token_lengths, (live,)),
+            (result.state.h, entry.out_h, (2, live, 5)),
+            (result.state.c, entry.out_c, (2, live, 5)),
+            (result.state.last_label, entry.out_last_label, (live,)),
+            (result.frame_emission_counts, entry.frame_emission_counts, (live, 2)),
+            (result.frame_final_labels, entry.frame_final_labels, (live, 2)),
+        ):
+            assert output.shape == expected_shape
+            assert output.data_ptr() == storage.data_ptr()
+            assert output.stride() == storage.stride()
+
+
+# @spec PORT-PERF-004
 def test_capture_failure_fails_startup_without_eager_fallback() -> None:
     _, decode = _decode_calls()
     binding = DenseGraphBinding(

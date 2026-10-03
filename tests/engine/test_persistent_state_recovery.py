@@ -386,6 +386,127 @@ def test_service_projection_exports_the_exact_installed_derating() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("hard_cap", [False, True])
+def test_capacity_consumers_recompute_current_authority(hard_cap: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """@spec PORT-STATE-027 / PORT-OBS-012: each consumer sees current charges."""
+    from vllm_omni.engine import persistent_state_capacity as capacity
+
+    service = _recovering_service(_RecoveryStage(), _Clock())
+    service._inventory = dict(_SNAPSHOT_BASE)
+    if hard_cap:
+        service._startup_authority = capacity.HardCapAuthority(
+            served_intervals_ms=tuple(service._resident_interval_counts),
+            effective_state_slots=4,
+            configured_resident_limit=4,
+            max_num_seqs=4,
+            model_profile_id="profile-a",
+            service_profile_identity=None,
+            execution_environment_key="env-a",
+            precision_policy="fp32",
+        )
+    else:
+        service._compiled_service_profile = _compiled_admission_profile()
+    service._engine_epoch = "epoch-a"
+    service._install_admission_controller()
+    metrics: list[dict[str, Any]] = []
+    service._metrics_sink = SimpleNamespace(
+        observe_persistent_state_capacity=lambda *args, **kwargs: metrics.append(kwargs),
+        observe_persistent_state_slots=lambda *args: None,
+    )
+    project = capacity.project_fixed_dispatch_capacity
+    calls: list[dict[str, Any]] = []
+
+    def counted_project(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return project(**kwargs)
+
+    monkeypatch.setattr(capacity, "project_fixed_dispatch_capacity", counted_project)
+    for resident, submitted, committed, pending, ready in (
+        (0, 0, 0, 0, True),
+        (1, 0, 1, 0, True),
+        (1, 1, 1, 1, True),
+        (1, 1, 0, 1, False),
+        (0, 0, 0, 0, True),
+    ):
+        service._inventory["resident_count"] = resident
+        service._resident_interval_counts[1120] = resident
+        service._submitted_interval_counts[1120] = submitted
+        service._service_intervals = {str(i): 1120 for i in range(committed)}
+        service._pending_service_intervals = {str(i): 1120 for i in range(pending)}
+        service._ready = service._admission_open = ready
+        expected = (
+            project(
+                startup_authority=service._startup_authority,
+                state_resident=resident,
+                state_submitted=submitted,
+                execution_committed=committed,
+                execution_submitted=pending,
+                authority_open=ready,
+            )
+            if hard_cap
+            else project(
+                profile=service._compiled_service_profile,
+                inventory=service._inventory,
+                resident_counts_by_interval=service._resident_interval_counts,
+                submitted_counts_by_interval=service._submitted_interval_counts,
+                authority_open=ready,
+                admission_policy="profile",
+            )
+        )
+        previous_calls = len(calls)
+        assert service._project_capacity() == expected
+        dispatch = service._project_dispatch_capacity()
+        assert dispatch.hard_headroom == min(expected.hard_headroom, 1)
+        assert dispatch.dispatchable_headroom_by_interval == expected.dispatchable_by_interval
+        assert dispatch.authority == ("OPEN" if ready else "UNHANDSHAKED")
+        assert service._candidate_supported(1120) == expected.candidate_supported_by_interval[1120]
+        service._sync_service_projection()
+        assert len(calls) == previous_calls + 4
+        assert metrics[-1]["execution_claims"] == expected.execution_claims
+        assert metrics[-1]["headroom_by_cadence"]["1120"]["hard"] == expected.hard_headroom
+        if hard_cap:
+            assert "charged_demand" not in service._inventory
+            assert metrics[-1]["charged_demand"] is None
+            assert service._inventory["service_profile_identity"] is None
+            assert "nominal" not in metrics[-1]["headroom_by_cadence"]["1120"]
+        else:
+            assert isinstance(expected, capacity.FixedDispatchCapacity)
+            assert service._inventory["charged_demand"] == expected.charged_units / expected.service_budget_units
+            assert (
+                metrics[-1]["headroom_by_cadence"]["1120"]["nominal"] == expected.nominal_dispatchable_by_interval[1120]
+            )
+    if hard_cap:
+        service._compiled_service_profile = _compiled_admission_profile()
+        with pytest.raises(RuntimeError, match="profile authority produced hard-cap projection"):
+            service._sync_service_projection()
+    service.shutdown()
+
+
+@pytest.mark.parametrize("missing", range(1, 16))
+def test_capacity_consumers_keep_missing_authority_policies(missing: int) -> None:
+    """@spec PORT-STATE-027: incomplete startup keeps each caller's policy."""
+    service = _recovering_service(_RecoveryStage(), _Clock())
+    service._inventory = None if missing & 1 else dict(_SNAPSHOT_BASE)
+    service._compiled_service_profile = _compiled_admission_profile()
+    service._engine_epoch = "epoch-a"
+    service._install_admission_controller()
+    if missing & 2:
+        service._compiled_service_profile = None
+    if missing & 4:
+        service._admission_config = None
+    if missing & 8:
+        service._admission_controller = None
+    with pytest.raises(PersistentStateServiceUnavailable, match="admission capacity is not installed"):
+        service._project_dispatch_capacity()
+    assert service._candidate_supported(1120) == (not bool(missing & 7))
+    if missing & 2 and not missing & 13:
+        with pytest.raises(PersistentStateServiceUnavailable, match="startup authority is absent"):
+            service._sync_service_projection()
+    else:
+        service._sync_service_projection()
+    service.shutdown()
+
+
 def test_hard_cap_service_seals_static_authority_without_profile() -> None:
     """@spec PORT-STATE-026/027 / PORT-OBS-012: no profile or bypass."""
 
@@ -1340,6 +1461,112 @@ def test_failed_release_stays_charged_and_exact_retries_after_terminality() -> N
         assert service.inventory["resident_count"] == 0
         assert service.inventory["execution_claims"] == 0
         assert service.inventory["charged_demand"] == 0
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("container", (None, list, tuple))
+def test_no_failed_releases_preserves_snapshot_bindings(container: Any) -> None:
+    """@spec PORT-STATE-022/023: ordinary handshakes do no release-recovery work."""
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _service(stage, _Clock())
+        service._inventory = dict(_SNAPSHOT_BASE)
+        bindings = None if container is None else container(({},))
+        snapshot = {} if container is None else {"bindings": bindings}
+        await service._reconcile_failed_releases(snapshot)
+        assert stage.release_calls == []
+        assert ("bindings" in snapshot) == (container is not None)
+        if container is not None:
+            assert snapshot["bindings"] is bindings
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", (None, "failure", "cancel"))
+def test_multiple_recovered_releases_preserve_survivors_and_resume_after_interruption(
+    interruption: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec PORT-STATE-014/022/023: exact retries free each retained lease once."""
+    from vllm_omni.engine.persistent_state_service import _ReleaseCommand
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        stage.snapshot_overrides.update(configured_limit=4, effective_capacity=4)
+        service = _service(stage, _Clock())
+        await _open_service(service)
+        leases = [await _reserve_with_interval(service, index) for index in range(1, 4)]
+        bindings = [dict(service._lease_payload(lease), terminal=True, claim_expires_at=0.0) for lease in leases]
+        orphan = dict(bindings[0], binding_token="orphan", session_key="lost")
+        stage.bindings = [bindings[2], bindings[1], orphan, bindings[0], bindings[2]]
+        stage.resident += 1
+        for index, lease in enumerate(leases[:2], 1):
+            service._mark_failed_release_interval(lease.binding_token)
+            service._failed_releases[lease.binding_token] = _ReleaseCommand(
+                operation_id=f"retry-{index}",
+                lease=lease,
+                reason="client_disconnect",
+                future=asyncio.get_running_loop().create_future(),
+            )
+        service.close_admission()
+        snapshot = stage._snapshot()
+        service._inventory = dict(snapshot)
+        utility = stage.call_utility_async
+        interrupted = False
+
+        async def interrupt_once(name: str, *args: Any) -> dict[str, Any]:
+            nonlocal interrupted
+            if (
+                interruption is not None
+                and not interrupted
+                and name == "persistent_state_release"
+                and args[0] == "retry-2"
+            ):
+                interrupted = True
+                if interruption == "cancel":
+                    stage.release_operation_ids.append(str(args[0]))
+                    stage.release_calls.append((str(args[2]), dict(args[1])))
+                    raise asyncio.CancelledError
+                stage.release_failures_remaining = 1
+            return await utility(name, *args)
+
+        monkeypatch.setattr(stage, "call_utility_async", interrupt_once)
+        if interruption is None:
+            await service._reconcile_failed_releases(snapshot)
+            assert snapshot["bindings"] == [bindings[2], orphan, bindings[2]]
+            await service._reconcile_orphan_bindings(snapshot)
+            expected_ids = ["retry-1", "retry-2", "orphan-orphan"]
+        else:
+            error = asyncio.CancelledError if interruption == "cancel" else PersistentStateServiceUnavailable
+            with pytest.raises(error):
+                await service._reconcile_failed_releases(snapshot)
+            assert list(service._failed_releases) == [leases[1].binding_token]
+            assert leases[0].binding_token not in service._live_leases
+            assert service._resident_interval_counts[560] == 2
+            assert service._failed_release_interval_counts[560] == 1
+            assert service._inventory["resident_count"] == 3
+            assert not service.ready
+            await service._perform_handshake(open_admission=True)
+            assert service.ready
+            expected_ids = ["retry-1", "retry-2", "retry-2", "orphan-orphan"]
+        assert stage.release_operation_ids == expected_ids
+        assert [reason for reason, _ in stage.release_calls] == [
+            *("client_disconnect" for _ in expected_ids[:-1]),
+            "orphan_reconciliation",
+        ]
+        assert stage.resident == 1
+        assert stage.bindings == [bindings[2], bindings[2]]
+        assert list(service._live_leases) == [leases[2].binding_token]
+        assert not service._failed_releases
+        assert service._failed_release_interval_counts[560] == 0
+        assert service._resident_interval_counts[560] == 1
+        assert service._inventory["execution_claims"] == 1
+        assert service._inventory["resident_count"] == 1
+        assert service._operations["retry-1"].result().operation_id == "retry-1"
+        assert service._operations["retry-2"].result().operation_id == "retry-2"
         service.shutdown()
 
     asyncio.run(scenario())

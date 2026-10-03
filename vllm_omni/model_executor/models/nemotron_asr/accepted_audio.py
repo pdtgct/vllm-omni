@@ -22,6 +22,7 @@ class AcceptedPiece:
     """Acknowledgement for one atomically accepted caller piece."""
 
     samples_accepted: int
+    newly_ready_units: tuple[ReadyAudioUnit, ...]
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,14 @@ class ReadyAudioUnit:
     @property
     def sample_count(self) -> int:
         return int(self.samples.shape[0])
+
+
+@dataclass(frozen=True)
+class FinalizationReceipt:
+    """The authoritative outstanding final tail and its creation transition."""
+
+    unit: ReadyAudioUnit | None
+    newly_created: bool
 
 
 @dataclass(frozen=True)
@@ -149,9 +158,8 @@ class AcceptedAudioAuthority:
             return self._eligibility_ns(self._ready[0])
 
     def _outstanding_samples(self) -> int:
-        ready = sum(unit.sample_count for unit in self._ready)
-        in_flight = 0 if self._in_flight is None else self._in_flight.sample_count
-        return self._residual_samples + ready + in_flight
+        """Return conserved sample credit while the caller holds the lock."""
+        return self._accepted_samples - self._parked_samples - self._cleared_samples
 
     def _new_unit(
         self,
@@ -231,17 +239,21 @@ class AcceptedAudioAuthority:
             self._pieces.append(owned)
             self._residual_samples += sample_count
             self._accepted_samples += sample_count
+            newly_ready_units: list[ReadyAudioUnit] = []
             while self._residual_samples >= self.chunk_samples:
                 chunk = self._take_samples(self.chunk_samples)
-                self._ready.append(
-                    self._new_unit(
-                        "regular",
-                        chunk,
-                        ready_at_ns,
-                        admission_ms_mod,
-                    )
+                unit = self._new_unit(
+                    "regular",
+                    chunk,
+                    ready_at_ns,
+                    admission_ms_mod,
                 )
-            return AcceptedPiece(samples_accepted=sample_count)
+                self._ready.append(unit)
+                newly_ready_units.append(unit)
+            return AcceptedPiece(
+                samples_accepted=sample_count,
+                newly_ready_units=tuple(newly_ready_units),
+            )
 
     # @spec PORT-SEG-004, PORT-SESS-014
     def force_segment(self) -> None:
@@ -279,25 +291,23 @@ class AcceptedAudioAuthority:
         *,
         finalize_at_ns: int | None = None,
         admission_ms_mod: int | None = None,
-    ) -> None:
+    ) -> FinalizationReceipt:
         ready_at_ns = time.monotonic_ns() if finalize_at_ns is None else finalize_at_ns
         if admission_ms_mod is None:
             admission_ms_mod = int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS
         with self._lock:
+            if self._finalizing:
+                if self._ready:
+                    return FinalizationReceipt(self._ready[-1], False)
+                unit = self._in_flight
+                return FinalizationReceipt(unit if unit is not None and unit.kind == "final_tail" else None, False)
             if self._cleared:
                 raise ValueError("session is cleared")
-            if self._finalizing:
-                return
             self._finalizing = True
             tail = self._take_samples(self._residual_samples)
-            self._ready.append(
-                self._new_unit(
-                    "final_tail",
-                    tail,
-                    ready_at_ns,
-                    admission_ms_mod,
-                )
-            )
+            unit = self._new_unit("final_tail", tail, ready_at_ns, admission_ms_mod)
+            self._ready.append(unit)
+            return FinalizationReceipt(unit, True)
 
     # @spec PORT-SESS-001, PORT-SESS-013
     def dispatch_next(self, *, now_ns: int | None = None) -> ReadyAudioUnit | None:
