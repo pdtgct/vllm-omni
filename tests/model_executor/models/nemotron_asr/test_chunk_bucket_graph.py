@@ -85,6 +85,14 @@ def test_exact_encoder_population_keeps_split_decoder_padding_and_retained_outpu
         result = eager_decode(frames, lengths, predictor, joint, decoder_state)
         entry = candidate_decoder._entries[(1, tier)]
         decoder_populations.append(int(entry.enc_frames.shape[0]))
+        for staged, supplied in (
+            (entry.enc_frames[:population], frames),
+            (entry.enc_lengths[:population], lengths),
+            (entry.h[:, :population], decoder_state.h),
+            (entry.c[:, :population], decoder_state.c),
+            (entry.last_label[:population], decoder_state.last_label),
+        ):
+            torch.testing.assert_close(staged, supplied, atol=0, rtol=0)
         assert torch.count_nonzero(entry.enc_lengths[population:]) == 0
         assert torch.count_nonzero(entry.enc_frames[population:]) == 0
         assert torch.count_nonzero(entry.h[:, population:]) == 0
