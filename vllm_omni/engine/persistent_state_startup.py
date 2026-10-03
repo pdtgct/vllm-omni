@@ -203,34 +203,15 @@ async def prepare_persistent_state_service(
         if runtime_config.admission_policy == "hard_cap":
             intervals = tuple(startup_provider.served_intervals_ms(model_config=engine_client.model_config))
             service.configure_bootstrap_intervals(intervals)
-            provisional_config = derive_admission_controller_config(
-                runtime_config,
-                supported_intervals_ms=intervals,
-            )
-            authority = derive_hard_cap_authority(
-                served_intervals_ms=intervals,
-                model_profile_id=str(inventory["profile_id"]),
-                execution_environment_key=str(inventory["execution_environment_key"]),
-                precision_policy=str(inventory["precision_policy"]),
-                schema_id=str(inventory["schema_id"]),
-                slot_bytes=int(inventory["slot_bytes"]),
-                stage=int(inventory.get("stage", 0)),
-                replica=int(inventory.get("replica", 0)),
-                physical_capacity=int(inventory["physical_capacity"]),
-                configured_limit=int(inventory["configured_limit"]),
-                effective_capacity=int(inventory["effective_capacity"]),
-                max_num_seqs=int(inventory["execution_claim_ceiling"]),
-                safety_reserve=int(inventory.get("safety_reserve", 0)),
-                controller_identity=repr(provisional_config),
+            hard_cap_capacity = min(
+                int(inventory["effective_capacity"]),
+                int(inventory["configured_limit"]),
+                int(inventory["execution_claim_ceiling"]),
             )
             admission_config = derive_admission_controller_config(
                 runtime_config,
                 supported_intervals_ms=intervals,
-                hard_cap_capacity=min(
-                    authority.effective_state_slots,
-                    authority.configured_resident_limit,
-                    authority.max_num_seqs,
-                ),
+                hard_cap_capacity=hard_cap_capacity,
             )
             authority = derive_hard_cap_authority(
                 served_intervals_ms=intervals,

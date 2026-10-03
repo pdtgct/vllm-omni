@@ -464,8 +464,15 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize(
+    "effective,configured,execution",
+    [(2, 4, 8), (4, 2, 8), (4, 4, 2), (1, 1, 1)],
+)
 async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     monkeypatch: pytest.MonkeyPatch,
+    effective: int,
+    configured: int,
+    execution: int,
 ) -> None:
     """@spec ENV-MIG-012 / PORT-PERF-005/006 / PORT-INT-013."""
     module = _startup_module()
@@ -496,6 +503,29 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     runtime.bootstrap_operation_budget = 0
     runtime.service_profile_identity = None
     runtime.profile_status = "not_measured"
+    inventory = _startup_inventory()
+    inventory.update(effective_capacity=effective, configured_limit=configured, execution_claim_ceiling=execution)
+    expected_config = module.derive_admission_controller_config(
+        runtime,
+        supported_intervals_ms=(80, 320, 560, 1_120),
+        hard_cap_capacity=min(effective, configured, execution),
+    )
+    expected_authority = module.derive_hard_cap_authority(
+        served_intervals_ms=(80, 320, 560, 1_120),
+        model_profile_id="profile-a",
+        execution_environment_key="env-a",
+        precision_policy="torch.float32",
+        schema_id="schema-a",
+        slot_bytes=6_314_936,
+        stage=0,
+        replica=0,
+        physical_capacity=5,
+        configured_limit=configured,
+        effective_capacity=effective,
+        max_num_seqs=execution,
+        safety_reserve=0,
+        controller_identity=repr(expected_config),
+    )
 
     class _HardCapProvider:
         def served_intervals_ms(self, *, model_config: Any) -> tuple[int, ...]:
@@ -516,7 +546,7 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
 
         async def bootstrap_handshake(self) -> dict[str, Any]:
             events.append("handshake")
-            return _startup_inventory()
+            return inventory
 
         def configure_bootstrap_intervals(self, intervals_ms: tuple[int, ...]) -> None:
             assert intervals_ms == (80, 320, 560, 1_120)
@@ -528,11 +558,10 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
             admission_config: Any,
             authority: Any,
         ) -> None:
-            assert admission_config == "hard-controller"
-            assert authority.policy == "hard_cap"
-            assert authority.service_profile_identity is None
-            assert authority.model_profile_id == "profile-a"
-            assert authority.served_intervals_ms == (80, 320, 560, 1_120)
+            assert admission_config == expected_config
+            assert authority == expected_authority
+            assert authority.controller_identity == repr(expected_config)
+            assert authority.hard_cap_envelope_sha256 == expected_authority.hard_cap_envelope_sha256
             events.append("seal-hard")
             self.ready = True
 
@@ -547,15 +576,17 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
     monkeypatch.setattr(module, "PersistentStateService", _Service)
     monkeypatch.setattr(module, "run_service_priming_round", forbidden)
     monkeypatch.setattr(module, "compile_provisional_service_profile", forbidden)
+    derive_config = module.derive_admission_controller_config
+    derive_authority = module.derive_hard_cap_authority
+
+    def derive_once(function: Any, *args: Any, **kwargs: Any) -> Any:
+        events.append(function.__name__)
+        return function(*args, **kwargs)
+
     monkeypatch.setattr(
-        module,
-        "derive_admission_controller_config",
-        lambda value, **kwargs: (
-            "hard-controller"
-            if value is runtime and kwargs["supported_intervals_ms"] == (80, 320, 560, 1_120)
-            else _fail("PORT-STATE-027 hard-cap controller authority mismatch")
-        ),
+        module, "derive_admission_controller_config", lambda *a, **k: derive_once(derive_config, *a, **k)
     )
+    monkeypatch.setattr(module, "derive_hard_cap_authority", lambda **k: derive_once(derive_authority, **k))
 
     service = await prepare(
         engine_client=engine,
@@ -571,8 +602,49 @@ async def test_hard_cap_preparation_attests_and_seals_without_profile_work(
         "handshake",
         "intervals",
         "configure",
+        "derive_admission_controller_config",
+        "derive_hard_cap_authority",
         "seal-hard",
     ]
+
+
+@pytest.mark.asyncio  # type: ignore[untyped-decorator]
+@pytest.mark.parametrize("field", ("effective_capacity", "configured_limit", "execution_claim_ceiling"))
+@pytest.mark.parametrize("value", (0, -1, "invalid"))
+async def test_hard_cap_preparation_rejects_invalid_capacity_before_sealing(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    """@spec PORT-STATE-027 / PORT-INT-013: invalid capacity shuts startup down."""
+    module = _startup_module()
+    runtime = _runtime()
+    runtime.admission_policy = "hard_cap"
+    inventory = _startup_inventory()
+    inventory[field] = value
+    events: list[str] = []
+
+    class _Service:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def bootstrap_handshake(self) -> dict[str, Any]:
+            return inventory
+
+        def configure_bootstrap_intervals(self, intervals: tuple[int, ...]) -> None:
+            events.append("configure")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    monkeypatch.setattr(module, "PersistentStateService", _Service)
+    with pytest.raises(ValueError):
+        await module.prepare_persistent_state_service(
+            engine_client=SimpleNamespace(model_config=object()),
+            stage_client="stage",
+            runtime_config=runtime,
+            startup_provider=SimpleNamespace(served_intervals_ms=lambda **kwargs: (80, 320, 560, 1_120)),
+            host_fatal_callback=lambda error: None,
+        )
+    assert events == ["configure", "shutdown"]
 
 
 def test_nemotron_provider_resolves_hard_cap_intervals_without_a_priming_plan() -> None:
