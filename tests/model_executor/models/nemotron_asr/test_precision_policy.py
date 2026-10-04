@@ -82,9 +82,13 @@ def test_engine_dtype_conflict_fails_fast_naming_policy():
     FP32_BRINGUP.assert_engine_dtype(torch.float32)
 
 
-def test_encoder_compute_default_preserves_existing_policy_identifiers():
+@pytest.mark.parametrize("selection", [None, "float32"])
+def test_encoder_compute_default_preserves_existing_policy_identifiers(selection):
+    """@spec PORT-PREC-009, PORT-PREC-013: defaults retain the exact bring-up identity."""
     assert precision.resolve_precision_policy(SimpleNamespace()) is FP32_BRINGUP
-    assert precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=None)) is FP32_BRINGUP
+    resolved = precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=selection))
+    assert resolved is FP32_BRINGUP
+    assert resolved.identifier == "pp-d479361445b4"
     assert FP32_BRINGUP.dtype_for("encoder_compute") == torch.float32
     assert precision.BF16_COMPUTE.dtype_for("encoder_compute") == torch.bfloat16
     assert precision.BF16_COMPUTE.content_hash == (
@@ -93,18 +97,40 @@ def test_encoder_compute_default_preserves_existing_policy_identifiers():
 
 
 def test_encoder_fp16_policy_keeps_all_other_classes_fp32():
-    policy = precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype="fp16"))
+    """@spec PORT-PREC-010: only the encoder axis changes; engine stays FP32."""
+    policy = precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype="float16"))
     assert policy.dtype_for("encoder_compute") == torch.float16
     for tensor_class in precision.TENSOR_CLASSES:
         if tensor_class != "encoder_compute":
             assert policy.dtype_for(tensor_class) == torch.float32
     assert policy.identifier != FP32_BRINGUP.identifier
     policy.assert_engine_dtype(torch.float32)
-    with pytest.raises(ValueError, match="engine dtype"):
-        policy.assert_engine_dtype(torch.float16)
+    for engine_dtype in (torch.float16, torch.bfloat16):
+        with pytest.raises(ValueError, match="PrecisionPolicy"):
+            policy.assert_engine_dtype(engine_dtype)
 
 
-@pytest.mark.parametrize("selection", ["fp32", "bf16", "float16", "", True, 16])
+@pytest.mark.parametrize("selection", ["fp32", "fp16", "bf16", "bfloat16", "FLOAT16", " float16", "", True, 16])
 def test_encoder_compute_rejects_invalid_selection(selection):
-    with pytest.raises(ValueError, match="experimental_encoder_compute_dtype"):
+    """@spec PORT-PREC-009: invalid values fail without aliases or coercion."""
+    with pytest.raises(ValueError, match="experimental_encoder_compute_dtype") as error:
         precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=selection))
+    message = str(error.value)
+    assert "float32" in message and "float16" in message
+    assert "None" in message or "null" in message
+
+
+def test_encoder_selector_is_read_once():
+    """@spec PORT-PREC-009: resolution reads the effective selector once."""
+
+    class EffectiveConfig:
+        reads = 0
+
+        @property
+        def experimental_encoder_compute_dtype(self):
+            self.reads += 1
+            return "float16"
+
+    config = EffectiveConfig()
+    assert precision.resolve_precision_policy(config).dtype_for("encoder_compute") == torch.float16
+    assert config.reads == 1

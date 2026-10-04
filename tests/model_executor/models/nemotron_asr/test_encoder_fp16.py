@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _core():
     torch.manual_seed(31)
-    policy = resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype="fp16"))
+    policy = resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype="float16"))
     return SimpleNamespace(
         policy=policy,
         encoder=FastConformerEncoder(
@@ -43,6 +43,7 @@ def _core():
 @pytest.mark.parametrize("equivalent_policy", [False, True])
 @torch.inference_mode()
 def test_fp16_encoder_retains_fp32_boundary_and_cache_history(equivalent_policy):
+    """@spec PORT-PREC-011, PORT-PREC-012: FP32 history and language boundary survive FP16."""
     core = _core()
     if equivalent_policy:
         core.policy = PrecisionPolicy({"*": "fp32", "encoder_compute": "fp16"})
@@ -82,6 +83,7 @@ def test_fp16_encoder_retains_fp32_boundary_and_cache_history(equivalent_policy)
 
 
 def test_mixed_encoder_lid_dtypes_bind_compiler_model_identity():
+    """@spec PORT-PREC-013: compiler identity binds component parameter dtypes."""
     core = _core()
     assert _compiled_transition_runner_device(core, activation_dtype=torch.float16) == torch.device("cpu")
     before = _compiled_transition_model_state(core)
@@ -93,15 +95,16 @@ def test_mixed_encoder_lid_dtypes_bind_compiler_model_identity():
         _compiled_transition_runner_device(core, activation_dtype=torch.float16)
 
 
-@pytest.mark.parametrize("selection", [None, "fp16", "bf16"])
+@pytest.mark.parametrize("selection", [None, "float32", "float16", "legacy_bf16_policy"])
 def test_apply_policy_dtypes_preserves_module_boundaries(selection):
+    """@spec PORT-PREC-010: frontend, conditioner and decoder retain their policy."""
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import apply_policy_dtypes
     from vllm_omni.model_executor.models.nemotron_asr.precision import BF16_COMPUTE
 
     core = _core()
     core.policy = (
         BF16_COMPUTE
-        if selection == "bf16"
+        if selection == "legacy_bf16_policy"
         else resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=selection))
     )
     core.encoder.float()
@@ -116,6 +119,7 @@ def test_apply_policy_dtypes_preserves_module_boundaries(selection):
 
 
 def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32():
+    """@spec PORT-PREC-017: FP32 source tensors survive encoder load conversion."""
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
 
     tiny = _core()
@@ -125,9 +129,13 @@ def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32():
     torch.nn.Module.__init__(model)
     model.core = core
     model._encoder_execution = SimpleNamespace(_model_state=None)
-    weights = [(name, torch.ones_like(value, dtype=torch.float32)) for name, value in core.state_dict().items()]
+    weights = [(name, torch.full_like(value, 1.0001, dtype=torch.float32)) for name, value in core.state_dict().items()]
+    source_snapshots = {name: value.clone() for name, value in weights}
     model.load_weights(weights)
     assert {p.dtype for p in core.encoder.parameters()} == {torch.float16}
     assert {p.dtype for p in core.lid.parameters()} == {torch.float32}
-    for parameter in core.parameters():
-        assert torch.equal(parameter, torch.ones_like(parameter))
+    for name, source in weights:
+        assert source.dtype == torch.float32
+        torch.testing.assert_close(source, source_snapshots[name], rtol=0, atol=0)
+        target = core.state_dict()[name]
+        torch.testing.assert_close(target, source.to(target.dtype), rtol=0, atol=0)
