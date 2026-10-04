@@ -74,6 +74,7 @@ from vllm_omni.model_executor.models.nemotron_asr.plan import (
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+    resolve_precision_policy,
 )
 from vllm_omni.model_executor.models.nemotron_asr.processor import (
     NemotronASRDummyInputsBuilder,
@@ -207,8 +208,9 @@ class NemotronASRCore(nn.Module):
 def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
     """Cast compute modules to the policy's weight dtype (PORT-PREC-001).
 
-    Encoder, LID, predictor, and joint move to ``dtype_for("weights")``;
-    activations follow at the module entry seams, so this realization
+    LID, predictor, and joint move to ``dtype_for("weights")``; the
+    encoder uses the separately declared ``encoder_compute`` override.
+    Activations follow at the module entry seams, so this realization
     requires the two classes to agree. The mel front-end stays fp32 —
     it sits upstream of the activations seam and is the golden input
     boundary. Recurrent/cache state dtypes are independent axes read at
@@ -224,7 +226,8 @@ def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
             f"dtype at the entry seams; policy {core.policy.identifier} "
             f"declares weights={weights} activations={activations}"
         )
-    for module in (core.encoder, core.lid, core.predictor, core.joint):
+    core.encoder.to(core.policy.dtype_for("encoder_compute"))
+    for module in (core.lid, core.predictor, core.joint):
         module.to(weights)
     return core
 
@@ -362,7 +365,7 @@ class NemotronASRForRNNT(nn.Module):
         reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
-        policy = FP32_BRINGUP
+        policy = resolve_precision_policy(hf_config)
         self.core = NemotronASRCore(
             vocab_size=hf_config.num_asr_labels,
             att_context=(
@@ -379,6 +382,8 @@ class NemotronASRForRNNT(nn.Module):
             window=torch.zeros(_WIN_LENGTH),
             policy=policy,
         )
+        if policy is not FP32_BRINGUP:
+            apply_policy_dtypes(self.core)
         state_prefix = f"{prefix}.persistent_state" if prefix else "persistent_state"
         self._persistent_state_layer = PersistentStateLayerBase(
             build_nemotron_persistent_state_spec(hf_config),
