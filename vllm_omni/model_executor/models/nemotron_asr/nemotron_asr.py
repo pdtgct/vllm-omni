@@ -208,6 +208,9 @@ class NemotronASRCore(nn.Module):
 def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
     """Cast compute modules to the policy's weight dtype (PORT-PREC-001).
 
+    @spec PORT-PREC-010: realize encoder precision independently of frontend,
+    conditioner, predictor, joint and persistent state.
+
     LID, predictor, and joint move to ``dtype_for("weights")``; the
     encoder uses the separately declared ``encoder_compute`` override.
     Activations follow at the module entry seams, so this realization
@@ -310,10 +313,14 @@ class NemotronASRForRNNT(nn.Module):
     num_logits = 13_092
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
+        """@spec PORT-PREC-009, PORT-PREC-010, PORT-PREC-013: bind startup policy."""
         super().__init__()
         if vllm_config is None:
             raise ValueError("NemotronASRForRNNT requires vllm_config")
         hf_config = vllm_config.model_config.hf_config
+        # Resolve the effective (stage-overridden) selector once, before any
+        # state reservation, execution construction or checkpoint loading.
+        policy = resolve_precision_policy(hf_config)
         from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
             ensure_prompt_dictionary,
             validate_prompt_dictionary,
@@ -349,7 +356,7 @@ class NemotronASRForRNNT(nn.Module):
         if engine_dtype is not None and engine_dtype != torch.float32:
             raise ValueError(
                 f"--dtype {engine_dtype} is not the qualified profile "
-                "for this model (float32); a precision change requires "
+                f"for PrecisionPolicy {policy.identifier} (float32); a precision change requires "
                 "requalification (PORT-STATE-009). If no --dtype was "
                 "given, vLLM's auto policy downcasts float32 checkpoints "
                 "on SM80+ GPUs and the pipeline's deploy profile "
@@ -365,7 +372,6 @@ class NemotronASRForRNNT(nn.Module):
         reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
-        policy = resolve_precision_policy(hf_config)
         self.core = NemotronASRCore(
             vocab_size=hf_config.num_asr_labels,
             att_context=(
@@ -480,6 +486,9 @@ class NemotronASRForRNNT(nn.Module):
 
     def load_weights(self, weights: Any) -> set[str]:
         """Strictly load the served tree or the public HF card.
+
+        @spec PORT-PREC-017: load the unchanged checkpoint into policy-typed
+        targets. Each copy converts its source once without modifying it.
 
         The served artifact's names load as-is. The public card's
         renamed modules map through ``remap_card_name``; shared leaves
