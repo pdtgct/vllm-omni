@@ -668,7 +668,8 @@ def stream_step(
     cache_len = caches.channel.shape[2]
     # All layers share the same logical lengths and cache geometry. Build
     # their read-only masks and gather indices once for this transition.
-    mask = _stream_attention_mask(caches.valid, new_valid, cache_len)
+    valid = caches.valid
+    mask = _stream_attention_mask(valid, new_valid, cache_len)
     attn_indices = _stream_cache_indices(out_lengths, cache_len).unsqueeze(-1).expand(b, cache_len, x.shape[2])
     conv_len = caches.time.shape[-1]
     conv_indices = _stream_cache_indices(out_lengths, conv_len).unsqueeze(1).expand(b, x.shape[2], conv_len)
@@ -697,7 +698,7 @@ def stream_step(
             layer,
             y,
             cache=caches.channel[idx],
-            valid=caches.valid,
+            valid=valid,
             pos_emb=pos_emb,
             new_valid=new_valid,
             new_lengths=out_lengths,
@@ -715,7 +716,7 @@ def stream_step(
         residual = residual + 0.5 * layer.feed_forward2(y)
         x = layer.norm_out(residual)
     caches.valid = torch.clamp(
-        caches.valid + out_lengths.to(caches.valid.dtype),
+        valid + out_lengths.to(valid.dtype),
         max=caches.left_context,
     )
     # Padded-output zeroing (PORT-ADV-004): frames at or past each

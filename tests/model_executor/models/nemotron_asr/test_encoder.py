@@ -26,13 +26,13 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _tiny(att_context=(8, 0)) -> FastConformerEncoder:
+def _tiny(att_context=(8, 0), *, n_layers=2) -> FastConformerEncoder:
     torch.manual_seed(31)
     enc = FastConformerEncoder(
         feat_in=16,
         d_model=32,
         d_ff=64,
-        n_layers=2,
+        n_layers=n_layers,
         n_heads=4,
         conv_kernel=5,
         subsampling_channels=16,
@@ -166,6 +166,51 @@ def _caches(batch: int, enc: FastConformerEncoder) -> StreamingCaches:
 
 def _clone_caches(c: StreamingCaches) -> tuple:
     return (c.channel.clone(), c.time.clone(), c.valid.clone())
+
+
+@pytest.mark.parametrize("n_layers", [2, 24])
+def test_stream_step_reads_gathered_valid_once_per_transition(monkeypatch, n_layers) -> None:
+    # @spec PORT-ADV-004
+    from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
+
+    enc = _tiny(att_context=(8, 1), n_layers=n_layers)
+    reference = _caches(3, enc)
+    reference.channel.normal_(0.0, 0.2)
+    reference.time.normal_(0.0, 0.2)
+    reference.valid = torch.tensor([7, 3, 0])
+    valid_slots = tuple(reference.valid.to(torch.int32).reshape(3, 1).clone() for _ in enc.layers)
+    gathered = _GatheredCaches._from_tensors(
+        channel=tuple(layer.clone() for layer in reference.channel),
+        time=tuple(layer.clone() for layer in reference.time),
+        valid=valid_slots,
+        left_context=enc.att_context[0],
+    )
+    original_valid = _GatheredCaches.valid
+    valid_reads = 0
+
+    def counted_valid(caches):
+        nonlocal valid_reads
+        valid_reads += 1
+        return original_valid.__get__(caches)
+
+    monkeypatch.setattr(_GatheredCaches, "valid", property(counted_valid, original_valid.fset))
+    mel = torch.cat([_mel(25, seed=seed) for seed in (71, 72, 73)])
+    with torch.no_grad():
+        for lengths in ([2, 0, 1], [0, 2, 1], [2, 1, 0]):
+            out_lengths = torch.tensor(lengths)
+            expected_valid = (reference.valid + out_lengths).clamp(max=enc.att_context[0])
+            args = dict(out_offsets=torch.tensor([2, 2, 2]), out_lengths=out_lengths, out_width=2)
+            expected = stream_step(enc, mel, reference, **args)
+            valid_reads = 0
+            actual = stream_step(enc, mel, gathered, **args)
+            assert valid_reads == 1
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            for layer, (channel, time, valid) in enumerate(
+                zip(gathered.channel.tensors, gathered.time.tensors, valid_slots)
+            ):
+                torch.testing.assert_close(channel, reference.channel[layer], rtol=0, atol=0)
+                torch.testing.assert_close(time, reference.time[layer], rtol=0, atol=0)
+                torch.testing.assert_close(valid.reshape(-1), expected_valid.to(torch.int32), rtol=0, atol=0)
 
 
 def test_stream_step_mixed_lengths_match_single_rows() -> None:
