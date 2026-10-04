@@ -88,7 +88,10 @@ class _CompilerCore(nn.Module):
     ) -> None:
         super().__init__()
         self.policy = SimpleNamespace(
-            dtype_for=lambda tensor_class: activation_dtype if tensor_class == "activations" else torch.float32
+            encoder_compute_override=None,
+            dtype_for=lambda tensor_class: (
+                activation_dtype if tensor_class in ("activations", "encoder_compute") else torch.float32
+            ),
         )
         self.encoder = _CompilerEncoder(dtype=activation_dtype)
         self.lid = nn.Linear(1, 1, bias=False).to(activation_dtype)
@@ -465,6 +468,40 @@ def test_missing_core_authority_fails_before_compiled_transition(
             invoke=lambda: execution.transition(*_transition_args()),
         )
     assert compiler_calls == 0
+    assert not execution.ready
+
+
+@pytest.mark.cpu
+def test_encoder_fp16_materialization_receipt_and_policy_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT, FP32_BRINGUP
+
+    core = _compiled_core()
+    core.policy = FP16_ENCODER_EXPERIMENT
+    core.encoder.half()
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    monkeypatch.setattr(
+        encoder_execution_module,
+        "execute_encoder_transition",
+        lambda *_args: (torch.zeros(1), torch.zeros(1)),
+    )
+    execution = build_encoder_execution(
+        core,
+        _compiled_config(),
+        maximum_population=1,
+        warmup_geometries=(0,),
+    )
+    args = _transition_args(out_width=execution.t_cap - 56)
+    execution.profile_cell(geometry=0, population=1, invoke=lambda: execution.transition(*args))
+    execution.warmup_domain(
+        expected_cells=((0, 1),),
+        invoke=lambda _geometry, _population: execution.transition(*args),
+    )
+    assert core.encoder.pos_enc.pe.dtype == torch.float16
+    assert core.lid.weight.dtype == torch.float32
+    assert execution.ready_receipt()["precision_policy_hash"] == FP16_ENCODER_EXPERIMENT.content_hash
+    core.policy = FP32_BRINGUP
+    with pytest.raises(ValueError, match="precision_policy"):
+        execution.profile_ready_cell(geometry=0, population=1, invoke=lambda: execution.transition(*args))
     assert not execution.ready
 
 

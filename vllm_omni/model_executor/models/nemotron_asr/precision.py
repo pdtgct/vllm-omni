@@ -25,6 +25,7 @@ import torch
 TENSOR_CLASSES: Final = (
     "weights",
     "activations",
+    "encoder_compute",
     "attention_cache",
     "conv_state",
     "lstm_state",
@@ -88,6 +89,10 @@ class PrecisionPolicy:
     def _name_for(self, tensor_class: str) -> str:
         if tensor_class in self._mapping:
             return self._mapping[tensor_class]
+        # A missing encoder override inherits the original compute policy;
+        # do not add a key to existing mappings or restamp their provenance.
+        if tensor_class == "encoder_compute":
+            return self._name_for("weights")
         if "*" in self._mapping:
             return self._mapping["*"]
         raise KeyError(f"policy declares no dtype for {tensor_class!r} and no '*'")
@@ -97,6 +102,11 @@ class PrecisionPolicy:
         if tensor_class != "*" and tensor_class not in TENSOR_CLASSES:
             raise KeyError(f"unknown tensor class: {tensor_class!r}")
         return _DTYPES[self._name_for(tensor_class)]
+
+    @property
+    def encoder_compute_override(self) -> str | None:
+        """The explicit experimental axis, absent in existing policies."""
+        return self._mapping.get("encoder_compute")
 
     @property
     def content_hash(self) -> str:
@@ -128,6 +138,20 @@ class PrecisionPolicy:
 
 FP32_BRINGUP: Final = PrecisionPolicy({"*": "fp32"})
 """The bring-up value: fp32 everywhere, matching the fp32-locked oracle."""
+
+FP16_ENCODER_EXPERIMENT: Final = PrecisionPolicy({"*": "fp32", "encoder_compute": "fp16"})
+"""Unqualified encoder-only experiment; frontend, decoder and state stay FP32."""
+
+
+def resolve_precision_policy(hf_config: object) -> PrecisionPolicy:
+    """Resolve the default-off encoder experiment independently of launch dtype."""
+    selection = getattr(hf_config, "experimental_encoder_compute_dtype", None)
+    if selection is None:
+        return FP32_BRINGUP
+    if selection == "fp16":
+        return FP16_ENCODER_EXPERIMENT
+    raise ValueError("experimental_encoder_compute_dtype must be None or 'fp16'")
+
 
 BF16_COMPUTE: Final = PrecisionPolicy(
     {

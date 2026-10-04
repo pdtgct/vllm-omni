@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.nemotron_asr.encoder import (
     StreamingCaches,
     stream_step,
 )
+from vllm_omni.model_executor.models.nemotron_asr.precision import FP32_BRINGUP
 from vllm_omni.model_executor.models.nemotron_asr.profiling import phase
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,7 @@ class CompilerModelState(NamedTuple):
     parameters: tuple[tuple[str, CompilerTensorState], ...]
     buffers: tuple[tuple[str, CompilerTensorState], ...]
     modules: tuple[tuple[str, bool], ...]
+    precision_policy: str | None
 
 
 class EncoderSignature(NamedTuple):
@@ -177,6 +179,7 @@ def _compiled_transition_model_state(core: Any) -> CompilerModelState:
         return f"{root}.{name}" if name else root
 
     return CompilerModelState(
+        precision_policy=getattr(core.policy, "content_hash", None),
         parameters=tuple(
             (qualified(root, name), _compiler_tensor_state(parameter))
             for root, module in roots
@@ -207,13 +210,17 @@ def _compiled_transition_runner_device(
     devices = {parameter.device for parameter in parameters}
     if len(devices) != 1:
         raise ValueError("compiled-static encoder transition spans multiple model devices")
-    dtypes = {parameter.dtype for parameter in parameters}
-    if dtypes != {activation_dtype}:
-        raise ValueError(
-            "compiled-static encoder transition parameter dtype differs from "
-            f"activation policy: parameters={sorted(map(str, dtypes))}, "
-            f"activation={activation_dtype}"
-        )
+    for module, expected_dtype in (
+        (core.encoder, activation_dtype),
+        (core.lid, core.policy.dtype_for("activations")),
+    ):
+        dtypes = {parameter.dtype for parameter in module.parameters()}
+        if dtypes != {expected_dtype}:
+            raise ValueError(
+                "compiled-static encoder transition parameter dtype differs from "
+                f"activation policy: parameters={sorted(map(str, dtypes))}, "
+                f"activation={expected_dtype}"
+            )
     return next(iter(devices))
 
 
@@ -221,6 +228,8 @@ def _changed_model_state_name(
     expected: CompilerModelState,
     actual: CompilerModelState,
 ) -> str | None:
+    if expected.precision_policy != actual.precision_policy:
+        return "precision_policy"
     for expected_family, actual_family in (
         (expected.parameters, actual.parameters),
         (expected.buffers, actual.buffers),
@@ -823,7 +832,7 @@ class ResolvedEncoderExecution:
         if self._model_state is not None:
             return
         encoder = self._core.encoder
-        activation_dtype = self._core.policy.dtype_for("activations")
+        activation_dtype = self._core.policy.dtype_for("encoder_compute")
         runner_device = _compiled_transition_runner_device(
             self._core,
             activation_dtype=activation_dtype,
@@ -1374,6 +1383,9 @@ class ResolvedEncoderExecution:
             receipt["population_bucketing"] = "powers_of_two_plus_exact_cap"
         if self._memory_diagnostics:
             receipt["memory_diagnostics"] = list(self._memory_diagnostics)
+        if self._core is not None and getattr(self._core.policy, "encoder_compute_override", None) == "fp16":
+            receipt["precision_policy"] = self._core.policy.identifier
+            receipt["precision_policy_hash"] = self._core.policy.content_hash
         return receipt
 
 
@@ -1387,6 +1399,8 @@ def execute_encoder_transition(
     prompt_index: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the exact cache-aware encoder and conditioning transition."""
+    policy = getattr(core, "policy", FP32_BRINGUP)
+    encoder_fp16 = policy.encoder_compute_override == "fp16"
     encoded = stream_step(
         core.encoder,
         mel,
@@ -1394,7 +1408,10 @@ def execute_encoder_transition(
         out_offsets=out_offsets,
         out_lengths=out_lengths,
         out_width=out_width,
+        preserve_conv_cache_precision=encoder_fp16,
     )
+    if encoder_fp16:
+        encoded = encoded.to(policy.dtype_for("activations"))
     conditioned = core.lid(encoded, prompt_index=prompt_index)
     frame = torch.arange(out_width, device=mel.device).view(1, -1, 1)
     conditioned = torch.where(
@@ -1460,7 +1477,12 @@ def build_encoder_execution(
         )
 
     if arm == "eager":
-        return ResolvedEncoderExecution(arm=arm, transition=transition)
+        policy = getattr(core, "policy", FP32_BRINGUP)
+        return ResolvedEncoderExecution(
+            arm=arm,
+            transition=transition,
+            _core=core if policy.encoder_compute_override == "fp16" else None,
+        )
     if arm in _GRAPHED_ARMS and vllm_config is None:
         raise ValueError("graphed encoder execution requires vllm_config")
     if arm in _GRAPHED_ARMS:
