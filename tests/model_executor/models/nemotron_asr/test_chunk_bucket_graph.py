@@ -265,10 +265,20 @@ def test_chunk_binding_resolution_failure_precedes_resident_gather(monkeypatch):
 
 
 @torch.inference_mode()
-def test_bucket_replay_changed_contents_lifetime_and_fail_closed():
+def test_bucket_replay_changed_contents_lifetime_and_fail_closed(monkeypatch):
     core, env, state, args = _fixture()
     initial = _clone_state(state)
     transition = capture_chunk_bucket(core, env, state, **args, vllm_config=None, runtime=_graph_runtime())
+    grouped_calls = []
+    original_copy = torch._foreach_copy_
+
+    def observed_copy(destinations, sources):
+        assert len({tensor.dtype for tensor in (*destinations, *sources)}) == 1
+        assert len({tensor.device for tensor in (*destinations, *sources)}) == 1
+        grouped_calls.append((destinations[0].dtype, len(destinations)))
+        return original_copy(destinations, sources)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", observed_copy)
     for actual, expected in zip(_state_tensors(state), _state_tensors(initial), strict=True):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     held = None
@@ -283,7 +293,16 @@ def test_bucket_replay_changed_contents_lifetime_and_fail_closed():
         expected = advance.advance_chunk_bucket(
             core, env, expected_state, **args, decode_fn=rnnt.decode_dense_masked_frames
         )
+        grouped_calls.clear()
         actual = transition(core, env, state, **args, decode_fn=rnnt.decode_dense_masked_frames)
+        assert grouped_calls == [
+            (torch.float32, 9),
+            (torch.int64, 3),
+            (torch.int32, 3),
+            (torch.float32, 8),
+            (torch.int64, 2),
+            (torch.int32, 2),
+        ]
         for left, right in zip(
             (*_outputs(actual), *_state_tensors(state)),
             (*_outputs(expected), *_state_tensors(expected_state)),
@@ -333,6 +352,151 @@ def test_bucket_full_transaction_preserves_mixed_status_and_resident_commit():
     assert int(sink.staged[0][0]) == 0
     assert int(sink.staged[0][1]) != 0
     assert torch.all(pools["book_pool"][2] == 123)
+
+
+@torch.inference_mode()
+def test_grouped_copy_24_layer_dispatch_counts(monkeypatch):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+
+    _core, env, state, args = _fixture(1)
+    # Model-sized tensor-list structure, without adding a model or kernel fixture.
+    state.channel = [state.channel[0].clone() for _ in range(24)]
+    state.window_valid = [state.window_valid[0].clone() for _ in range(24)]
+    state.time = [state.time[0].clone() for _ in range(24)]
+    copies = []
+    original = torch._foreach_copy_
+
+    def observed(destinations, sources):
+        copies.append(len(destinations))
+        return original(destinations, sources)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", observed)
+    for sources, expected in (
+        ((env, args["admitted_prompt"], args["incoming_status"], *_state_tensors(state)), [53, 3, 25]),
+        (_state_tensors(state), [52, 2, 24]),
+    ):
+        destinations = tuple(torch.empty_like(tensor) for tensor in sources)
+        copies.clear()
+        graph._copy_tensors(destinations, sources, graph._copy_groups(destinations, sources))
+        assert copies == expected
+        for destination, source in zip(destinations, sources, strict=True):
+            torch.testing.assert_close(destination, source, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("sharing", ["destination", "read_after_write"])
+def test_grouped_copy_storage_sharing_uses_whole_ordered_loop(monkeypatch, sharing):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+
+    first, middle, last = torch.zeros(2), torch.zeros(2, dtype=torch.long), torch.zeros(2)
+    destinations = (first, middle, first if sharing == "destination" else last)
+    sources = (
+        torch.full((2,), 3.0),
+        torch.full((2,), 4, dtype=torch.long),
+        torch.full((2,), 5.0) if sharing == "destination" else first,
+    )
+
+    def forbidden(*_args):
+        pytest.fail("storage-sharing copy must choose the whole scalar loop before mutation")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", forbidden)
+    groups = graph._copy_groups(destinations, sources)
+    assert groups is not None  # Static eligibility is separate from dynamic storage identity.
+    graph._copy_tensors(destinations, sources, groups)
+    assert torch.all(first == (5 if sharing == "destination" else 3))
+    assert torch.all(middle == 4)
+    if sharing == "read_after_write":
+        assert torch.all(last == 3)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("kind", ["transpose", "strided", "subclass", "conjugate", "negative", "conversion"])
+def test_grouped_copy_unusual_tensor_uses_whole_scalar_loop(monkeypatch, kind):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+
+    source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    if kind == "transpose":
+        source = source.T
+    elif kind == "strided":
+        source = source[:, ::2]
+    elif kind == "subclass":
+
+        class TensorSubclass(torch.Tensor):
+            pass
+
+        source = source.as_subclass(TensorSubclass)
+    elif kind == "conjugate":
+        source = torch.complex(source, source).conj()
+    elif kind == "negative":
+        source = torch._neg_view(source)
+    destination = torch.empty_like(source, dtype=torch.long if kind == "conversion" else source.dtype)
+    destinations = (torch.zeros(2), destination)
+    sources = (torch.ones(2), source)
+
+    def forbidden(*_args):
+        pytest.fail("unusual tensor must select the whole scalar loop before mutation")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", forbidden)
+    groups = graph._copy_groups(destinations, sources)
+    assert groups is None
+    graph._copy_tensors(destinations, sources, groups)
+    assert torch.all(destinations[0] == 1)
+    torch.testing.assert_close(destination, source.to(destination.dtype), atol=0, rtol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("sharing", ["destination", "read_after_write"])
+def test_grouped_copy_distinct_storage_ranges_use_whole_ordered_loop(monkeypatch, sharing):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+
+    backing = bytearray(12)
+    first = torch.frombuffer(backing, dtype=torch.float32, count=2, offset=0)
+    overlap = torch.frombuffer(backing, dtype=torch.float32, count=2, offset=4)
+    assert first.untyped_storage().data_ptr() != overlap.untyped_storage().data_ptr()
+    middle, last = torch.zeros(2, dtype=torch.long), torch.zeros(2)
+    destinations = (first, middle, overlap if sharing == "destination" else last)
+    sources = (
+        torch.full((2,), 3.0),
+        torch.full((2,), 4, dtype=torch.long),
+        torch.full((2,), 5.0) if sharing == "destination" else overlap,
+    )
+
+    def forbidden(*_args):
+        pytest.fail("overlapping distinct storage ranges must select scalar ordering before mutation")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", forbidden)
+    groups = graph._copy_groups(destinations, sources)
+    assert groups is not None
+    graph._copy_tensors(destinations, sources, groups)
+    assert torch.all(middle == 4)
+    if sharing == "destination":
+        torch.testing.assert_close(first, torch.tensor([3.0, 5.0]), atol=0, rtol=0)
+        assert torch.all(overlap == 5)
+    else:
+        assert torch.all(first == 3)
+        torch.testing.assert_close(last, torch.tensor([3.0, 0.0]), atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_grouped_copy_failure_never_retries_after_mutation(monkeypatch):
+    from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph as graph
+
+    destinations = (torch.zeros(2), torch.zeros(2), torch.zeros(2, dtype=torch.long))
+    sources = (torch.ones(2), torch.ones(2), torch.ones(2, dtype=torch.long))
+    calls = []
+
+    def failing(destinations, _sources):
+        calls.append(len(destinations))
+        destinations[0].fill_(7)
+        raise RuntimeError("grouped copy failed after mutation")
+
+    monkeypatch.setattr(torch, "_foreach_copy_", failing)
+    with pytest.raises(RuntimeError, match="after mutation"):
+        graph._copy_tensors(destinations, sources, graph._copy_groups(destinations, sources))
+    assert calls == [2]
+    assert torch.all(destinations[0] == 7)
+    assert not torch.count_nonzero(destinations[1])
+    assert not torch.count_nonzero(destinations[2])
 
 
 @torch.inference_mode()

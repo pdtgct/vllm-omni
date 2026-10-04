@@ -43,6 +43,75 @@ def _state_tensors(state: SessionStateBatch) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _copy_groups(
+    destinations: tuple[torch.Tensor, ...], sources: tuple[torch.Tensor, ...]
+) -> tuple[tuple[int, ...], ...] | None:
+    """Prepare conservative groups for the cell's already-frozen tensor signatures."""
+    if len(destinations) != len(sources):
+        return None
+    groups: dict[tuple[torch.dtype, torch.device], list[int]] = {}
+    for index, (destination, source) in enumerate(zip(destinations, sources, strict=True)):
+        if any(
+            type(tensor) is not torch.Tensor
+            or tensor.layout != torch.strided
+            or tensor.device.type not in ("cpu", "cuda")
+            or tensor.dtype not in (torch.float32, torch.int32, torch.int64)
+            or tensor.requires_grad
+            or not tensor.is_contiguous()
+            or tensor.is_conj()
+            or tensor.is_neg()
+            for tensor in (destination, source)
+        ) or (
+            destination.dtype != source.dtype
+            or destination.device != source.device
+            or destination.shape != source.shape
+            or destination.stride() != source.stride()
+        ):
+            return None
+        groups.setdefault((destination.dtype, destination.device), []).append(index)
+    return tuple(tuple(indices) for indices in groups.values())
+
+
+def _copy_tensors(
+    destinations: tuple[torch.Tensor, ...],
+    sources: tuple[torch.Tensor, ...],
+    groups: tuple[tuple[int, ...], ...] | None,
+) -> None:
+    """Keep scalar ordering for shared/uncertain storage, before any copy mutates it.
+
+    Metadata eligibility is prepared at startup and protected by the invocation
+    signature. Whole-storage byte ranges deliberately include disjoint views
+    and overlapping distinct storage wrappers: neither destination sharing nor
+    source/destination dependencies may be reordered.
+    A grouped failure propagates without scalar retry after partial mutation.
+    """
+    if groups is not None:
+        independent = True
+        intervals = []
+        for is_destination, tensors in ((True, destinations), (False, sources)):
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                start, size = storage.data_ptr(), storage.nbytes()
+                if start == 0 or size == 0:
+                    independent = False
+                intervals.append((str(tensor.device), start, start + size, is_destination))
+        device, prior_end, prior_destination_end = "", 0, 0
+        for current_device, start, end, is_destination in sorted(intervals):
+            if current_device != device:
+                device, prior_end, prior_destination_end = current_device, 0, 0
+            if start < prior_destination_end or (is_destination and start < prior_end):
+                independent = False
+            prior_end = max(prior_end, end)
+            if is_destination:
+                prior_destination_end = max(prior_destination_end, end)
+        if independent:
+            for indices in groups:
+                torch._foreach_copy_([destinations[index] for index in indices], [sources[index] for index in indices])
+            return
+    for destination, source in zip(destinations, sources, strict=True):
+        destination.copy_(source)
+
+
 def _clone_state(state: SessionStateBatch) -> SessionStateBatch:
     return SessionStateBatch(
         raw_tail=state.raw_tail.clone(),
@@ -121,14 +190,15 @@ def capture_chunk_bucket(
     static_state = _clone_state(state)
     sources = (env, admitted_prompt, incoming_status, *_state_tensors(state))
     scratch = (static_env, static_prompt, static_status, *_state_tensors(static_state))
+    stage_groups = _copy_groups(scratch, sources)
+    copyback_groups = _copy_groups(_state_tensors(state), _state_tensors(static_state))
     signature = tuple(_tensor_signature(tensor) for tensor in sources)
     descriptor = runtime.descriptor_factory(population)
     result_type: Any = None
     owned: tuple[torch.Tensor, ...] = ()
 
     def stage(values: tuple[torch.Tensor, ...]) -> None:
-        for destination, source in zip(scratch, values, strict=True):
-            destination.copy_(source)
+        _copy_tensors(scratch, values, stage_groups)
 
     def body() -> tuple[torch.Tensor, ...]:
         bucket = advance_chunk_bucket(
@@ -221,8 +291,7 @@ def capture_chunk_bucket(
             raise ValueError("bucket caller aliases graph-owned scratch")
         stage(values)
         output = call(runtime.graph_mode)
-        for destination, source in zip(_state_tensors(actual_state), _state_tensors(static_state), strict=True):
-            destination.copy_(source)
+        _copy_tensors(_state_tensors(actual_state), _state_tensors(static_state), copyback_groups)
         escaped = tuple(tensor.clone() for tensor in output)
         result = result_type(
             token_ids=escaped[0],
