@@ -308,8 +308,9 @@ class ServiceTimingTrace:
         for slot in sorted(
             self.slots[: self.count], key=lambda x: -1 if x.logical_sequence is None else x.logical_sequence
         ):
-            e = None if slot.e_ns is None else slot.e_ns / 1e9
-            s = None if slot.s_ns is None else slot.s_ns / 1e9
+            # Match model-session readiness conversion without rounding ns first.
+            e = None if slot.e_ns is None else slot.e_ns / 1_000_000_000
+            s = None if slot.s_ns is None else slot.s_ns / 1_000_000_000
             if slot.kind == "forced_eou":
                 # Accepted-audio controls have a logical identity but no audio
                 # carrier, ready/eligibility/park stamp, or unit disposition.
