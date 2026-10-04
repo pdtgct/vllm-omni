@@ -57,6 +57,92 @@ def _projection(*, is_profile: bool, num_rows: int = 2) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize(
+    "native_burst,lookaheads,error",
+    [
+        (False, [1], None),
+        (False, [1, 6], None),
+        (False, [6], "declared exact 160-ms"),
+        (True, [1, 6], "160-ms lookahead"),
+        (True, [1], "requires native burst disabled"),
+    ],
+)
+def test_chunk_constructor_keeps_native_geometry_guard_scoped(monkeypatch, native_burst, lookaheads, error):
+    # @spec PORT-DEC-011, PORT-DEC-014
+    model_module, config = _chunk_constructor_config(monkeypatch)
+    config.model_config.hf_config.supported_num_lookahead_tokens = lookaheads
+    config.model_config.hf_config.experimental_native_burst = native_burst
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            model_module.NemotronASRForRNNT(vllm_config=config)
+        return
+    model = model_module.NemotronASRForRNNT(vllm_config=config)
+    expected = (1, 3) if 6 in lookaheads else (1,)
+    assert model._native_burst_handoff is None
+    assert model._encoder_execution.warmup_geometries == expected
+    assert model._encoder_execution._chunk_graph_cells == frozenset({(1, 1)})
+
+
+@pytest.mark.parametrize(
+    "section,name,value",
+    [
+        ("scheduler_config", "async_scheduling", True),
+        (None, "speculative_config", object()),
+        ("parallel_config", "pipeline_parallel_size", 2),
+        ("parallel_config", "tensor_parallel_size", 2),
+        ("parallel_config", "data_parallel_size", 2),
+        ("parallel_config", "decode_context_parallel_size", 2),
+        ("parallel_config", "prefill_context_parallel_size", 2),
+        ("parallel_config", "enable_expert_parallel", True),
+        ("model_config", "logits_processors", [object()]),
+    ],
+)
+def test_chunk_constructor_retains_serial_execution_guard(monkeypatch, section, name, value):
+    # @spec PORT-DEC-014
+    model_module, config = _chunk_constructor_config(monkeypatch)
+    setattr(config if section is None else getattr(config, section), name, value)
+    with pytest.raises(ValueError, match="synchronous non-speculative single-device"):
+        model_module.NemotronASRForRNNT(vllm_config=config)
+
+
+def _chunk_constructor_config(monkeypatch):
+    from test_encoder_execution import _graph_runtime
+
+    from vllm_omni.model_executor.models.nemotron_asr import decode_graph, encoder_execution
+
+    model_module = _model_module()
+    hf_config = _config(decode_dispatch_arm="dense-graphed")
+    for name, value in {
+        "num_asr_labels": 12,
+        "d_model": 32,
+        "n_layers": 2,
+        "pred_hidden": 16,
+        "joint_hidden": 16,
+        "encoder_execution_arm": "eager-graphed",
+        "supported_num_lookahead_tokens": [1, 6],
+        "chunk_bucket_graph_populations": [1],
+    }.items():
+        setattr(hf_config, name, value)
+    # Keep real model/geometry/binding construction; only platform capture and
+    # registration of the later worker-owned state allocation are replaced.
+    monkeypatch.setattr(model_module, "PersistentStateLayerBase", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(encoder_execution, "platform_graph_runtime", _graph_runtime)
+    monkeypatch.setattr(decode_graph, "platform_graph_runtime", _graph_runtime)
+    return model_module, SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config, dtype=torch.float32, logits_processors=None),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_expert_parallel=False,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=1),
+        speculative_config=None,
+    )
+
+
 def _no_state_model() -> Any:
     model = object.__new__(_model_class())
     object.__setattr__(model, "config", _config())
@@ -617,8 +703,9 @@ def test_prepare_inputs_snapshot_flows_directly_into_forward(
 
 
 @pytest.mark.parametrize("fail_selected_profile", [False, True])
+@pytest.mark.parametrize("lookaheads,geometries", [([1], (1,)), ([1, 6], (1, 3))])
 def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_resident_allocation(
-    monkeypatch, fail_selected_profile
+    monkeypatch, fail_selected_profile, lookaheads, geometries
 ):
     profile = _profile_module()
     model = _no_state_model()
@@ -635,10 +722,10 @@ def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_reside
     def decoder_warmup(device, dtype):
         assert not execution.ready
         events.append("decoder")
-        decoder.captured_keys = tuple((1, n) for n in (1, 2, 4, 8, 16, 32, 64, 128))
+        decoder.captured_keys = tuple((g, n) for g in geometries for n in (1, 2, 4, 8, 16, 32, 64, 128))
 
     def chunk_warmup(device):
-        assert len(decoder.captured_keys) == 8
+        assert len(decoder.captured_keys) == 8 * len(geometries)
         events.append("chunk")
         execution.ready = chunk.ready = True
 
@@ -648,7 +735,7 @@ def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_reside
 
     def final_profile(value, *, num_rows, device, geometry_id, ready_domain):
         assert value is model and ready_domain and execution.ready and chunk.ready
-        assert geometry_id == 1 and device == parameter.device
+        assert geometry_id == (max(geometries) if num_rows == 128 else 1) and device == parameter.device
         events.append(num_rows)
         if fail_selected_profile:
             raise RuntimeError("selected profile failed")
@@ -657,7 +744,7 @@ def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_reside
     decoder.warmup = decoder_warmup
     chunk.warmup = chunk_warmup
     for name, value in {
-        "config": SimpleNamespace(supported_num_lookahead_tokens=[1], decode_dispatch_arm="dense-graphed"),
+        "config": SimpleNamespace(supported_num_lookahead_tokens=lookaheads, decode_dispatch_arm="dense-graphed"),
         "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter]))),
         "_max_num_seqs": 128,
         "_encoder_execution": execution,

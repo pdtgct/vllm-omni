@@ -2226,7 +2226,10 @@ def test_eager_graphed_native_profile_matches_unprepared_encoder(monkeypatch):
 @pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("population,tier", [(1, 1), (31, 32)])
-def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(monkeypatch, population, tier):
+@pytest.mark.parametrize("geometries", [(1,), (1, 3)])
+def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publication(
+    monkeypatch, population, tier, geometries
+):
     import json
 
     from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
@@ -2236,25 +2239,27 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
         _compiled_core(),
         _dense_graphed_config("eager-graphed"),
         maximum_population=31,
-        warmup_geometries=(1,),
+        warmup_geometries=geometries,
         vllm_config=object(),
         graph_runtime=_graph_runtime(),
     )
     binding = ExactChunkGraphBinding(
         execution._core, object(), execution, SimpleNamespace(execution_tier=lambda _n: tier), [population]
     )
-    shape = execution._geometry_shapes[1]
 
-    def arguments(population):
+    def arguments(population, geometry=1):
+        shape = execution._geometry_shapes[geometry]
         values = _graph_transition_args(population=population, mel_width=shape.mel_width, out_width=shape.out_width)
         values[-1].remainder_(4)
         return values
 
+    expected_cells = {(g, n) for g in geometries for n in range(1, 32)}
+    encoder_cells = expected_cells - {(1, population)}
     execution.warmup_domain(
-        expected_cells=tuple((1, n) for n in range(1, 32)),
-        invoke=lambda _geometry, population: execution.transition(*arguments(population)),
+        expected_cells=tuple(sorted(expected_cells)),
+        invoke=lambda geometry, population: execution.transition(*arguments(population, geometry)),
     )
-    assert set(execution._graph_entries) == {(1, n) for n in range(1, 32) if n != population}
+    assert set(execution._graph_entries) == encoder_cells
     assert not execution.ready
     assert not execution._pending_graph_entries
     with pytest.raises(ValueError, match="inventory"):
@@ -2269,10 +2274,26 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
     execution.publish_chunk_graphs({(1, population): replacement})
     assert execution.ready
     receipt = execution.ready_receipt()
-    assert receipt["captured_keys"] == [[1, n] for n in range(1, 32) if n != population]
+    assert receipt["captured_keys"] == [list(cell) for cell in sorted(encoder_cells)]
     assert receipt["chunk_graph_keys"] == [[1, population]]
     assert not set(execution._graph_entries) & set(execution._chunk_graph_entries)
-    assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == {(1, n) for n in range(1, 32)}
+    assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == expected_cells
+    if 3 in geometries:
+        assert (
+            binding.resolve(
+                geometry=3,
+                population=population,
+                decode_fn=object(),
+                encoder_transition=execution.transition,
+                capture=False,
+            )
+            == binding._fallback
+        )
+        execution.profile_ready_cell(
+            geometry=3,
+            population=population,
+            invoke=lambda: execution.transition(*arguments(population, 3)),
+        )
     first = binding.receipt()
     second = binding.receipt()
     assert first == second == json.loads(json.dumps(first))
