@@ -144,13 +144,23 @@ FP16_ENCODER_EXPERIMENT: Final = PrecisionPolicy({"*": "fp32", "encoder_compute"
 
 
 def resolve_precision_policy(hf_config: object) -> PrecisionPolicy:
-    """Resolve the default-off encoder experiment independently of launch dtype."""
+    """@spec PORT-PREC-009, PORT-PREC-013: resolve the startup-only selector.
+
+    The effective HF configuration already includes stage-local overrides.
+    Keep omission, null and explicit float32 byte-identical to the bring-up
+    policy; public selector spellings do not alias the internal dtype names.
+    """
     selection = getattr(hf_config, "experimental_encoder_compute_dtype", None)
     if selection is None:
         return FP32_BRINGUP
-    if selection == "fp16":
-        return FP16_ENCODER_EXPERIMENT
-    raise ValueError("experimental_encoder_compute_dtype must be None or 'fp16'")
+    if isinstance(selection, str):
+        if selection == "float32":
+            return FP32_BRINGUP
+        if selection == "float16":
+            return FP16_ENCODER_EXPERIMENT
+    raise ValueError(
+        f"experimental_encoder_compute_dtype must be None (null), 'float32' or 'float16'; got {selection!r}"
+    )
 
 
 BF16_COMPUTE: Final = PrecisionPolicy(

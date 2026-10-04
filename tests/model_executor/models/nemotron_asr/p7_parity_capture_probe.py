@@ -78,6 +78,7 @@ import time
 import traceback
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -98,8 +99,12 @@ from vllm_omni.model_executor.models.nemotron_asr import commit_sink as commit_s
 from vllm_omni.model_executor.models.nemotron_asr import frontend as frontend_mod
 from vllm_omni.model_executor.models.nemotron_asr import plan as plan_mod
 from vllm_omni.model_executor.models.nemotron_asr.lid import resolve_prompt_index
-from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRCore
-from vllm_omni.model_executor.models.nemotron_asr.precision import FP32_BRINGUP
+from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRCore, apply_policy_dtypes
+from vllm_omni.model_executor.models.nemotron_asr.precision import (
+    FP32_BRINGUP,
+    PrecisionPolicy,
+    resolve_precision_policy,
+)
 
 #: Fixed FastConformer architecture constants — NOT checkpoint fields
 #: (unlike n_layers/d_model/etc., which come from config.json). Mirrors
@@ -214,8 +219,12 @@ def _build_execution_fingerprint(
     repo_root: Path,
     container_image_digest: str,
     venv_freeze_hash: str,
+    policy: PrecisionPolicy = FP32_BRINGUP,
 ) -> dict[str, Any]:
-    """Build a fully checkpoint-bound, adoption-eligible fingerprint."""
+    """@spec PORT-PREC-017: keep artifact identity separate from runtime policy.
+
+    A fingerprint records provenance; it does not qualify the selected policy.
+    """
     tree_digest, tree_clean = _git_tree_identity(repo_root)
     is_cuda = device == "cuda"
     return {
@@ -239,8 +248,8 @@ def _build_execution_fingerprint(
         # source checkpoint, not the derived PORT safetensors file.
         "model_artifact_digest": checkpoint_identity.source_checkpoint_digest,
         "derived_model_digest": checkpoint_identity.derived_model_digest,
-        "precision_policy_id": FP32_BRINGUP.identifier,
-        "precision_policy_hash": FP32_BRINGUP.content_hash,
+        "precision_policy_id": policy.identifier,
+        "precision_policy_hash": policy.content_hash,
         "checkpoint_profile_id": checkpoint_identity.checkpoint_profile_id,
         "checkpoint_profile_hash": checkpoint_identity.checkpoint_profile_hash,
         "state_manifest_hash": checkpoint_identity.manifest_hashes["state"],
@@ -276,6 +285,7 @@ def _load_core(cfg: dict[str, Any], checkpoint_dir: Path, device: str) -> Nemotr
     ``pos_enc.pe``, an init-computed sinusoid never persisted by NeMo)
     is legitimately absent from the checkpoint.
     """
+    policy = resolve_precision_policy(SimpleNamespace(**cfg))
     core = NemotronASRCore(
         vocab_size=int(cfg["num_asr_labels"]),
         att_context=(int(cfg["att_context_left"]), int(cfg["att_context_right"])),
@@ -287,8 +297,10 @@ def _load_core(cfg: dict[str, Any], checkpoint_dir: Path, device: str) -> Nemotr
         num_prompts=int(cfg["num_prompts"]),
         filterbank=torch.zeros(N_MELS, 512 // 2 + 1),
         window=torch.zeros(400),
-        policy=FP32_BRINGUP,
+        policy=policy,
     ).to(device)
+    if policy is not FP32_BRINGUP:
+        apply_policy_dtypes(core)
     core.eval()
     weights = load_file(str(checkpoint_dir / "model.safetensors"))
     expected: dict[str, torch.Tensor] = dict(core.named_parameters())
@@ -714,11 +726,12 @@ def _run_cadence(
         repo_root=repo_root,
         container_image_digest=container_image_digest,
         venv_freeze_hash=venv_freeze_hash,
+        policy=core.policy,
     )
     manifest = build_manifest(
         model_revision=model_revision,
         nemo_commit=nemo_commit,
-        precision_policy_id=FP32_BRINGUP.identifier,
+        precision_policy_id=core.policy.identifier,
         execution_fingerprint=fingerprint,
         seed=seed,
         cadence=cadence,

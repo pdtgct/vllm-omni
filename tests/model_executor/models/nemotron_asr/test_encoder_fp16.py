@@ -118,7 +118,7 @@ def test_apply_policy_dtypes_preserves_module_boundaries(selection):
         assert {p.dtype for p in module.parameters()} == {core.policy.dtype_for("weights")}
 
 
-def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32():
+def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32(monkeypatch):
     """@spec PORT-PREC-017: FP32 source tensors survive encoder load conversion."""
     from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
 
@@ -131,7 +131,17 @@ def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32():
     model._encoder_execution = SimpleNamespace(_model_state=None)
     weights = [(name, torch.full_like(value, 1.0001, dtype=torch.float32)) for name, value in core.state_dict().items()]
     source_snapshots = {name: value.clone() for name, value in weights}
+    copies = []
+    original_copy = torch.Tensor.copy_
+
+    def copy_weight(target, source, *args, **kwargs):
+        copies.append((target, source))
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_weight)
     model.load_weights(weights)
+    assert len(copies) == len(weights)
+    assert [id(source) for _, source in copies] == [id(source) for _, source in weights]
     assert {p.dtype for p in core.encoder.parameters()} == {torch.float16}
     assert {p.dtype for p in core.lid.parameters()} == {torch.float32}
     for name, source in weights:
@@ -139,3 +149,137 @@ def test_weight_loading_preserves_encoder_fp16_and_decoder_fp32():
         torch.testing.assert_close(source, source_snapshots[name], rtol=0, atol=0)
         target = core.state_dict()[name]
         torch.testing.assert_close(target, source.to(target.dtype), rtol=0, atol=0)
+
+
+def test_capture_fingerprint_separates_source_artifact_and_runtime_policy(monkeypatch, tmp_path):
+    """@spec PORT-PREC-017: keep a fixture artifact identity across runtime policies."""
+    import p7_parity_capture_probe as probe
+    from p7_capture_manifest import CheckpointIdentity
+
+    from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT, FP32_BRINGUP
+
+    identity = CheckpointIdentity(
+        source_checkpoint_digest="sha256:" + "a" * 64,
+        converted_dump_digest="sha256:" + "b" * 64,
+        derived_model_digest="sha256:" + "c" * 64,
+        checkpoint_profile_id="fp32-source-profile",
+        checkpoint_profile_hash="sha256:" + "d" * 64,
+        manifest_hashes={name: "sha256:" + "e" * 64 for name in ("state", "geometry", "transition", "emission")},
+        prompt_dictionary={"en-US": 0},
+        num_prompts=1,
+    )
+    monkeypatch.setattr(probe, "_git_tree_identity", lambda _root: ("sha256:" + "f" * 64, True))
+    inputs = dict(
+        device="cpu",
+        checkpoint_identity=identity,
+        repo_root=tmp_path,
+        container_image_digest="sha256:" + "1" * 64,
+        venv_freeze_hash="sha256:" + "2" * 64,
+    )
+    baseline = probe._build_execution_fingerprint(**inputs)
+    assert probe._build_execution_fingerprint(**inputs, policy=FP32_BRINGUP) == baseline
+    candidate = probe._build_execution_fingerprint(**inputs, policy=FP16_ENCODER_EXPERIMENT)
+    assert candidate["model_artifact_digest"] == baseline["model_artifact_digest"] == identity.source_checkpoint_digest
+    assert candidate["derived_model_digest"] == baseline["derived_model_digest"] == identity.derived_model_digest
+    assert candidate["precision_policy_id"] == FP16_ENCODER_EXPERIMENT.identifier
+    assert candidate["precision_policy_hash"] == FP16_ENCODER_EXPERIMENT.content_hash
+    assert {key for key in baseline if candidate[key] != baseline[key]} == {
+        "precision_policy_id",
+        "precision_policy_hash",
+    }
+
+
+@pytest.mark.parametrize("selection", ["fp16", "fp32", True, "bfloat16"])
+def test_startup_rejects_selector_before_state_construction(monkeypatch, selection):
+    """@spec PORT-PREC-009: invalid effective selectors fail before reservation."""
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as model_module
+
+    def unexpected_construction(*args, **kwargs):
+        pytest.fail("invalid precision selector reached core or persistent state construction")
+
+    monkeypatch.setattr(model_module, "NemotronASRCore", unexpected_construction)
+    monkeypatch.setattr(model_module, "PersistentStateLayerBase", unexpected_construction)
+    config = SimpleNamespace(experimental_encoder_compute_dtype=selection)
+    with pytest.raises(ValueError, match="experimental_encoder_compute_dtype.*float32.*float16"):
+        model_module.NemotronASRForRNNT(vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=config)))
+
+
+def test_startup_binds_effective_policy_once_and_ignores_later_config_edits(monkeypatch):
+    """@spec PORT-PREC-009, PORT-PREC-013: loaded policy is independent of mutable config."""
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as model_module
+    from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT
+
+    class EffectiveConfig(SimpleNamespace):
+        reads = 0
+        selection = "float16"
+
+        @property
+        def experimental_encoder_compute_dtype(self):
+            self.reads += 1
+            return self.selection
+
+    config = EffectiveConfig(
+        vocab_size=13092,
+        num_asr_labels=13087,
+        hidden_size=17926,
+        eos_token_id=13088,
+        audio_chunk_token_id=13089,
+        eou_token_id=13090,
+        flush_token_id=13091,
+        n_layers=2,
+        d_model=32,
+        pred_hidden=2,
+        pred_rnn_layers=1,
+        joint_hidden=2,
+        conv_kernel=5,
+        att_context_left=8,
+        att_context_right=1,
+        n_mels=128,
+        endpoint_history_capacity_frames=12,
+        num_prompts=4,
+        prompt_dictionary={"en-US": 0},
+        decode_dispatch_arm="dense-eager",
+    )
+    core = torch.nn.Module()
+    tiny = _core()
+    core.encoder, core.lid = tiny.encoder, tiny.lid
+    core.featurizer = torch.nn.Linear(2, 2)
+    core.predictor = torch.nn.LSTM(2, 2)
+    core.joint = torch.nn.Linear(2, 2)
+    core.blank_id = 4
+
+    def construct_core(*, policy, **kwargs):
+        core.policy = policy
+        return core
+
+    reservations = []
+    monkeypatch.setattr(model_module, "NemotronASRCore", construct_core)
+    monkeypatch.setattr(model_module, "PersistentStateLayerBase", lambda *a, **kw: reservations.append(kw))
+    runtime_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config, dtype=torch.float32),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+    model = model_module.NemotronASRForRNNT(vllm_config=runtime_config)
+    assert config.reads == 1 and len(reservations) == 1
+    assert model.core.policy is FP16_ENCODER_EXPERIMENT
+    config.selection = "float32"
+    assert model.core.policy is FP16_ENCODER_EXPERIMENT
+    assert config.reads == 1
+    assert {parameter.dtype for parameter in model.core.encoder.parameters()} == {torch.float16}
+
+
+@pytest.mark.parametrize("engine_dtype", [torch.float16, torch.bfloat16])
+def test_encoder_fp16_startup_rejects_global_reduced_precision(engine_dtype):
+    """@spec PORT-PREC-002, PORT-PREC-010: global dtype conflicts fail with policy identity."""
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
+    from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT
+
+    config = SimpleNamespace(
+        experimental_encoder_compute_dtype="float16",
+        prompt_dictionary={"en-US": 0},
+        num_prompts=1,
+    )
+    with pytest.raises(ValueError, match=FP16_ENCODER_EXPERIMENT.identifier):
+        NemotronASRForRNNT(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=config, dtype=engine_dtype))
+        )
