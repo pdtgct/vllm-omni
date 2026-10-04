@@ -60,6 +60,11 @@ FP32. The selection stays fixed until the runtime is reloaded. Selection does
 not establish accuracy, graph/eager equivalence or serving performance; those
 require separate qualification, including paired human-reference WER.
 
+Pass the selector in only one place. A stage-local `hf_overrides` replaces any
+top-level `--hf-overrides` dictionary for that stage; the two are not merged.
+If you also need other `hf_overrides` keys, put all of them in the same
+stage-0 `hf_overrides` object alongside the selector.
+
 ### Stream audio
 
 The route speaks the vLLM realtime dialect. The client sequence is:
