@@ -1632,18 +1632,30 @@ def test_dense_graphed_model_drift_during_capture_discards_readiness(
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA capture")
 @torch.inference_mode()
+@pytest.mark.parametrize("policy_name", ["fp32", "fp16-encoder"])
 @pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
 def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     monkeypatch: pytest.MonkeyPatch,
     arm: str,
+    policy_name: str,
 ) -> None:
-    # @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
+    """Graph replay equals same-policy eager/compiled execution on real CUDA.
+
+    The oracle is exact under both policies: replay and the uncaptured
+    transition run the same kernels under the same policy, and the only
+    published tolerance (parity-tolerances.json) is the FP32 exact entry; no
+    looser graph/eager tolerance exists for the encoder-only FP16 policy.
+
+    @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
+    @spec PORT-PREC-011, PORT-PREC-012, PORT-PREC-013
+    """
     from vllm.config import VllmConfig
 
     from vllm_omni.model_executor.models.nemotron_asr.advance import _GatheredCaches
     from vllm_omni.model_executor.models.nemotron_asr.encoder import FastConformerEncoder
     from vllm_omni.model_executor.models.nemotron_asr.lid import PromptConditioner
-    from vllm_omni.model_executor.models.nemotron_asr.precision import PrecisionPolicy
+    from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import apply_policy_dtypes
+    from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT, PrecisionPolicy
 
     if arm == "eager-graphed":
         monkeypatch.setattr(torch, "compile", lambda *_args, **_kwargs: pytest.fail("native graph must not compile"))
@@ -1662,7 +1674,22 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
         att_context=(56, 1),
     )
     core.lid = PromptConditioner(enc_hidden=32, num_prompts=4)
-    core.policy = PrecisionPolicy({"*": "fp32"})
+    other_policy: PrecisionPolicy
+    if policy_name == "fp32":
+        core.policy = PrecisionPolicy({"*": "fp32"})
+        other_policy = FP16_ENCODER_EXPERIMENT
+    else:
+        core.policy = FP16_ENCODER_EXPERIMENT
+        other_policy = PrecisionPolicy({"*": "fp32"})
+        # Realize dtypes as production does for any non-bring-up policy. The
+        # decoder modules are absent from this fixture, so tensorless stand-ins
+        # satisfy the realization without changing the transition members.
+        core.predictor = nn.Module()
+        core.joint = nn.Module()
+        apply_policy_dtypes(core)
+        assert {parameter.dtype for parameter in core.encoder.parameters()} == {torch.float16}
+        assert {parameter.dtype for parameter in core.lid.parameters()} == {torch.float32}
+    assert core.policy.content_hash != other_policy.content_hash
     core.cuda().eval()
     device = torch.device("cuda", torch.accelerator.current_device_index())
 
@@ -1743,6 +1770,18 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
     assert capture_graph_counts[0] == capture_graph_counts[1]
     assert bool(core.encoder._stream_relative_position_lengths) == (arm == "dense-graphed")
     assert execution.ready_receipt()["captured_keys"] == [list(cell) for cell in cells]
+    # PORT-PREC-013: the captured domain is bound to this policy's identity.
+    assert execution._model_state is not None
+    assert execution._model_state.precision_policy == core.policy.content_hash
+    if policy_name == "fp16-encoder":
+        assert execution.ready_receipt()["precision_policy_hash"] == FP16_ENCODER_EXPERIMENT.content_hash
+    else:
+        assert "precision_policy_hash" not in execution.ready_receipt()
+    # PORT-PREC-011/012: captured state buffers and downstream frames are FP32.
+    for entry in execution._graph_entries.values():
+        assert {t.dtype for family in entry.cache_storage() for t in family if t.is_floating_point()} == {torch.float32}
+        assert entry.raw.dtype == torch.float32
+        assert entry.conditioned.dtype == torch.float32
     retained: list[tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]] = []
     compiled = execution._compiled_transition
     assert compiled is not None
@@ -1758,11 +1797,13 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
                 expected_outputs = compiled(*expected_args)
                 actual_outputs = execution.transition(*actual_args)
                 for actual, expected in zip(actual_outputs, expected_outputs, strict=True):
+                    assert actual.dtype == torch.float32
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 actual_state = tuple(t for family in actual_args[1].graph_storage() for t in family)
                 expected_state = tuple(t for family in expected_args[1].graph_storage() for t in family)
                 zero_rows = actual_args[3] == 0
                 for actual, expected, original in zip(actual_state, expected_state, before, strict=True):
+                    assert actual.dtype == original.dtype
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     torch.testing.assert_close(actual[zero_rows], original[zero_rows], rtol=0, atol=0)
                 for output in actual_outputs:
@@ -1773,6 +1814,16 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
                 retained.append((actual_outputs, tuple(t.clone() for t in actual_outputs)))
     stages = [item["stage"] for item in execution.ready_receipt()["memory_diagnostics"]]
     assert stages == ["before-staging", "after-staging", *(["after-capture"] * len(cells)), "after-all-captures"]
+    # PORT-PREC-013: a different policy identity never reuses this captured
+    # domain; the check precedes any replay and discards the domain.
+    core.policy = other_policy
+    with pytest.raises(ValueError, match="precision_policy"):
+        execution.profile_ready_cell(
+            geometry=0,
+            population=1,
+            invoke=lambda: pytest.fail("cross-policy replay must not execute"),
+        )
+    assert not execution.ready
 
 
 @pytest.mark.cpu
