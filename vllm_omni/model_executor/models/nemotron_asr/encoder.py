@@ -586,6 +586,7 @@ def _stream_conv(
     *,
     new_lengths: torch.Tensor,
     cache_indices: torch.Tensor | None = None,
+    preserve_cache_precision: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Conv module over [time_cache | new] (CausalConv1D.update_cache).
 
@@ -605,7 +606,12 @@ def _stream_conv(
     cw = cache.shape[-1]
     if cache_indices is None:
         cache_indices = _stream_cache_indices(new_lengths, cw).unsqueeze(1).expand(y.shape[0], y.shape[1], cw)
-    new_cache = padded.gather(2, cache_indices).to(cache.dtype)
+    if preserve_cache_precision:
+        # Keep retained FP32 history exact in the encoder-only experiment,
+        # including zero-length rows. Only newly computed values are widened.
+        new_cache = torch.cat([cache, y.to(cache.dtype)], dim=-1).gather(2, cache_indices)
+    else:
+        new_cache = padded.gather(2, cache_indices).to(cache.dtype)
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
@@ -621,6 +627,7 @@ def stream_step(
     out_offsets: torch.Tensor | None = None,
     out_lengths: torch.Tensor | None = None,
     out_width: int | None = None,
+    preserve_conv_cache_precision: bool = False,
 ) -> torch.Tensor:
     """One cached streaming encoder step (batch of sessions).
 
@@ -643,6 +650,9 @@ def stream_step(
     ``drop_extra`` is the uniform adapter used by the P3/P4 parity
     probes: equivalent to offsets = ``drop_extra``, lengths = full
     width, over the same single algorithm.
+
+    ``preserve_conv_cache_precision`` is enabled by the encoder-only
+    FP16 experiment so retained FP32 history avoids a compute-dtype round trip.
     """
     b = chunk_mel.shape[0]
     device = chunk_mel.device
@@ -708,7 +718,12 @@ def stream_step(
         residual = residual + attn_out
         y = layer.norm_conv(residual)
         conv_out, caches.time[idx] = _stream_conv(
-            layer, y, caches.time[idx], new_lengths=out_lengths, cache_indices=conv_indices
+            layer,
+            y,
+            caches.time[idx],
+            new_lengths=out_lengths,
+            cache_indices=conv_indices,
+            preserve_cache_precision=preserve_conv_cache_precision,
         )
         residual = residual + conv_out
         y = layer.norm_feed_forward2(residual)

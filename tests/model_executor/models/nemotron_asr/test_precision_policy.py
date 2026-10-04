@@ -8,9 +8,12 @@ Specs: PORT-PREC-001 (delegation, no hardcoded dtypes), PORT-PREC-002
 independent axis, defaults fp32, never silently reduced).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr import precision
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
@@ -77,3 +80,31 @@ def test_engine_dtype_conflict_fails_fast_naming_policy():
     with pytest.raises(ValueError, match="PrecisionPolicy"):
         FP32_BRINGUP.assert_engine_dtype(torch.bfloat16)
     FP32_BRINGUP.assert_engine_dtype(torch.float32)
+
+
+def test_encoder_compute_default_preserves_existing_policy_identifiers():
+    assert precision.resolve_precision_policy(SimpleNamespace()) is FP32_BRINGUP
+    assert precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=None)) is FP32_BRINGUP
+    assert FP32_BRINGUP.dtype_for("encoder_compute") == torch.float32
+    assert precision.BF16_COMPUTE.dtype_for("encoder_compute") == torch.bfloat16
+    assert precision.BF16_COMPUTE.content_hash == (
+        "sha256:023cadacb8c7c9aaae64acb544be77c991da83b7591c9457f2aeac39deb9daa9"
+    )
+
+
+def test_encoder_fp16_policy_keeps_all_other_classes_fp32():
+    policy = precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype="fp16"))
+    assert policy.dtype_for("encoder_compute") == torch.float16
+    for tensor_class in precision.TENSOR_CLASSES:
+        if tensor_class != "encoder_compute":
+            assert policy.dtype_for(tensor_class) == torch.float32
+    assert policy.identifier != FP32_BRINGUP.identifier
+    policy.assert_engine_dtype(torch.float32)
+    with pytest.raises(ValueError, match="engine dtype"):
+        policy.assert_engine_dtype(torch.float16)
+
+
+@pytest.mark.parametrize("selection", ["fp32", "bf16", "float16", "", True, 16])
+def test_encoder_compute_rejects_invalid_selection(selection):
+    with pytest.raises(ValueError, match="experimental_encoder_compute_dtype"):
+        precision.resolve_precision_policy(SimpleNamespace(experimental_encoder_compute_dtype=selection))
