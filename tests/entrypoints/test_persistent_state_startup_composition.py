@@ -437,20 +437,39 @@ async def test_api_install_delegates_to_one_typed_preparation_function(
     ]
 
 
+@pytest.mark.parametrize("keep_alive", (False, True))
 def test_host_fatal_records_engine_state_before_termination_supervision(
     monkeypatch: pytest.MonkeyPatch,
+    keep_alive: bool,
 ) -> None:
-    """@spec PORT-STATE-014 / PORT-INT-013."""
+    """@spec PORT-STATE-014 / PORT-INT-013 / ING-VEH-017."""
+    from vllm.entrypoints.launchers import launcher as upstream_launcher
+
+    from vllm_omni.entrypoints import launcher
     from vllm_omni.entrypoints.openai import api_server
 
     if not hasattr(api_server, "_persistent_state_host_fatal_callback"):
         _fail("PORT-STATE-014 missing API host-fatal supervision adapter")
     events: list[str] = []
-    engine = SimpleNamespace(report_persistent_state_fatal=lambda error: events.append("report"))
+    engine = SimpleNamespace(errored=False, is_running=True)
+    error = RuntimeError("release recovery exhausted")
+
+    def report_fatal(cause: BaseException) -> None:
+        assert cause is error
+        engine.errored = True
+        engine.is_running = False
+        events.append("report")
+
+    def request_shutdown(cause: BaseException) -> None:
+        assert cause is error
+        events.append("close-admission")
+
+    engine.report_persistent_state_fatal = report_fatal
     server = object()
-    state = SimpleNamespace(server=server)
+    state = SimpleNamespace(server=server, request_application_shutdown=request_shutdown)
+    monkeypatch.setattr(launcher.envs, "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", keep_alive)
     monkeypatch.setattr(
-        api_server,
+        upstream_launcher,
         "terminate_if_errored",
         lambda *, server, engine: events.append("terminate"),
     )
@@ -459,8 +478,9 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
         state=state,
         engine_client=engine,
     )
-    callback(RuntimeError("release recovery exhausted"))
-    assert events == ["report", "terminate"]
+    callback(error)
+    expected = ["report", "terminate"] if keep_alive else ["report", "close-admission", "terminate"]
+    assert events == expected
 
 
 @pytest.mark.asyncio  # type: ignore[untyped-decorator]

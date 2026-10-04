@@ -519,7 +519,7 @@ class TestErrorHandling:
         handler.create_audio_generate = AsyncMock(side_effect=exc)
         app = _make_api_server_test_app(handler)
 
-        with patch.object(serve_errors, "terminate_if_errored") as terminate_mock:
+        with patch.object(serve_errors, "request_application_shutdown") as terminate_mock:
             with TestClient(app) as client:
                 response = client.post("/v1/audio/generate", json={"input": "Hello"})
 

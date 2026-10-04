@@ -727,7 +727,7 @@ def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatc
     req = _request_for(app, method="POST", path="/v1/chat/completions")
     req.state.request_metadata = SimpleNamespace(request_id="req-123")
 
-    monkeypatch.setattr(serve_errors, "terminate_if_errored", lambda **_kwargs: None)
+    monkeypatch.setattr(serve_errors, "request_application_shutdown", lambda *_args: None)
 
     exc = EngineGenerateError("boom")
     exc.error_stage_id = 2  # type: ignore[attr-defined]
@@ -753,7 +753,7 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
     app.state.server = object()
     app.state.args = SimpleNamespace(log_error_stack=False)
 
-    monkeypatch.setattr(serve_errors, "terminate_if_errored", lambda **_kwargs: None)
+    monkeypatch.setattr(serve_errors, "request_application_shutdown", lambda *_args: None)
 
     handler = app.exception_handlers[EngineDeadError]
     req = _request_for(app)
