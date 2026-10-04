@@ -758,7 +758,7 @@ class NemotronASRForRNNT(nn.Module):
             device = parameter.device
             warmup_static_encoder_execution(self, device=device)
             if self._decode_graph_binding is not None:
-                self._decode_graph_binding.warmup(device, parameter.dtype)
+                self._decode_graph_binding.warmup(device, self.core.policy.dtype_for("activations"))
             chunk_binding = getattr(self, "_chunk_bucket_binding", None)
             if chunk_binding is not None:
                 chunk_binding.warmup(device)
