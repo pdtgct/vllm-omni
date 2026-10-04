@@ -1030,6 +1030,86 @@ class TestServiceTiming:
             assert result["units"][0]["p"] is None
             assert result["units"][0]["disposition"] == "error"
 
+    @pytest.mark.parametrize("stamp_ns", [2**53 - 1, 2**53 + 1, 14_000_000_000_000_001, 18_000_000_000_000_003])
+    def test_equal_large_ns_preserve_ready_eligible_submitted_order(self, monkeypatch: Any, stamp_ns: int) -> None:
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        stamps = []
+        for seq, kind in enumerate(("regular", "final_tail")):
+            ns = stamp_ns + seq * 1_000_000_000
+            stamp = ns / 1_000_000_000  # Same conversion as model-session readiness.
+            stamps.append(stamp)
+            handle = self.ready(observer, kind=kind, stamp=stamp)
+            observer.unit_minted(handle)
+            trace.submitted(handle, seq, seq, kind, ns, ns)
+            observer.unit_parked(handle, park_stamp_s=stamp)
+        assert trace.valid
+        record = trace.finish("completed")
+        assert record["valid"] and record["complete"] and record["end"]
+        assert record["schema"] == 1 and record["overflow"] == 0
+        assert record["count"] == record["audio_count"] == 2
+        for row, stamp in zip(record["units"], stamps):
+            assert row["r"] == row["e"] == row["s"] == row["p"] == stamp
+        observer.session_finished(session_key="timing", reason="completed")
+
+    @pytest.mark.parametrize("step_ns", [1, 2, 4])
+    def test_adjacent_large_ns_preserve_order(self, monkeypatch: Any, step_ns: int) -> None:
+        stamp_ns = 14_000_000_000_000_001
+        ready_s = stamp_ns / 1_000_000_000
+        park_s = (stamp_ns + 3 * step_ns) / 1_000_000_000
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        handle = self.ready(observer, kind="final_tail", stamp=ready_s)
+        observer.unit_minted(handle)
+        trace.submitted(handle, 0, 0, "final_tail", stamp_ns + step_ns, stamp_ns + 2 * step_ns)
+        observer.unit_parked(handle, park_stamp_s=park_s)
+        record = trace.finish("completed")
+        assert record["valid"] and record["complete"]
+        row = record["units"][0]
+        assert row["r"] == ready_s and row["p"] == park_s
+        assert row["e"] == (stamp_ns + step_ns) / 1_000_000_000
+        assert row["s"] == (stamp_ns + 2 * step_ns) / 1_000_000_000
+        assert row["r"] <= row["e"] <= row["s"] <= row["p"]
+        observer.session_finished(session_key="timing", reason="completed")
+
+    @pytest.mark.parametrize("offsets", [(4, 0, 8, 12), (0, 8, 4, 12), (0, 4, 12, 8)])
+    def test_large_ns_reverse_order_remains_invalid(self, monkeypatch: Any, offsets: tuple[int, ...]) -> None:
+        stamp_ns = 14_000_000_000_000_001
+        r_ns, e_ns, s_ns, p_ns = (stamp_ns + offset for offset in offsets)
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        handle = self.ready(observer, kind="final_tail", stamp=r_ns / 1_000_000_000)
+        observer.unit_minted(handle)
+        trace.submitted(handle, 0, 0, "final_tail", e_ns, s_ns)
+        observer.unit_parked(handle, park_stamp_s=p_ns / 1_000_000_000)
+        assert trace.valid
+        record = trace.finish("completed")
+        assert record["complete"] and not record["valid"]
+        row = record["units"][0]
+        assert row["r"] == r_ns / 1_000_000_000 and row["p"] == p_ns / 1_000_000_000
+        assert not row["r"] <= row["e"] <= row["s"] <= row["p"]
+        observer.session_finished(session_key="timing", reason="completed")
+
+    def test_large_ns_conversion_preserves_upstream_invalid(self, monkeypatch: Any) -> None:
+        stamp_ns = 14_000_000_000_000_001
+        stamp = stamp_ns / 1_000_000_000
+        observer = self.observer(monkeypatch)
+        observer.session_opened(session_key="timing", cadence_ms="160")
+        trace = observer.service_timing("timing")
+        handle = self.ready(observer, kind="final_tail", stamp=stamp)
+        observer.unit_minted(handle)
+        trace.submitted(handle, 0, 0, "final_tail", stamp_ns, stamp_ns)
+        observer.unit_parked(handle, park_stamp_s=stamp)
+        trace.valid = False
+        record = trace.finish("completed")
+        assert record["complete"] and not record["valid"]
+        row = record["units"][0]
+        assert row["r"] == row["e"] == row["s"] == row["p"] == stamp
+        observer.session_finished(session_key="timing", reason="completed")
+
     def test_fixed_capacity_even_after_overflow(self, monkeypatch: Any) -> None:
         observer = self.observer(monkeypatch)
         observer.session_opened(session_key="timing", cadence_ms="160")
