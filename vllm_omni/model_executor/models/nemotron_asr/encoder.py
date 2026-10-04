@@ -320,6 +320,8 @@ class FastConformerEncoder(nn.Module):
         # lengths are transition windows (new output width + left cache),
         # not session state; never add or replace them from stream_step.
         self._stream_relative_position_lengths: tuple[int, ...] = ()
+        self._stream_relative_rhs_maximum_population = 0
+        self._stream_relative_rhs_generation = 0
 
     @staticmethod
     def _stream_relative_position_name(length: int) -> str:
@@ -330,10 +332,12 @@ class FastConformerEncoder(nn.Module):
         for layer in self.layers:
             attn = layer.self_attn
             for length in self._stream_relative_position_lengths:
-                name = self._stream_relative_position_name(length)
-                if name in attn._buffers:
-                    delattr(attn, name)
+                for name in (self._stream_relative_position_name(length), f"_stream_relative_rhs_{length}"):
+                    if name in attn._buffers:
+                        delattr(attn, name)
         self._stream_relative_position_lengths = ()
+        self._stream_relative_rhs_maximum_population = 0
+        self._stream_relative_rhs_generation += 1
 
     def _apply(self, fn, recurse: bool = True):
         # A device or dtype transition must rebuild from the original full
@@ -414,6 +418,87 @@ class FastConformerEncoder(nn.Module):
         for attn, name, projection in prepared:
             attn.register_buffer(name, projection, persistent=False)
         self._stream_relative_position_lengths = lengths
+
+    def prepare_stream_relative_position_rhs(
+        self,
+        *,
+        out_widths: tuple[int, ...],
+        cache_len: int,
+        maximum_population: int,
+        reference: torch.Tensor,
+    ) -> None:
+        """Experimental startup-only FP32 preparation for native eager graphs.
+
+        Each exact window retains its original projection for B1 and one
+        contiguous maximum-population RHS per layer. All larger populations
+        borrow prefixes; graph keys never own another copy of these buffers.
+        """
+        if self.training or not torch.is_inference_mode_enabled():
+            raise ValueError("relative RHS preparation requires frozen serving inference")
+        if reference.dtype != torch.float32 or torch.is_autocast_enabled(reference.device.type):
+            raise ValueError("relative RHS preparation requires FP32 with autocast disabled")
+        if type(maximum_population) is not int or maximum_population <= 0:
+            raise ValueError("relative RHS maximum population must be positive")
+        if self._stream_relative_rhs_maximum_population:
+            if maximum_population != self._stream_relative_rhs_maximum_population:
+                raise ValueError("relative RHS population changed after materialization")
+            if tuple(sorted({width + cache_len for width in out_widths})) != self._stream_relative_position_lengths:
+                raise ValueError("relative RHS geometry changed after materialization")
+            return
+        if self._stream_relative_position_lengths:
+            raise ValueError("relative RHS preparation requires an unprepared encoder")
+        try:
+            self.prepare_stream_relative_position_projections(
+                out_widths=out_widths, cache_len=cache_len, reference=reference
+            )
+            if maximum_population > 1:
+                for layer in self.layers:
+                    attn = layer.self_attn
+                    for length in self._stream_relative_position_lengths:
+                        projection = getattr(attn, self._stream_relative_position_name(length))
+                        rhs = (
+                            projection.transpose(-2, -1)
+                            .expand(maximum_population, attn.h, attn.d_k, 2 * length - 1)
+                            .contiguous()
+                        )
+                        attn.register_buffer(f"_stream_relative_rhs_{length}", rhs, persistent=False)
+            self._stream_relative_rhs_maximum_population = maximum_population
+        except Exception:
+            self.invalidate_stream_relative_position_projections()
+            raise
+
+    def stream_relative_position_rhs(
+        self,
+        *,
+        out_width: int,
+        cache_len: int,
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Borrow immutable prefixes without allocating or changing geometry."""
+        maximum = self._stream_relative_rhs_maximum_population
+        if not maximum:
+            return None
+        if self.training or not torch.is_inference_mode_enabled():
+            raise ValueError("prepared relative RHS requires frozen serving inference")
+        if reference.dtype != torch.float32 or torch.is_autocast_enabled(reference.device.type):
+            raise ValueError("prepared relative RHS requires FP32 with autocast disabled")
+        batch = reference.shape[0]
+        length = int(out_width) + cache_len
+        if not 1 <= batch <= maximum or length not in self._stream_relative_position_lengths:
+            raise ValueError("prepared relative RHS population or geometry differs from startup")
+        if (
+            self.stream_relative_position_projections(out_width=out_width, cache_len=cache_len, reference=reference)
+            is None
+        ):
+            raise ValueError("prepared relative RHS projection metadata differs from execution")
+        if batch == 1:
+            # The native B1 RHS flattens with stride (Dk, 1, H*Dk), unlike
+            # B>1's broadcast materialization. Retain that original path.
+            return None
+        buffers = tuple(getattr(layer.self_attn, f"_stream_relative_rhs_{length}") for layer in self.layers)
+        if any(buffer.device != reference.device or buffer.dtype != reference.dtype for buffer in buffers):
+            raise ValueError("prepared relative RHS metadata differs from execution")
+        return tuple(buffer[:batch] for buffer in buffers)
 
     def stream_relative_position_projections(
         self,
@@ -524,6 +609,7 @@ def _stream_attention(
     new_valid: torch.Tensor,
     new_lengths: torch.Tensor,
     projected_pos: torch.Tensor | None = None,
+    position_rhs: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
     cache_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -559,7 +645,10 @@ def _stream_attention(
         p = projected_pos
     q_u = (q + attn.pos_bias_u).transpose(1, 2)
     q_v = (q + attn.pos_bias_v).transpose(1, 2)
-    matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
+    # For B>1, native matmul expands [1,H,Dk,P] then flattens to
+    # [B*H,Dk,P], materializing the broadcast. The prepared prefix has
+    # exactly those values and strides: rhs[b,h,d,p] = p[0,h,p,d].
+    matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1) if position_rhs is None else position_rhs))
     matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
     scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / attn.s_d_k
     # Mask: cache rows beyond each element's valid count are dead;
@@ -677,6 +766,7 @@ def stream_step(
         cache_len=cache_len,
         reference=x,
     )
+    position_rhs = encoder.stream_relative_position_rhs(out_width=out_width, cache_len=cache_len, reference=x)
     pos_emb = None
     if projections is None:
         pos_emb = encoder.pos_enc(
@@ -702,6 +792,7 @@ def stream_step(
             new_valid=new_valid,
             new_lengths=out_lengths,
             projected_pos=None if projections is None else projections[idx],
+            position_rhs=None if position_rhs is None else position_rhs[idx],
             mask=mask,
             cache_indices=attn_indices,
         )

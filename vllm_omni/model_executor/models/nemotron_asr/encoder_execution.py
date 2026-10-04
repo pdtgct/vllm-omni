@@ -594,6 +594,9 @@ class ResolvedEncoderExecution:
     warmup_geometries: tuple[int, ...] = ()
     warmup_populations: tuple[int, ...] = ()
     _population_bucketing: bool = False
+    _relative_rhs_preparation: bool = False
+    _relative_rhs_memory: dict[str, Any] = field(default_factory=dict, repr=False)
+    _relative_rhs_generation: int | None = None
     t_cap: int = 0
     _history_frames: int = 0
     _geometry_shapes: dict[int, EncoderGeometryShape] = field(
@@ -806,6 +809,9 @@ class ResolvedEncoderExecution:
         self._chunk_graph_entries.clear()
         self._pending_graph_entries.clear()
         self._staging_cell = None
+        if self._relative_rhs_preparation and self._core is not None:
+            self._core.encoder.invalidate_stream_relative_position_projections()
+            self._relative_rhs_memory["resident_bytes"] = 0
 
     def _materialize_preprofile_state(
         self,
@@ -853,6 +859,47 @@ class ResolvedEncoderExecution:
                 cache_len=self._history_frames,
                 reference=reference,
             )
+        if self._relative_rhs_preparation:
+            lengths = sorted({shape.out_width + self._history_frames for shape in self._geometry_shapes.values()})
+            maximum = max(self.warmup_populations)
+            projection_bytes = sum(
+                (2 * length - 1) * layer.self_attn.h * layer.self_attn.d_k * reference.element_size()
+                for layer in encoder.layers
+                for length in lengths
+            )
+            rhs_bytes = projection_bytes * maximum if maximum > 1 else 0
+            self._relative_rhs_memory = {
+                "maximum_population": maximum,
+                "window_lengths": lengths,
+                "dtype": str(activation_dtype),
+                "autocast": False,
+                "float32_matmul_precision": torch.get_float32_matmul_precision(),
+                "projection_bytes": projection_bytes,
+                "rhs_bytes": rhs_bytes,
+                "expected_bytes": projection_bytes + rhs_bytes,
+                "resident_bytes": 0,
+            }
+            try:
+                encoder.prepare_stream_relative_position_rhs(
+                    out_widths=tuple(shape.out_width for shape in self._geometry_shapes.values()),
+                    cache_len=self._history_frames,
+                    maximum_population=maximum,
+                    reference=reference,
+                )
+            except Exception:
+                self._discard()
+                raise
+            storages = {
+                (buffer.device, buffer.untyped_storage().data_ptr()): buffer.untyped_storage().nbytes()
+                for name, buffer in encoder.named_buffers()
+                if name.rsplit(".", 1)[-1].startswith(("_stream_relative_position_", "_stream_relative_rhs_"))
+            }
+            resident_bytes = sum(storages.values())
+            self._relative_rhs_memory["resident_bytes"] = resident_bytes
+            if resident_bytes != projection_bytes + rhs_bytes:
+                self._discard()
+                raise ValueError("prepared relative RHS inventory differs from expected bytes")
+            self._relative_rhs_generation = encoder._stream_relative_rhs_generation
         self._runner_device = runner_device
         self._model_state = _compiled_transition_model_state(self._core)
 
@@ -860,8 +907,24 @@ class ResolvedEncoderExecution:
         if self.arm != "eager-graphed" or self._core is None:
             return
         encoder = self._core.encoder
+        if self._relative_rhs_preparation:
+            if self._core.policy.dtype_for("activations") != torch.float32:
+                raise ValueError("relative RHS preparation requires FP32")
+            device = next(encoder.parameters()).device
+            if torch.is_autocast_enabled(device.type):
+                raise ValueError("relative RHS preparation requires autocast disabled")
+            if self._model_state is not None and encoder._stream_relative_rhs_maximum_population != max(
+                self.warmup_populations
+            ):
+                raise ValueError("prepared relative RHS population changed after materialization")
+            if self._relative_rhs_generation is not None and (
+                self._relative_rhs_generation != encoder._stream_relative_rhs_generation
+                or self._relative_rhs_memory["float32_matmul_precision"] != torch.get_float32_matmul_precision()
+            ):
+                raise ValueError("prepared relative RHS model or precision changed after materialization")
+            return
         if getattr(encoder, "_stream_relative_position_lengths", ()) or any(
-            name.rsplit(".", 1)[-1].startswith("_stream_relative_position_")
+            name.rsplit(".", 1)[-1].startswith(("_stream_relative_position_", "_stream_relative_rhs_"))
             for name, _buffer in encoder.named_buffers()
         ):
             raise ValueError("eager-graphed encoder rejects prepared learned position projections")
@@ -1365,6 +1428,8 @@ class ResolvedEncoderExecution:
             "warmup_geometries": list(self.warmup_geometries),
             "warmup_populations": list(self.warmup_populations),
         }
+        if self._relative_rhs_preparation:
+            receipt["relative_position_rhs"] = {"enabled": True, **self._relative_rhs_memory}
         if self.arm in _GRAPHED_ARMS:
             receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
         if self._chunk_graph_cells:
@@ -1440,6 +1505,11 @@ def build_encoder_execution(
             f"unknown encoder_execution_arm {arm!r} "
             "(known: ['compiled-static', 'dense-graphed', 'eager', 'eager-graphed'])"
         )
+    relative_rhs_preparation = getattr(hf_config, "encoder_relative_rhs_preparation", False)
+    if not isinstance(relative_rhs_preparation, bool):
+        raise ValueError("encoder_relative_rhs_preparation must be boolean")
+    if relative_rhs_preparation and arm != "eager-graphed":
+        raise ValueError("encoder_relative_rhs_preparation requires eager-graphed execution")
 
     def transition(
         mel: torch.Tensor,
@@ -1498,6 +1568,7 @@ def build_encoder_execution(
         warmup_geometries=geometries,
         warmup_populations=populations,
         _population_bucketing=population_bucketing,
+        _relative_rhs_preparation=relative_rhs_preparation,
         t_cap=t_cap,
         _history_frames=history_frames,
         _geometry_shapes=geometry_shape_by_id,
@@ -1516,6 +1587,8 @@ def build_encoder_execution(
         prompt_index: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         execution._raise_if_failed()
+        if execution._relative_rhs_preparation:
+            execution._assert_native_projection_state()
         if not execution._sealed and execution._active_cell is None:
             raise ValueError(f"{arm} encoder pre-seal invocation lacks declared cell authority")
         signature = _encoder_signature(

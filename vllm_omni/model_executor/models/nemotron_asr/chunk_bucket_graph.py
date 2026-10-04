@@ -24,7 +24,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     advance_chunk_bucket,
 )
 from vllm_omni.model_executor.models.nemotron_asr.decode_graph import GraphRuntime, platform_graph_runtime
-from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import _tensor_signature
+from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import ResolvedEncoderExecution, _tensor_signature
 from vllm_omni.model_executor.models.nemotron_asr.manifests import CADENCES
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import decode_dense_masked_frames
 
@@ -95,6 +95,7 @@ def capture_chunk_bucket(
     admitted_decode_fn: Any = decode_dense_masked_frames,
     admitted_encoder_transition: Any = None,
     decoder_tier: int | None = None,
+    prepared_encoder_execution: ResolvedEncoderExecution | None = None,
 ) -> Callable[..., ChunkBucketResult]:
     """Capture a single explicit cell, preserving caller state and output lifetime.
 
@@ -111,7 +112,20 @@ def capture_chunk_bucket(
     if population in (1, 31, 63) and (capture_decode_fn is None or decoder_tier is None):
         raise ValueError("selected CHUNK population requires the sealed split decoder")
     execute_decode = decode_dense_masked_frames if capture_decode_fn is None else capture_decode_fn
-    if getattr(core.encoder, "_stream_relative_position_lengths", ()):
+    if prepared_encoder_execution is not None:
+        authority = prepared_encoder_execution
+        if (
+            authority.arm != "eager-graphed"
+            or not authority._relative_rhs_preparation
+            or authority._core is not core
+            or authority.transition is not admitted_encoder_transition
+            or not authority._sealed
+            or (geometry, population) not in authority._chunk_graph_cells
+        ):
+            raise ValueError("prepared CHUNK capture differs from its sealed encoder authority")
+        authority._raise_if_failed()
+        authority._assert_model_state()
+    elif getattr(core.encoder, "_stream_relative_position_lengths", ()):
         raise ValueError("bucket graph requires unprepared native positional projections")
     runtime = runtime or platform_graph_runtime()
     sample_width = 8 * (list(CADENCES.values())[geometry][1] + 1) * int(core.featurizer.hop_length)
@@ -186,6 +200,8 @@ def capture_chunk_bucket(
         ):
             torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
         runtime.synchronize(env.device)
+        if prepared_encoder_execution is not None:
+            prepared_encoder_execution._assert_model_state()
     finally:
         runtime.set_capture_enabled(False)
 
@@ -204,6 +220,12 @@ def capture_chunk_bucket(
         capture: bool = False,
         capture_geometry: Any | None = None,
     ) -> ChunkBucketResult:
+        if prepared_encoder_execution is not None:
+            # Retained callables must reject supported model mutations even
+            # when invoked without another binding.resolve(). As with native
+            # graphs, arbitrary in-place weight edits violate frozen serving.
+            prepared_encoder_execution._raise_if_failed()
+            prepared_encoder_execution._assert_native_projection_state()
         values = (actual_env, admitted_prompt, incoming_status, *_state_tensors(actual_state))
         if (
             actual_core is not core
@@ -347,6 +369,9 @@ class ExactChunkGraphBinding:
                     admitted_decode_fn=self._decoder.decode_fn(geometry=geometry, tier=tier),
                     admitted_encoder_transition=self._encoder.transition,
                     decoder_tier=tier,
+                    prepared_encoder_execution=(
+                        self._encoder if getattr(self._encoder, "_relative_rhs_preparation", False) else None
+                    ),
                 )
                 self._encoder._record_memory_diagnostic(device, stage="after-chunk-capture", key=(geometry, population))
                 del state, pools, invocation
@@ -368,6 +393,8 @@ class ExactChunkGraphBinding:
         """Resolve from host row authority before any resident state is read."""
         if not self.ready:
             raise ValueError("CHUNK graph inventory is incomplete")
+        if getattr(self._encoder, "_relative_rhs_preparation", False):
+            self._encoder._assert_native_projection_state()
         cell = (geometry, population)
         if cell not in self._cells:
             return self._fallback
@@ -388,7 +415,7 @@ class ExactChunkGraphBinding:
 
     def receipt(self) -> dict[str, Any]:
         """Read host-only counters; never synchronize or reset measured state."""
-        return {
+        receipt = {
             "ready": self.ready,
             "worker_pid": os.getpid(),
             "instance_id": self._instance_id,
@@ -407,3 +434,6 @@ class ExactChunkGraphBinding:
                 for (g, n), count in sorted(self._fallback_counts.items())
             ],
         }
+        if getattr(self._encoder, "_relative_rhs_preparation", False):
+            receipt["relative_position_rhs"] = self._encoder.ready_receipt()["relative_position_rhs"]
+        return receipt

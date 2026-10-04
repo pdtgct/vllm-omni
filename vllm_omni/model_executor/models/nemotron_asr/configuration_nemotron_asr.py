@@ -107,6 +107,7 @@ class NemotronASRConfig(PretrainedConfig):
         flush_token_id: int | None = None,
         endpoint_history_capacity_frames: int = 12,
         encoder_execution_arm: str | None = None,
+        encoder_relative_rhs_preparation: bool = False,
         decode_dispatch_arm: str | None = None,
         decode_dispatch_table: str | None = None,
         performance_gated: bool = False,
@@ -160,6 +161,11 @@ class NemotronASRConfig(PretrainedConfig):
         # Absence retains the compatibility eager baseline; an experiment
         # stamps the resolved value into its evidence fingerprint.
         self.encoder_execution_arm = encoder_execution_arm
+        # Default-off eager-graphed research policy, serialized with the
+        # model configuration so experimental execution has explicit identity.
+        if not isinstance(encoder_relative_rhs_preparation, bool):
+            raise ValueError("encoder_relative_rhs_preparation must be boolean")
+        self.encoder_relative_rhs_preparation = encoder_relative_rhs_preparation
         # Startup decode policy is part of the served artifact, not a
         # process-local default. Preserve all three fields through HF
         # serialization so build_decode_resolver sees the declaration
