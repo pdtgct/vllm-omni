@@ -11,6 +11,8 @@ from typing import Any, cast
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.precision import FP32_BRINGUP
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -658,7 +660,7 @@ def test_chunk_final_inventory_profiles_selected_cells_and_maximum_before_reside
     chunk.warmup = chunk_warmup
     for name, value in {
         "config": SimpleNamespace(supported_num_lookahead_tokens=[1], decode_dispatch_arm="dense-graphed"),
-        "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter]))),
+        "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter])), policy=FP32_BRINGUP),
         "_max_num_seqs": 128,
         "_encoder_execution": execution,
         "_decode_graph_binding": decoder,

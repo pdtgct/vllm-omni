@@ -10,6 +10,11 @@ import torch
 
 from vllm_omni.model_executor.models.nemotron_asr import profile_execution as profile
 from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
+from vllm_omni.model_executor.models.nemotron_asr.precision import (
+    BF16_COMPUTE,
+    FP16_ENCODER_EXPERIMENT,
+    FP32_BRINGUP,
+)
 from vllm_omni.worker import base as worker_module
 from vllm_omni.worker import gpu_ar_model_runner_v2 as runner_module
 from vllm_omni.worker import persistent_state as worker_state
@@ -17,10 +22,10 @@ from vllm_omni.worker import persistent_state as worker_state
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _model(monkeypatch, *, graphs=True, fail=None):
+def _model(monkeypatch, *, graphs=True, fail=None, policy=FP32_BRINGUP):
     model = object.__new__(NemotronASRForRNNT)
     events = []
-    parameter = torch.zeros(1)
+    parameter = torch.zeros(1, dtype=policy.dtype_for("encoder_compute"))
     execution = SimpleNamespace(arm="compiled-static" if graphs else "eager", ready=not graphs)
     execution.ready_receipt = lambda: {"ready": execution.ready}
     binding = SimpleNamespace(captured_keys=()) if graphs else None
@@ -35,7 +40,7 @@ def _model(monkeypatch, *, graphs=True, fail=None):
 
     def decoder_warmup(device, dtype):
         assert binding is not None
-        assert device == parameter.device and dtype == parameter.dtype
+        assert device == parameter.device and dtype == policy.dtype_for("activations")
         assert torch.is_inference_mode_enabled()
         events.append("decoder")
         if fail == "decoder":
@@ -63,7 +68,7 @@ def _model(monkeypatch, *, graphs=True, fail=None):
         "config": SimpleNamespace(
             supported_num_lookahead_tokens=[0], decode_dispatch_arm="dense-graphed" if graphs else "dense-eager"
         ),
-        "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter]))),
+        "core": SimpleNamespace(encoder=SimpleNamespace(parameters=lambda: iter([parameter])), policy=policy),
         "_max_num_seqs": 2,
         "_encoder_execution": execution,
         "_decode_graph_binding": binding,
@@ -78,9 +83,12 @@ def _model(monkeypatch, *, graphs=True, fail=None):
 
 
 @pytest.mark.parametrize("graphs", [False, True])
-def test_preparation_retains_complete_inventory_for_final_profile(monkeypatch, graphs):
-    """@spec PORT-STATE-003, PORT-PERF-009, PORT-PERF-011."""
-    model, events, execution, binding = _model(monkeypatch, graphs=graphs)
+@pytest.mark.parametrize(
+    "policy", [FP32_BRINGUP, BF16_COMPUTE, FP16_ENCODER_EXPERIMENT], ids=["fp32", "bf16", "fp16-encoder"]
+)
+def test_preparation_retains_complete_inventory_for_final_profile(monkeypatch, graphs, policy):
+    """@spec PORT-PREC-001, PORT-STATE-003, PORT-PERF-009, PORT-PERF-011."""
+    model, events, execution, binding = _model(monkeypatch, graphs=graphs, policy=policy)
     model.prepare_execution_memory()
     assert events == (["encoder", "decoder", "final-profile"] if graphs else ["encoder", "final-profile"])
     assert model._encoder_execution is execution
