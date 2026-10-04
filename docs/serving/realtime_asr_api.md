@@ -40,6 +40,26 @@ FP32 weights, eager execution, and prefix caching disabled are selected
 automatically. `--served-model-name` sets the public model id clients must
 use; the checkpoint path is never a client-facing identity.
 
+### Optional encoder precision experiment
+
+Encoder-only FP16 is experimental, unqualified and disabled by default. Select
+it at startup through the existing stage-local model configuration:
+
+```bash
+vllm-omni serve ./nemotron-3.5-asr-streaming-0.6b \
+    --served-model-name nemotron --omni --dtype float32 \
+    --stage-overrides '{"0":{"hf_overrides":{"experimental_encoder_compute_dtype":"float16"}}}'
+```
+
+The exact selector values are `"float16"` and `"float32"`. Omission, JSON `null`
+or `"float32"` retains the unchanged FP32 policy; aliases such as `"fp16"` and
+`"fp32"`, other dtypes and invalid values fail startup. Engine dtype must remain
+FP32. The same FP32 checkpoint loads into FP16 encoder weights once; frontend,
+language conditioning, predictor, joint and floating persistent state remain
+FP32. The selection stays fixed until the runtime is reloaded. Selection does
+not establish accuracy, graph/eager equivalence or serving performance; those
+require separate qualification, including paired human-reference WER.
+
 ### Stream audio
 
 The route speaks the vLLM realtime dialect. The client sequence is:
