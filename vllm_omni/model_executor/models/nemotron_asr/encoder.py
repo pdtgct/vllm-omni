@@ -380,6 +380,8 @@ class FastConformerEncoder(nn.Module):
         window.  The source is the original centered positional slice from
         the full positional table, passed through that layer's original
         ``linear_pos``; it is never a crop of another projected window.
+        Each buffer is stored head-major and contiguous, ``(h, 2T-1, d_k)``,
+        so the batch-independent projection is never copied per batch row.
         """
         if self.training or torch.is_grad_enabled():
             raise ValueError("stream relative-position projections require frozen inference")
@@ -400,16 +402,7 @@ class FastConformerEncoder(nn.Module):
                 raise ValueError("stream relative-position projection weight metadata differs from execution")
             for length in lengths:
                 pos_emb = self.pos_enc.pe[:, center - length : center + length - 1]
-                projection = (
-                    attn.linear_pos(pos_emb)
-                    .view(
-                        pos_emb.size(0),
-                        -1,
-                        attn.h,
-                        attn.d_k,
-                    )
-                    .transpose(1, 2)
-                )
+                projection = _head_major_position_projection(attn, pos_emb)
                 prepared.append((attn, self._stream_relative_position_name(length), projection))
         for attn, name, projection in prepared:
             attn.register_buffer(name, projection, persistent=False)
@@ -514,6 +507,38 @@ def _stream_cache_indices(new_lengths: torch.Tensor, capacity: int) -> torch.Ten
     return new_lengths.view(-1, 1) + torch.arange(capacity, device=new_lengths.device).unsqueeze(0)
 
 
+def _head_major_position_projection(attn: RelPositionMHA, pos_emb: torch.Tensor) -> torch.Tensor:
+    """Project ``(1, 2T-1, d)`` positions to contiguous ``(h, 2T-1, d_k)``."""
+    if pos_emb.size(0) != 1:
+        raise ValueError("stream positional embeddings are batch-independent")
+    return attn.linear_pos(pos_emb).view(-1, attn.h, attn.d_k).transpose(0, 1).contiguous()
+
+
+def _stream_rel_shift(raw: torch.Tensor, *, batch: int, queries: int, keys: int) -> torch.Tensor:
+    """Relative shift of head-major position scores, as a strided view.
+
+    ``raw`` is the contiguous ``(h, B*F, 2T-1)`` product. For query ``i``
+    and key ``j < T`` the Transformer-XL shift (``RelPositionMHA._rel_shift``
+    followed by the ``[..., :T]`` crop) selects ``raw[..., i, F-1-i+j]``:
+    a pure index map, so the result is a ``(B, h, F, T)`` view with no
+    padding copy and values identical to the shift-and-crop. Within each
+    (head, row) block that element sits at flat offset
+    ``F-1 + i*(2T-2) + j``, so the view drops ``F-1`` leading elements and
+    re-reads the block with row pitch ``2T-2``.
+    """
+    heads, rows, pos_len = raw.shape
+    if rows != batch * queries or pos_len != 2 * keys - 1 or queries > keys:
+        raise ValueError("stream position scores have an unexpected geometry")
+    blocks = raw.view(heads, batch, queries * pos_len)
+    if keys == 1:
+        shifted = blocks.view(heads, batch, queries, 1)
+    else:
+        pitch = pos_len - 1
+        shifted = blocks[..., queries - 1 : queries - 1 + queries * pitch].view(heads, batch, queries, pitch)
+        shifted = shifted[..., :keys]
+    return shifted.transpose(0, 1)
+
+
 def _stream_attention(
     layer: ConformerLayer,
     x: torch.Tensor,
@@ -556,14 +581,24 @@ def _stream_attention(
     if projected_pos is None:
         if pos_emb is None:
             raise ValueError("stream attention requires positional embeddings or a prepared projection")
-        p = attn.linear_pos(pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
+        p = _head_major_position_projection(attn, pos_emb)
     else:
         p = projected_pos
-    q_u = (q + attn.pos_bias_u).transpose(1, 2)
-    q_v = (q + attn.pos_bias_v).transpose(1, 2)
-    matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
+    # Content scores: the bias add writes q_u head-major directly, so the
+    # batched matmul reads it without a separate layout copy.
+    q_u = q.new_empty((b, attn.h, new_frames, attn.d_k))
+    torch.add(q.transpose(1, 2), attn.pos_bias_u.unsqueeze(1), out=q_u)
     matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
-    scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / attn.s_d_k
+    # Position scores: p is shared by every row, so fold the batch into
+    # the GEMM rows -- one head-batched (B*F, d_k) @ (d_k, 2T-1) product.
+    q_v = (q + attn.pos_bias_v).view(b * new_frames, attn.h, attn.d_k).transpose(0, 1)
+    matrix_bd = _stream_rel_shift(
+        torch.matmul(q_v, p.transpose(-2, -1)),
+        batch=b,
+        queries=new_frames,
+        keys=t2,
+    )
+    scores = (matrix_ac + matrix_bd) / attn.s_d_k
     # Mask: cache rows beyond each element's valid count are dead;
     # padded new frames are dead keys; padded queries mask fully.
     if mask is None:
