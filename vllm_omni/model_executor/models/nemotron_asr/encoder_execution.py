@@ -67,6 +67,10 @@ class EncoderCaches(Protocol):
         """Build the same adapter class/layout over fresh tensor storage."""
         ...
 
+    def narrow_rows(self, rows: int) -> EncoderCaches:
+        """Build the same adapter class over this storage's leading rows."""
+        ...
+
 
 EncoderTransition = Callable[
     [
@@ -419,6 +423,14 @@ def _copy_cache_storage_(
             strict=True,
         ):
             destination_tensor.copy_(source_tensor)
+
+
+def _bank_rows(bank: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Borrow a zero-offset leading-row prefix laid out exactly like ``like``."""
+    rows = bank.narrow(0, 0, like.shape[0])
+    if rows.shape != like.shape or rows.stride() != like.stride() or rows.dtype != like.dtype:
+        raise ValueError("graphed encoder bank changed tensor layout")
+    return rows
 
 
 def _population_capture_tiers(maximum: int) -> tuple[int, ...]:
@@ -1040,10 +1052,19 @@ class ResolvedEncoderExecution:
         runtime = self._graph_runtime
         if run_transition is None or runtime is None or self._vllm_config is None:
             raise ValueError("graphed encoder runtime authority is unavailable")
-        empty_like = getattr(caches, "empty_like", None)
-        if not callable(empty_like):
-            raise TypeError("graphed encoder caches require empty_like()")
-        stable_caches = empty_like()
+        # Cells of one geometry borrow leading rows of the largest staged
+        # population's storage. Replays are serial and copy out before return.
+        bank = self._graph_bank(cell)
+        if bank is None:
+            empty_like = getattr(caches, "empty_like", None)
+            if not callable(empty_like):
+                raise TypeError("graphed encoder caches require empty_like()")
+            stable_caches = empty_like()
+        else:
+            narrow_rows = getattr(bank.caches, "narrow_rows", None)
+            if not callable(narrow_rows):
+                raise TypeError("graphed encoder caches require narrow_rows()")
+            stable_caches = narrow_rows(cell[1])
         if type(stable_caches) is not type(caches):
             raise TypeError("graphed encoder cache factory changed adapter class")
         caller_storage = _cache_storage(caches)
@@ -1052,10 +1073,13 @@ class ResolvedEncoderExecution:
         if _cache_storage_signature(stable_storage) != caller_storage_signature:
             raise ValueError("graphed encoder cache factory changed tensor layout")
 
-        stable_mel = torch.empty_like(mel)
-        stable_offsets = torch.empty_like(out_offsets)
-        stable_lengths = torch.empty_like(out_lengths)
-        stable_prompt = torch.empty_like(prompt_index)
+        def stable(tensor: torch.Tensor, name: str) -> torch.Tensor:
+            return torch.empty_like(tensor) if bank is None else _bank_rows(getattr(bank, name), tensor)
+
+        stable_mel = stable(mel, "mel")
+        stable_offsets = stable(out_offsets, "out_offsets")
+        stable_lengths = stable(out_lengths, "out_lengths")
+        stable_prompt = stable(prompt_index, "prompt_index")
         descriptor = runtime.descriptor_factory(cell[1])
 
         # Discover result layouts before allocating strong graph outputs. This
@@ -1102,8 +1126,8 @@ class ResolvedEncoderExecution:
             out_lengths=stable_lengths,
             out_width=int(out_width),
             prompt_index=stable_prompt,
-            raw=torch.empty_like(raw),
-            conditioned=torch.empty_like(conditioned),
+            raw=stable(raw, "raw"),
+            conditioned=stable(conditioned, "conditioned"),
             descriptor=descriptor,
             wrapper=None,
         )
@@ -1127,6 +1151,17 @@ class ResolvedEncoderExecution:
             runtime_mode=runtime.graph_mode,
         )
         return entry
+
+    def _graph_bank(self, cell: tuple[int, int]) -> _EncoderGraphEntry | None:
+        """Return the staged largest-population entry of this cell's geometry."""
+        bank = max(
+            (entry for key, entry in self._pending_graph_entries.items() if key[0] == cell[0]),
+            key=lambda entry: entry.key[1],
+            default=None,
+        )
+        if bank is not None and bank.key[1] < cell[1]:
+            raise ValueError("graphed encoder staging must start at the largest population")
+        return bank
 
     def _call_graph_entry(
         self,
@@ -1210,7 +1245,15 @@ class ResolvedEncoderExecution:
             raise ValueError("encoder graph capture requires a sealed static domain")
         if self._graph_entries or self._pending_graph_entries:
             raise ValueError("graphed encoder capture was repeated")
-        cells = tuple(cell for cell in cells if cell not in self._chunk_graph_cells)
+        # Largest populations first: they own each geometry's storage bank,
+        # and capture into the shared graph pool proceeds from the largest.
+        cells = tuple(
+            sorted(
+                (cell for cell in cells if cell not in self._chunk_graph_cells),
+                key=lambda cell: cell[1],
+                reverse=True,
+            )
+        )
         runtime = self._graph_runtime
         device = self._runner_device
         if runtime is None or device is None:
