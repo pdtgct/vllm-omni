@@ -158,6 +158,13 @@ class _GraphCaches:
             tuple(torch.empty_like(tensor) for tensor in self._valid_slots),
         )
 
+    def narrow_rows(self, rows: int) -> "_GraphCaches":
+        return type(self)(
+            tuple(tensor.narrow(0, 0, rows) for tensor in self.channel),
+            tuple(tensor.narrow(0, 0, rows) for tensor in self.time),
+            tuple(tensor.narrow(0, 0, rows) for tensor in self._valid_slots),
+        )
+
 
 class _FakeGraphWrapper:
     """Record-only first capture, then Python execution for CPU contracts.
@@ -2381,3 +2388,118 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
     execution._discard()
     assert not execution.ready
     assert not execution._chunk_graph_entries and not execution._graph_entries
+
+
+def _retained_storage_bytes(tensors: Any) -> int:
+    storages = {tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes() for tensor in tensors}
+    return sum(storages.values())
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+def test_graphed_staging_borrows_one_max_population_bank_per_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+) -> None:
+    # @spec PORT-PERF-011
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    core = _compiled_core()
+    execution = build_encoder_execution(
+        core,
+        _dense_graphed_config(arm),
+        maximum_population=8,
+        warmup_geometries=(0, 1),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    shapes = {geometry: encoder_execution_module.encoder_geometry_shape(core, geometry) for geometry in (0, 1)}
+    cells = tuple((geometry, population) for geometry in (0, 1) for population in range(1, 9))
+    execution.warmup_domain(
+        expected_cells=cells,
+        invoke=lambda geometry, population: execution.transition(
+            *_graph_transition_args(
+                population=population,
+                mel_width=shapes[geometry].mel_width,
+                out_width=shapes[geometry].out_width,
+            )
+        ),
+    )
+    assert execution.ready
+    assert execution.ready_receipt()["captured_keys"] == [list(cell) for cell in sorted(cells)]
+    entries = execution._graph_entries
+    row_bytes = 56 * 3 * 4
+    for geometry in (0, 1):
+        small, large = entries[(geometry, 1)], entries[(geometry, 8)]
+        for small_tensor, large_tensor in zip(
+            (small.mel, small.out_offsets, small.out_lengths, small.prompt_index, small.raw, small.conditioned),
+            (large.mel, large.out_offsets, large.out_lengths, large.prompt_index, large.raw, large.conditioned),
+            strict=True,
+        ):
+            assert small_tensor.untyped_storage().data_ptr() == large_tensor.untyped_storage().data_ptr()
+            assert small_tensor.storage_offset() == 0 and small_tensor.is_contiguous()
+            assert small_tensor.shape[0] == 1 and large_tensor.shape[0] == 8
+        for small_family, large_family in zip(small.cache_storage(), large.cache_storage(), strict=True):
+            for small_tensor, large_tensor in zip(small_family, large_family, strict=True):
+                assert small_tensor.untyped_storage().data_ptr() == large_tensor.untyped_storage().data_ptr()
+                assert small_tensor.storage_offset() == 0 and small_tensor.is_contiguous()
+        channel = [
+            tensor for (g, _), entry in entries.items() if g == geometry for tensor in entry.cache_storage().channel
+        ]
+        # Two channel layers retain 8 rows each, not the 1+...+8 = 36-row triangle.
+        assert _retained_storage_bytes(channel) == 2 * 8 * row_bytes
+    # Geometries never share a bank.
+    assert entries[(0, 8)].mel.untyped_storage().data_ptr() != entries[(1, 8)].mel.untyped_storage().data_ptr()
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+def test_graphed_shared_bank_replays_are_isolated_from_prefix_neighbours(
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+) -> None:
+    # @spec PORT-PERF-011
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config(arm),
+        maximum_population=4,
+        warmup_geometries=(0,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    execution.warmup_domain(
+        expected_cells=tuple((0, population) for population in range(1, 5)),
+        invoke=lambda _geometry, population: execution.transition(*_graph_transition_args(population=population)),
+    )
+    bank_pointers = {
+        tensor.untyped_storage().data_ptr()
+        for entry in execution._graph_entries.values()
+        for tensor in (
+            entry.raw,
+            entry.conditioned,
+            entry.mel,
+            *(t for family in entry.cache_storage() for t in family),
+        )
+    }
+
+    def state(caches: _GraphCaches) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor.clone() for family in caches.graph_storage() for tensor in family)
+
+    retained: list[tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]] = []
+    # small -> clone -> large -> small again; every result equals a no-sharing oracle.
+    for population, base in ((2, 3.0), (4, 11.0), (2, 23.0), (1, 31.0), (3, 37.0)):
+        actual = _graph_transition_args(population=population, base=base)
+        oracle = _graph_transition_args(population=population, base=base)
+        expected_outputs = _functional_graph_transition(_compiled_core(), *oracle)
+        outputs = execution.transition(*actual)
+        assert all(torch.equal(left, right) for left, right in zip(outputs, expected_outputs, strict=True))
+        assert all(torch.equal(left, right) for left, right in zip(state(actual[1]), state(oracle[1]), strict=True))
+        # Callers receive clones, never bank views.
+        assert not {tensor.untyped_storage().data_ptr() for tensor in outputs} & bank_pointers
+        for old_outputs, old_values in retained:
+            assert all(torch.equal(left, right) for left, right in zip(old_outputs, old_values, strict=True))
+        retained.append((outputs, tuple(tensor.clone() for tensor in outputs)))
