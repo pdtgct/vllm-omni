@@ -526,6 +526,7 @@ def _stream_attention(
     projected_pos: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
     cache_indices: torch.Tensor | None = None,
+    cache_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
@@ -537,7 +538,8 @@ def _stream_attention(
     so its output is exactly 0 — never NaN), and the cache advances by
     each row's LOGICAL length via a per-row gather over [cache | new].
     Returns the attention output for the new frames and the advanced
-    cache.
+    cache. With ``cache_out`` (which may be ``cache`` itself) the advance
+    is gathered straight into that storage and it is returned.
     """
     attn = layer.self_attn
     batch, new_frames, _ = x.shape
@@ -575,7 +577,14 @@ def _stream_attention(
     # bit-identical; gather indices never touch padded frames.
     if cache_indices is None:
         cache_indices = _stream_cache_indices(new_lengths, capacity).unsqueeze(-1).expand(b, capacity, keys.shape[2])
-    new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, cache_indices)
+    # The gather source is a fresh concatenation, so writing the advance
+    # into ``cache_out`` (even when it is ``cache``) cannot alias a read:
+    # every read of ``cache`` (``keys`` and this source) precedes it.
+    source = torch.cat([cache, x.to(cache.dtype)], dim=1)
+    if cache_out is None:
+        new_cache = source.gather(1, cache_indices)
+    else:
+        new_cache = torch.gather(source, 1, cache_indices, out=cache_out)
     return attn.linear_out(out), new_cache
 
 
@@ -587,13 +596,15 @@ def _stream_conv(
     new_lengths: torch.Tensor,
     cache_indices: torch.Tensor | None = None,
     preserve_cache_precision: bool = False,
+    cache_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Conv module over [time_cache | new] (CausalConv1D.update_cache).
 
     The causal depthwise conv makes every valid output independent of
     padded columns (and the norm is per-position), so only the cache
     tail needs length awareness: slot j of the new tail gathers
-    [cache | glu][j + F_b], each row's own logical append.
+    [cache | glu][j + F_b], each row's own logical append. ``cache_out``
+    (which may be ``cache`` itself) receives the advance in place.
     """
     conv = layer.conv
     batch, frames, width = x.shape
@@ -606,12 +617,23 @@ def _stream_conv(
     cw = cache.shape[-1]
     if cache_indices is None:
         cache_indices = _stream_cache_indices(new_lengths, cw).unsqueeze(1).expand(y.shape[0], y.shape[1], cw)
+    # Both gather sources are fresh concatenations (no alias with
+    # ``cache_out``), and every read of ``cache`` precedes the write.
     if preserve_cache_precision:
         # Keep retained FP32 history exact in the encoder-only experiment,
         # including zero-length rows. Only newly computed values are widened.
-        new_cache = torch.cat([cache, y.to(cache.dtype)], dim=-1).gather(2, cache_indices)
-    else:
+        source = torch.cat([cache, y.to(cache.dtype)], dim=-1)
+        if cache_out is None:
+            new_cache = source.gather(2, cache_indices)
+        else:
+            new_cache = torch.gather(source, 2, cache_indices, out=cache_out)
+    elif cache_out is None:
         new_cache = padded.gather(2, cache_indices).to(cache.dtype)
+    elif padded.dtype == cache_out.dtype:
+        new_cache = torch.gather(padded, 2, cache_indices, out=cache_out)
+    else:
+        # The write-cast happens in the copy (same rounding as ``.to``).
+        new_cache = cache_out.copy_(padded.gather(2, cache_indices))
     y = conv.depthwise_conv(padded)
     y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
@@ -703,10 +725,13 @@ def stream_step(
         y = layer.norm_feed_forward1(x)
         residual = residual + 0.5 * layer.feed_forward1(y)
         y = layer.norm_self_att(residual)
-        attn_out, caches.channel[idx] = _stream_attention(
+        # Each advance gathers straight into its layer's cache storage
+        # (static addresses under graph capture; no copy-back).
+        channel = caches.channel[idx]
+        attn_out, _ = _stream_attention(
             layer,
             y,
-            cache=caches.channel[idx],
+            cache=channel,
             valid=caches.valid,
             pos_emb=pos_emb,
             new_valid=new_valid,
@@ -714,16 +739,19 @@ def stream_step(
             projected_pos=None if projections is None else projections[idx],
             mask=mask,
             cache_indices=attn_indices,
+            cache_out=channel,
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)
-        conv_out, caches.time[idx] = _stream_conv(
+        time = caches.time[idx]
+        conv_out, _ = _stream_conv(
             layer,
             y,
-            caches.time[idx],
+            time,
             new_lengths=out_lengths,
             cache_indices=conv_indices,
             preserve_cache_precision=preserve_conv_cache_precision,
+            cache_out=time,
         )
         residual = residual + conv_out
         y = layer.norm_feed_forward2(residual)
