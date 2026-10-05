@@ -32,6 +32,13 @@ from vllm_omni.model_executor.models.nemotron_asr.masks import (
 )
 
 _LOG_BASE = 10000.0
+# Finite additive mask value of NeMo's SDPA path (INF_VAL,
+# NVIDIA-NeMo/Speech@981fd4e0 multi_head_attention.py:54). Representable in
+# FP16; exp(-10000 + O(scores)) underflows to exactly 0 in every dtype.
+_SDPA_MASK_VALUE = 10000.0
+# Memory-efficient SDPA needs attention-bias rows on a 16-element pitch or
+# it pads (copies) the bias itself; the bias is computed at such a pitch.
+_SDPA_BIAS_ALIGNMENT = 16
 
 
 def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
@@ -502,6 +509,35 @@ def _stream_attention_mask(
     return mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
 
 
+def _sdpa_bias_width(keys: int) -> int:
+    """Bias row width: ``keys`` rounded up to the SDPA alignment when the
+    shifted position-score view can supply it (``<= 2T-2`` columns)."""
+    aligned = -(-keys // _SDPA_BIAS_ALIGNMENT) * _SDPA_BIAS_ALIGNMENT
+    return aligned if keys > 1 and aligned <= 2 * keys - 2 else keys
+
+
+class StreamSDPAMask:
+    """Per-transition read-only inputs of the SDPA streaming attention.
+
+    Built once per encoder transition from the boolean ``(B, 1, F, T)``
+    mask and shared by every layer: ``additive`` is ``(B, 1, F, W)`` with
+    0 for attendable and ``-_SDPA_MASK_VALUE`` for masked keys, where
+    ``W = _sdpa_bias_width(T)``; columns ``>= T`` are alignment padding
+    that SDPA never reads. ``dead_queries`` is ``(B, 1, F, 1)`` True where
+    a query row is fully masked.
+    """
+
+    __slots__ = ("additive", "dead_queries")
+
+    def __init__(self, mask: torch.Tensor, *, dtype: torch.dtype) -> None:
+        batch, _, queries, keys = mask.shape
+        width = _sdpa_bias_width(keys)
+        additive = torch.zeros(batch, 1, queries, width, dtype=dtype, device=mask.device)
+        additive[..., :keys].masked_fill_(mask, -_SDPA_MASK_VALUE)
+        self.additive = additive
+        self.dead_queries = mask.all(dim=-1, keepdim=True)
+
+
 def _stream_cache_indices(new_lengths: torch.Tensor, capacity: int) -> torch.Tensor:
     """Select each row's retained history after its logical append."""
     return new_lengths.view(-1, 1) + torch.arange(capacity, device=new_lengths.device).unsqueeze(0)
@@ -514,7 +550,14 @@ def _head_major_position_projection(attn: RelPositionMHA, pos_emb: torch.Tensor)
     return attn.linear_pos(pos_emb).view(-1, attn.h, attn.d_k).transpose(0, 1).contiguous()
 
 
-def _stream_rel_shift(raw: torch.Tensor, *, batch: int, queries: int, keys: int) -> torch.Tensor:
+def _stream_rel_shift(
+    raw: torch.Tensor,
+    *,
+    batch: int,
+    queries: int,
+    keys: int,
+    width: int | None = None,
+) -> torch.Tensor:
     """Relative shift of head-major position scores, as a strided view.
 
     ``raw`` is the contiguous ``(h, B*F, 2T-1)`` product. For query ``i``
@@ -525,17 +568,25 @@ def _stream_rel_shift(raw: torch.Tensor, *, batch: int, queries: int, keys: int)
     (head, row) block that element sits at flat offset
     ``F-1 + i*(2T-2) + j``, so the view drops ``F-1`` leading elements and
     re-reads the block with row pitch ``2T-2``.
+
+    ``width`` (``keys <= width <= 2T-2``) widens the view past the crop;
+    columns ``>= keys`` are in-bounds but are not position scores, so a
+    caller must exclude them (the SDPA bias uses them only as alignment
+    padding).
     """
     heads, rows, pos_len = raw.shape
+    width = keys if width is None else width
     if rows != batch * queries or pos_len != 2 * keys - 1 or queries > keys:
         raise ValueError("stream position scores have an unexpected geometry")
+    if width != keys and not keys < width <= pos_len - 1:
+        raise ValueError("stream position score width is out of range")
     blocks = raw.view(heads, batch, queries * pos_len)
     if keys == 1:
         shifted = blocks.view(heads, batch, queries, 1)
     else:
         pitch = pos_len - 1
         shifted = blocks[..., queries - 1 : queries - 1 + queries * pitch].view(heads, batch, queries, pitch)
-        shifted = shifted[..., :keys]
+        shifted = shifted[..., :width]
     return shifted.transpose(0, 1)
 
 
@@ -552,6 +603,7 @@ def _stream_attention(
     mask: torch.Tensor | None = None,
     cache_indices: torch.Tensor | None = None,
     cache_out: torch.Tensor | None = None,
+    sdpa: StreamSDPAMask | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's attention over [cache | new] keys (NeMo update_cache).
 
@@ -565,6 +617,14 @@ def _stream_attention(
     Returns the attention output for the new frames and the advanced
     cache. With ``cache_out`` (which may be ``cache`` itself) the advance
     is gathered straight into that storage and it is returned.
+
+    With ``sdpa`` the score/softmax/value chain is one fused
+    ``scaled_dot_product_attention`` over ``q_u, k, v`` with the scaled,
+    additively masked position scores as its float bias, then fully
+    masked query rows are zeroed (NeMo's public formulation,
+    NVIDIA-NeMo/Speech@981fd4e0 multi_head_attention.py:320-345). It is
+    the same math with a different reduction order, so it is selected
+    only by the encoder FP16 precision policy, never for FP32.
     """
     attn = layer.self_attn
     batch, new_frames, _ = x.shape
@@ -588,7 +648,6 @@ def _stream_attention(
     # batched matmul reads it without a separate layout copy.
     q_u = q.new_empty((b, attn.h, new_frames, attn.d_k))
     torch.add(q.transpose(1, 2), attn.pos_bias_u.unsqueeze(1), out=q_u)
-    matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
     # Position scores: p is shared by every row, so fold the batch into
     # the GEMM rows -- one head-batched (B*F, d_k) @ (d_k, 2T-1) product.
     q_v = (q + attn.pos_bias_v).view(b * new_frames, attn.h, attn.d_k).transpose(0, 1)
@@ -597,15 +656,28 @@ def _stream_attention(
         batch=b,
         queries=new_frames,
         keys=t2,
+        width=None if sdpa is None else sdpa.additive.shape[-1],
     )
-    scores = (matrix_ac + matrix_bd) / attn.s_d_k
     # Mask: cache rows beyond each element's valid count are dead;
     # padded new frames are dead keys; padded queries mask fully.
-    if mask is None:
+    if mask is None and sdpa is None:
         mask = _stream_attention_mask(valid, new_valid, capacity)
-    scores = scores.masked_fill(mask, -_LOG_BASE)
-    weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
-    out = torch.matmul(weights, v)
+    if sdpa is not None:
+        # bias = mask + bd / sqrt(d_k) in one kernel (SDPA applies the same
+        # 1/sqrt(d_k) to q_u.k^T). It is computed over the aligned width and
+        # cropped, so its rows keep a 16-element pitch and SDPA needs no
+        # padding copy; the padding columns are never read.
+        bias = torch.add(sdpa.additive, matrix_bd, alpha=1.0 / attn.s_d_k)[..., :t2]
+        out = torch.nn.functional.scaled_dot_product_attention(q_u, k, v, attn_mask=bias)
+        # A fully masked query row is exactly zero (never NaN/uniform mix).
+        out = out.masked_fill(sdpa.dead_queries, 0.0)
+    else:
+        assert mask is not None
+        matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+        scores = (matrix_ac + matrix_bd) / attn.s_d_k
+        scores = scores.masked_fill(mask, -_LOG_BASE)
+        weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+        out = torch.matmul(weights, v)
     out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
     # Advance cache by each row's logical length: slot j of the new
     # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
@@ -685,6 +757,7 @@ def stream_step(
     out_lengths: torch.Tensor | None = None,
     out_width: int | None = None,
     preserve_conv_cache_precision: bool = False,
+    sdpa_attention: bool = False,
 ) -> torch.Tensor:
     """One cached streaming encoder step (batch of sessions).
 
@@ -710,6 +783,10 @@ def stream_step(
 
     ``preserve_conv_cache_precision`` is enabled by the encoder-only
     FP16 experiment so retained FP32 history avoids a compute-dtype round trip.
+
+    ``sdpa_attention`` selects the fused SDPA attention core (see
+    ``_stream_attention``). It is resolved from the immutable encoder FP16
+    precision policy; the FP32 path keeps the bitwise eager oracle.
     """
     b = chunk_mel.shape[0]
     device = chunk_mel.device
@@ -736,6 +813,7 @@ def stream_step(
     # All layers share the same logical lengths and cache geometry. Build
     # their read-only masks and gather indices once for this transition.
     mask = _stream_attention_mask(caches.valid, new_valid, cache_len)
+    sdpa = StreamSDPAMask(mask, dtype=x.dtype) if sdpa_attention else None
     attn_indices = _stream_cache_indices(out_lengths, cache_len).unsqueeze(-1).expand(b, cache_len, x.shape[2])
     conv_len = caches.time.shape[-1]
     conv_indices = _stream_cache_indices(out_lengths, conv_len).unsqueeze(1).expand(b, x.shape[2], conv_len)
@@ -775,6 +853,7 @@ def stream_step(
             mask=mask,
             cache_indices=attn_indices,
             cache_out=channel,
+            sdpa=sdpa,
         )
         residual = residual + attn_out
         y = layer.norm_conv(residual)

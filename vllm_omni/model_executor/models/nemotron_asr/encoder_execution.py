@@ -1452,6 +1452,7 @@ def execute_encoder_transition(
         out_lengths=out_lengths,
         out_width=out_width,
         preserve_conv_cache_precision=encoder_fp16,
+        sdpa_attention=encoder_fp16,
     )
     if encoder_fp16:
         encoded = encoded.to(policy.dtype_for("activations"))

@@ -76,8 +76,10 @@ def _pre_change_attention(
     mask=None,
     cache_indices=None,
     cache_out=None,
+    sdpa=None,
 ):
     """The pre-change streaming attention, always from ``pos_emb``."""
+    assert sdpa is None
     attn = layer.self_attn
     b, new_frames, _ = x.shape
     capacity = cache.shape[1]
