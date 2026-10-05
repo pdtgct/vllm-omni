@@ -1705,6 +1705,12 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
         current.wait_stream(stream)
 
     runtime = replace(platform_graph_runtime(), capture_context=capture_stream)
+    # Dynamo keys its specializations on the transition's code object, which
+    # every build in this process shares. The production budget covers one
+    # runtime's single immutable policy (PORT-PREC-013); without a reset, an
+    # earlier parametrization's other-policy entries count against this
+    # policy's exact 20-cell domain and the dense arm hits the recompile limit.
+    torch._dynamo.reset()
     execution = build_encoder_execution(
         core,
         _dense_graphed_config(arm),
