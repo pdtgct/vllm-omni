@@ -74,7 +74,7 @@ def _addmm_fake(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.T
 
 @torch.library.custom_op("nemotron_bi::matmul", mutates_args=())
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # Broadcasting includes head-major relative position: [B,H,Q,D] @ [1,H,D,P].
+    # Includes the head-major, batch-folded relative position: [H,B*Q,D] @ [H,D,P].
     if a.is_cuda:
         from vllm.model_executor.determinism.batch_invariant import matmul_batch_invariant
 
