@@ -1530,6 +1530,16 @@ class _GatheredCaches:
             left_context=self.left_context,
         )
 
+    def narrow_rows(self, rows: int) -> _GatheredCaches:
+        """Clone this adapter's layout over a leading-row view of its storage."""
+        storage = self.graph_storage()
+        return type(self)._from_tensors(
+            channel=tuple(tensor.narrow(0, 0, rows) for tensor in storage.channel),
+            time=tuple(tensor.narrow(0, 0, rows) for tensor in storage.time),
+            valid=tuple(tensor.narrow(0, 0, rows) for tensor in storage.valid),
+            left_context=self.left_context,
+        )
+
 
 def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Host-authority tensor to the compute device without a hot-path
