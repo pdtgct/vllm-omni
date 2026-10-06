@@ -30,6 +30,7 @@ from torch import nn
 from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
     depthwise_conv1d_fp32,
     execution_mode,
+    invariant_gemm,
     layer_norm_fp32,
     pointwise_conv_as_linear,
     softmax_fp32_sum,
@@ -166,7 +167,12 @@ class SubsamplingDwStriding(nn.Module):
         else:
             x = self.conv(x)
         b, c, t, f = x.size()
-        x = self.out(x.transpose(1, 2).reshape(b, t, c * f))
+        x = x.transpose(1, 2).reshape(b, t, c * f)
+        if execution_mode(self).enabled:
+            # Keep the biased projection out of Inductor's addmm padding pass.
+            x = invariant_gemm(x.reshape(b * t, c * f), self.out.weight.t(), self.out.bias).reshape(b, t, -1)
+        else:
+            x = self.out(x)
         return x, self.output_lengths(lengths)
 
 
