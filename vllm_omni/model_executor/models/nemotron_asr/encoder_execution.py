@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar, cast
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    MODE_OFF,
+    BatchInvariantExecution,
+    execution_mode,
+)
 from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
     GraphRuntime,
     platform_graph_runtime,
@@ -602,6 +607,7 @@ class ResolvedEncoderExecution:
     transition: EncoderTransition
     warmup_geometries: tuple[int, ...] = ()
     warmup_populations: tuple[int, ...] = ()
+    _batch_invariant_mode: BatchInvariantExecution = MODE_OFF
     _population_bucketing: bool = False
     t_cap: int = 0
     _history_frames: int = 0
@@ -624,16 +630,16 @@ class ResolvedEncoderExecution:
     _compiled_transition: EncoderTransition | None = field(default=None, repr=False)
     _vllm_config: Any | None = field(default=None, repr=False)
     _graph_runtime: GraphRuntime | None = field(default=None, repr=False)
-    _graph_entries: dict[tuple[int, int], _EncoderGraphEntry] = field(
+    _graph_entries: dict[tuple[Any, ...], _EncoderGraphEntry] = field(
         default_factory=dict,
         repr=False,
     )
     # Experimental CHUNK capture owns these exact cells instead of a second
     # standalone encoder graph/cache bank. Entries publish only as a full set.
     _chunk_graph_cells: frozenset[tuple[int, int]] = field(default_factory=frozenset, repr=False)
-    _chunk_graph_entries: dict[tuple[int, int], Any] = field(default_factory=dict, repr=False)
+    _chunk_graph_entries: dict[tuple[Any, ...], Any] = field(default_factory=dict, repr=False)
     _staging_cell: tuple[int, int] | None = field(default=None, repr=False)
-    _pending_graph_entries: dict[tuple[int, int], _EncoderGraphEntry] = field(
+    _pending_graph_entries: dict[tuple[Any, ...], _EncoderGraphEntry] = field(
         default_factory=dict,
         repr=False,
     )
@@ -654,11 +660,15 @@ class ResolvedEncoderExecution:
             encoder_keys, chunk_keys = set(self._graph_entries), set(self._chunk_graph_entries)
             return (
                 self._sealed
-                and encoder_keys == expected - self._chunk_graph_cells
-                and chunk_keys == self._chunk_graph_cells
+                and encoder_keys == {self.graph_key("cuda", cell) for cell in expected - self._chunk_graph_cells}
+                and chunk_keys == {self.graph_key("chunk", cell) for cell in self._chunk_graph_cells}
                 and not self._failed
             )
         return self._sealed and not self._failed
+
+    def graph_key(self, kind: str, cell: tuple[int, int]) -> tuple[Any, ...]:
+        """@spec PORT-PREC-019, PORT-PREC-025: preserve the off-mode cell tuple."""
+        return self._batch_invariant_mode.graph_key(kind, cell)
 
     @property
     def cell_active(self) -> bool:
@@ -679,10 +689,12 @@ class ResolvedEncoderExecution:
         self._raise_if_failed()
         if not self._sealed or set(entries) != self._chunk_graph_cells or self._chunk_graph_entries:
             raise ValueError("CHUNK capture inventory differs from its startup reservation")
-        if set(entries) & set(self._graph_entries) or not all(callable(value) for value in entries.values()):
+        if any(self.graph_key("cuda", cell) in self._graph_entries for cell in entries) or not all(
+            callable(value) for value in entries.values()
+        ):
             raise ValueError("CHUNK and encoder graph owners overlap or are malformed")
         self._assert_model_state()
-        self._chunk_graph_entries = dict(entries)
+        self._chunk_graph_entries = {self.graph_key("chunk", cell): entry for cell, entry in entries.items()}
 
     def warmup_cell(
         self,
@@ -1207,7 +1219,7 @@ class ResolvedEncoderExecution:
                     )
                 finally:
                     self._staging_cell = None
-                if cell not in self._pending_graph_entries:
+                if self.graph_key("cuda", cell) not in self._pending_graph_entries:
                     raise ValueError(f"encoder graph staging cell {cell} did not execute")
             self._record_memory_diagnostic(device, stage="after-staging")
             self._assert_model_state()
@@ -1218,7 +1230,7 @@ class ResolvedEncoderExecution:
             try:
                 with torch.inference_mode(), runtime.capture_context(device):
                     for cell in cells:
-                        entry = self._pending_graph_entries[cell]
+                        entry = self._pending_graph_entries[self.graph_key("cuda", cell)]
                         self._capture_graph_entry(entry)
                         self._record_memory_diagnostic(device, stage="after-capture", key=cell)
                     cell = None
@@ -1253,12 +1265,12 @@ class ResolvedEncoderExecution:
         out_width: int,
         prompt_index: torch.Tensor,
     ) -> None:
-        if cell in self._pending_graph_entries:
+        if self.graph_key("cuda", cell) in self._pending_graph_entries:
             raise ValueError(f"encoder graph staging cell {cell} was repeated")
         expected_signature = self._warmup_signatures.get(cell)
         if expected_signature is None or signature != expected_signature:
             raise ValueError("encoder graph staging signature differs from transition warmup")
-        self._pending_graph_entries[cell] = self._new_graph_entry(
+        self._pending_graph_entries[self.graph_key("cuda", cell)] = self._new_graph_entry(
             cell=cell,
             signature=signature,
             mel=mel,
@@ -1375,7 +1387,7 @@ class ResolvedEncoderExecution:
             "warmup_populations": list(self.warmup_populations),
         }
         if self.arm in _GRAPHED_ARMS:
-            receipt["captured_keys"] = [[geometry, population] for geometry, population in sorted(self._graph_entries)]
+            receipt["captured_keys"] = [list(key) for key in sorted(self._graph_entries)]
         if self._chunk_graph_cells:
             receipt["chunk_graph_keys"] = [list(cell) for cell in sorted(self._chunk_graph_entries)]
             receipt["reserved_chunk_graph_keys"] = [list(cell) for cell in sorted(self._chunk_graph_cells)]
@@ -1386,7 +1398,7 @@ class ResolvedEncoderExecution:
         if self._core is not None and getattr(self._core.policy, "encoder_compute_override", None) == "fp16":
             receipt["precision_policy"] = self._core.policy.identifier
             receipt["precision_policy_hash"] = self._core.policy.content_hash
-        return receipt
+        return self._batch_invariant_mode.readiness_receipt(receipt)
 
 
 def execute_encoder_transition(
@@ -1481,6 +1493,7 @@ def build_encoder_execution(
         return ResolvedEncoderExecution(
             arm=arm,
             transition=transition,
+            _batch_invariant_mode=execution_mode(core),
             _core=core if policy.encoder_compute_override == "fp16" else None,
         )
     if arm in _GRAPHED_ARMS and vllm_config is None:
@@ -1517,6 +1530,7 @@ def build_encoder_execution(
     execution = ResolvedEncoderExecution(
         arm=arm,
         transition=transition,
+        _batch_invariant_mode=execution_mode(core),
         warmup_geometries=geometries,
         warmup_populations=populations,
         _population_bucketing=population_bucketing,

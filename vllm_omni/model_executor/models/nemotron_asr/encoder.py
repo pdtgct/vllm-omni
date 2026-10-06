@@ -27,6 +27,14 @@ import math
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    depthwise_conv1d_fp32,
+    execution_mode,
+    layer_norm_fp32,
+    pointwise_conv_as_linear,
+    softmax_fp32_sum,
+    strided_conv2d_fp32,
+)
 from vllm_omni.model_executor.models.nemotron_asr.masks import (
     chunked_limited_mask,
 )
@@ -36,6 +44,48 @@ _LOG_BASE = 10000.0
 
 def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
     return (length + pad - kernel) // stride + 1
+
+
+# @spec PORT-PREC-019, PORT-PREC-021: branch only on the installed record.
+def _conv(module: nn.Conv1d | nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    if not execution_mode(module).enabled:
+        return module(x)
+    if (
+        all(k == 1 for k in module.kernel_size)
+        and all(s == 1 for s in module.stride)
+        and all(p == 0 for p in module.padding)
+        and all(d == 1 for d in module.dilation)
+        and module.groups == 1
+    ):
+        return pointwise_conv_as_linear(x, module.weight, module.bias)
+    if isinstance(module, nn.Conv1d):
+        return depthwise_conv1d_fp32(
+            x,
+            module.weight,
+            module.bias,
+            stride=module.stride[0],
+            padding=module.padding[0],
+            dilation=module.dilation[0],
+        )
+    return strided_conv2d_fp32(
+        x,
+        module.weight,
+        module.bias,
+        stride=module.stride,
+        padding=module.padding,
+        dilation=module.dilation,
+        groups=module.groups,
+    )
+
+
+def _norm(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if execution_mode(module).enabled and isinstance(module, nn.LayerNorm):
+        return layer_norm_fp32(x, module.normalized_shape, module.weight, module.bias, module.eps)
+    return module(x)
+
+
+def _softmax(owner: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return softmax_fp32_sum(x, dim=-1) if execution_mode(owner).enabled else torch.softmax(x, dim=-1)
 
 
 class CausalConv2dSub(nn.Conv2d):
@@ -48,6 +98,8 @@ class CausalConv2dSub(nn.Conv2d):
         self._pad = (k - 1, s - 1, k - 1, s - 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if execution_mode(self).enabled:
+            return _conv(self, nn.functional.pad(x, self._pad))
         return super().forward(nn.functional.pad(x, self._pad))
 
 
@@ -104,7 +156,15 @@ class SubsamplingDwStriding(nn.Module):
         # the fp32 mel front-end sits upstream of it (PORT-PREC-001).
         mel = mel.to(next(self.parameters()).dtype)
         x = mel.transpose(1, 2).unsqueeze(1)  # (B, 1, T, F)
-        x = self.conv(x)
+        if execution_mode(self).enabled:
+            for module in self.conv:
+                x = (
+                    _conv(module, x)
+                    if isinstance(module, nn.Conv2d) and not isinstance(module, CausalConv2dSub)
+                    else module(x)
+                )
+        else:
+            x = self.conv(x)
         b, c, t, f = x.size()
         x = self.out(x.transpose(1, 2).reshape(b, t, c * f))
         return x, self.output_lengths(lengths)
@@ -183,7 +243,7 @@ class RelPositionMHA(nn.Module):
         scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / self.s_d_k
         mask = masked.unsqueeze(1)
         scores = scores.masked_fill(mask, -_LOG_BASE)
-        attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+        attn = _softmax(self, scores).masked_fill(mask, 0.0)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(b, t, self.h * self.d_k)
         return self.linear_out(out)
@@ -209,16 +269,16 @@ class ConformerConv(nn.Module):
     def forward(self, x: torch.Tensor, pad_zero: torch.Tensor | None) -> torch.Tensor:
         """``(B, T, d)`` -> ``(B, T, d)``; ``pad_zero`` True = padding."""
         x = x.transpose(1, 2)
-        x = nn.functional.glu(self.pointwise_conv1(x), dim=1)
+        x = nn.functional.glu(_conv(self.pointwise_conv1, x), dim=1)
         if pad_zero is not None:
             x = x.masked_fill(pad_zero.unsqueeze(1), 0.0)
-        x = self.depthwise_conv(nn.functional.pad(x, (self.left_pad, 0)))
+        x = _conv(self.depthwise_conv, nn.functional.pad(x, (self.left_pad, 0)))
         if self.norm_type == "layer_norm":
-            x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
+            x = _norm(self.batch_norm, x.transpose(1, 2)).transpose(1, 2)
         else:
             x = self.batch_norm(x)
         x = nn.functional.silu(x)
-        return self.pointwise_conv2(x).transpose(1, 2)
+        return _conv(self.pointwise_conv2, x).transpose(1, 2)
 
 
 class FeedForward(nn.Module):
@@ -268,11 +328,11 @@ class ConformerLayer(nn.Module):
         masked: torch.Tensor,
         pad_zero: torch.Tensor | None,
     ) -> torch.Tensor:
-        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
-        x = x + self.self_attn(self.norm_self_att(x), pos_emb=pos_emb, masked=masked)
-        x = x + self.conv(self.norm_conv(x), pad_zero)
-        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
-        return self.norm_out(x)
+        x = x + 0.5 * self.feed_forward1(_norm(self.norm_feed_forward1, x))
+        x = x + self.self_attn(_norm(self.norm_self_att, x), pos_emb=pos_emb, masked=masked)
+        x = x + self.conv(_norm(self.norm_conv, x), pad_zero)
+        x = x + 0.5 * self.feed_forward2(_norm(self.norm_feed_forward2, x))
+        return _norm(self.norm_out, x)
 
 
 class FastConformerEncoder(nn.Module):
@@ -567,7 +627,7 @@ def _stream_attention(
     if mask is None:
         mask = _stream_attention_mask(valid, new_valid, capacity)
     scores = scores.masked_fill(mask, -_LOG_BASE)
-    weights = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+    weights = _softmax(attn, scores).masked_fill(mask, 0.0)
     out = torch.matmul(weights, v)
     out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
     # Advance cache by each row's logical length: slot j of the new
@@ -598,7 +658,7 @@ def _stream_conv(
     conv = layer.conv
     batch, frames, width = x.shape
     y = x.permute(2, 0, 1).contiguous().view(1, width, batch * frames)
-    y = conv.pointwise_conv1(y)
+    y = _conv(conv.pointwise_conv1, y)
     y = y.view(conv.pointwise_conv1.out_channels, batch, frames).permute(1, 0, 2).contiguous()
     y = torch.nn.functional.glu(y, dim=1)
     # conv_state axis: read-cast to compute dtype, write-cast back.
@@ -612,10 +672,10 @@ def _stream_conv(
         new_cache = torch.cat([cache, y.to(cache.dtype)], dim=-1).gather(2, cache_indices)
     else:
         new_cache = padded.gather(2, cache_indices).to(cache.dtype)
-    y = conv.depthwise_conv(padded)
-    y = conv.batch_norm(y.transpose(1, 2)).transpose(1, 2)
+    y = _conv(conv.depthwise_conv, padded)
+    y = _norm(conv.batch_norm, y.transpose(1, 2)).transpose(1, 2)
     y = torch.nn.functional.silu(y)
-    return conv.pointwise_conv2(y).transpose(1, 2), new_cache
+    return _conv(conv.pointwise_conv2, y).transpose(1, 2), new_cache
 
 
 def stream_step(
@@ -700,9 +760,9 @@ def stream_step(
         )
     for idx, layer in enumerate(encoder.layers):
         residual = x
-        y = layer.norm_feed_forward1(x)
+        y = _norm(layer.norm_feed_forward1, x)
         residual = residual + 0.5 * layer.feed_forward1(y)
-        y = layer.norm_self_att(residual)
+        y = _norm(layer.norm_self_att, residual)
         attn_out, caches.channel[idx] = _stream_attention(
             layer,
             y,
@@ -716,7 +776,7 @@ def stream_step(
             cache_indices=attn_indices,
         )
         residual = residual + attn_out
-        y = layer.norm_conv(residual)
+        y = _norm(layer.norm_conv, residual)
         conv_out, caches.time[idx] = _stream_conv(
             layer,
             y,
@@ -726,9 +786,9 @@ def stream_step(
             preserve_cache_precision=preserve_conv_cache_precision,
         )
         residual = residual + conv_out
-        y = layer.norm_feed_forward2(residual)
+        y = _norm(layer.norm_feed_forward2, residual)
         residual = residual + 0.5 * layer.feed_forward2(y)
-        x = layer.norm_out(residual)
+        x = _norm(layer.norm_out, residual)
     caches.valid = torch.clamp(
         caches.valid + out_lengths.to(caches.valid.dtype),
         max=caches.left_context,
