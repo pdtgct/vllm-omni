@@ -301,6 +301,30 @@ SIDE_EFFECTS = {
 }
 
 
+# Port-owned schema compatibility is additional to every pinned vLLM effect.
+SIDE_EFFECTS.update(
+    {
+        "nemotron_bi.aten_schema_adapters",
+        "aten::mm.out",
+        "aten::mm.dtype",
+        "aten::mm.dtype_out",
+        "aten::addmm.out",
+        "aten::addmm.dtype",
+        "aten::addmm.dtype_out",
+        "aten::bmm.out",
+        "aten::bmm.dtype",
+        "aten::bmm.dtype_out",
+        "aten::matmul.out",
+        "aten::linear.out",
+        "aten::softmax.int",
+        "aten::softmax.int_out",
+        "aten::_softmax.out",
+        "aten::_log_softmax.out",
+        "aten::mean.out",
+    }
+)
+
+
 def test_prec022_disclosure_manifest():
     """@spec PORT-PREC-022: matched unprofiled alternating pairs, no speed threshold."""
     manifest, _ = _manifest("NEMOTRON_BI_COST_MANIFEST")
