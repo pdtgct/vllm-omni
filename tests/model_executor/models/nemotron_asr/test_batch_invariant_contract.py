@@ -31,6 +31,26 @@ from vllm_omni.model_executor.models.nemotron_asr.precision import FP32_BRINGUP
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model]
 
 
+def test_cuda_qualification_compile_domain_guard():
+    """@spec PORT-PREC-020, PORT-PREC-023: bounded tiers retain all geometries."""
+    from test_batch_invariant_cuda import CAPTURE_TIERS, GEOMETRIES, _qualification_cells
+
+    from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import _population_capture_tiers
+
+    execution = SimpleNamespace(
+        warmup_geometries=GEOMETRIES,
+        warmup_populations=_population_capture_tiers(128),
+    )
+    assert _qualification_cells(execution) == tuple((g, p) for g in GEOMETRIES for p in CAPTURE_TIERS)
+    execution.warmup_populations = tuple(range(1, 129))
+    with pytest.raises(AssertionError, match="compile domain exceeds 40 cells"):
+        _qualification_cells(execution)
+    execution.warmup_populations = CAPTURE_TIERS
+    execution.warmup_geometries = GEOMETRIES[:-1]
+    with pytest.raises(AssertionError):
+        _qualification_cells(execution)
+
+
 def api() -> Any:
     return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.batch_invariance")
 

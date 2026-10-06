@@ -47,6 +47,18 @@ pytestmark = [
 ]
 POPULATIONS = (1, 2, 31, 63, 64, 128)
 GEOMETRIES = (0, 1, 2, 3, 4)
+CAPTURE_TIERS = (1, 2, 4, 8, 16, 32, 64, 128)
+MAX_COMPILED_CELLS = 40
+
+
+def _qualification_cells(execution):
+    cells = tuple((g, p) for g in execution.warmup_geometries for p in execution.warmup_populations)
+    # Fail before compilation if bucketing is accidentally disabled. Keep the
+    # bound independent of the domain so expanding it cannot relax the guard.
+    assert len(cells) <= MAX_COMPILED_CELLS, "CUDA qualification compile domain exceeds 40 cells"
+    assert execution.warmup_geometries == GEOMETRIES
+    assert execution.warmup_populations == CAPTURE_TIERS
+    return cells
 
 
 def _api():
@@ -151,9 +163,19 @@ def _capture_stream(device):
 def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
     """@spec PORT-PREC-020, PORT-PREC-023, PORT-PREC-026, PORT-PREC-027.
 
-    Every geometry, population, first/middle/last position, repeated/mixed rows,
+    Every geometry, first/middle/last position, repeated/mixed rows,
     empty/nonempty histories, final tails and independent B128 resets. The
     deployment cap is deliberately irrelevant to the B128 qualification envelope.
+
+    Both arms use production population bucketing. Exact covers every capture
+    tier; padded additionally covers every required falsifier population (31->32,
+    63->64). This preserves the exact/padded axis without compiling all 128 sizes.
+    Five geometries x eight tiers = 40 static cells per parameter case, versus
+    640 for the former exact arm; both policies/arms total 160 versus 1360 cells.
+    At the r6 planning assumption of >~2 s/cell, compilation alone is >~80 s/case
+    (>~320 s total), versus >~1280 s/exact case (>~2720 s total). These are paper
+    estimates, not measured cell timings or wall-time caps: capture, replay and
+    eager comparisons add cost, and cold compiler/autotuning costs can dominate.
     """
     from vllm.config import VllmConfig
 
@@ -164,9 +186,7 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
     torch._dynamo.reset()
     execution = build_encoder_execution(
         core,
-        SimpleNamespace(
-            encoder_execution_arm="dense-graphed", encoder_population_bucketing=padded, att_context_left=56
-        ),
+        SimpleNamespace(encoder_execution_arm="dense-graphed", encoder_population_bucketing=True, att_context_left=56),
         maximum_population=128,
         warmup_geometries=GEOMETRIES,
         vllm_config=VllmConfig(),
@@ -178,7 +198,7 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
         mel, offsets, lengths, prompts, width, _ = _inputs(core, geometry, population, 0, "mixed", 0, 1, device)
         return execution.transition(mel, _GatheredCaches(state), offsets, lengths, width, prompts)
 
-    cells = tuple((g, p) for g in GEOMETRIES for p in execution.warmup_populations)
+    cells = _qualification_cells(execution)
     execution.warmup_domain(expected_cells=cells, invoke=warmup)
     assert execution.ready
     assert execution.ready_receipt()["batch_invariant_mode"] == "on"
@@ -206,12 +226,13 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
             snapshots.append([_snapshot(raw, state, r, valid) for r in selected])
         return snapshots
 
+    populations = tuple(sorted(set(CAPTURE_TIERS) | set(POPULATIONS))) if padded else CAPTURE_TIERS
     for geometry in GEOMETRIES:
         width = encoder_geometry_shape(core, geometry).out_width
         for history in (0, 37):
             for tail in sorted({0, 1, max(1, width - 1)}):
                 reference = sequence(geometry, 1, 0, "repeated", history, tail)
-                for population in POPULATIONS:
+                for population in populations:
                     for composition in ("repeated", "mixed"):
                         for row in sorted({0, population // 2, population - 1}):
                             actual = sequence(geometry, population, row, composition, history, tail)
