@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     SessionStateBatch,
     advance_chunk_bucket,
 )
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import execution_mode
 from vllm_omni.model_executor.models.nemotron_asr.decode_graph import GraphRuntime, platform_graph_runtime
 from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import _tensor_signature
 from vllm_omni.model_executor.models.nemotron_asr.manifests import CADENCES
@@ -293,7 +294,10 @@ class ExactChunkGraphBinding:
 
     @property
     def ready(self) -> bool:
-        return self._encoder.ready and set(self._encoder._chunk_graph_entries) == self._cells
+        # @spec PORT-PREC-025, PORT-PREC-026: require the mode-bound inventory.
+        return self._encoder.ready and set(self._encoder._chunk_graph_entries) == {
+            execution_mode(self._core).graph_key("chunk", cell) for cell in self._cells
+        }
 
     @torch.inference_mode()
     def warmup(self, device: torch.device) -> None:
@@ -378,7 +382,7 @@ class ExactChunkGraphBinding:
             or decode_fn is not self._decoder.decode_fn(geometry=geometry, tier=tier)
         ):
             raise ValueError("CHUNK graph cell differs from its sealed serving binding")
-        return self._encoder._chunk_graph_entries[cell]
+        return self._encoder._chunk_graph_entries[execution_mode(self._core).graph_key("chunk", cell)]
 
     def _fallback(self, core: Any, env: torch.Tensor, state: SessionStateBatch, **kwargs: Any) -> ChunkBucketResult:
         result = advance_chunk_bucket(core, env, state, **kwargs)
@@ -388,22 +392,27 @@ class ExactChunkGraphBinding:
 
     def receipt(self) -> dict[str, Any]:
         """Read host-only counters; never synchronize or reset measured state."""
-        return {
-            "ready": self.ready,
-            "worker_pid": os.getpid(),
-            "instance_id": self._instance_id,
-            "source_sha256": dict(self._source_sha256),
-            "cells": [
-                {
-                    "geometry": g,
-                    "encoder_population": n,
-                    "decoder_tier": self._decoder.execution_tier(n),
-                    "successful_replays": entry.replay_count,
-                }
-                for (g, n), entry in sorted(self._encoder._chunk_graph_entries.items())
-            ],
-            "fallbacks": [
-                {"geometry": g, "encoder_population": n, "successful_calls": count}
-                for (g, n), count in sorted(self._fallback_counts.items())
-            ],
-        }
+        return execution_mode(self._core).readiness_receipt(
+            {
+                "ready": self.ready,
+                "worker_pid": os.getpid(),
+                "instance_id": self._instance_id,
+                "source_sha256": dict(self._source_sha256),
+                "cells": [
+                    {
+                        "geometry": g,
+                        "encoder_population": n,
+                        "decoder_tier": self._decoder.execution_tier(n),
+                        "successful_replays": self._encoder._chunk_graph_entries[
+                            execution_mode(self._core).graph_key("chunk", (g, n))
+                        ].replay_count,
+                    }
+                    for g, n in sorted(self._cells)
+                    if execution_mode(self._core).graph_key("chunk", (g, n)) in self._encoder._chunk_graph_entries
+                ],
+                "fallbacks": [
+                    {"geometry": g, "encoder_population": n, "successful_calls": count}
+                    for (g, n), count in sorted(self._fallback_counts.items())
+                ],
+            }
+        )
