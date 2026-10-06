@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.model_executor.models.nemotron_asr import bi_ops
+from vllm_omni.model_executor.models.nemotron_asr import bi_ops  # noqa: F401 -- register opaque operators
 
 
 @dataclass(frozen=True)
@@ -263,6 +263,12 @@ def execution_mode(owner: Any) -> BatchInvariantExecution:
     return getattr(owner, "batch_invariant_mode", MODE_OFF)
 
 
+def batch_invariant_enabled(owner: Any) -> bool:
+    """Use the construction-bound flag in traced code, retaining unbound probes."""
+    enabled = getattr(owner, "_batch_invariant_enabled", None)
+    return execution_mode(owner).enabled if enabled is None else enabled
+
+
 def bind_batch_invariant_mode(core: Any, record: BatchInvariantExecution) -> None:
     """@spec PORT-PREC-018, PORT-PREC-028: bind once, before any model work."""
     owners = [core]
@@ -277,6 +283,7 @@ def bind_batch_invariant_mode(core: Any, record: BatchInvariantExecution) -> Non
         if previous is not None and previous != record:
             raise RuntimeError("batch-invariant mode cannot change on a loaded model")
     for owner in owners:
+        owner._batch_invariant_enabled = record.enabled
         if isinstance(getattr(type(owner), "batch_invariant_mode", None), property):
             owner._batch_invariant_mode = record
         else:
@@ -348,19 +355,23 @@ def accumulation_evidence_complete(operator: str, *, backend: str, execution: st
 
 def invariant_gemm(operand: torch.Tensor, matrix: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """@spec PORT-PREC-021: opaque pinned GEMM, bias before result cast."""
-    return bi_ops.mm(operand, matrix) if bias is None else bi_ops.addmm(bias, operand, matrix)
+    return (
+        torch.ops.nemotron_bi.mm.default(operand, matrix)
+        if bias is None
+        else torch.ops.nemotron_bi.addmm.default(bias, operand, matrix)
+    )
 
 
 def invariant_linear(module: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
     """Route only the installed mode; preserve the original mode-off call."""
-    if not execution_mode(module).enabled:
+    if not batch_invariant_enabled(module):
         return module(x)
     result = invariant_gemm(x.reshape(-1, x.shape[-1]), module.weight.t(), module.bias)
     return result.reshape(*x.shape[:-1], module.weight.shape[0])
 
 
 def invariant_matmul(owner: torch.nn.Module, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return bi_ops.matmul(a, b) if execution_mode(owner).enabled else torch.matmul(a, b)
+    return torch.ops.nemotron_bi.matmul.default(a, b) if batch_invariant_enabled(owner) else torch.matmul(a, b)
 
 
 def pointwise_conv_as_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -386,7 +397,7 @@ def sum_fp32(x: torch.Tensor, dim: int | tuple[int, ...], keepdim: bool = False)
 
 def softmax_fp32_sum(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """@spec PORT-PREC-021: opaque fixed FP32 reduction, activation result."""
-    return bi_ops.softmax_sum(x.float(), dim).to(x.dtype)
+    return torch.ops.nemotron_bi.softmax_sum.default(x.float(), dim).to(x.dtype)
 
 
 def log_softmax_fp32_sum(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -405,7 +416,7 @@ def layer_norm_fp32(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """@spec PORT-PREC-021: normalization and affine precede the result cast."""
-    return bi_ops.layer_norm_sum(
+    return torch.ops.nemotron_bi.layer_norm_sum.default(
         x.float(),
         list(normalized_shape),
         None if weight is None else weight.float(),
@@ -424,7 +435,7 @@ def depthwise_conv1d_fp32(
     dilation: int = 1,
 ) -> torch.Tensor:
     """@spec PORT-PREC-021: depthwise taps reduce in FP32, independently per row."""
-    return bi_ops.depthwise_conv1d_sum(
+    return torch.ops.nemotron_bi.depthwise_conv1d_sum.default(
         x.float(),
         weight.float(),
         None if bias is None else bias.float(),
@@ -445,7 +456,7 @@ def strided_conv2d_fp32(
     groups: int = 1,
 ) -> torch.Tensor:
     """@spec PORT-PREC-020, PORT-PREC-021: opaque ordered FP32 tap sum."""
-    return bi_ops.strided_conv2d_sum(
+    return torch.ops.nemotron_bi.strided_conv2d_sum.default(
         x.float(),
         weight.float(),
         None if bias is None else bias.float(),

@@ -14,7 +14,7 @@ through ``prompt_kernel`` — op-for-op NeMo's
 import torch
 from torch import nn
 
-from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import execution_mode, invariant_linear
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import batch_invariant_enabled, invariant_linear
 
 
 def resolve_prompt_index(prompt_dictionary: dict[str, int], target_lang: str) -> int:
@@ -85,7 +85,7 @@ class PromptConditioner(nn.Module):
             )
             prompt[:, :, prompt_index] = 1.0
         out_dtype = encoded.dtype
-        if execution_mode(self).enabled:
+        if batch_invariant_enabled(self):
             conditioned = torch.cat([encoded, prompt], dim=-1)
             for module in self.prompt_kernel:
                 conditioned = (
