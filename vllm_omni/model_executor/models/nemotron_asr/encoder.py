@@ -28,8 +28,8 @@ import torch
 from torch import nn
 
 from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    batch_invariant_enabled,
     depthwise_conv1d_fp32,
-    execution_mode,
     invariant_gemm,
     invariant_linear,
     invariant_matmul,
@@ -51,7 +51,7 @@ def _conv_out_len(length: int, *, pad: int, kernel: int, stride: int) -> int:
 
 # @spec PORT-PREC-019, PORT-PREC-021: branch only on the installed record.
 def _conv(module: nn.Conv1d | nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    if not execution_mode(module).enabled:
+    if not batch_invariant_enabled(module):
         return module(x)
     if (
         all(k == 1 for k in module.kernel_size)
@@ -82,13 +82,13 @@ def _conv(module: nn.Conv1d | nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
 
 
 def _norm(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if execution_mode(module).enabled and isinstance(module, nn.LayerNorm):
+    if batch_invariant_enabled(module) and isinstance(module, nn.LayerNorm):
         return layer_norm_fp32(x, module.normalized_shape, module.weight, module.bias, module.eps)
     return module(x)
 
 
 def _softmax(owner: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    return softmax_fp32_sum(x, dim=-1) if execution_mode(owner).enabled else torch.softmax(x, dim=-1)
+    return softmax_fp32_sum(x, dim=-1) if batch_invariant_enabled(owner) else torch.softmax(x, dim=-1)
 
 
 class CausalConv2dSub(nn.Conv2d):
@@ -101,7 +101,7 @@ class CausalConv2dSub(nn.Conv2d):
         self._pad = (k - 1, s - 1, k - 1, s - 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if execution_mode(self).enabled:
+        if batch_invariant_enabled(self):
             return _conv(self, nn.functional.pad(x, self._pad))
         return super().forward(nn.functional.pad(x, self._pad))
 
@@ -159,7 +159,7 @@ class SubsamplingDwStriding(nn.Module):
         # the fp32 mel front-end sits upstream of it (PORT-PREC-001).
         mel = mel.to(next(self.parameters()).dtype)
         x = mel.transpose(1, 2).unsqueeze(1)  # (B, 1, T, F)
-        if execution_mode(self).enabled:
+        if batch_invariant_enabled(self):
             for module in self.conv:
                 x = (
                     _conv(module, x)
@@ -170,7 +170,7 @@ class SubsamplingDwStriding(nn.Module):
             x = self.conv(x)
         b, c, t, f = x.size()
         x = x.transpose(1, 2).reshape(b, t, c * f)
-        if execution_mode(self).enabled:
+        if batch_invariant_enabled(self):
             # Keep the biased projection out of Inductor's addmm padding pass.
             x = invariant_gemm(x.reshape(b * t, c * f), self.out.weight.t(), self.out.bias).reshape(b, t, -1)
         else:
