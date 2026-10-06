@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the inductor factorable-divisibility patch.
 
 torch 2.13 proves symbolic divisibility with torch's own unevaluated Mod,
@@ -81,3 +81,18 @@ def test_patch_installs_when_original_cannot_prove(monkeypatch):
     # Idempotency: a second install call must not wrap the wrapper.
     patch_module._patch_inductor_factorable_divisibility()
     assert SizeVarAllocator.statically_known_multiple_of is method
+
+
+def test_factorable_proof_defers_on_large_expressions_and_is_cached():
+    """Large index expressions defer to upstream instead of stalling codegen."""
+    import sympy
+
+    from vllm_omni import patch
+
+    a, b = sympy.symbols("a b", positive=True, integer=True)
+    patch._provably_factorable_multiple.cache_clear()
+    assert patch._provably_factorable_multiple(7 * a + 7 * b, a + b)
+    large = sum((i + 1) * a**i for i in range(40))
+    assert not patch._provably_factorable_multiple(large * (a + b), a + b)
+    patch._provably_factorable_multiple(7 * a + 7 * b, a + b)
+    assert patch._provably_factorable_multiple.cache_info().hits >= 1
