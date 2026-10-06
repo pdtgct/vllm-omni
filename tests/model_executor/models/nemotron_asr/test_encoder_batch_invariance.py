@@ -83,6 +83,12 @@ import torch
 from torch import nn
 
 from vllm_omni.model_executor.models.nemotron_asr.advance import PRE_ENCODE_DROP, _GatheredCaches
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    MODE_OFF,
+    BatchInvariantExecution,
+    bind_batch_invariant_mode,
+    installed_batch_invariant_mode,
+)
 from vllm_omni.model_executor.models.nemotron_asr.encoder import FastConformerEncoder
 from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
     encoder_geometry_shape,
@@ -129,13 +135,14 @@ ChunkHook = Callable[[int, torch.Tensor, torch.Tensor, SimpleNamespace], None]
 # --------------------------------------------------------------------------
 
 _APPLIED_MODE: str | None = None
+_EXECUTION_MODE = MODE_OFF
 _CUDA_INITIALIZED_BEFORE_MODE: bool | None = None
 _REDUCED_PRECISION_NOTE = ""
 
 
 def apply_bi_mode(mode: str) -> dict[str, Any]:
     """Apply one batch-invariance mode once per process, before capture."""
-    global _APPLIED_MODE, _CUDA_INITIALIZED_BEFORE_MODE, _REDUCED_PRECISION_NOTE
+    global _APPLIED_MODE, _CUDA_INITIALIZED_BEFORE_MODE, _REDUCED_PRECISION_NOTE, _EXECUTION_MODE
     if mode not in BI_MODES:
         raise ValueError(f"BI_MODE must be one of {BI_MODES}, got {mode!r}")
     if _APPLIED_MODE is not None:
@@ -158,8 +165,10 @@ def apply_bi_mode(mode: str) -> dict[str, Any]:
         os.environ["VLLM_BATCH_INVARIANT"] = "1"
         from vllm.model_executor.determinism import batch_invariant
 
-        batch_invariant.init_batch_invariance()
-        if not getattr(batch_invariant, "_batch_invariant_MODE", False):
+        _EXECUTION_MODE = installed_batch_invariant_mode(
+            module=batch_invariant, initialize=batch_invariant.init_batch_invariance
+        )
+        if not _EXECUTION_MODE.enabled:
             raise RuntimeError("vLLM batch-invariant mode did not enable")
     _APPLIED_MODE = mode
     return bi_settings()
@@ -196,7 +205,13 @@ def bi_settings() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def build_core(policy_name: str, device: torch.device, dims: dict[str, int] | None = None) -> nn.Module:
+def build_core(
+    policy_name: str,
+    device: torch.device,
+    dims: dict[str, int] | None = None,
+    *,
+    mode: BatchInvariantExecution | None = None,
+) -> nn.Module:
     """Encoder + conditioner with seeded random weights at realistic scale."""
     dims = dict(REAL_DIMENSIONS if dims is None else dims)
     torch.manual_seed(SEED)
@@ -235,6 +250,7 @@ def build_core(policy_name: str, device: torch.device, dims: dict[str, int] | No
     else:
         raise ValueError(f"unknown policy {policy_name!r}")
     setattr(core, "bi_dims", dims)
+    bind_batch_invariant_mode(core, _EXECUTION_MODE if mode is None else mode)
     return core.eval()
 
 
@@ -1003,8 +1019,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA")
 
 
-@pytest.fixture(scope="module")
-def bi_mode() -> str:
+@pytest.fixture
+def bi_mode(isolated_batch_invariance) -> str:
     mode = os.environ.get("BI_MODE", "none")
     print("\nsettings:", json.dumps(apply_bi_mode(mode), sort_keys=True))
     return mode

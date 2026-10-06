@@ -448,3 +448,76 @@ def test_prec020_bit_patterns_include_signed_zero_and_nan_payloads():
     assert not torch.equal(_bits(values[0:1]), _bits(values[1:2]))
     assert not torch.equal(_bits(values[2:3]), _bits(values[3:4]))
     assert not torch.equal(_bits(values[4:5]), _bits(values[5:6]))
+
+
+@pytest.mark.parametrize("biased", [False, True])
+def test_prec021_compiled_pointwise_keeps_dispatch(monkeypatch, biased):
+    """@spec PORT-PREC-021: compilation must retain the installed GEMM boundary."""
+    subject = api()
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    x = torch.randn(2, 3, 5)
+    weight = torch.randn(4, 3, 1)
+    bias = torch.randn(4) if biased else None
+    compiled = torch.compile(subject.pointwise_conv_as_linear, backend=backend, fullgraph=True)
+    with torch.inference_mode():
+        expected = subject.pointwise_conv_as_linear(x, weight, bias)
+        actual = compiled(x, weight, bias)
+    assert torch.equal(actual, expected)
+    assert any("nemotron_bi" in str(node.target) for graph in graphs for node in graph.graph.nodes)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prec018_probe_binds_engine_record(monkeypatch, enabled, explicit):
+    """@spec PORT-PREC-018: standalone probes use the engine's module routing."""
+    from tests.model_executor.models.nemotron_asr import test_encoder_batch_invariance as probe
+
+    record = installed(enabled)
+    monkeypatch.setattr(probe, "_EXECUTION_MODE", api().MODE_OFF if explicit else record)
+    core = probe.build_core("fp32", torch.device("cpu"), probe._TINY, mode=record if explicit else None)
+    assert api().execution_mode(core) is record
+    assert all(api().execution_mode(module) is record for module in core.encoder.modules())
+
+
+def test_prec028_test_installation_restored_after_failure():
+    """@spec PORT-PREC-028: test teardown cannot contaminate the next runtime."""
+    import os
+
+    from tests.model_executor.models.nemotron_asr.conftest import preserve_batch_invariance
+
+    class Library:
+        destroyed = False
+
+        def _destroy(self):
+            self.destroyed = True
+
+    library = Library()
+    module = SimpleNamespace(
+        _batch_invariant_MODE=False,
+        _batch_invariant_LIB=None,
+        _fp16_block_size_n=256,
+        _fp32_block_size_n=128,
+        _fp32_num_stages=3,
+    )
+    configs = SimpleNamespace(_TUNED_MATMUL_CONFIGS_FOR_DEVICE=None, _TUNED_MATMUL_CONFIGS_RESOLVED=False)
+    before_env = os.environ.get("VLLM_BATCH_INVARIANT")
+    before_bmm = torch.bmm
+    with pytest.raises(RuntimeError, match="partial installation"):
+        with preserve_batch_invariance(module, configs):
+            module._batch_invariant_MODE = True
+            module._batch_invariant_LIB = library
+            configs._TUNED_MATMUL_CONFIGS_RESOLVED = True
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+            torch.bmm = lambda *args: None
+            raise RuntimeError("partial installation")
+    assert library.destroyed
+    assert module._batch_invariant_MODE is False
+    assert module._batch_invariant_LIB is None
+    assert configs._TUNED_MATMUL_CONFIGS_RESOLVED is False
+    assert os.environ.get("VLLM_BATCH_INVARIANT") == before_env
+    assert torch.bmm is before_bmm
