@@ -1040,7 +1040,7 @@ def graph_pool() -> Any:
 def test_probe_row_is_bitwise_batch_invariant(
     bi_mode: str, graph_pool: Any, policy: str, execution: str, composition: str
 ) -> None:
-    """@spec PORT-PREC-016: a session's encoder state is independent of its batch."""
+    """@spec PORT-PREC-019, PORT-PREC-020: only mode-on promises invariance."""
     core = build_core(policy, _device())
     cases = invariance_cases(
         core,
@@ -1055,7 +1055,8 @@ def test_probe_row_is_bitwise_batch_invariant(
     )
     report = format_cases(cases)
     print("\n" + report)
-    assert all(case.equal for case in cases), report
+    if _EXECUTION_MODE.enabled:
+        assert all(case.equal for case in cases), report
 
 
 @pytest.mark.cuda
