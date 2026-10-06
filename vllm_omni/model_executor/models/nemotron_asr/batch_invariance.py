@@ -10,7 +10,8 @@ from threading import RLock
 from typing import Any
 
 import torch
-from torch.nn import functional as F
+
+from vllm_omni.model_executor.models.nemotron_asr import bi_ops
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ def _schema_wrappers(module: Any) -> dict[str, Callable]:
     The optional third GEMM argument is out_dtype in newer aten schemas,
     not the output buffer. All out overloads copy only after computation.
     Unsupported accumulator/output types fail explicitly instead of narrowing.
+    Retained for non-encoder ATen callers; opaque encoder ops bypass these.
     """
 
     def operands(a, b, out_dtype):
@@ -267,6 +269,9 @@ def bind_batch_invariant_mode(core: Any, record: BatchInvariantExecution) -> Non
     encoder = getattr(core, "encoder", None)
     if encoder is not None:
         owners.extend(encoder.modules())
+    lid = getattr(core, "lid", None)
+    if lid is not None:
+        owners.extend(lid.modules())
     for owner in owners:
         previous = getattr(owner, "batch_invariant_mode", None)
         if previous is not None and previous != record:
@@ -342,34 +347,20 @@ def accumulation_evidence_complete(operator: str, *, backend: str, execution: st
 
 
 def invariant_gemm(operand: torch.Tensor, matrix: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """@spec PORT-PREC-021: preserve installed mm/addmm dispatch under compile.
-
-    Inductor's pad_mm benchmark supplies alpha/beta kwargs unsupported by the
-    pinned vLLM addmm override. An opaque boundary also prevents replacement
-    of that kernel (and its FP32 bias-before-store contract) by a lowering.
-    Do not replace biased addmm with a post-cast addition or F.linear.
-    """
-    return _invariant_mm(operand, matrix) if bias is None else _invariant_addmm(bias, operand, matrix)
+    """@spec PORT-PREC-021: opaque pinned GEMM, bias before result cast."""
+    return bi_ops.mm(operand, matrix) if bias is None else bi_ops.addmm(bias, operand, matrix)
 
 
-@torch.library.custom_op("nemotron_bi::mm", mutates_args=())
-def _invariant_mm(operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    return torch.mm(operand, matrix)
+def invariant_linear(module: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """Route only the installed mode; preserve the original mode-off call."""
+    if not execution_mode(module).enabled:
+        return module(x)
+    result = invariant_gemm(x.reshape(-1, x.shape[-1]), module.weight.t(), module.bias)
+    return result.reshape(*x.shape[:-1], module.weight.shape[0])
 
 
-@_invariant_mm.register_fake
-def _invariant_mm_fake(operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    return operand.new_empty((operand.shape[0], matrix.shape[1]))
-
-
-@torch.library.custom_op("nemotron_bi::addmm", mutates_args=())
-def _invariant_addmm(bias: torch.Tensor, operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    return torch.addmm(bias, operand, matrix)
-
-
-@_invariant_addmm.register_fake
-def _invariant_addmm_fake(bias: torch.Tensor, operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-    return operand.new_empty((operand.shape[0], matrix.shape[1]))
+def invariant_matmul(owner: torch.nn.Module, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return bi_ops.matmul(a, b) if execution_mode(owner).enabled else torch.matmul(a, b)
 
 
 def pointwise_conv_as_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -379,8 +370,8 @@ def pointwise_conv_as_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.
     channels_last = x.movedim(1, -1)
     operand = channels_last.reshape(-1, x.shape[1])
     matrix = weight.reshape(weight.shape[0], weight.shape[1]).t()
-    # CUDA uses vLLM's installed addmm accumulator. The CPU oracle has no
-    # installed kernel, so explicitly widen before the biased reduction.
+    # CUDA calls the pinned biased persistent GEMM directly. Keep the CPU
+    # oracle operands FP32 before the biased reduction.
     if x.device.type == "cpu":
         operand, matrix = operand.float(), matrix.float()
         bias = None if bias is None else bias.float()
@@ -394,11 +385,8 @@ def sum_fp32(x: torch.Tensor, dim: int | tuple[int, ...], keepdim: bool = False)
 
 
 def softmax_fp32_sum(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """@spec PORT-PREC-021: exp rounding is distinct from summation width."""
-    if x.shape[dim] == 0:
-        return x.clone()
-    exp = (x - x.amax(dim=dim, keepdim=True)).exp()
-    return (exp.float() / exp.float().sum(dim=dim, keepdim=True)).to(x.dtype)
+    """@spec PORT-PREC-021: opaque fixed FP32 reduction, activation result."""
+    return bi_ops.softmax_sum(x.float(), dim).to(x.dtype)
 
 
 def log_softmax_fp32_sum(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -417,9 +405,9 @@ def layer_norm_fp32(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """@spec PORT-PREC-021: normalization and affine precede the result cast."""
-    return F.layer_norm(
+    return bi_ops.layer_norm_sum(
         x.float(),
-        tuple(normalized_shape),
+        list(normalized_shape),
         None if weight is None else weight.float(),
         None if bias is None else bias.float(),
         eps,
@@ -436,12 +424,14 @@ def depthwise_conv1d_fp32(
     dilation: int = 1,
 ) -> torch.Tensor:
     """@spec PORT-PREC-021: depthwise taps reduce in FP32, independently per row."""
-    taps = weight.shape[-1]
-    windows = F.pad(x, (padding, padding)).unfold(-1, dilation * (taps - 1) + 1, stride)[..., ::dilation]
-    result = (windows.float() * weight[:, 0, :].float()[None, :, None, :]).sum(-1)
-    if bias is not None:
-        result = result + bias.float()[None, :, None]
-    return result.to(x.dtype)
+    return bi_ops.depthwise_conv1d_sum(
+        x.float(),
+        weight.float(),
+        None if bias is None else bias.float(),
+        stride,
+        padding,
+        dilation,
+    ).to(x.dtype)
 
 
 def strided_conv2d_fp32(
@@ -454,43 +444,16 @@ def strided_conv2d_fp32(
     dilation: int | tuple[int, int] = 1,
     groups: int = 1,
 ) -> torch.Tensor:
-    """@spec PORT-PREC-020, PORT-PREC-021: fixed spatial contraction on CUDA.
-
-    cuDNN can choose a different convolution algorithm as population changes.
-    Lower CUDA subsampling to the installed GEMM (or a depthwise tap sum),
-    with FP32 operands and one result cast. CPU convolution is the oracle.
-    """
-    if x.device.type != "cuda":
-        return F.conv2d(
-            x.float(),
-            weight.float(),
-            None if bias is None else bias.float(),
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-        ).to(x.dtype)
-    sh, sw = (stride, stride) if isinstance(stride, int) else stride
-    ph, pw = (padding, padding) if isinstance(padding, int) else padding
-    dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
-    kh, kw = weight.shape[-2:]
-    height = (x.shape[-2] + 2 * ph - dh * (kh - 1) - 1) // sh + 1
-    width = (x.shape[-1] + 2 * pw - dw * (kw - 1) - 1) // sw + 1
-    patches = F.unfold(x.float(), (kh, kw), dilation=dilation, padding=padding, stride=stride)
-    batch, _, positions = patches.shape
-    if groups == x.shape[1] == weight.shape[0]:
-        taps = patches.reshape(batch, groups, kh * kw, positions).transpose(-1, -2)
-        result = (taps * weight.float().reshape(groups, 1, kh * kw)).sum(-1)
-        if bias is not None:
-            result = result + bias.float()[None, :, None]
-    elif groups == 1:
-        operand = patches.transpose(1, 2).reshape(batch * positions, -1)
-        matrix = weight.float().flatten(1).t()
-        result = invariant_gemm(operand, matrix, None if bias is None else bias.float())
-        result = result.reshape(batch, positions, weight.shape[0]).transpose(1, 2)
-    else:
-        raise ValueError("subsampling requires dense or depthwise convolution")
-    return result.reshape(batch, weight.shape[0], height, width).to(x.dtype)
+    """@spec PORT-PREC-020, PORT-PREC-021: opaque ordered FP32 tap sum."""
+    return bi_ops.strided_conv2d_sum(
+        x.float(),
+        weight.float(),
+        None if bias is None else bias.float(),
+        [stride, stride] if isinstance(stride, int) else list(stride),
+        [padding, padding] if isinstance(padding, int) else list(padding),
+        [dilation, dilation] if isinstance(dilation, int) else list(dilation),
+        groups,
+    ).to(x.dtype)
 
 
 @dataclass(frozen=True)

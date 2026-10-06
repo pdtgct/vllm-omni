@@ -31,6 +31,8 @@ from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
     depthwise_conv1d_fp32,
     execution_mode,
     invariant_gemm,
+    invariant_linear,
+    invariant_matmul,
     layer_norm_fp32,
     pointwise_conv_as_linear,
     softmax_fp32_sum,
@@ -237,22 +239,22 @@ class RelPositionMHA(nn.Module):
     ) -> torch.Tensor:
         """Self-attention; ``masked`` is (B, T, T) True = MAY NOT attend."""
         b, t, _ = x.shape
-        q = self.linear_q(x).view(b, t, self.h, self.d_k)
-        k = self.linear_k(x).view(b, t, self.h, self.d_k).transpose(1, 2)
-        v = self.linear_v(x).view(b, t, self.h, self.d_k).transpose(1, 2)
-        p = self.linear_pos(pos_emb).view(pos_emb.size(0), -1, self.h, self.d_k).transpose(1, 2)
+        q = invariant_linear(self.linear_q, x).view(b, t, self.h, self.d_k)
+        k = invariant_linear(self.linear_k, x).view(b, t, self.h, self.d_k).transpose(1, 2)
+        v = invariant_linear(self.linear_v, x).view(b, t, self.h, self.d_k).transpose(1, 2)
+        p = invariant_linear(self.linear_pos, pos_emb).view(pos_emb.size(0), -1, self.h, self.d_k).transpose(1, 2)
 
         q_u = (q + self.pos_bias_u).transpose(1, 2)
         q_v = (q + self.pos_bias_v).transpose(1, 2)
-        matrix_bd = self._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
-        matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+        matrix_bd = self._rel_shift(invariant_matmul(self, q_v, p.transpose(-2, -1)))
+        matrix_ac = invariant_matmul(self, q_u, k.transpose(-2, -1))
         scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / self.s_d_k
         mask = masked.unsqueeze(1)
         scores = scores.masked_fill(mask, -_LOG_BASE)
         attn = _softmax(self, scores).masked_fill(mask, 0.0)
-        out = torch.matmul(attn, v)
+        out = invariant_matmul(self, attn, v)
         out = out.transpose(1, 2).reshape(b, t, self.h * self.d_k)
-        return self.linear_out(out)
+        return invariant_linear(self.linear_out, out)
 
 
 class ConformerConv(nn.Module):
@@ -300,7 +302,7 @@ class FeedForward(nn.Module):
         self.linear2 = nn.Linear(d_ff, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(nn.functional.silu(self.linear1(x)))
+        return invariant_linear(self.linear2, nn.functional.silu(invariant_linear(self.linear1, x)))
 
 
 class ConformerLayer(nn.Module):
@@ -467,7 +469,7 @@ class FastConformerEncoder(nn.Module):
             for length in lengths:
                 pos_emb = self.pos_enc.pe[:, center - length : center + length - 1]
                 projection = (
-                    attn.linear_pos(pos_emb)
+                    invariant_linear(attn.linear_pos, pos_emb)
                     .view(
                         pos_emb.size(0),
                         -1,
@@ -614,19 +616,19 @@ def _stream_attention(
     keys = torch.cat([cache.to(x.dtype), x], dim=1)  # (B, C+F, d)
 
     b, t2 = batch, keys.shape[1]
-    q = attn.linear_q(x).view(b, new_frames, attn.h, attn.d_k)
-    k = attn.linear_k(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
-    v = attn.linear_v(keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    q = invariant_linear(attn.linear_q, x).view(b, new_frames, attn.h, attn.d_k)
+    k = invariant_linear(attn.linear_k, keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
+    v = invariant_linear(attn.linear_v, keys).view(b, t2, attn.h, attn.d_k).transpose(1, 2)
     if projected_pos is None:
         if pos_emb is None:
             raise ValueError("stream attention requires positional embeddings or a prepared projection")
-        p = attn.linear_pos(pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
+        p = invariant_linear(attn.linear_pos, pos_emb).view(pos_emb.size(0), -1, attn.h, attn.d_k).transpose(1, 2)
     else:
         p = projected_pos
     q_u = (q + attn.pos_bias_u).transpose(1, 2)
     q_v = (q + attn.pos_bias_v).transpose(1, 2)
-    matrix_bd = attn._rel_shift(torch.matmul(q_v, p.transpose(-2, -1)))
-    matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+    matrix_bd = attn._rel_shift(invariant_matmul(attn, q_v, p.transpose(-2, -1)))
+    matrix_ac = invariant_matmul(attn, q_u, k.transpose(-2, -1))
     scores = (matrix_ac + matrix_bd[:, :, :, : matrix_ac.size(-1)]) / attn.s_d_k
     # Mask: cache rows beyond each element's valid count are dead;
     # padded new frames are dead keys; padded queries mask fully.
@@ -634,7 +636,7 @@ def _stream_attention(
         mask = _stream_attention_mask(valid, new_valid, capacity)
     scores = scores.masked_fill(mask, -_LOG_BASE)
     weights = _softmax(attn, scores).masked_fill(mask, 0.0)
-    out = torch.matmul(weights, v)
+    out = invariant_matmul(attn, weights, v)
     out = out.transpose(1, 2).reshape(batch, new_frames, attn.h * attn.d_k)
     # Advance cache by each row's logical length: slot j of the new
     # cache is [cache | x][j + F_b] — F_b = 0 leaves the row's cache
@@ -642,7 +644,7 @@ def _stream_attention(
     if cache_indices is None:
         cache_indices = _stream_cache_indices(new_lengths, capacity).unsqueeze(-1).expand(b, capacity, keys.shape[2])
     new_cache = torch.cat([cache, x.to(cache.dtype)], dim=1).gather(1, cache_indices)
-    return attn.linear_out(out), new_cache
+    return invariant_linear(attn.linear_out, out), new_cache
 
 
 def _stream_conv(
