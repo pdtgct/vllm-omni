@@ -1,0 +1,450 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Phase 5 contracts for PORT-PREC-018..028; no production implementation.
+
+Missing imports occur inside tests, so absent Phase-6 seams fail individually.
+Proposed seam: nemotron_asr.batch_invariance supplies an installed-state adapter
+(initializer dependency injection witnesses successful return), an immutable
+BatchInvariantExecution record, operator helpers and qualification_verdict.
+Record methods stamp copies of receipts/fingerprints and namespace existing keys;
+they must be wired into model construction and the existing capture owners.
+GPU execution tests live in test_batch_invariant_cuda.py.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import json
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+
+from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import ResolvedEncoderExecution
+from vllm_omni.model_executor.models.nemotron_asr.manifests import canonical_json
+from vllm_omni.model_executor.models.nemotron_asr.precision import FP32_BRINGUP
+
+pytestmark = [pytest.mark.cpu, pytest.mark.core_model]
+
+
+def api() -> Any:
+    return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.batch_invariance")
+
+
+def installed(enabled: bool = True) -> Any:
+    module = SimpleNamespace(_batch_invariant_MODE=enabled, _batch_invariant_LIB=object() if enabled else None)
+    return api().installed_batch_invariant_mode(module=module, initialize=lambda: None)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prec018_installed_mode_snapshot(monkeypatch, enabled):
+    """@spec PORT-PREC-018: initialization completes before reading installed state."""
+    subject = api()
+    module = SimpleNamespace(_batch_invariant_MODE=False, _batch_invariant_LIB=None)
+    events = []
+
+    def initialize():
+        events.append("returned")
+        module._batch_invariant_MODE = enabled
+        module._batch_invariant_LIB = object() if enabled else None
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if enabled else "1")
+    record = subject.installed_batch_invariant_mode(module=module, initialize=initialize)
+    assert record.enabled is enabled
+    assert events == ["returned"]
+    module._batch_invariant_MODE = not enabled
+    assert record.enabled is enabled  # snapshot, not a live proxy
+
+
+@pytest.mark.parametrize("broken", ["missing_flag", "missing_library", "null_library", "raised_after_library"])
+def test_prec018_installed_mode_snapshot_incomplete(broken):
+    """@spec PORT-PREC-018: a library object alone does not attest completion."""
+    subject = api()
+    module = SimpleNamespace(_batch_invariant_MODE=True, _batch_invariant_LIB=object())
+    error = RuntimeError("registration failed after library creation")
+
+    def initialize():
+        if broken == "raised_after_library":
+            raise error
+        if broken == "missing_flag":
+            del module._batch_invariant_MODE
+        elif broken == "missing_library":
+            del module._batch_invariant_LIB
+        else:
+            module._batch_invariant_LIB = None
+
+    with pytest.raises(RuntimeError) as caught:
+        subject.installed_batch_invariant_mode(module=module, initialize=initialize)
+    if broken == "raised_after_library":
+        assert caught.value is error
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prec028_mode_immutability(monkeypatch, enabled):
+    """@spec PORT-PREC-028: environment/config/session writes cannot change a record."""
+    record = installed(enabled)
+    before = record.fingerprint({"policy": FP32_BRINGUP.identifier})
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if enabled else "1")
+    with pytest.raises((FrozenInstanceError, AttributeError, TypeError)):
+        record.enabled = not enabled
+    # Unknown model/session overrides must never become a second mode selector.
+    for overrides in ({"batch_invariant_mode": not enabled}, {"VLLM_BATCH_INVARIANT": not enabled}):
+        assert api().resolve_execution_mode(record, hf_overrides=overrides, session_controls=overrides) is record
+    assert record.fingerprint({"policy": FP32_BRINGUP.identifier}) == before
+
+
+_READY_BYTES = b'{"arm":"eager","ready":true,"warmup_cells":[],"warmup_geometries":[],"warmup_populations":[]}'
+
+
+def test_prec019_legacy_serialization():
+    """@spec PORT-PREC-019: fixed observations retain baseline bytes and policy id."""
+    execution = ResolvedEncoderExecution(arm="eager", transition=lambda *args: None)
+    assert canonical_json(execution.ready_receipt()).encode() == _READY_BYTES
+    assert FP32_BRINGUP.identifier == "pp-d479361445b4"
+    assert FP32_BRINGUP.content_hash == "sha256:d479361445b45b54ce1b0df4cd11b7ee1a06deb235ceeb8cf97c565bed2f5ccd"
+    assert "batch_invariant_mode" not in execution.ready_receipt()
+
+
+def test_prec019_legacy_serialization_adapter():
+    """@spec PORT-PREC-019: off omits the new field; it does not append False to keys."""
+    record = installed(False)
+    fixtures = [
+        b'{"policy":"pp-d479361445b4","source":"fixed-source","version":1}',
+        _READY_BYTES,
+        b'{"bounds":[100,200],"capacity":2,"durations":[90,190],"execution_environment_key":"fixed-env"}',
+    ]
+    for raw, stamp in zip(
+        fixtures, (record.fingerprint, record.readiness_receipt, record.service_receipt), strict=True
+    ):
+        baseline = json.loads(raw)
+        assert canonical_json(stamp(baseline)).encode() == raw
+        assert canonical_json(baseline).encode() == raw
+    for kind, key in (("decode", (1, 31, "fp32")), ("decode_fn", (1, 31)), ("cuda", (1, 31)), ("chunk", (1, 31))):
+        assert record.graph_key(kind, key) == key
+
+
+@pytest.mark.parametrize("kind", ["decode", "decode_fn", "cuda", "chunk"])
+def test_prec020_mode_identity_isolation(kind):
+    """@spec PORT-PREC-020, PORT-PREC-025: cross-mode/cross-kernel artifacts never match."""
+    off, on = installed(False), installed(True)
+    base = {"policy": "fp32", "kernel": "operator-accumulation-v1", "optimization": "prefix-bank"}
+    original = copy.deepcopy(base)
+    old_key = (1, 31, "fp32") if kind == "decode" else (1, 31)
+    assert off.graph_key(kind, old_key) == old_key
+    assert on.graph_key(kind, old_key) != old_key
+    cache = {off.graph_key(kind, old_key): "off", on.graph_key(kind, old_key): "on"}
+    assert len(cache) == 2
+    for stamp in (on.fingerprint, on.readiness_receipt, on.service_receipt):
+        assert stamp(base) == {**base, "batch_invariant_mode": "on"}
+    assert base == original
+    fp = on.fingerprint(base)
+    assert api().artifact_matches(fp, copy.deepcopy(fp))
+    assert not api().artifact_matches(fp, off.fingerprint(base))
+    for field in base:
+        assert not api().artifact_matches(fp, {**fp, field: "different"})
+
+
+# Table rows are obligations, NOT claims that a tensor dtype proves a kernel.
+OPERATOR_ROWS = {
+    "gemm": "vllm",
+    "bmm": "vllm",
+    "softmax": "port",
+    "log_softmax": "port",
+    "layer_norm": "port",
+    "depthwise_conv1d": "port",
+    "strided_conv2d": "port",
+    "pointwise_conv": "port",
+    "mean": "vllm",
+    "sum": "port",
+    "sdpa": "port",
+}
+
+
+def test_prec021_operator_accumulation_contract():
+    """@spec PORT-PREC-021: pin all table rows and require actual-backend evidence."""
+    contract = api().operator_accumulation_contract(device_capability=(8, 0))
+    assert contract["version"] == "operator-accumulation-v1"
+    assert set(contract["rows"]) == set(OPERATOR_ROWS)
+    for name, owner in OPERATOR_ROWS.items():
+        row = contract["rows"][name]
+        assert row["owner"] == owner
+        assert row["required_accumulator"] == "float32"
+        assert row["fp16_accumulation"] == "unspecified"
+    assert contract["rows"]["pointwise_conv"]["bias_order"] == "before_result_cast"
+    assert contract["rows"]["softmax"]["reduction"] == "summation"
+    assert api().operator_accumulation_contract(device_capability=(8, 6)) == contract
+    other = api().operator_accumulation_contract(device_capability=(9, 0))
+    assert not other["rows"]["gemm"]["accumulator_established"]
+
+
+class DispatchTrace(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.calls.append((str(func), args, dict(kwargs or {})))
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("ndim", [1, 2])
+@pytest.mark.parametrize("biased", [False, True])
+def test_prec021_operator_accumulation_contract_pointwise(ndim, biased):
+    """@spec PORT-PREC-021: k=1 lowering preserves layout and adds bias before cast."""
+    lower = api().pointwise_conv_as_linear
+    cls = torch.nn.Conv1d if ndim == 1 else torch.nn.Conv2d
+    conv = cls(2, 3, 1, bias=biased).half()
+    with torch.no_grad():
+        conv.weight.fill_(1.0)
+        if biased:
+            conv.bias.fill_(-1.0)
+    # 1 + 2^-11 rounds to 1 in fp16; subtracting 1 BEFORE that cast
+    # gives 2^-11. Post-store linear bias addition instead gives zero.
+    shape = (2, 2, 5) if ndim == 1 else (2, 2, 3, 5)
+    x = torch.empty(shape, dtype=torch.float16)
+    x[:, 0] = 1.0
+    x[:, 1] = 2**-11
+    trace = DispatchTrace()
+    with trace:
+        actual = lower(x, conv.weight, conv.bias)
+    expected = x.float().movedim(1, -1) @ conv.weight.float().reshape(3, 2).T
+    if biased:
+        expected = expected + conv.bias.float()
+    expected = expected.movedim(-1, 1).half()
+    assert torch.equal(actual, expected)
+    assert actual.shape == (shape[0], 3, *shape[2:])
+    assert actual.dtype == x.dtype
+    names = [name for name, _, _ in trace.calls]
+    assert not any("convolution" in name for name in names)
+    assert any(("addmm" if biased else "mm") in name for name in names), names
+    if biased:
+        post_cast = (x.movedim(1, -1) @ conv.weight.reshape(3, 2).T + conv.bias).movedim(-1, 1)
+        assert not torch.equal(actual, post_cast)
+
+
+@pytest.mark.parametrize("operation", ["softmax", "sum", "layer_norm", "depthwise_conv1d", "strided_conv2d"])
+def test_prec021_operator_accumulation_contract_dispatch(operation):
+    """@spec PORT-PREC-021: CPU-visible PORT paths must promote before reduction."""
+    subject = api()
+    x = torch.tensor([[[1.0, 2**-11, -1.0, 0.25], [0.5, -0.5, 0.125, 1.0]]], dtype=torch.float16)
+    trace = DispatchTrace()
+    with trace:
+        if operation == "softmax":
+            result = subject.softmax_fp32_sum(x, dim=-1)
+        elif operation == "sum":
+            result = subject.sum_fp32(x, dim=-1)
+        elif operation == "layer_norm":
+            result = subject.layer_norm_fp32(x, (4,), eps=1e-5)
+        elif operation == "depthwise_conv1d":
+            result = subject.depthwise_conv1d_fp32(x, torch.ones(2, 1, 3, dtype=x.dtype), padding=1)
+        else:
+            result = subject.strided_conv2d_fp32(x.unsqueeze(1), torch.ones(2, 1, 2, 2, dtype=x.dtype), stride=2)
+    assert result.dtype == x.dtype
+    relevant = [call for call in trace.calls if any(s in call[0] for s in ("sum.", "native_layer_norm", "convolution"))]
+    assert relevant, trace.calls
+    for name, args, kwargs in relevant:
+        assert args[0].dtype == torch.float32 or kwargs.get("dtype") == torch.float32, name
+    if operation == "sum":
+        assert torch.equal(result, x.float().sum(-1).half())
+    elif operation == "softmax":
+        assert torch.isfinite(result).all()
+        # Explicitly inspect masked and empty reductions as well.
+        for special in (torch.full_like(x, -torch.inf), x[..., :0]):
+            masked_trace = DispatchTrace()
+            with masked_trace:
+                special_result = subject.softmax_fp32_sum(special, dim=-1)
+            assert special_result.shape == special.shape
+            for name, args, kwargs in masked_trace.calls:
+                if "sum." in name:
+                    assert args[0].dtype == torch.float32 or kwargs.get("dtype") == torch.float32
+
+
+def _fingerprint(**changes):
+    result = {
+        "gpu": "NVIDIA A100",
+        "precision": "fp32",
+        "software": "98dff2a81+292e48605",
+        "kernel": "operator-accumulation-v1",
+        "backend": "triton",
+        "batch_invariant_mode": "on",
+        "optimizations": {"prefix_bank": True, "inplace_cache": True, "head_major": False, "sdpa": False},
+    }
+    return {**result, **changes}
+
+
+def _evidence(fp):
+    return {
+        "fingerprint": copy.deepcopy(fp),
+        "executable": True,
+        "populations": [1, 2, 31, 63, 64, 128],
+        "geometries": [0, 1, 2, 3, 4],
+        "compositions": ["repeated", "mixed"],
+        "independent_b128_runs": 2,
+        "gates": {f"PORT-PREC-{n:03}": True for n in (14, 16, 20, 21, 22, 24, 26, 27)},
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("gpu", "NVIDIA A40"),
+        ("precision", "fp16-encoder"),
+        ("software", "other"),
+        ("kernel", "other"),
+        ("backend", "other"),
+        ("batch_invariant_mode", "off"),
+        ("optimizations", {"prefix_bank": True, "inplace_cache": True, "head_major": False, "sdpa": True}),
+    ],
+)
+def test_prec023_qualification_identity(field, value):
+    """@spec PORT-PREC-023, PORT-PREC-025: evidence binds the full execution identity."""
+    qualify = api().qualification_verdict
+    fp = _fingerprint()
+    evidence = _evidence(fp)
+    assert qualify(fp, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20).qualified
+    assert not qualify({**fp, field: value}, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20).qualified
+
+
+@pytest.mark.parametrize(
+    "missing", ["128", "geometry", "reset", "mixed", "014", "016", "020", "021", "022", "024", "026", "027"]
+)
+def test_prec023_qualification_failure_isolation(missing):
+    """@spec PORT-PREC-023, PORT-PREC-024: numerical misses are local, not startup errors."""
+    qualify = api().qualification_verdict
+    fp = _fingerprint()
+    good = _evidence(fp)
+    bad = copy.deepcopy(good)
+    if missing == "128":
+        bad["populations"].remove(128)
+    elif missing == "geometry":
+        bad["geometries"].pop()
+    elif missing == "reset":
+        bad["independent_b128_runs"] = 1
+    elif missing == "mixed":
+        bad["compositions"].remove("mixed")
+    else:
+        bad["gates"][f"PORT-PREC-{missing}"] = False
+    result = qualify(fp, bad, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
+    assert result.ready and not result.qualified and not result.default and not result.supported
+    assert qualify(fp, good, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20).qualified
+    # Unspecified hardware is permitted to execute, but receives no inherited qualification.
+    unknown = _fingerprint(gpu="NVIDIA H100")
+    result = qualify(unknown, _evidence(unknown), served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
+    assert result.ready and not result.qualified
+
+
+@pytest.mark.parametrize("failure", ["compile", "capture", "replay"])
+def test_mode_on_capture_failure_closes_readiness(failure):
+    """@spec PORT-PREC-023, PORT-PREC-026: execution failure is not a numerical waiver."""
+    fp = _fingerprint()
+    evidence = _evidence(fp)
+    evidence.update(executable=False, execution_failure=failure)
+    result = api().qualification_verdict(fp, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
+    assert not result.ready and not result.qualified
+
+
+@pytest.mark.parametrize("option", ["prefix_bank", "inplace_cache", "head_major", "sdpa"])
+def test_prec027_optimization_equivalence(option):
+    """@spec PORT-PREC-027: mode binding preserves selections and gates independent evidence."""
+    subject = api()
+    for enabled in (False, True):
+        selected = dict(_fingerprint()["optimizations"], **{option: enabled})
+        assert subject.resolve_optimizations(installed(True), selected) == selected
+    fp = _fingerprint(optimizations={**_fingerprint()["optimizations"], option: True})
+    evidence = _evidence(fp)
+    evidence["gates"]["PORT-PREC-027"] = False
+    assert not subject.qualification_verdict(
+        fp, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=128
+    ).qualified
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_prec018_installed_mode_snapshot_construction(monkeypatch, fails):
+    """@spec PORT-PREC-018, PORT-PREC-028: construction resolves before model work."""
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as model
+
+    record = installed(True)
+    events = []
+    error = RuntimeError("incomplete installation")
+
+    def adapter():
+        events.append("mode")
+        if fails:
+            raise error
+        return record
+
+    def component(**kwargs):
+        assert events == ["mode"], "model work preceded installation witness"
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(model, "installed_batch_invariant_mode", adapter)
+    for name in ("MelFeaturizer", "FastConformerEncoder", "PromptConditioner", "Predictor", "Joint"):
+        monkeypatch.setattr(model, name, component)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    kwargs = dict(vocab_size=4, filterbank=torch.ones(1), window=torch.ones(1))
+    if fails:
+        with pytest.raises(RuntimeError) as caught:
+            model.NemotronASRCore(**kwargs)
+        assert caught.value is error and events == ["mode"]
+    else:
+        core = model.NemotronASRCore(**kwargs)
+        assert core.batch_invariant_mode is record
+        assert events == ["mode"]
+        with pytest.raises((AttributeError, RuntimeError, TypeError)):
+            api().bind_batch_invariant_mode(core, installed(False))
+        assert core.batch_invariant_mode is record
+
+
+@pytest.mark.parametrize("operator", list(OPERATOR_ROWS))
+@pytest.mark.parametrize("execution", ["eager", "compiled"])
+def test_prec021_operator_accumulation_contract_evidence(operator, execution):
+    """@spec PORT-PREC-021: numerical equality, dtype and a wrong backend are insufficient."""
+    check = api().accumulation_evidence_complete
+    evidence = {
+        "operator": operator,
+        "backend": "actual-backend",
+        "execution": execution,
+        "accumulator": "float32",
+        "kind": "generated_kernel" if execution == "compiled" else "pinned_backend",
+        "source_sha256": "a" * 64,
+        "symbol": "actual_kernel.sum",
+        "bias_before_cast": True,
+    }
+    assert check(operator, backend="actual-backend", execution=execution, evidence=evidence)
+    for patch in (
+        {"kind": "numerical_equality"},
+        {"kind": "operand_dtype"},
+        {"backend": "other"},
+        {"source_sha256": ""},
+        {"accumulator": "float16"},
+    ):
+        assert not check(operator, backend="actual-backend", execution=execution, evidence={**evidence, **patch})
+    if execution == "compiled":
+        assert not check(
+            operator,
+            backend="actual-backend",
+            execution=execution,
+            evidence={**evidence, "execution": "eager", "kind": "dispatch"},
+        )
+    if operator == "pointwise_conv":
+        assert not check(
+            operator, backend="actual-backend", execution=execution, evidence={**evidence, "bias_before_cast": False}
+        )
+
+
+def test_prec020_bit_patterns_include_signed_zero_and_nan_payloads():
+    """@spec PORT-PREC-020: discriminator compares storage, not IEEE value equality."""
+    from test_batch_invariant_cuda import _bits
+
+    # qNaNs with distinct payloads, positive/negative zero, positive/negative infinity.
+    values = torch.tensor([0, -2147483648, 2143289345, 2143289346, 2139095040, -8388608], dtype=torch.int32).view(
+        torch.float32
+    )
+    assert torch.equal(_bits(values), _bits(values.clone()))
+    assert not torch.equal(_bits(values[0:1]), _bits(values[1:2]))
+    assert not torch.equal(_bits(values[2:3]), _bits(values[3:4]))
+    assert not torch.equal(_bits(values[4:5]), _bits(values[5:6]))

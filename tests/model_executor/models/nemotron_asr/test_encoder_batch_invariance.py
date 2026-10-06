@@ -175,7 +175,10 @@ def bi_settings() -> dict[str, Any]:
         "VLLM_BATCH_INVARIANT": os.environ.get("VLLM_BATCH_INVARIANT"),
         "allow_fp16_reduced_precision_reduction": repr(matmul.allow_fp16_reduced_precision_reduction),
         "matmul_fp32_precision": str(getattr(matmul, "fp32_precision", "n/a")),
-        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        # vLLM sets the per-operation precision API. Reading the legacy
+        # aggregate allow_tf32 flag then raises on mixed backend settings.
+        "cudnn_conv_fp32_precision": str(torch.backends.cudnn.conv.fp32_precision),
+        "cudnn_rnn_fp32_precision": str(torch.backends.cudnn.rnn.fp32_precision),
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
     }
     if _REDUCED_PRECISION_NOTE:
@@ -1071,6 +1074,26 @@ _TINY = {
     "subsampling_channels": 16,
     "num_prompts": 8,
 }
+
+
+@pytest.mark.cpu
+def test_bi_settings_uses_per_operation_precision(monkeypatch) -> None:
+    """Reporting vLLM's precision settings must not read legacy TF32 flags."""
+
+    class CudnnSettings:
+        conv = SimpleNamespace(fp32_precision="ieee")
+        rnn = SimpleNamespace(fp32_precision="ieee")
+        benchmark = False
+
+        @property
+        def allow_tf32(self):
+            raise RuntimeError("legacy and per-operation precision APIs cannot be mixed")
+
+    monkeypatch.setattr(torch.backends, "cudnn", CudnnSettings())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    settings = bi_settings()
+    assert settings["cudnn_conv_fp32_precision"] == "ieee"
+    assert settings["cudnn_rnn_fp32_precision"] == "ieee"
 
 
 @pytest.mark.cpu
