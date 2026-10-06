@@ -14,6 +14,8 @@ through ``prompt_kernel`` — op-for-op NeMo's
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import execution_mode, invariant_linear
+
 
 def resolve_prompt_index(prompt_dictionary: dict[str, int], target_lang: str) -> int:
     """Resolve a locale to its prompt index at session admission.
@@ -83,5 +85,13 @@ class PromptConditioner(nn.Module):
             )
             prompt[:, :, prompt_index] = 1.0
         out_dtype = encoded.dtype
-        conditioned: torch.Tensor = self.prompt_kernel(torch.cat([encoded, prompt], dim=-1)).to(out_dtype)
+        if execution_mode(self).enabled:
+            conditioned = torch.cat([encoded, prompt], dim=-1)
+            for module in self.prompt_kernel:
+                conditioned = (
+                    invariant_linear(module, conditioned) if isinstance(module, nn.Linear) else module(conditioned)
+                )
+            conditioned = conditioned.to(out_dtype)
+        else:
+            conditioned = self.prompt_kernel(torch.cat([encoded, prompt], dim=-1)).to(out_dtype)
         return conditioned
