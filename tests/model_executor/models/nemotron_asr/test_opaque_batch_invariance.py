@@ -172,3 +172,37 @@ def test_evidence_rejects_unprotected_matmul():
         assert_opaque_graph(graph)
     with pytest.raises(AssertionError, match="unprotected"):
         assert_opaque_code("torch.ops.nemotron_bi.mm.default(a,b)\nextern_kernels.mm(a,b)")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_bound_transition_avoids_mode_record_lookup(monkeypatch, enabled):
+    """@spec PORT-PREC-019, PORT-PREC-027: routing is fixed before tracing."""
+    from tests.model_executor.models.nemotron_asr import test_encoder_batch_invariance as probe
+
+    device = torch.device("cpu")
+    core = probe.build_core("fp32", device, probe._TINY, mode=bi.BatchInvariantExecution(enabled))
+    schedule = probe.schedule_for(core)
+    state = probe.new_state(schedule, population=2, composition="mixed", probe_row=1, device=device)
+    args = probe.chunk_inputs(schedule, population=2, chunk=0, composition="mixed", probe_row=1, device=device)
+    caches = probe.gathered(state)
+    graphs = []
+
+    def reject_lookup(owner):
+        raise AssertionError("bound transition must not read the execution record")
+
+    def backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def transition(mel, offsets, lengths, prompt):
+        return probe.execute_encoder_transition(core, mel, caches, offsets, lengths, schedule.out_width, prompt)
+
+    with torch.inference_mode():
+        core.encoder.prepare_stream_relative_position_projections(
+            out_widths=(schedule.out_width,), cache_len=56, reference=next(core.encoder.parameters())
+        )
+        monkeypatch.setattr(bi, "execution_mode", reject_lookup)
+        compiled = torch.compile(transition, backend=backend, fullgraph=True, dynamic=False)
+        compiled(*args)
+        compiled(*args)
+    assert len(graphs) == 1
