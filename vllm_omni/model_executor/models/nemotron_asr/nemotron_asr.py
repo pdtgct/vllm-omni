@@ -37,6 +37,12 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ResolvedDecode,
     make_mrv1_adapter,
 )
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    BatchInvariantExecution,
+    bind_batch_invariant_mode,
+    execution_mode,
+    installed_batch_invariant_mode,
+)
 from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
     resolve_status_reports,
@@ -151,6 +157,8 @@ class NemotronASRCore(nn.Module):
         policy: PrecisionPolicy = FP32_BRINGUP,
     ) -> None:
         super().__init__()
+        # @spec PORT-PREC-018, PORT-PREC-028: resolve before building components.
+        bind_batch_invariant_mode(self, installed_batch_invariant_mode())
         self.policy = policy
         self.vocab_size = vocab_size
         self.blank_id = vocab_size
@@ -172,8 +180,13 @@ class NemotronASRCore(nn.Module):
             joint_hidden=joint_hidden,
             vocab_size=vocab_size,
         )
+        bind_batch_invariant_mode(self, self.batch_invariant_mode)
         self._pred_layers = pred_rnn_layers
         self._pred_hidden = pred_hidden
+
+    @property
+    def batch_invariant_mode(self) -> BatchInvariantExecution:
+        return self._batch_invariant_mode
 
     def fresh_decode_state(self, device: torch.device) -> DecodeState:
         """Zeroed decode state; last label = blank (SOS, PORT-STATE-003)."""
@@ -436,6 +449,7 @@ class NemotronASRForRNNT(nn.Module):
 
             served_geometry_set = set(served_geometry_ids)
             self._decode_graph_binding = DenseGraphBinding(
+                batch_invariant_mode=self.core.batch_invariant_mode,
                 decode_fn=decode_dense_masked_frames,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
@@ -745,6 +759,7 @@ class NemotronASRForRNNT(nn.Module):
             for geometry in _served_geometry_ids(self.config)
             for tier in execution_tiers(self._max_num_seqs)
         }
+        expected = {execution_mode(self.core).graph_key("decode_fn", key) for key in expected}
         if set(binding.captured_keys) != expected:
             raise RuntimeError("decoder execution inventory is incomplete")
 
@@ -847,7 +862,7 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
-        return receipt
+        return execution_mode(getattr(self, "core", None)).readiness_receipt(receipt)
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
