@@ -158,6 +158,37 @@ def accumulation_evidence_complete(operator: str, *, backend: str, execution: st
     )
 
 
+def invariant_gemm(operand: torch.Tensor, matrix: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    """@spec PORT-PREC-021: preserve installed mm/addmm dispatch under compile.
+
+    Inductor's pad_mm benchmark supplies alpha/beta kwargs unsupported by the
+    pinned vLLM addmm override. An opaque boundary also prevents replacement
+    of that kernel (and its FP32 bias-before-store contract) by a lowering.
+    Do not replace biased addmm with a post-cast addition or F.linear.
+    """
+    return _invariant_mm(operand, matrix) if bias is None else _invariant_addmm(bias, operand, matrix)
+
+
+@torch.library.custom_op("nemotron_bi::mm", mutates_args=())
+def _invariant_mm(operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    return torch.mm(operand, matrix)
+
+
+@_invariant_mm.register_fake
+def _invariant_mm_fake(operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    return operand.new_empty((operand.shape[0], matrix.shape[1]))
+
+
+@torch.library.custom_op("nemotron_bi::addmm", mutates_args=())
+def _invariant_addmm(bias: torch.Tensor, operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    return torch.addmm(bias, operand, matrix)
+
+
+@_invariant_addmm.register_fake
+def _invariant_addmm_fake(bias: torch.Tensor, operand: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    return operand.new_empty((operand.shape[0], matrix.shape[1]))
+
+
 def pointwise_conv_as_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
     """@spec PORT-PREC-021: k=1 GEMM with bias inside the accumulator."""
     if weight.ndim != x.ndim or any(size != 1 for size in weight.shape[2:]):
@@ -170,7 +201,7 @@ def pointwise_conv_as_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.
     if x.device.type == "cpu":
         operand, matrix = operand.float(), matrix.float()
         bias = None if bias is None else bias.float()
-    result = torch.mm(operand, matrix) if bias is None else torch.addmm(bias, operand, matrix)
+    result = invariant_gemm(operand, matrix, bias)
     return result.to(x.dtype).reshape(*channels_last.shape[:-1], weight.shape[0]).movedim(-1, 1)
 
 
@@ -272,7 +303,7 @@ def strided_conv2d_fp32(
     elif groups == 1:
         operand = patches.transpose(1, 2).reshape(batch * positions, -1)
         matrix = weight.float().flatten(1).t()
-        result = torch.mm(operand, matrix) if bias is None else torch.addmm(bias.float(), operand, matrix)
+        result = invariant_gemm(operand, matrix, None if bias is None else bias.float())
         result = result.reshape(batch, positions, weight.shape[0]).transpose(1, 2)
     else:
         raise ValueError("subsampling requires dense or depthwise convolution")

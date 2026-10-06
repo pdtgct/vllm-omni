@@ -53,8 +53,8 @@ def _api():
     return importlib.import_module("vllm_omni.model_executor.models.nemotron_asr.batch_invariance")
 
 
-@pytest.fixture(scope="module")
-def mode_on():
+@pytest.fixture
+def mode_on(isolated_batch_invariance):
     # Must precede weights, capture, or reservations. The adapter owns the
     # successful-return witness; the environment alone is not the record.
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
@@ -160,8 +160,7 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     gpu = torch.cuda.get_device_name(device)
     assert "A100" in gpu or "A40" in gpu, "qualification partition must be A100 or A40"
-    core = build_core(policy, device)
-    _api().bind_batch_invariant_mode(core, mode_on)
+    core = build_core(policy, device, mode=mode_on)
     torch._dynamo.reset()
     execution = build_encoder_execution(
         core,
@@ -343,3 +342,20 @@ def test_prec022_disclosure_manifest():
     for arm, metrics in samples.items():
         for metric, values in metrics.items():
             assert arms[arm]["reported"][metric] == pytest.approx(statistics.median(values))
+
+
+@pytest.mark.parametrize("ndim", [1, 2])
+@torch.inference_mode()
+def test_prec021_compiled_biased_pointwise(mode_on, ndim):
+    """@spec PORT-PREC-021: Inductor retains addmm and its pre-cast bias."""
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    shape = (2, 2, 5) if ndim == 1 else (2, 2, 3, 5)
+    x = torch.empty(shape, device=device, dtype=torch.float16)
+    x[:, 0], x[:, 1] = 1.0, 2**-11
+    weight = torch.ones((3, 2) + (1,) * ndim, device=device, dtype=x.dtype)
+    bias = torch.full((3,), -1.0, device=device, dtype=x.dtype)
+    compiled = torch.compile(_api().pointwise_conv_as_linear, backend="inductor", fullgraph=True)
+    actual = compiled(x, weight, bias)
+    # A post-store bias addition would lose the half-ULP and return zero.
+    assert torch.equal(actual, torch.full((2, 3) + shape[2:], 2**-11, device=device, dtype=x.dtype))
+    assert torch.equal(actual, _api().pointwise_conv_as_linear(x, weight, bias))
