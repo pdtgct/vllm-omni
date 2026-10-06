@@ -48,7 +48,7 @@ def preserve_batch_invariance(batch_invariant, configs):
             ),
         ),
         (configs, ("_TUNED_MATMUL_CONFIGS_FOR_DEVICE", "_TUNED_MATMUL_CONFIGS_RESOLVED")),
-        (port, ("_installed", "_install_failure")),
+        (port, ("_installed", "_install_failure", "_schema_library", "_schema_source", "_schema_installed")),
         (torch, ("bmm",)),
         (
             torch.backends.cuda.matmul,
@@ -69,6 +69,7 @@ def preserve_batch_invariance(batch_invariant, configs):
                     "_REDUCED_PRECISION_NOTE",
                 )
             )
+    adapter_library = port._schema_library
     library = batch_invariant._batch_invariant_LIB
     blas = torch.backends.cuda.preferred_blas_library()
     try:
@@ -76,6 +77,8 @@ def preserve_batch_invariance(batch_invariant, configs):
     finally:
         # Drop compiled artifacts that could retain a mode-on specialization.
         torch._dynamo.reset()
+        if port._schema_library is not None and port._schema_library is not adapter_library:
+            port._schema_library._destroy()
         installed = batch_invariant._batch_invariant_LIB
         if installed is not None and installed is not library:
             installed._destroy()
