@@ -4,7 +4,9 @@
 
 All arms execute the same encoder, language-conditioning, and padded-row
 zeroing function. Inductor specializes the compiled arms for exact tensor
-shapes with compiler-owned CUDA graphs disabled. The dense-graphed arm then
+shapes with compiler-owned CUDA graphs disabled. Batch-invariant mode shares
+one bounded dynamic population frame plus a singleton frame per geometry.
+The dense-graphed arm then
 captures that compiled transition with explicit, stable graph-owned scratch.
 The experimental eager-graphed arm captures native eager arithmetic with the
 same scratch ownership, exact population domain, and fail-closed lifecycle.
@@ -576,6 +578,9 @@ _STATIC_ARMS = _COMPILED_ARMS | _GRAPHED_ARMS
 @contextmanager
 def _compiler_specialization_budget(
     specializations: int,
+    *,
+    exact: bool = False,
+    entries_taken: int = 0,
 ) -> Generator[None, None, None]:
     """Scope Dynamo's process-global limits to one declared-domain call."""
     if specializations <= 0:
@@ -585,13 +590,17 @@ def _compiler_specialization_budget(
         original_cache_size = int(config.cache_size_limit)
         original_accumulated_cache_size = int(config.accumulated_cache_size_limit)
         try:
-            config.cache_size_limit = max(
-                original_cache_size,
-                specializations,
+            config.cache_size_limit = (
+                specializations
+                if exact
+                else max(
+                    original_cache_size,
+                    specializations,
+                )
             )
             config.accumulated_cache_size_limit = max(
                 original_accumulated_cache_size,
-                specializations,
+                entries_taken + specializations,
             )
             yield
         finally:
@@ -947,7 +956,12 @@ class ResolvedEncoderExecution:
             if self.arm == "dense-graphed":
                 # Initial warmup intentionally specializes. After sealing,
                 # staging and capture must reuse exactly that compiler domain.
-                with _compiler_specialization_budget(len(cells)), torch._dynamo.config.patch(error_on_recompile=True):
+                with (
+                    _compiler_specialization_budget(len(cells))
+                    if not self._batch_invariant_mode.enabled
+                    else nullcontext(),
+                    torch._dynamo.config.patch(error_on_recompile=True),
+                ):
                     self._capture_graph_domain(cells=cells, invoke=invoke)
             elif self.arm == "eager-graphed":
                 self._capture_graph_domain(cells=cells, invoke=invoke)
@@ -1434,7 +1448,7 @@ def execute_encoder_transition(
     return encoded, conditioned
 
 
-# @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011
+# @spec PORT-PERF-009, PORT-PERF-010, PORT-PERF-011, PORT-PREC-029
 def build_encoder_execution(
     core: NemotronASRCore,
     hf_config: Any,
@@ -1450,7 +1464,9 @@ def build_encoder_execution(
     ``compiled-static`` uses a full, static graph and deliberately has no
     eager fallback: a graph break or compilation failure invalidates that
     experimental arm. ``dynamic=False`` may cache multiple exact-shape
-    specializations; the profiling warmup must cover the measured shapes.
+    specializations; batch-invariant mode marks only population axes and
+    permits one singleton and one bounded dynamic frame per geometry.
+    The profiling warmup must cover the measured shapes.
     ``dense-graphed`` retains that compiler domain and then explicitly captures
     every exact geometry/population transition through the platform graph seam.
     ``eager-graphed`` captures the uncompiled transition, including its native
@@ -1521,12 +1537,85 @@ def build_encoder_execution(
     specialization_budget = len(geometries) * len(populations)
     run_transition = transition
     if arm in _COMPILED_ARMS:
-        run_transition = torch.compile(
-            transition,
-            fullgraph=True,
-            dynamic=False,
-            options={"triton.cudagraphs": False},
-        )
+        if not execution_mode(core).enabled:
+            run_transition = torch.compile(
+                transition,
+                fullgraph=True,
+                dynamic=False,
+                options={"triton.cudagraphs": False},
+            )
+        else:
+            from torch._dynamo.backends.registry import lookup_backend
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from torch.compiler import config as compiler_config
+
+            region_budget = 2 * len(geometries)
+            frame_counts: dict[tuple[int, bool], int] = {}
+            compiling_class: tuple[int, bool] | None = None
+            inductor = lookup_backend("inductor")
+
+            def counted_backend(graph: Any, inputs: Any, **kwargs: Any) -> Any:
+                if compiling_class is None or execution._sealed:
+                    raise RuntimeError("encoder compiler frame requested outside warmup")
+                if frame_counts.get(compiling_class, 0):
+                    raise RuntimeError(f"extra encoder compiler variant for geometry/class {compiling_class}")
+                # Callable backends receive options directly; unlike the
+                # named Inductor backend they do not get its config wrapper.
+                options = kwargs.pop("options", {})
+                # AOT/FX cache hits can import guards from a narrower marked
+                # range (e.g. B<=64 into a B<=128 region). Preserve caching,
+                # but bind artifacts to this region's population bounds.
+                cache_tag = f"{compiler_config.cache_key_tag}|nemotron-bi-population:2:{maximum_population}"
+                with (
+                    torch._inductor.config.patch(options),
+                    compiler_config.patch(cache_key_tag=cache_tag),
+                ):
+                    result = inductor(graph, inputs, **kwargs)
+                frame_counts[compiling_class] = 1
+                return result
+
+            compiled = torch.compile(
+                transition,
+                backend=counted_backend,
+                fullgraph=True,
+                dynamic=False,
+                options={"triton.cudagraphs": False},
+            )
+
+            def dynamic_transition(
+                mel: torch.Tensor,
+                caches: EncoderCaches,
+                out_offsets: torch.Tensor,
+                out_lengths: torch.Tensor,
+                out_width: int,
+                prompt_index: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                nonlocal compiling_class
+                # This guard also covers fresh graph-owned scratch, bypassing
+                # the public admission wrapper during staging and capture.
+                if mel.shape[0] >= 2:
+                    axes = [(tensor, 0) for tensor in (mel, out_offsets, out_lengths, prompt_index)]
+                    if isinstance(caches.channel, torch.Tensor):
+                        axes.extend(((caches.channel, 1), (caches.time, 1), (caches.valid, 0)))
+                    else:
+                        axes.extend((tensor, 0) for family in _cache_storage(caches) for tensor in family)
+                    for tensor, axis in axes:
+                        torch._dynamo.mark_dynamic(tensor, axis, min=2, max=maximum_population)
+                with _COMPILER_BUDGET_LOCK:
+                    previous_class = compiling_class
+                    cell = execution._active_cell
+                    compiling_class = None if cell is None else (cell[0], mel.shape[0] == 1)
+                    try:
+                        entries = len(_debug_get_cache_entry_list(transition))
+                        with (
+                            _compiler_specialization_budget(region_budget, exact=True, entries_taken=entries),
+                            torch._dynamo.config.patch(error_on_recompile=True) if execution._sealed else nullcontext(),
+                        ):
+                            return compiled(mel, caches, out_offsets, out_lengths, out_width, prompt_index)
+                    finally:
+                        compiling_class = previous_class
+
+            run_transition = dynamic_transition
     execution = ResolvedEncoderExecution(
         arm=arm,
         transition=transition,
@@ -1672,7 +1761,11 @@ def build_encoder_execution(
                 prompt_index,
                 runner_device=execution._runner_device,
             )
-            with _compiler_specialization_budget(specialization_budget) if arm in _COMPILED_ARMS else nullcontext():
+            with (
+                _compiler_specialization_budget(specialization_budget)
+                if arm in _COMPILED_ARMS and not execution._batch_invariant_mode.enabled
+                else nullcontext()
+            ):
                 result = run_transition(
                     mel,
                     caches,
