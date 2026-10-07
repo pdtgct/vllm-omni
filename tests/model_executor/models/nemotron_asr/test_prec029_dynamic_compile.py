@@ -274,10 +274,9 @@ def test_prec029_dynamic_batch_cuda_capture(monkeypatch, order, isolated_batch_i
 def test_prec029_named_population_axes_before_profile(monkeypatch, enabled, layout, population):
     """@spec PORT-PREC-029: mark only population axes before the first compiler invocation."""
     calls = []
-    monkeypatch.setattr(
-        torch._dynamo, "maybe_mark_dynamic", lambda tensor, dim, **kw: calls.append((id(tensor), dim, kw))
-    )
-    monkeypatch.setattr(torch._dynamo, "mark_dynamic", lambda *_a, **_k: pytest.fail("strong dynamic mark forbidden"))
+    # B>=2 invocations mark with bounds; B=1 is never marked (size-1 frame).
+    monkeypatch.setattr(torch._dynamo, "mark_dynamic", lambda tensor, dim, **kw: calls.append((id(tensor), dim, kw)))
+    monkeypatch.setattr(torch._dynamo, "maybe_mark_dynamic", lambda *_a, **_k: pytest.fail("unbounded mark forbidden"))
     expected: set[tuple[int, int]] = set()
 
     def fake_compile(fn, **kwargs):
@@ -285,7 +284,7 @@ def test_prec029_named_population_axes_before_profile(monkeypatch, enabled, layo
         assert kwargs["options"]["triton.cudagraphs"] is False
 
         def invoke(*args):
-            assert {(ident, dim) for ident, dim, _kw in calls} == (expected if enabled else set())
+            assert {(ident, dim) for ident, dim, _kw in calls} == (expected if enabled and population >= 2 else set())
             assert all(kw == {"min": 2, "max": 64} for _ident, _dim, kw in calls)
             return args[0], args[0]
 
