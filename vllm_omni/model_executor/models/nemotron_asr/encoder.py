@@ -577,6 +577,18 @@ def _stream_attention_mask(
     return mask | (~new_valid).unsqueeze(1).unsqueeze(-1)
 
 
+def _gather_into(source: torch.Tensor, dim: int, index: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Gather ``source`` along ``dim`` into the storage of ``out``.
+
+    Eager writes directly with ``out=`` (no intermediate). While tracing,
+    the ``out=`` meta check cannot run on symbolic batch sizes, so the
+    functional gather is copied into ``out`` and Inductor fuses the write.
+    """
+    if torch.compiler.is_compiling():
+        return out.copy_(source.gather(dim, index))
+    return torch.gather(source, dim, index, out=out)
+
+
 def _stream_cache_indices(new_lengths: torch.Tensor, capacity: int) -> torch.Tensor:
     """Select each row's retained history after its logical append."""
     return new_lengths.view(-1, 1) + torch.arange(capacity, device=new_lengths.device).unsqueeze(0)
@@ -652,7 +664,7 @@ def _stream_attention(
     if cache_out is None:
         new_cache = source.gather(1, cache_indices)
     else:
-        new_cache = torch.gather(source, 1, cache_indices, out=cache_out)
+        new_cache = _gather_into(source, 1, cache_indices, cache_out)
     return invariant_linear(attn.linear_out, out), new_cache
 
 
@@ -694,11 +706,11 @@ def _stream_conv(
         if cache_out is None:
             new_cache = source.gather(2, cache_indices)
         else:
-            new_cache = torch.gather(source, 2, cache_indices, out=cache_out)
+            new_cache = _gather_into(source, 2, cache_indices, cache_out)
     elif cache_out is None:
         new_cache = padded.gather(2, cache_indices).to(cache.dtype)
     elif padded.dtype == cache_out.dtype:
-        new_cache = torch.gather(padded, 2, cache_indices, out=cache_out)
+        new_cache = _gather_into(padded, 2, cache_indices, cache_out)
     else:
         # The write-cast happens in the copy (same rounding as ``.to``).
         new_cache = cache_out.copy_(padded.gather(2, cache_indices))
