@@ -228,7 +228,9 @@ def _static_oracle(monkeypatch, results, cap, device="cpu"):
             ),
             fullgraph=True,
             dynamic=False,
-            options={"triton.cudagraphs": False},
+            # PORT-PREC-029: the oracle is the same mode-on arm compiled
+            # statically, so it uses the production mode-on compiler options.
+            options={"triton.cudagraphs": False, "selective_decompose": True, "fallback_by_default": True},
         )
         budget = len(GEOMETRIES) * cap
         with torch._dynamo.config.patch(cache_size_limit=budget, accumulated_cache_size_limit=budget + 256):

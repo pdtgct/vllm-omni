@@ -1579,7 +1579,19 @@ def build_encoder_execution(
                 backend=counted_backend,
                 fullgraph=True,
                 dynamic=False,
-                options={"triton.cudagraphs": False},
+                # PORT-PREC-026: retain eager ATen pointwise semantics between
+                # the opaque reductions/GEMMs. Cast emulation alone can elide
+                # the mel FP32->FP16->FP32 round trip; fused SiLU/GLU, division
+                # and residuals can also change eager rounding. Selective
+                # decomposition plus ATen lowering keeps those boundaries in
+                # the full compiled graph, including its dynamic B frame.
+                # Outer CUDA capture still records the launches. This trades
+                # pointwise fusion/storage savings for exact eager numerics.
+                options={
+                    "triton.cudagraphs": False,
+                    "selective_decompose": True,
+                    "fallback_by_default": True,
+                },
             )
 
             def dynamic_transition(
