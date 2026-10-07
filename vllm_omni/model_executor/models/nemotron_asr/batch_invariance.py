@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from threading import RLock
 from typing import Any
 
@@ -207,6 +208,16 @@ SCHEMA_ADAPTER_SIDE_EFFECTS = (
 )
 
 
+def _schema_dispatch(wrapper: Callable, keyset: torch._C.DispatchKeySet, *args: Any, **kwargs: Any) -> Any:
+    """Keep the dispatcher calling convention separate from tensor schemas.
+
+    Native conditional overrides (including CUDA bmm) receive a keyset before
+    the schema arguments. Own that convention explicitly when replacing them;
+    the public torch.bmm wrapper must continue to accept tensors only.
+    """
+    return wrapper(*args, **kwargs)
+
+
 def _install_schema_adapters(module: Any) -> tuple[str, ...]:
     """@spec PORT-PREC-018, PORT-PREC-022, PORT-PREC-028: install after vLLM.
 
@@ -245,7 +256,7 @@ def _install_schema_adapters(module: Any) -> tuple[str, ...]:
                 if overload in schemas:
                     overloads[f"{base}.{overload}"] = wrappers[name]
             for overload, wrapper in overloads.items():
-                library.impl(overload, wrapper, key, allow_override=True)
+                library.impl(overload, partial(_schema_dispatch, wrapper), key, with_keyset=True, allow_override=True)
                 installed.append(f"aten::{overload}/{key}")
         # vLLM also monkeypatches the public Python entry point. Its original
         # keyword-only out signature cannot accept the dtype positional form.
