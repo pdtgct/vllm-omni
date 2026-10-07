@@ -25,6 +25,7 @@ import os
 import statistics
 from contextlib import contextmanager
 from dataclasses import replace
+from itertools import combinations, product
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,15 +41,85 @@ from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
     execute_encoder_transition,
 )
 
-pytestmark = [
-    pytest.mark.core_model,
-    pytest.mark.cuda,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA qualification only"),
-]
+pytestmark = pytest.mark.core_model
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA qualification only")
 POPULATIONS = (1, 2, 31, 63, 64, 128)
 GEOMETRIES = (0, 1, 2, 3, 4)
 CAPTURE_TIERS = (1, 2, 4, 8, 16, 32, 64, 128)
 MAX_COMPILED_CELLS = 40
+
+
+def _covering_axes(padded):
+    # Tail and row are semantic positions: resolve against geometry/population
+    # only when executing. B1/B2 position aliases still cover their categories.
+    populations = tuple(sorted(set(CAPTURE_TIERS) | set(POPULATIONS))) if padded else CAPTURE_TIERS
+    return (
+        GEOMETRIES,
+        (0, 37),
+        ("zero", "one", "partial"),
+        populations,
+        ("repeated", "mixed"),
+        ("first", "middle", "last"),
+    )
+
+
+def _covering_cases(padded):
+    """Greedy 2-wise cover; stable product order breaks ties without randomness."""
+    axes = _covering_axes(padded)
+    axis_pairs = tuple(combinations(range(len(axes)), 2))
+    candidates = tuple(product(*axes))
+    pairs = tuple({(i, case[i], j, case[j]) for i, j in axis_pairs} for case in candidates)
+    uncovered = set().union(*pairs)
+    cases, reference_keys = [], set()
+    while uncovered:
+        # Prefer reusing a B1 reference only when pair-coverage scores tie.
+        best = max(
+            range(len(candidates)), key=lambda k: (len(pairs[k] & uncovered), candidates[k][:3] in reference_keys)
+        )
+        case = candidates[best]
+        cases.append(case)
+        reference_keys.add(case[:3])
+        uncovered.difference_update(pairs[best])
+    return tuple(cases)
+
+
+def _falsifier_cases(padded):
+    """Pairwise cover by default; NEMOTRON_BI_EXHAUSTIVE=1 runs the full product."""
+    if os.environ.get("NEMOTRON_BI_EXHAUSTIVE") == "1":
+        return tuple(product(*_covering_axes(padded)))
+    return _covering_cases(padded)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("padded", [False, True], ids=["exact", "padded"])
+def test_covering_cases_pairwise_complete(padded):
+    axes = _covering_axes(padded)
+    cases = _covering_cases(padded)
+    assert cases == _covering_cases(padded)
+    assert len(cases) == len(set(cases))
+    for i, values in enumerate(axes):
+        assert {case[i] for case in cases} == set(values)
+        for j in range(i + 1, len(axes)):
+            assert {(case[i], case[j]) for case in cases} == set(product(values, axes[j]))
+    references = len({case[:3] for case in cases})
+    resets = sum(case[3] == 128 for case in cases)
+    sequences = len(cases) + references + resets
+    print(
+        f"{padded=}: {len(cases)} covering cases + {references} B1 references + "
+        f"{resets} B128 resets = {sequences} sequences"
+    )
+    assert 40 <= sequences <= 80
+
+
+@pytest.mark.cpu
+def test_covering_cases_mandated_falsifiers():
+    # Exact exercises all capture tiers; padded adds the non-tier 31/63 probes.
+    for padded in (False, True):
+        cases = _covering_cases(padded)
+        assert set(CAPTURE_TIERS) <= {case[3] for case in cases}
+        assert {case[4] for case in cases} == {"repeated", "mixed"}
+        assert {case[0] for case in cases if case[3] == 128} == set(GEOMETRIES)
+    assert set(POPULATIONS) <= {case[3] for case in _covering_cases(True)}
 
 
 def _qualification_cells(execution):
@@ -160,16 +231,22 @@ def _capture_stream(device):
 @pytest.mark.parametrize("policy", ["fp32", "fp16-encoder"])
 @pytest.mark.parametrize("padded", [False, True], ids=["exact", "padded"])
 @torch.inference_mode()
+@pytest.mark.cuda
+@cuda_only
 def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
     """@spec PORT-PREC-020, PORT-PREC-023, PORT-PREC-026, PORT-PREC-027.
 
     Every geometry, first/middle/last position, repeated/mixed rows,
-    empty/nonempty histories, final tails and independent B128 resets. The
+    empty/nonempty histories and final tails in a deterministic pairwise cover,
+    with independent B128 resets for every geometry. The
     deployment cap is deliberately irrelevant to the B128 qualification envelope.
 
     Both arms use production population bucketing. Exact covers every capture
     tier; padded additionally covers every required falsifier population (31->32,
     63->64). This preserves the exact/padded axis without compiling all 128 sizes.
+    The cover has 41 exact / 50 padded cases; with 15 B1 references and five
+    independent resets this runs 61 / 70 three-chunk sequences per parameter.
+    This is a 2-wise falsifier, not exhaustive higher-order interaction coverage.
     Five geometries x eight tiers = 40 static cells per parameter case, versus
     640 for the former exact arm; both policies/arms total 160 versus 1360 cells.
     At the r6 planning assumption of >~2 s/cell, compilation alone is >~80 s/case
@@ -226,25 +303,29 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
             snapshots.append([_snapshot(raw, state, r, valid) for r in selected])
         return snapshots
 
-    populations = tuple(sorted(set(CAPTURE_TIERS) | set(POPULATIONS))) if padded else CAPTURE_TIERS
-    for geometry in GEOMETRIES:
+    cases = _falsifier_cases(padded)
+    references = {}
+    sequences = len(cases) + len({case[:3] for case in cases}) + sum(case[3] == 128 for case in cases)
+    print(f"{policy=} {padded=}: {len(cases)} pairwise cases, {sequences} sequences including B1/reset runs")
+    assert 40 <= sequences <= 80
+    for geometry, history, tail_kind, population, composition, position in cases:
         width = encoder_geometry_shape(core, geometry).out_width
-        for history in (0, 37):
-            for tail in sorted({0, 1, max(1, width - 1)}):
-                reference = sequence(geometry, 1, 0, "repeated", history, tail)
-                for population in populations:
-                    for composition in ("repeated", "mixed"):
-                        for row in sorted({0, population // 2, population - 1}):
-                            actual = sequence(geometry, population, row, composition, history, tail)
-                            context = (policy, padded, geometry, population, composition, row, history, tail)
-                            for chunk, (outputs, baseline) in enumerate(zip(actual, reference, strict=True)):
-                                for output in outputs:
-                                    _assert_snapshot(output, baseline[0], (context, chunk))
-                            if population == 128:
-                                repeat = sequence(geometry, population, row, composition, history, tail)
-                                for chunk_a, chunk_b in zip(actual, repeat, strict=True):
-                                    for a, b in zip(chunk_a, chunk_b, strict=True):
-                                        _assert_snapshot(a, b, (context, "independent reset"))
+        tail = {"zero": 0, "one": 1, "partial": max(1, width - 1)}[tail_kind]
+        row = {"first": 0, "middle": population // 2, "last": population - 1}[position]
+        key = (geometry, history, tail)
+        if key not in references:
+            references[key] = sequence(geometry, 1, 0, "repeated", history, tail)
+        reference = references[key]
+        actual = sequence(geometry, population, row, composition, history, tail)
+        context = (policy, padded, geometry, population, composition, row, history, tail)
+        for chunk, (outputs, baseline) in enumerate(zip(actual, reference, strict=True)):
+            for output in outputs:
+                _assert_snapshot(output, baseline[0], (context, chunk))
+        if population == 128:
+            repeat = sequence(geometry, population, row, composition, history, tail)
+            for chunk_a, chunk_b in zip(actual, repeat, strict=True):
+                for a, b in zip(chunk_a, chunk_b, strict=True):
+                    _assert_snapshot(a, b, (context, "independent reset"))
 
 
 def _manifest(variable):
@@ -263,6 +344,8 @@ def _file(base, relative):
 
 
 @torch.inference_mode()
+@pytest.mark.cuda
+@cuda_only
 def test_prec024_fp32_nemo_parity(mode_on):
     """@spec PORT-PREC-024: unchanged goldens, complete shapes, exact 5e-5 gate."""
     from safetensors.torch import load_file
@@ -347,6 +430,8 @@ SIDE_EFFECTS.update(
 )
 
 
+@pytest.mark.cuda
+@cuda_only
 def test_prec022_disclosure_manifest():
     """@spec PORT-PREC-022: matched unprofiled alternating pairs, no speed threshold."""
     manifest, _ = _manifest("NEMOTRON_BI_COST_MANIFEST")
@@ -392,6 +477,8 @@ def test_prec022_disclosure_manifest():
 
 @pytest.mark.parametrize("ndim", [1, 2])
 @torch.inference_mode()
+@pytest.mark.cuda
+@cuda_only
 def test_prec021_compiled_biased_pointwise(mode_on, ndim):
     """@spec PORT-PREC-021: Inductor retains addmm and its pre-cast bias."""
     device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -405,3 +492,14 @@ def test_prec021_compiled_biased_pointwise(mode_on, ndim):
     # A post-store bias addition would lose the half-ULP and return zero.
     assert torch.equal(actual, torch.full((2, 3) + shape[2:], 2**-11, device=device, dtype=x.dtype))
     assert torch.equal(actual, _api().pointwise_conv_as_linear(x, weight, bias))
+
+
+@pytest.mark.cpu
+def test_exhaustive_switch_selects_full_product(monkeypatch):
+    """NEMOTRON_BI_EXHAUSTIVE=1 selects every axis combination for long runs."""
+    monkeypatch.setenv("NEMOTRON_BI_EXHAUSTIVE", "1")
+    full = _falsifier_cases(False)
+    assert len(full) == len(tuple(product(*_covering_axes(False))))
+    assert set(_covering_cases(False)) <= set(full)
+    monkeypatch.delenv("NEMOTRON_BI_EXHAUSTIVE")
+    assert _falsifier_cases(False) == _covering_cases(False)
