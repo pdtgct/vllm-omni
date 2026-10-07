@@ -78,6 +78,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ...     print(output)
     """
 
+    # Class default so liveness reads stay defined before ``__init__`` runs.
+    _persistent_state_fatal: BaseException | None = None
+
     @property
     def orchestrator(self) -> Any:
         """The engine's orchestrator binding (``None`` before startup).
