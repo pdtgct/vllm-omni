@@ -83,9 +83,13 @@ def _covering_cases(padded):
     return tuple(cases)
 
 
+def _exhaustive():
+    return os.environ.get("NEMOTRON_BI_EXHAUSTIVE") == "1"
+
+
 def _falsifier_cases(padded):
     """Pairwise cover by default; NEMOTRON_BI_EXHAUSTIVE=1 runs the full product."""
-    if os.environ.get("NEMOTRON_BI_EXHAUSTIVE") == "1":
+    if _exhaustive():
         return tuple(product(*_covering_axes(padded)))
     return _covering_cases(padded)
 
@@ -307,7 +311,10 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
     references = {}
     sequences = len(cases) + len({case[:3] for case in cases}) + sum(case[3] == 128 for case in cases)
     print(f"{policy=} {padded=}: {len(cases)} pairwise cases, {sequences} sequences including B1/reset runs")
-    assert 40 <= sequences <= 80
+    if not _exhaustive():
+        # The bound holds for the pairwise cover only; the exhaustive
+        # product (NEMOTRON_BI_EXHAUSTIVE=1) is far larger.
+        assert 40 <= sequences <= 80
     for geometry, history, tail_kind, population, composition, position in cases:
         width = encoder_geometry_shape(core, geometry).out_width
         tail = {"zero": 0, "one": 1, "partial": max(1, width - 1)}[tail_kind]
