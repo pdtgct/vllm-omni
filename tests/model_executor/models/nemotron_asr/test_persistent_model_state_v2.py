@@ -68,13 +68,24 @@ def test_model_state_accounts_for_the_complete_v029_hook_surface() -> None:
         "gather_mm_embeddings",
         "preprocess_state",
         "postprocess_state",
-        "custom_sampler",
     }
+    # Opt-in override: ``custom_sampler`` wraps the base sampler only when the
+    # model enabled the experimental native burst handoff
+    # (``experimental_native_burst``); otherwise it keeps the v0.29 default.
+    opt_in_hooks = {"custom_sampler"}
 
     assert not state_cls.__abstractmethods__
     assert projected_hooks <= state_cls.__dict__.keys()
+    assert opt_in_hooks <= state_cls.__dict__.keys()
     assert inherited_hooks.isdisjoint(state_cls.__dict__)
     assert state_cls.num_new_sampled_tokens_per_step == 1
+    # With the opt-in disabled the override is indistinguishable from the
+    # inherited hook, which also returns None to keep the default sampler.
+    state = object.__new__(state_cls)
+    state.model = SimpleNamespace(_native_burst_handoff=None)
+    sampler = object()
+    assert state.custom_sampler(sampler) is None
+    assert ModelState.custom_sampler(state, sampler) is None
 
 
 def test_mrv2_profile_uses_the_encoder_runners_ephemeral_embedding_buffer() -> None:

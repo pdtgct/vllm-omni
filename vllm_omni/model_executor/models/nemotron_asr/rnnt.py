@@ -419,9 +419,17 @@ def decode_dense_masked_frames(
     pred_out, (pred_h, pred_c) = predictor.step(last_label, (h, c))
     for t in range(t_pad):
         frame = enc_frames[:, t]
+        # The encoder side is invariant across this frame's label attempts.
+        # Keep the original per-frame shape/strides and custom joint protocol.
+        projected_frame = (
+            joint.enc(frame.to(joint.enc.weight.dtype)) if type(joint) is Joint and max_symbols > 0 else None
+        )
         active = t < enc_lengths
         for _ in range(max_symbols):
-            logits = joint.logits(frame, pred_out)
+            if projected_frame is None:
+                logits = joint.logits(frame, pred_out)
+            else:
+                logits = joint.joint_net(projected_frame + joint.pred(pred_out.to(joint.enc.weight.dtype)))
             labels = logits.argmax(dim=-1)
             emit = active & (labels != blank)
             idx = token_lengths.clamp(max=capacity - 1).unsqueeze(1)

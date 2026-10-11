@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import functools
 import logging
 import os
 import sys
@@ -446,6 +450,13 @@ _patch_fp8_use_quack_fused_bias()
 # whether the unpatched method already proves the canonical factorable case
 # (as torch <= 2.11 does). When upstream restores factor-aware proving, the
 # probe passes and nothing is patched.
+# Inductor queries this for every masked load; large index expressions make
+# sympy.cancel/together arbitrarily expensive. Results are memoized and large
+# expressions defer to the original method, which keeps the patch sound.
+_FACTORABLE_MAX_OPS = 64
+
+
+@functools.lru_cache(maxsize=4096)
 def _provably_factorable_multiple(numerator, denominator) -> bool:
     """True only when numerator/denominator cancels to an integer polynomial."""
     try:
@@ -457,6 +468,8 @@ def _provably_factorable_multiple(numerator, denominator) -> bool:
             return False
         symbols = num.free_symbols | den.free_symbols
         if len(symbols) > 20:
+            return False
+        if sympy.count_ops(num) + sympy.count_ops(den) > _FACTORABLE_MAX_OPS:
             return False
         if not (num.is_polynomial(*symbols) and den.is_polynomial(*symbols)):
             return False
@@ -496,7 +509,10 @@ def _patch_inductor_factorable_divisibility():
     def statically_known_multiple_of(self, numerator, denominator):
         if original(self, numerator, denominator):
             return True
-        return _provably_factorable_multiple(numerator, denominator)
+        try:
+            return _provably_factorable_multiple(numerator, denominator)
+        except TypeError:  # unhashable arguments: no proof, never break compile
+            return False
 
     statically_known_multiple_of._vllm_omni_factorable_divisibility = True
     SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of

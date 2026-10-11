@@ -37,6 +37,12 @@ from vllm_omni.model_executor.models.nemotron_asr.advance import (
     ResolvedDecode,
     make_mrv1_adapter,
 )
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import (
+    BatchInvariantExecution,
+    bind_batch_invariant_mode,
+    execution_mode,
+    installed_batch_invariant_mode,
+)
 from vllm_omni.model_executor.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
     resolve_status_reports,
@@ -74,6 +80,7 @@ from vllm_omni.model_executor.models.nemotron_asr.plan import (
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+    resolve_precision_policy,
 )
 from vllm_omni.model_executor.models.nemotron_asr.processor import (
     NemotronASRDummyInputsBuilder,
@@ -150,6 +157,8 @@ class NemotronASRCore(nn.Module):
         policy: PrecisionPolicy = FP32_BRINGUP,
     ) -> None:
         super().__init__()
+        # @spec PORT-PREC-018, PORT-PREC-028: resolve before building components.
+        bind_batch_invariant_mode(self, installed_batch_invariant_mode())
         self.policy = policy
         self.vocab_size = vocab_size
         self.blank_id = vocab_size
@@ -171,8 +180,13 @@ class NemotronASRCore(nn.Module):
             joint_hidden=joint_hidden,
             vocab_size=vocab_size,
         )
+        bind_batch_invariant_mode(self, self.batch_invariant_mode)
         self._pred_layers = pred_rnn_layers
         self._pred_hidden = pred_hidden
+
+    @property
+    def batch_invariant_mode(self) -> BatchInvariantExecution:
+        return self._batch_invariant_mode
 
     def fresh_decode_state(self, device: torch.device) -> DecodeState:
         """Zeroed decode state; last label = blank (SOS, PORT-STATE-003)."""
@@ -207,8 +221,12 @@ class NemotronASRCore(nn.Module):
 def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
     """Cast compute modules to the policy's weight dtype (PORT-PREC-001).
 
-    Encoder, LID, predictor, and joint move to ``dtype_for("weights")``;
-    activations follow at the module entry seams, so this realization
+    @spec PORT-PREC-010: realize encoder precision independently of frontend,
+    conditioner, predictor, joint and persistent state.
+
+    LID, predictor, and joint move to ``dtype_for("weights")``; the
+    encoder uses the separately declared ``encoder_compute`` override.
+    Activations follow at the module entry seams, so this realization
     requires the two classes to agree. The mel front-end stays fp32 —
     it sits upstream of the activations seam and is the golden input
     boundary. Recurrent/cache state dtypes are independent axes read at
@@ -224,7 +242,8 @@ def apply_policy_dtypes(core: NemotronASRCore) -> NemotronASRCore:
             f"dtype at the entry seams; policy {core.policy.identifier} "
             f"declares weights={weights} activations={activations}"
         )
-    for module in (core.encoder, core.lid, core.predictor, core.joint):
+    core.encoder.to(core.policy.dtype_for("encoder_compute"))
+    for module in (core.lid, core.predictor, core.joint):
         module.to(weights)
     return core
 
@@ -307,10 +326,14 @@ class NemotronASRForRNNT(nn.Module):
     num_logits = 13_092
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
+        """@spec PORT-PREC-009, PORT-PREC-010, PORT-PREC-013: bind startup policy."""
         super().__init__()
         if vllm_config is None:
             raise ValueError("NemotronASRForRNNT requires vllm_config")
         hf_config = vllm_config.model_config.hf_config
+        # Resolve the effective (stage-overridden) selector once, before any
+        # state reservation, execution construction or checkpoint loading.
+        policy = resolve_precision_policy(hf_config)
         from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
             ensure_prompt_dictionary,
             validate_prompt_dictionary,
@@ -346,7 +369,7 @@ class NemotronASRForRNNT(nn.Module):
         if engine_dtype is not None and engine_dtype != torch.float32:
             raise ValueError(
                 f"--dtype {engine_dtype} is not the qualified profile "
-                "for this model (float32); a precision change requires "
+                f"for PrecisionPolicy {policy.identifier} (float32); a precision change requires "
                 "requalification (PORT-STATE-009). If no --dtype was "
                 "given, vLLM's auto policy downcasts float32 checkpoints "
                 "on SM80+ GPUs and the pipeline's deploy profile "
@@ -362,7 +385,6 @@ class NemotronASRForRNNT(nn.Module):
         reject_unsupported_outer_graph_mode(getattr(vllm_config, "compilation_config", None))
         self.config = hf_config
         self.num_logits = int(hf_config.vocab_size)
-        policy = FP32_BRINGUP
         self.core = NemotronASRCore(
             vocab_size=hf_config.num_asr_labels,
             att_context=(
@@ -379,6 +401,8 @@ class NemotronASRForRNNT(nn.Module):
             window=torch.zeros(_WIN_LENGTH),
             policy=policy,
         )
+        if policy is not FP32_BRINGUP:
+            apply_policy_dtypes(self.core)
         state_prefix = f"{prefix}.persistent_state" if prefix else "persistent_state"
         self._persistent_state_layer = PersistentStateLayerBase(
             build_nemotron_persistent_state_spec(hf_config),
@@ -425,6 +449,7 @@ class NemotronASRForRNNT(nn.Module):
 
             served_geometry_set = set(served_geometry_ids)
             self._decode_graph_binding = DenseGraphBinding(
+                batch_invariant_mode=self.core.batch_invariant_mode,
                 decode_fn=decode_dense_masked_frames,
                 predictor=self.core.predictor,
                 joint=self.core.joint,
@@ -443,6 +468,23 @@ class NemotronASRForRNNT(nn.Module):
             hf_config,
             graph_binding=self._decode_graph_binding,
         )
+        self._chunk_bucket_binding = None
+        chunk_populations = getattr(hf_config, "chunk_bucket_graph_populations", ())
+        if not isinstance(chunk_populations, (tuple, list)):
+            raise ValueError("chunk_bucket_graph_populations must be a sequence")
+        if chunk_populations:
+            from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
+            from vllm_omni.model_executor.models.nemotron_asr.native_burst import validate_native_burst_config
+
+            # Reuse the existing initial-profile configuration guard only.
+            # This does not enable native burst; shared decoder scratch requires
+            # synchronous, non-speculative single-device worker execution.
+            if native_burst_enabled:
+                raise ValueError("CHUNK serving pilot requires native burst disabled")
+            validate_native_burst_config(vllm_config, hf_config=hf_config)
+            self._chunk_bucket_binding = ExactChunkGraphBinding(
+                self.core, hf_config, self._encoder_execution, self._decode_graph_binding, chunk_populations
+            )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
         self._execution_memory_prepared = False
@@ -458,6 +500,9 @@ class NemotronASRForRNNT(nn.Module):
 
     def load_weights(self, weights: Any) -> set[str]:
         """Strictly load the served tree or the public HF card.
+
+        @spec PORT-PREC-017: load the unchanged checkpoint into policy-typed
+        targets. Each copy converts its source once without modifying it.
 
         The served artifact's names load as-is. The public card's
         renamed modules map through ``remap_card_name``; shared leaves
@@ -699,6 +744,9 @@ class NemotronASRForRNNT(nn.Module):
         """Validate complete model-owned inventory without creating allocations."""
         if not self._encoder_execution.ready:
             raise RuntimeError("encoder execution inventory is incomplete")
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None and not chunk_binding.ready:
+            raise RuntimeError("CHUNK execution inventory is incomplete")
         binding = self._decode_graph_binding
         if binding is None:
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
@@ -711,6 +759,7 @@ class NemotronASRForRNNT(nn.Module):
             for geometry in _served_geometry_ids(self.config)
             for tier in execution_tiers(self._max_num_seqs)
         }
+        expected = {execution_mode(self.core).graph_key("decode_fn", key) for key in expected}
         if set(binding.captured_keys) != expected:
             raise RuntimeError("decoder execution inventory is incomplete")
 
@@ -733,10 +782,18 @@ class NemotronASRForRNNT(nn.Module):
             device = parameter.device
             warmup_static_encoder_execution(self, device=device)
             if self._decode_graph_binding is not None:
-                self._decode_graph_binding.warmup(device, parameter.dtype)
+                self._decode_graph_binding.warmup(device, self.core.policy.dtype_for("activations"))
+            chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+            if chunk_binding is not None:
+                chunk_binding.warmup(device)
             self._require_execution_inventory_ready()
             # All retained graph buffers must coexist with this temporary
             # transaction so the profiler sees their combined high-water mark.
+            if chunk_binding is not None:
+                for geometry, population in sorted(self._encoder_execution._chunk_graph_cells):
+                    run_persistent_state_profile(
+                        self, num_rows=population, device=device, geometry_id=geometry, ready_domain=True
+                    )
             run_persistent_state_profile(
                 self,
                 num_rows=self._max_num_seqs,
@@ -747,6 +804,8 @@ class NemotronASRForRNNT(nn.Module):
             self._require_execution_inventory_ready()
         except Exception:
             self._execution_memory_failed = True
+            if getattr(self, "_chunk_bucket_binding", None) is not None:
+                self._encoder_execution._discard()
             raise
         self._execution_memory_prepared = True
 
@@ -791,7 +850,7 @@ class NemotronASRForRNNT(nn.Module):
         binding = self._decode_graph_binding
         keys = () if binding is None else binding.captured_keys
         decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
-        return {
+        receipt = {
             "schema": "nemotron-execution-profile/1",
             "decode": {
                 "arm": decode_arm,
@@ -800,6 +859,10 @@ class NemotronASRForRNNT(nn.Module):
             },
             "encoder": self._encoder_execution.ready_receipt(),
         }
+        chunk_binding = getattr(self, "_chunk_bucket_binding", None)
+        if chunk_binding is not None:
+            receipt["chunk"] = chunk_binding.receipt()
+        return execution_mode(getattr(self, "core", None)).readiness_receipt(receipt)
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
         if self._commit_sink is None:
@@ -961,6 +1024,7 @@ class NemotronASRForRNNT(nn.Module):
                 adapter=self._emission_adapter,
                 decode_resolver=self._decode_resolver,
                 encoder_transition=self._encoder_execution.transition,
+                bucket_transition=getattr(self, "_chunk_bucket_binding", None),
                 placeholder_id=int(self.config.audio_chunk_token_id),
                 park_id=int(self.config.eos_token_id),
                 commit_sink=self._ensure_commit_sink(inputs_embeds.device),
