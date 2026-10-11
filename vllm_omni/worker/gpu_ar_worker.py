@@ -84,6 +84,22 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         return bool(getattr(self, "_persistent_state_warmup_complete", False))
 
+    def nemotron_execution_profile_receipt(self) -> dict:
+        """Read live graph inventory/counters through the existing dev RPC.
+
+        This host-only snapshot does not reset counters, replay work, synchronize
+        the device, or log on the request path. The server's existing dev-mode
+        gate controls access to /collective_rpc.
+        """
+        receipt = getattr(self.model_runner.model, "execution_profile_receipt", None)
+        if not callable(receipt):
+            raise RuntimeError("model does not expose a Nemotron execution receipt")
+        return {
+            "worker_pid": os.getpid(),
+            "persistent_state_warmup_complete": self.persistent_state_warmup_attestation(),
+            "execution_profile": receipt(),
+        }
+
     @instrument(span_name="Warmup persistent-only model (GPU)")
     @torch.inference_mode()
     def _compile_or_warm_up_persistent_only_model(self) -> CompilationTimes:

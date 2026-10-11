@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import MODE_OFF, BatchInvariantExecution
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
     DecodeState,
@@ -130,6 +131,7 @@ class DenseGraphBinding:
         predictor_hidden: int,
         blank_id: int,
         runtime: GraphRuntime | None = None,
+        batch_invariant_mode: BatchInvariantExecution = MODE_OFF,
     ) -> None:
         if (
             not frame_widths
@@ -139,6 +141,8 @@ class DenseGraphBinding:
             raise ValueError("decode graph requires at least one positive frame width")
         if not tiers or tuple(sorted(set(tiers))) != tiers or tiers[0] <= 0:
             raise ValueError("decode graph tiers must be positive and increasing")
+        # @spec PORT-PREC-018, PORT-PREC-025: namespace before capture.
+        self._batch_invariant_mode = batch_invariant_mode
         self._decode_fn = decode_fn
         self._predictor = predictor
         self._joint = joint
@@ -150,11 +154,11 @@ class DenseGraphBinding:
         self._predictor_hidden = predictor_hidden
         self._blank_id = blank_id
         self._runtime = runtime
-        self._entries: dict[tuple[int, int], _GraphEntry] = {}
-        self._decode_fns: dict[tuple[int, int], Callable[..., Any]] = {}
+        self._entries: dict[tuple[Any, ...], _GraphEntry] = {}
+        self._decode_fns: dict[tuple[Any, ...], Callable[..., Any]] = {}
 
     @property
-    def captured_keys(self) -> tuple[tuple[int, int], ...]:
+    def captured_keys(self) -> tuple[tuple[Any, ...], ...]:
         return tuple(sorted(self._entries))
 
     def execution_tier(self, live_rows: int) -> int:
@@ -305,7 +309,7 @@ class DenseGraphBinding:
             return
         runtime = self._runtime or platform_graph_runtime()
         pending = {
-            (geometry, tier): self._new_entry(
+            self._batch_invariant_mode.graph_key("decode_fn", (geometry, tier)): self._new_entry(
                 geometry,
                 tier,
                 device=device,
@@ -337,6 +341,7 @@ class DenseGraphBinding:
         finally:
             runtime.set_capture_enabled(False)
         decode_fns = {key: self._bind_decode(entry, runtime) for key, entry in pending.items()}
+        self._runtime = runtime
         self._entries = pending
         self._decode_fns = decode_fns
 
@@ -344,6 +349,8 @@ class DenseGraphBinding:
         self,
         entry: _GraphEntry,
         runtime: GraphRuntime,
+        *,
+        captured: bool = True,
     ) -> Callable[..., Any]:
         def decode(
             enc_frames: torch.Tensor,
@@ -399,7 +406,7 @@ class DenseGraphBinding:
             entry.c[:, :live].copy_(state.c)
             entry.last_label.fill_(self._blank_id)
             entry.last_label[:live].copy_(state.last_label)
-            output = self._call(entry, runtime, runtime.graph_mode)
+            output = self._call(entry, runtime, runtime.graph_mode if captured else runtime.eager_mode)
             (
                 token_ids,
                 token_lengths,
@@ -423,10 +430,23 @@ class DenseGraphBinding:
 
         return decode
 
+    def uncaptured_decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
+        """Reuse sealed tier storage while an enclosing CHUNK graph captures it.
+
+        Input padding, output layouts and numerical arithmetic are identical to
+        the split decoder. The nested wrapper runs eagerly, so the enclosing
+        capture records the decoder operations instead of another graph replay.
+        Callers must serialize this storage with the ordinary decoder binding.
+        """
+        key = self._batch_invariant_mode.graph_key("decode_fn", (geometry, tier))
+        if key not in self._entries or self._runtime is None:
+            raise ValueError(f"uncaptured dense graph key geometry={geometry} tier={tier}")
+        return self._bind_decode(self._entries[key], self._runtime, captured=False)
+
     def decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
         """Return the startup-bound callable for one exact graph key."""
 
-        key = (geometry, tier)
+        key = self._batch_invariant_mode.graph_key("decode_fn", (geometry, tier))
         try:
             return self._decode_fns[key]
         except KeyError:
