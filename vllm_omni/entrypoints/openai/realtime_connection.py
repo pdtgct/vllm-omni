@@ -725,6 +725,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         cancelled: asyncio.CancelledError | None = None
         disconnected = False
         model_finalized = False
+        error_finish = False
         # ``getattr`` defensive: some fixtures across this test suite
         # construct a connection via ``RealtimeConnection.__new__``,
         # bypassing ``__init__`` (and hence these two attributes)
@@ -774,6 +775,13 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
 
             async for output in result_gen:
+                # A scheduler-side failure (FINISHED_ERROR) reaches this loop
+                # as a CompletionOutput finish_reason of "error", followed by
+                # normal generator exhaustion. It must not be reported as a
+                # successful (possibly empty) final transcript.
+                if any(getattr(o, "finish_reason", None) == "error" for o in (getattr(output, "outputs", None) or ())):
+                    error_finish = True
+                    break
                 stage_id = getattr(output, "stage_id", None)
                 if stage_id == 0 and output.outputs:
                     first_output = output.outputs[0]
@@ -855,7 +863,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                 model_finalized = True
                 await self._cancel_session_lifecycle_timeout()
 
-            if self._is_connected:
+            if error_finish:
+                self._streaming_finish_reason = "error"
+                logger.error("Realtime generation finished with an engine error: %s", request_id)
+                if self._is_connected:
+                    await self.send_error("generation failed", "processing_error")
+            elif self._is_connected:
                 usage = UsageInfo(
                     prompt_tokens=prompt_token_ids_len,
                     completion_tokens=completion_tokens_len,
