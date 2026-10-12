@@ -1754,6 +1754,9 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
             torch.zeros_like(rows),
             torch.full_like(rows, shape.out_width) - offsets,
         )
+        # The production tuple carries each row's valid mel width: partial
+        # widths exercise the captured, length-masked subsampling.
+        mel_lengths = torch.full_like(rows, shape.mel_width) if variant == 2 else shape.mel_width - (rows + variant) % 8
         return (
             torch.full((population, 16, shape.mel_width), base, device=device),
             caches,
@@ -1761,6 +1764,7 @@ def test_graphed_real_cuda_encoder_matches_state_and_retained_outputs(
             lengths,
             shape.out_width,
             (rows + variant) % 4,
+            mel_lengths,
         )
 
     capture_graph_counts: list[int] = []
@@ -2503,3 +2507,62 @@ def test_graphed_shared_bank_replays_are_isolated_from_prefix_neighbours(
         for old_outputs, old_values in retained:
             assert all(torch.equal(left, right) for left, right in zip(old_outputs, old_values, strict=True))
         retained.append((outputs, tuple(tensor.clone() for tensor in outputs)))
+
+
+def _mel_length_graph_transition(
+    core: Any,
+    mel: torch.Tensor,
+    caches: _GraphCaches,
+    out_offsets: torch.Tensor,
+    out_lengths: torch.Tensor,
+    out_width: int,
+    prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raw, conditioned = _functional_graph_transition(
+        core, mel, caches, out_offsets, out_lengths, out_width, prompt_index
+    )
+    shift = mel_lengths.reshape(-1, 1, 1).to(raw.dtype)
+    return raw + shift, conditioned + shift
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+@pytest.mark.parametrize("arm", ["dense-graphed", "eager-graphed"])
+def test_graphed_arms_stage_valid_mel_widths_as_a_replayed_input(
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+) -> None:
+    # @spec PORT-PERF-010, PORT-PERF-011
+    # The per-row valid mel width rides the graph as staged storage: a replay
+    # with new widths must observe them (no captured constant), and a caller
+    # that omits them cannot reach a domain warmed with them.
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _mel_length_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config(arm),
+        maximum_population=2,
+        warmup_geometries=(0,),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    populations = execution.warmup_populations
+
+    def args(population: int, base: float, widths: list[int]) -> tuple[Any, ...]:
+        return (*_graph_transition_args(population=population, base=base), torch.tensor(widths))
+
+    execution.warmup_domain(
+        expected_cells=tuple((0, population) for population in populations),
+        invoke=lambda _geometry, population: execution.transition(*args(population, 1.0, [17] * population)),
+    )
+    assert execution.ready
+
+    live = 2
+    for widths in ([5, 11], [17, 2]):
+        actual = execution.transition(*args(live, 7.0, widths))
+        expected = _mel_length_graph_transition(_compiled_core(), *args(live, 7.0, widths))
+        assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+
+    with pytest.raises(ValueError, match="signature"):
+        execution.transition(*_graph_transition_args(population=live, base=7.0))

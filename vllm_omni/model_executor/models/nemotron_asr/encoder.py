@@ -160,21 +160,42 @@ class SubsamplingDwStriding(nn.Module):
             out = torch.div(out + pad - self.kernel, self.stride, rounding_mode="floor") + 1
         return out.to(torch.int64)
 
-    def forward(self, mel: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(B, feat_in, T)`` mel -> ``(B, T//8, d_model)``."""
+    def forward(
+        self,
+        mel: torch.Tensor,
+        lengths: torch.Tensor,
+        *,
+        mask_padding: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, feat_in, T)`` mel -> ``(B, T//8, d_model)``.
+
+        ``mask_padding`` zeroes every time step at or past a row's valid
+        length before each strided conv, with the length advanced by the
+        same formula as :meth:`output_lengths` — the masked subsampling of
+        NeMo's ``MaskedConvSequential`` (``nemo/collections/asr/parts/
+        submodules/subsampling.py``). The right pad of each causal conv
+        makes the last valid output of a layer read one step past an even
+        valid length; masking gives that step the zero an exact-width
+        input would have. Pointwise layers need no mask of their own: the
+        next strided conv's mask covers their padded outputs. A row whose
+        lengths reach every layer's full width selects ``x`` unchanged.
+        """
         # Activations follow the policy-cast weights from this seam on;
         # the fp32 mel front-end sits upstream of it (PORT-PREC-001).
         mel = mel.to(next(self.parameters()).dtype)
         x = mel.transpose(1, 2).unsqueeze(1)  # (B, 1, T, F)
-        if batch_invariant_enabled(self):
-            for module in self.conv:
-                x = (
-                    _conv(module, x)
-                    if isinstance(module, nn.Conv2d) and not isinstance(module, CausalConv2dSub)
-                    else module(x)
-                )
-        else:
-            x = self.conv(x)
+        valid = lengths.to(torch.int64)
+        pad = (self.kernel - 1) + (self.stride - 1)
+        invariant = batch_invariant_enabled(self)
+        for module in self.conv:
+            if mask_padding and isinstance(module, CausalConv2dSub):
+                step = torch.arange(x.shape[2], device=x.device).view(1, 1, -1, 1)
+                x = torch.where(step < valid.view(-1, 1, 1, 1), x, x.new_zeros(()))
+                valid = torch.div(valid + pad - self.kernel, self.stride, rounding_mode="floor") + 1
+            if invariant and isinstance(module, nn.Conv2d) and not isinstance(module, CausalConv2dSub):
+                x = _conv(module, x)
+            else:
+                x = module(x)
         b, c, t, f = x.size()
         x = x.transpose(1, 2).reshape(b, t, c * f)
         if batch_invariant_enabled(self):
@@ -842,6 +863,7 @@ def stream_step(
     out_width: int | None = None,
     preserve_conv_cache_precision: bool = False,
     sdpa_attention: bool = False,
+    mel_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One cached streaming encoder step (batch of sessions).
 
@@ -853,9 +875,13 @@ def stream_step(
     Length-aware form (PORT-ADV-004): ``out_offsets`` (B,) is each
     row's pre-encode drop, ``out_lengths`` (B,) its logical encoder
     frame count, and ``out_width`` the fixed host-derived output
-    width. Rows are realigned per-row after subsampling (the causal
-    conv makes valid outputs independent of trailing padding),
-    attention masks padded keys AND queries, caches append by logical
+    width. ``mel_lengths`` (B,) is each row's valid input mel width
+    (pre-encode prefix included); the subsampling masks every step past
+    it (see :meth:`SubsamplingDwStriding.forward`), so a partial final
+    chunk encodes exactly like an exact-width one. ``None`` means every
+    row spans the full input width and skips the mask. Rows are
+    realigned per-row after subsampling, attention masks padded keys
+    AND queries, caches append by logical
     lengths, ``window_valid`` accumulates logical lengths, and output
     frames at or past a row's length are exactly zero. A zero-length
     row leaves its caches bit-identical. No tensor value determines a
@@ -874,8 +900,11 @@ def stream_step(
     """
     b = chunk_mel.shape[0]
     device = chunk_mel.device
-    lengths = torch.full((b,), chunk_mel.shape[2], device=device)
-    x, _ = encoder.pre_encode(chunk_mel, lengths)
+    if mel_lengths is None:
+        lengths = torch.full((b,), chunk_mel.shape[2], device=device)
+        x, _ = encoder.pre_encode(chunk_mel, lengths)
+    else:
+        x, _ = encoder.pre_encode(chunk_mel, mel_lengths, mask_padding=True)
     if drop_extra is not None:
         if out_offsets is not None or out_lengths is not None:
             raise ValueError(

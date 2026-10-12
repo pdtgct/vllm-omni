@@ -72,17 +72,24 @@ class EncoderCaches(Protocol):
         ...
 
 
-EncoderTransition = Callable[
-    [
-        torch.Tensor,
-        EncoderCaches,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        torch.Tensor,
-    ],
-    tuple[torch.Tensor, torch.Tensor],
-]
+class EncoderTransition(Protocol):
+    """One encoder+conditioning transition over the shared input tuple.
+
+    ``mel_lengths`` (B,) int64 is each row's valid input mel width; ``None``
+    means every row spans the full mel width (no subsampling mask).
+    """
+
+    def __call__(
+        self,
+        mel: torch.Tensor,
+        caches: EncoderCaches,
+        out_offsets: torch.Tensor,
+        out_lengths: torch.Tensor,
+        out_width: int,
+        prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
+        /,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class TensorSignature(NamedTuple):
@@ -150,6 +157,7 @@ class EncoderSignature(NamedTuple):
     out_width: int
     prompt_index: TensorSignature
     cache_type: str
+    mel_lengths: TensorSignature | None = None
 
 
 def _tensor_signature(tensor: torch.Tensor) -> TensorSignature:
@@ -315,6 +323,7 @@ def _transition_tensor_items(
     out_offsets: torch.Tensor,
     out_lengths: torch.Tensor,
     prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor | None = None,
 ) -> tuple[tuple[str, torch.Tensor], ...]:
     items: list[tuple[str, torch.Tensor]] = [("mel", mel)]
     for family_name in ("channel", "time"):
@@ -329,6 +338,8 @@ def _transition_tensor_items(
             ("prompt_index", prompt_index),
         )
     )
+    if mel_lengths is not None:
+        items.append(("mel_lengths", mel_lengths))
     return tuple(items)
 
 
@@ -338,6 +349,7 @@ def _validate_transition_tensor_contract(
     out_offsets: torch.Tensor,
     out_lengths: torch.Tensor,
     prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor | None = None,
     *,
     runner_device: torch.device,
 ) -> None:
@@ -347,6 +359,7 @@ def _validate_transition_tensor_contract(
         "out_offsets": torch.int64,
         "out_lengths": torch.int64,
         "prompt_index": torch.int64,
+        "mel_lengths": torch.int64,
     }
     for name, tensor in _transition_tensor_items(
         mel,
@@ -354,6 +367,7 @@ def _validate_transition_tensor_contract(
         out_offsets,
         out_lengths,
         prompt_index,
+        mel_lengths,
     ):
         if tensor.device != runner_device:
             raise ValueError(f"encoder transition tensor {name} differs from runner device")
@@ -374,6 +388,7 @@ def _encoder_signature(
     out_lengths: torch.Tensor,
     out_width: int,
     prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor | None = None,
 ) -> EncoderSignature:
     """Return the complete static compiler input contract."""
     return EncoderSignature(
@@ -387,6 +402,7 @@ def _encoder_signature(
         int(out_width),
         _tensor_signature(prompt_index),
         f"{type(caches).__module__}.{type(caches).__qualname__}",
+        None if mel_lengths is None else _tensor_signature(mel_lengths),
     )
 
 
@@ -503,6 +519,7 @@ def _bucketed_encoder_signature(
         out_offsets=row(signature.out_offsets, "out_offsets"),
         out_lengths=row(signature.out_lengths, "out_lengths"),
         prompt_index=row(signature.prompt_index, "prompt_index"),
+        mel_lengths=None if signature.mel_lengths is None else row(signature.mel_lengths, "mel_lengths"),
     )
 
 
@@ -558,6 +575,7 @@ class _EncoderGraphEntry:
     out_lengths: torch.Tensor
     out_width: int
     prompt_index: torch.Tensor
+    mel_lengths: torch.Tensor | None
     raw: torch.Tensor
     conditioned: torch.Tensor
     descriptor: Any
@@ -1022,13 +1040,19 @@ class ResolvedEncoderExecution:
             tensor.copy_(valid.reshape(tensor.shape).to(tensor.dtype))
         if entry.out_width <= 0:
             raise ValueError("graphed encoder output width must be positive")
+        mel_width = int(entry.mel.shape[-1])
         if variant == "full":
             entry.out_offsets.copy_(rows.remainder(2) * min(2, entry.out_width - 1))
             entry.out_lengths.copy_(entry.out_width - entry.out_offsets)
+            if entry.mel_lengths is not None:
+                entry.mel_lengths.fill_(mel_width)
         else:
             zero_rows = rows.remainder(2) == 0
             entry.out_offsets.copy_(torch.where(zero_rows, min(2, entry.out_width), 0))
             entry.out_lengths.copy_(torch.where(zero_rows, 0, entry.out_width))
+            if entry.mel_lengths is not None:
+                # Partial widths exercise the captured subsampling mask.
+                entry.mel_lengths.copy_((mel_width - rows.remainder(8)).clamp(min=1))
         # Transition warmup established this authority before graph parity.
         core = self._core
         assert core is not None
@@ -1047,6 +1071,7 @@ class ResolvedEncoderExecution:
         out_lengths: torch.Tensor,
         out_width: int,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> _EncoderGraphEntry:
         run_transition = self._compiled_transition
         runtime = self._graph_runtime
@@ -1080,6 +1105,7 @@ class ResolvedEncoderExecution:
         stable_offsets = stable(out_offsets, "out_offsets")
         stable_lengths = stable(out_lengths, "out_lengths")
         stable_prompt = stable(prompt_index, "prompt_index")
+        stable_mel_lengths = None if mel_lengths is None else stable(mel_lengths, "mel_lengths")
         descriptor = runtime.descriptor_factory(cell[1])
 
         # Discover result layouts before allocating strong graph outputs. This
@@ -1094,6 +1120,7 @@ class ResolvedEncoderExecution:
             out_lengths=stable_lengths,
             out_width=int(out_width),
             prompt_index=stable_prompt,
+            mel_lengths=stable_mel_lengths,
             raw=torch.empty(0, dtype=mel.dtype, device=mel.device),
             conditioned=torch.empty(0, dtype=mel.dtype, device=mel.device),
             descriptor=descriptor,
@@ -1113,6 +1140,7 @@ class ResolvedEncoderExecution:
                 stable_lengths,
                 int(out_width),
                 stable_prompt,
+                stable_mel_lengths,
             )
         if not isinstance(raw, torch.Tensor) or not isinstance(conditioned, torch.Tensor):
             raise TypeError("graphed encoder transition returned malformed outputs")
@@ -1126,6 +1154,7 @@ class ResolvedEncoderExecution:
             out_lengths=stable_lengths,
             out_width=int(out_width),
             prompt_index=stable_prompt,
+            mel_lengths=stable_mel_lengths,
             raw=stable(raw, "raw"),
             conditioned=stable(conditioned, "conditioned"),
             descriptor=descriptor,
@@ -1140,6 +1169,7 @@ class ResolvedEncoderExecution:
                 entry.out_lengths,
                 entry.out_width,
                 entry.prompt_index,
+                entry.mel_lengths,
             )
             entry.raw.copy_(next_raw)
             entry.conditioned.copy_(next_conditioned)
@@ -1321,6 +1351,7 @@ class ResolvedEncoderExecution:
         out_lengths: torch.Tensor,
         out_width: int,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> None:
         if self.graph_key("cuda", cell) in self._pending_graph_entries:
             raise ValueError(f"encoder graph staging cell {cell} was repeated")
@@ -1336,6 +1367,7 @@ class ResolvedEncoderExecution:
             out_lengths=out_lengths,
             out_width=out_width,
             prompt_index=prompt_index,
+            mel_lengths=mel_lengths,
         )
 
     def _replay_graph_entry(
@@ -1347,6 +1379,7 @@ class ResolvedEncoderExecution:
         out_offsets: torch.Tensor,
         out_lengths: torch.Tensor,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         matches = [entry for entry in self._graph_entries.values() if entry.signature == signature]
         if not matches:
@@ -1375,6 +1408,8 @@ class ResolvedEncoderExecution:
             entry.out_offsets.copy_(out_offsets)
             entry.out_lengths.copy_(out_lengths)
             entry.prompt_index.copy_(prompt_index)
+            if entry.mel_lengths is not None and mel_lengths is not None:
+                entry.mel_lengths.copy_(mel_lengths)
         with phase("port.encode.replay"):
             self._call_graph_entry(entry, mode=runtime.graph_mode)
         with phase("port.encode.stage_out"):
@@ -1392,6 +1427,7 @@ class ResolvedEncoderExecution:
         out_offsets: torch.Tensor,
         out_lengths: torch.Tensor,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Replay one captured tier from a validated live row prefix."""
         normalized = _bucketed_encoder_signature(signature, live=live, tier=tier)
@@ -1413,14 +1449,16 @@ class ResolvedEncoderExecution:
         runtime = self._graph_runtime
         if runtime is None:
             raise ValueError("graphed encoder runtime authority is unavailable")
+        controls = [
+            (entry.mel, mel),
+            (entry.out_offsets, out_offsets),
+            (entry.out_lengths, out_lengths),
+            (entry.prompt_index, prompt_index),
+        ]
+        if entry.mel_lengths is not None and mel_lengths is not None:
+            controls.append((entry.mel_lengths, mel_lengths))
         with phase("port.encode.stage_in"):
-            for destination, source in (
-                (entry.mel, mel),
-                (entry.out_offsets, out_offsets),
-                (entry.out_lengths, out_lengths),
-                (entry.prompt_index, prompt_index),
-                *copies,
-            ):
+            for destination, source in (*controls, *copies):
                 destination[live:].zero_()
                 destination[:live].copy_(source)
         try:
@@ -1466,8 +1504,13 @@ def execute_encoder_transition(
     out_lengths: torch.Tensor,
     out_width: int,
     prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the exact cache-aware encoder and conditioning transition."""
+    """Run the exact cache-aware encoder and conditioning transition.
+
+    ``mel_lengths`` selects the length-masked subsampling for rows whose
+    valid mel width is shorter than the padded input (partial finals).
+    """
     policy = getattr(core, "policy", FP32_BRINGUP)
     encoder_fp16 = policy.encoder_compute_override == "fp16"
     encoded = stream_step(
@@ -1479,6 +1522,7 @@ def execute_encoder_transition(
         out_width=out_width,
         preserve_conv_cache_precision=encoder_fp16,
         sdpa_attention=encoder_fp16,
+        mel_lengths=mel_lengths,
     )
     if encoder_fp16:
         encoded = encoded.to(policy.dtype_for("activations"))
@@ -1537,7 +1581,18 @@ def build_encoder_execution(
         out_lengths: torch.Tensor,
         out_width: int,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if mel_lengths is None:
+            return execute_encoder_transition(
+                core,
+                mel,
+                caches,
+                out_offsets,
+                out_lengths,
+                out_width,
+                prompt_index,
+            )
         return execute_encoder_transition(
             core,
             mel,
@@ -1546,6 +1601,7 @@ def build_encoder_execution(
             out_lengths,
             out_width,
             prompt_index,
+            mel_lengths,
         )
 
     if arm == "eager":
@@ -1645,12 +1701,15 @@ def build_encoder_execution(
                 out_lengths: torch.Tensor,
                 out_width: int,
                 prompt_index: torch.Tensor,
+                mel_lengths: torch.Tensor | None = None,
             ) -> tuple[torch.Tensor, torch.Tensor]:
                 nonlocal compiling_class
                 # This guard also covers fresh graph-owned scratch, bypassing
                 # the public admission wrapper during staging and capture.
                 if mel.shape[0] >= 2:
                     axes = [(tensor, 0) for tensor in (mel, out_offsets, out_lengths, prompt_index)]
+                    if mel_lengths is not None:
+                        axes.append((mel_lengths, 0))
                     if isinstance(caches.channel, torch.Tensor):
                         axes.extend(((caches.channel, 1), (caches.time, 1), (caches.valid, 0)))
                     else:
@@ -1667,7 +1726,7 @@ def build_encoder_execution(
                             _compiler_specialization_budget(region_budget, exact=True, entries_taken=entries),
                             torch._dynamo.config.patch(error_on_recompile=True) if execution._sealed else nullcontext(),
                         ):
-                            return compiled(mel, caches, out_offsets, out_lengths, out_width, prompt_index)
+                            return compiled(mel, caches, out_offsets, out_lengths, out_width, prompt_index, mel_lengths)
                     finally:
                         compiling_class = previous_class
 
@@ -1695,6 +1754,7 @@ def build_encoder_execution(
         out_lengths: torch.Tensor,
         out_width: int,
         prompt_index: torch.Tensor,
+        mel_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         execution._raise_if_failed()
         if not execution._sealed and execution._active_cell is None:
@@ -1706,6 +1766,7 @@ def build_encoder_execution(
             out_lengths,
             out_width,
             prompt_index,
+            mel_lengths,
         )
         population = signature.mel.shape[0]
         active_cell = execution._active_cell
@@ -1762,6 +1823,7 @@ def build_encoder_execution(
                         out_lengths=out_lengths,
                         out_width=out_width,
                         prompt_index=prompt_index,
+                        mel_lengths=mel_lengths,
                     )
                     result = run_transition(
                         mel,
@@ -1770,6 +1832,7 @@ def build_encoder_execution(
                         out_lengths,
                         out_width,
                         prompt_index,
+                        mel_lengths,
                     )
                 else:
                     if bucketed_replay:
@@ -1782,6 +1845,7 @@ def build_encoder_execution(
                             out_offsets=out_offsets,
                             out_lengths=out_lengths,
                             prompt_index=prompt_index,
+                            mel_lengths=mel_lengths,
                         )
                     else:
                         result = execution._replay_graph_entry(
@@ -1791,6 +1855,7 @@ def build_encoder_execution(
                             out_offsets=out_offsets,
                             out_lengths=out_lengths,
                             prompt_index=prompt_index,
+                            mel_lengths=mel_lengths,
                         )
             else:
                 result = run_transition(
@@ -1800,6 +1865,7 @@ def build_encoder_execution(
                     out_lengths,
                     out_width,
                     prompt_index,
+                    mel_lengths,
                 )
         else:
             if active_cell is None:
@@ -1815,6 +1881,7 @@ def build_encoder_execution(
                 out_offsets,
                 out_lengths,
                 prompt_index,
+                mel_lengths,
                 runner_device=execution._runner_device,
             )
             with (
@@ -1829,6 +1896,7 @@ def build_encoder_execution(
                     out_lengths,
                     out_width,
                     prompt_index,
+                    mel_lengths,
                 )
         execution._invocations += 1
         execution._last_signature = signature

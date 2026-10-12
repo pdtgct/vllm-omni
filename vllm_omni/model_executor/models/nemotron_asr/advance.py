@@ -88,6 +88,7 @@ def prepare_encoder_transition_inputs(
     out_lengths: torch.Tensor,
     out_width: int,
     prompt_index: torch.Tensor,
+    mel_lengths: torch.Tensor,
 ) -> tuple[
     torch.Tensor,
     EncoderCaches,
@@ -95,8 +96,13 @@ def prepare_encoder_transition_inputs(
     torch.Tensor,
     int,
     torch.Tensor,
+    torch.Tensor,
 ]:
-    """Build the one transition tuple shared by profile, warmup, and serve."""
+    """Build the one transition tuple shared by profile, warmup, and serve.
+
+    ``mel_lengths`` is each row's valid input mel width (pre-encode prefix
+    included); the encoder masks its subsampling past it.
+    """
     return (
         mel,
         caches,
@@ -104,6 +110,7 @@ def prepare_encoder_transition_inputs(
         out_lengths,
         int(out_width),
         prompt_index,
+        mel_lengths,
     )
 
 
@@ -1263,6 +1270,7 @@ def advance_session(
         enc_lengths,
         out_width,
         batch.prompt_index,
+        mel_len,
     )
     with torch.no_grad():
         with phase("port.encode"):

@@ -254,27 +254,141 @@ def test_multi_chunk_final_flush_matches_streaming_walk(geometry: int, n_samples
 
 
 # Partial final chunks whose valid mel width is not 0 or 1 mod 8. The
-# causal subsampling convs pad one frame on the right, so an intermediate
+# causal subsampling convs pad one step on the right, so an intermediate
 # layer whose valid length is even reads one position past it. The walk
-# encodes exactly the valid width (and the public NeMo subsampling masks
-# padded positions before every conv), so that position is zero there;
-# the engine's fixed-width input instead carries the conv bias of the
-# zero-padded mel tail into the last valid frame, and intra-chunk
-# attention spreads it to every frame of the final chunk.
+# encodes exactly the valid width (and NeMo's masked subsampling zeroes
+# padded steps before every conv), so the engine must mask the same steps
+# of its fixed-width input; otherwise the conv bias of the zero-padded mel
+# tail reaches the last valid frame and intra-chunk attention spreads it
+# to every frame of the final chunk.
 _PADDED_PARTIAL_FINALS = [
     (1, 1_000),  # session-first, six frames
+    (2, 2_000),  # session-first, twelve frames
     (2, 17_000),  # continuing final, 17 frames
     (3, 20_000),  # continuing final, 20 frames
     (4, 20_000),  # continuing final, 20 frames
+    (4, 22_000),  # continuing final, 32 frames
 ]
 
 
 # @spec PORT-FEAT-004, PORT-ADV-004
-@pytest.mark.xfail(
-    strict=True,
-    reason="known defect: the encoder pre-encode is not length-masked, so a "
-    "padded partial final chunk differs from the exact-width walk",
-)
+@pytest.mark.parametrize("seed", [1, 3])
 @pytest.mark.parametrize(("geometry", "n_samples"), _PADDED_PARTIAL_FINALS)
-def test_padded_partial_final_matches_streaming_walk(geometry: int, n_samples: int) -> None:
-    _assert_walk_parity(geometry, n_samples, seed=1)
+def test_padded_partial_final_matches_streaming_walk(geometry: int, n_samples: int, seed: int) -> None:
+    _assert_walk_parity(geometry, n_samples, seed)
+
+
+def _unmasked_stream_step(encoder: Any, mel: torch.Tensor, caches: Any, **kwargs: Any) -> torch.Tensor:
+    """The pre-mask computation: the subsampling sees the full input width."""
+    return encoder_mod.stream_step(encoder, mel, caches, **kwargs)
+
+
+def _frozen_subsampling(pre_encode: Any, mel: torch.Tensor) -> torch.Tensor:
+    """The subsampling exactly as it ran before the length mask existed."""
+    x = mel.to(next(pre_encode.parameters()).dtype).transpose(1, 2).unsqueeze(1)
+    x = pre_encode.conv(x)
+    b, c, t, f = x.size()
+    return pre_encode.out(x.transpose(1, 2).reshape(b, t, c * f))
+
+
+# @spec PORT-ADV-004
+@pytest.mark.parametrize("geometry", range(len(LOOKAHEADS)))
+def test_masked_subsampling_keeps_every_valid_frame_of_full_width_rows(geometry: int) -> None:
+    core = _core(seed=5)
+    pre_encode = core.encoder.pre_encode
+    cadence = 8 * (LOOKAHEADS[geometry] + 1)
+    width = frontend.MEL_TAIL_FRAMES + cadence
+    torch.manual_seed(100 + geometry)
+    mel = torch.randn(2, FEAT, width)
+    mel[1, :, cadence - 7 :] = 0
+    lengths = torch.tensor([width, cadence - 7])
+    with torch.no_grad():
+        expected = _frozen_subsampling(pre_encode, mel)
+        actual, _ = pre_encode(mel, lengths, mask_padding=True)
+        unmasked, _ = pre_encode(mel, lengths)
+    valid = pre_encode.output_lengths(lengths).tolist()
+    assert valid[0] == expected.shape[1]
+    assert torch.equal(unmasked, expected)
+    for row, frames in enumerate(valid):
+        assert torch.equal(actual[row, :frames], expected[row, :frames])
+
+
+def _fresh_caches(batch: int) -> Any:
+    return encoder_mod.StreamingCaches(
+        n_layers=N_LAYERS,
+        batch=batch,
+        d_model=D_MODEL,
+        left_context=WINDOW,
+        conv_kernel=KERNEL,
+        device=torch.device("cpu"),
+    )
+
+
+# @spec PORT-ADV-004, PORT-PERF-009
+@pytest.mark.parametrize("geometry", range(len(LOOKAHEADS)))
+def test_full_width_rows_are_bitwise_unchanged_by_the_mask(geometry: int) -> None:
+    # Regular chunks: a continuing row spans the whole 9+C input, and a
+    # session-first row's 8L+1 frames keep every subsampling layer's valid
+    # length odd, so no valid output reads a masked step. Both must equal
+    # the unmasked computation bit for bit, cache writes included.
+    core = _core(seed=5)
+    cadence = 8 * (LOOKAHEADS[geometry] + 1)
+    width = frontend.MEL_TAIL_FRAMES + cadence
+    out_width = int(core.encoder.pre_encode.output_lengths(torch.tensor([width]))[0])
+    torch.manual_seed(geometry)
+    mel = torch.randn(2, FEAT, width)
+    mel[1, :, cadence - 7 :] = 0  # session-first row: 8L+1 valid frames
+    mel_lengths = torch.tensor([width, cadence - 7])
+    offsets = torch.tensor([advance.PRE_ENCODE_DROP, 0])
+    lengths = torch.full((2,), LOOKAHEADS[geometry] + 1)
+    reference_caches, masked_caches = _fresh_caches(2), _fresh_caches(2)
+    for caches in (reference_caches, masked_caches):
+        caches.channel.normal_()
+        caches.time.normal_()
+        caches.valid.fill_(WINDOW)
+    masked_caches.channel.copy_(reference_caches.channel)
+    masked_caches.time.copy_(reference_caches.time)
+    common = {"out_offsets": offsets, "out_lengths": lengths, "out_width": out_width}
+    with torch.no_grad():
+        expected = _unmasked_stream_step(core.encoder, mel, reference_caches, **common)
+        actual = encoder_mod.stream_step(core.encoder, mel, masked_caches, mel_lengths=mel_lengths, **common)
+    assert torch.equal(actual, expected)
+    assert torch.equal(masked_caches.channel, reference_caches.channel)
+    assert torch.equal(masked_caches.time, reference_caches.time)
+    assert torch.equal(masked_caches.valid, reference_caches.valid)
+
+
+# @spec PORT-PERF-010
+def test_transition_tuple_carries_the_valid_mel_width() -> None:
+    # The serving transition receives the per-row valid mel width as a
+    # tensor (a staged graph input, never a Python constant).
+    core = _core(seed=5)
+    received: list[tuple[Any, ...]] = []
+    execute = mods["encoder_execution"].execute_encoder_transition
+
+    def observe(*args: Any) -> Any:
+        received.append(args)
+        return execute(core, *args)
+
+    state = _fresh_state()
+    unit = 8 * (LOOKAHEADS[1] + 1) * HOP
+    signal = torch.randn(1, unit)
+    for seq, (samples, final) in enumerate(((signal, False), (signal[:, :1_000], True))):
+        padded = torch.zeros(1, unit)
+        padded[:, : samples.shape[1]] = samples
+        batch = advance.ChunkBatch(
+            samples=padded,
+            valid_samples=torch.tensor([samples.shape[1]]),
+            geometry_id=torch.tensor([1]),
+            final_tail=torch.tensor([final]),
+            prompt_index=torch.tensor([0]),
+            chunk_sequence=torch.tensor([seq]),
+        )
+        with torch.no_grad():
+            advance.advance_session(
+                core, batch, state, geometry=1, decode_fn=rnnt.decode_compact_active, encoder_transition=observe
+            )
+    # First chunk: B_1 = 9 frames, no prefix. Final: 3,560 samples hold
+    # 22 frames, 13 past B_1, behind the nine-frame prefix: 9 + 13 = 22.
+    assert [args[6].tolist() for args in received] == [[9], [22]]
+    assert all(args[6].dtype == torch.int64 for args in received)
