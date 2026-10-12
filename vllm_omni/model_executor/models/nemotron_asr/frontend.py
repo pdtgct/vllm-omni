@@ -180,7 +180,8 @@ def advance_frontend(
     design §Exact Bounded Frontend); columns at or past a row's count
     are exactly zero. Finalization reproduces the reference buffer
     walk: at most one ``C``-frame cadence shift is committed, and the
-    remaining sub-eight boundary debt is dropped. Failure handling is
+    remaining sub-eight boundary debt is dropped; a session-first final
+    is the walk's first chunk (one to ``C-7`` frames). Failure handling is
     the ``ROW_STATUS_*``
     bitmask: the caller's incoming protocol bits are AND-composed
     with the frontend-owned FINALIZED predicate and the
@@ -267,15 +268,32 @@ def advance_frontend(
     # less than C available, consume the actual remainder only when it
     # has at least eight frames. Finalization still marks atomically
     # when nothing is committed.
+    #
+    # A session-first final (nothing committed yet) is the walk's FIRST
+    # chunk instead: it needs only one frame and spans at most the first
+    # boundary C-7 (= 8L+1). Its remainder past that boundary is under
+    # eight frames — a final residual is strictly under one cadence of
+    # samples — so the walk drops it, exactly like boundary debt.
     n_final = total0 // hop  # == final_frames(total0)
     final_remaining = n_final - committed
-    final_count = torch.where(
-        final_remaining >= cadence_frames,
-        torch.full_like(final_remaining, cadence_frames),
-        torch.where(
-            final_remaining >= 8,
+    first_final_count = torch.clamp(
+        torch.minimum(
             final_remaining,
-            torch.zeros_like(final_remaining),
+            torch.full_like(final_remaining, cadence_frames - 7),
+        ),
+        min=0,
+    )
+    final_count = torch.where(
+        committed == 0,
+        first_final_count,
+        torch.where(
+            final_remaining >= cadence_frames,
+            torch.full_like(final_remaining, cadence_frames),
+            torch.where(
+                final_remaining >= 8,
+                final_remaining,
+                torch.zeros_like(final_remaining),
+            ),
         ),
     )
     final_target = committed + final_count

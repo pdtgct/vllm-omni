@@ -1168,8 +1168,9 @@ def advance_session(
     geometry_shape = encoder_geometry_shape(core, geometry)
     cadence = geometry_shape.cadence_frames
     # The bucket's padded frontend width is one reference cadence
-    # shift: first rows commit C-7, continuing rows C, and final rows
-    # consume at most C before dropping the sub-eight boundary debt.
+    # shift: first rows commit C-7, continuing rows C, session-first
+    # final rows at most C-7, and continuing final rows at most C before
+    # dropping the sub-eight boundary debt.
     pad_frames = cadence
     mel_width = geometry_shape.mel_width
 
@@ -1900,13 +1901,20 @@ def _counter_invariant_rows(
     )
     final_available = total // hop_length
     final_remaining = final_available - final_base_committed
+    # A session-first final is the walk's first chunk: at most C-7
+    # frames, at least one (mirrors ``advance_frontend``).
+    first_final_count = torch.clamp(torch.minimum(final_remaining, cadence_frames - 7), min=0)
     final_count = torch.where(
-        final_remaining >= cadence_frames,
-        cadence_frames,
+        regular_chunks_from_total == 0,
+        first_final_count,
         torch.where(
-            final_remaining >= 8,
-            final_remaining,
-            torch.zeros_like(final_remaining),
+            final_remaining >= cadence_frames,
+            cadence_frames,
+            torch.where(
+                final_remaining >= 8,
+                final_remaining,
+                torch.zeros_like(final_remaining),
+            ),
         ),
     )
     expected_final_committed = final_base_committed + final_count
