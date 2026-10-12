@@ -103,6 +103,7 @@ from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import NemotronAS
 from vllm_omni.model_executor.models.nemotron_asr.precision import (
     FP32_BRINGUP,
     PrecisionPolicy,
+    reduced_precision_state,
     resolve_precision_policy,
 )
 
@@ -227,6 +228,7 @@ def _build_execution_fingerprint(
     """
     tree_digest, tree_clean = _git_tree_identity(repo_root)
     is_cuda = device == "cuda"
+    precision_state = reduced_precision_state()
     return {
         "platform_backend": "cuda" if is_cuda else "cpu",
         "device_identity": torch.cuda.get_device_name(0) if is_cuda else "cpu",
@@ -234,8 +236,8 @@ def _build_execution_fingerprint(
         "python_build": ".".join(str(v) for v in sys.version_info[:3]),
         "torch_build": torch.__version__,
         "accel_library_versions": ([["cuda", str(torch.version.cuda)]] if is_cuda and torch.version.cuda else []),
-        "tf32_matmul_enabled": torch.backends.cuda.matmul.allow_tf32,
-        "tf32_cudnn_enabled": torch.backends.cudnn.allow_tf32,
+        "tf32_matmul_enabled": precision_state["tf32_matmul_enabled"],
+        "tf32_cudnn_enabled": precision_state["tf32_cudnn_enabled"],
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "matmul_precision": torch.get_float32_matmul_precision(),
