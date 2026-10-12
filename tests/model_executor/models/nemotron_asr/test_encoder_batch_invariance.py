@@ -96,7 +96,11 @@ from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.lid import PromptConditioner
 from vllm_omni.model_executor.models.nemotron_asr.nemotron_asr import apply_policy_dtypes
-from vllm_omni.model_executor.models.nemotron_asr.precision import FP16_ENCODER_EXPERIMENT, PrecisionPolicy
+from vllm_omni.model_executor.models.nemotron_asr.precision import (
+    FP16_ENCODER_EXPERIMENT,
+    PrecisionPolicy,
+    reduced_precision_state,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.model_executor.models.nemotron_asr.advance import SessionStateBatch
@@ -175,19 +179,20 @@ def apply_bi_mode(mode: str) -> dict[str, Any]:
 
 
 def bi_settings() -> dict[str, Any]:
-    matmul = torch.backends.cuda.matmul
+    state = reduced_precision_state()
     settings: dict[str, Any] = {
         "mode": _APPLIED_MODE,
         "torch": torch.__version__,
         "cuda_initialized_before_mode": _CUDA_INITIALIZED_BEFORE_MODE,
         "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "VLLM_BATCH_INVARIANT": os.environ.get("VLLM_BATCH_INVARIANT"),
-        "allow_fp16_reduced_precision_reduction": repr(matmul.allow_fp16_reduced_precision_reduction),
-        "matmul_fp32_precision": str(getattr(matmul, "fp32_precision", "n/a")),
-        # vLLM sets the per-operation precision API. Reading the legacy
-        # aggregate allow_tf32 flag then raises on mixed backend settings.
-        "cudnn_conv_fp32_precision": str(torch.backends.cudnn.conv.fp32_precision),
-        "cudnn_rnn_fp32_precision": str(torch.backends.cudnn.rnn.fp32_precision),
+        # vLLM sets the per-operation precision API; the helper never reads
+        # the legacy aggregate allow_tf32 flags unguarded (they raise on
+        # mixed backend settings).
+        "allow_fp16_reduced_precision_reduction": repr(state["allow_fp16_reduced_precision_reduction"]),
+        "matmul_fp32_precision": str(state["matmul_fp32_precision"]),
+        "cudnn_conv_fp32_precision": str(state["cudnn_conv_fp32_precision"]),
+        "cudnn_rnn_fp32_precision": str(state["cudnn_rnn_fp32_precision"]),
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
     }
     if _REDUCED_PRECISION_NOTE:

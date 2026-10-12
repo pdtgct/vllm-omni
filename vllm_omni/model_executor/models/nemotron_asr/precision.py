@@ -17,7 +17,7 @@ silently reduced — recurrent accumulation compounds rounding error
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Final
 
 import torch
@@ -183,3 +183,55 @@ bf16, every state class fp32 — the vLLM mamba mixed-precision idiom
 (compute dtype below the recurrent/cache dtype, never the reverse).
 Transcript parity vs the fp32-locked oracle stays BLOCKING; tensor
 deltas are advisory under this identifier (EVAL-PAR-006)."""
+
+
+def _safe_read(read: Callable[[], object]) -> object:
+    """Evaluate ``read()``; any failure (e.g. torch's mixed legacy/new TF32
+    API ``RuntimeError``) yields ``None`` instead of propagating."""
+    try:
+        return read()
+    except Exception:
+        return None
+
+
+def _tf32_from(precision: object, legacy_read: Callable[[], object]) -> bool | None:
+    """Effective TF32 state: the per-operation ``fp32_precision`` string when
+    it is decisive, else the legacy flag, else ``None`` (unknown)."""
+    if precision == "tf32":
+        return True
+    if precision == "ieee":
+        return False
+    legacy = _safe_read(legacy_read)
+    return legacy if isinstance(legacy, bool) else None
+
+
+def reduced_precision_state() -> dict[str, object]:
+    """Report torch's effective reduced-precision flags without ever raising.
+
+    Read-only. Newer PyTorch exposes per-operation ``fp32_precision``
+    settings; once those are set (vLLM batch-invariant mode does so),
+    reading the aggregate legacy ``allow_tf32`` attributes can raise
+    ``RuntimeError`` when the cuBLAS or cuDNN conv/RNN settings disagree.
+    This prefers the new API, falls back to the legacy attributes, and
+    reports ``None`` for any value that cannot be determined.
+    """
+    matmul = torch.backends.cuda.matmul
+    cudnn = torch.backends.cudnn
+    matmul_precision = _safe_read(lambda: matmul.fp32_precision)
+    conv_precision = _safe_read(lambda: cudnn.conv.fp32_precision)
+    rnn_precision = _safe_read(lambda: cudnn.rnn.fp32_precision)
+    conv_tf32 = _tf32_from(conv_precision, lambda: cudnn.allow_tf32)
+    rnn_tf32 = _tf32_from(rnn_precision, lambda: cudnn.allow_tf32)
+    return {
+        "matmul_fp32_precision": matmul_precision,
+        "cudnn_conv_fp32_precision": conv_precision,
+        "cudnn_rnn_fp32_precision": rnn_precision,
+        "float32_matmul_precision": _safe_read(torch.get_float32_matmul_precision),
+        "tf32_matmul_enabled": _tf32_from(matmul_precision, lambda: matmul.allow_tf32),
+        "tf32_cudnn_conv_enabled": conv_tf32,
+        "tf32_cudnn_rnn_enabled": rnn_tf32,
+        # Aggregate cuDNN flag: defined only when conv and RNN agree.
+        "tf32_cudnn_enabled": conv_tf32 if conv_tf32 == rnn_tf32 else None,
+        "allow_fp16_reduced_precision_reduction": _safe_read(lambda: matmul.allow_fp16_reduced_precision_reduction),
+        "allow_bf16_reduced_precision_reduction": _safe_read(lambda: matmul.allow_bf16_reduced_precision_reduction),
+    }
