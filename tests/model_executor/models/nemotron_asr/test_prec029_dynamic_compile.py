@@ -453,3 +453,68 @@ def test_prec029_mode_off_cartesian_budget(monkeypatch, bucketed):
         execution.profile_cell(geometry=1, population=5, invoke=lambda: execution.transition(*args))
         assert torch._dynamo.config.cache_size_limit == 1
     assert seen == [len(GEOMETRIES) * len(execution.warmup_populations)]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prec029_bucketed_graph_replays_partial_mel_widths(monkeypatch, enabled):
+    """@spec PORT-PERF-010, PORT-PERF-011: valid mel widths are staged graph inputs.
+
+    The real reduced encoder runs the length-masked subsampling through the
+    compiled, population-bucketed graph arm; an underfilled live prefix with
+    partial widths must match the uncompiled transition, and the widths must
+    change the result (they are replayed values, not captured constants).
+    """
+    _assert_bucketed_partial_mel_widths(monkeypatch, enabled=enabled, device="cpu")
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA capture/replay")
+def test_prec029_bucketed_graph_replays_partial_mel_widths_cuda(monkeypatch):
+    """@spec PORT-PERF-010, PORT-PERF-011: the same contract under real CUDA capture."""
+    _assert_bucketed_partial_mel_widths(monkeypatch, enabled=False, device="cuda")
+
+
+def _assert_bucketed_partial_mel_widths(monkeypatch, *, enabled, device):
+    execution = _build(
+        monkeypatch, enabled=enabled, cap=4, arm="dense-graphed", bucketed=True, device=device, real=True
+    )
+    populations = execution.warmup_populations
+    assert populations == (1, 2, 4)
+
+    def args(geometry, population, widths):
+        mel_lengths = torch.tensor(widths, dtype=torch.int64, device=device)
+        mel, caches, _offsets, _lengths, out_width, prompt = _args(execution, geometry, population, device)
+        # Session-first rows (no pre-encode drop) emitting every valid frame,
+        # so each row's last frame reads its subsampling's padded tail.
+        offsets = torch.zeros(population, dtype=torch.int64, device=device)
+        lengths = execution._core.encoder.pre_encode.output_lengths(mel_lengths).clamp(max=out_width)
+        return mel, caches, offsets, lengths, out_width, prompt, mel_lengths
+
+    def full(geometry, population):
+        return [execution._geometry_shapes[geometry].mel_width] * population
+
+    with torch.inference_mode():
+        execution.warmup_domain(
+            expected_cells=tuple((g, p) for g in GEOMETRIES for p in populations),
+            invoke=lambda g, p: execution.transition(*args(g, p, full(g, p))),
+        )
+        assert execution.ready
+        geometry = GEOMETRIES[-1]
+        width = execution._geometry_shapes[geometry].mel_width
+        partial = [width - 3, width, width - 6]
+        replayed = execution.transition(*args(geometry, 3, partial))
+        eager_args = args(geometry, 3, partial)
+        expected = _REAL_TRANSITION(execution._core, *eager_args)
+        for actual, oracle in zip(replayed, expected, strict=True):
+            # CUDA convolutions may use TF32 in either execution; the
+            # mask's effect below is far larger than that tolerance.
+            torch.testing.assert_close(actual, oracle, rtol=0, atol=1e-5 if device == "cpu" else 1e-3)
+        # The same rows and emitted frames with the mask disabled (full
+        # widths) differ only where a width is partial.
+        unmasked_args = list(args(geometry, 3, partial))
+        unmasked_args[6] = torch.tensor(full(geometry, 3), dtype=torch.int64, device=device)
+        unmasked = execution.transition(*unmasked_args)
+        assert not torch.equal(replayed[0][0], unmasked[0][0])
+        assert not torch.equal(replayed[0][2], unmasked[0][2])
+        assert torch.equal(replayed[0][1], unmasked[0][1])
