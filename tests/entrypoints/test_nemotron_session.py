@@ -688,8 +688,8 @@ def test_factory_finalization_timeout_aborts_without_terminal_result() -> None:
 
         flush = asyncio.create_task(lease.flush())
         await asyncio.wait_for(engine.generation_started.wait(), timeout=1.0)
-        lease._session_lifecycle._finalization_timeout_s = 0.01
-        lease._arm_session_lifecycle_timeout("finalization")
+        # PORT-SESS-017: a frozen absolute deadline cannot be reconfigured.
+        lease._session_lifecycle._deadline_reached(lease._session_lifecycle.generation, "finalization")
         with pytest.raises(TimeoutError, match="finalization_timeout"):
             await flush
 
@@ -1010,3 +1010,31 @@ def test_binding_source_has_no_cadence_arithmetic() -> None:
         "PORT owns cadence segmentation and the ledger replaces prediction "
         "(ING-FE-006, PORT-RTC-002)"
     )
+
+
+# @spec PORT-SESS-016
+def test_lease_reads_model_progress_with_observer_disabled() -> None:
+    async def scenario() -> None:
+        engine = FakeAsyncOmni()
+        lease, _ = _make_lease(engine)
+        authority = lease.session.accepted_audio
+        script = engine.script
+
+        def progress_script(item: Any, index: int) -> Any:
+            for output in script(item, index):
+                unit = authority.in_flight_unit
+                if unit is not None:
+                    output.outputs[0].finalization_progress = (
+                        authority.request_id,
+                        authority.lease_generation,
+                        (unit.logical_sequence, 0, 2),
+                    )
+                yield output
+
+        engine.script = progress_script
+        await _wait(lease.feed(_audio(_CHUNK)))
+        assert lease._session_lifecycle._high_water == (0, 0, 2)
+        await lease.abort()
+        await lease.release()
+
+    _run(scenario())

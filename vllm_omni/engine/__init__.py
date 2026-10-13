@@ -144,6 +144,7 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # dict here; the consumer (StagePool._poll_stage_raw) rehydrates it back into
     # ``pooling_output`` after decode. Tensor pooling outputs are unaffected.
     pooling_output_payload: AdditionalInformationPayload | None = None
+    finalization_progress: tuple[str, int, tuple[int, int, int]] | None = None
     # Finished flag for streaming input segment
     is_segment_finished: bool | None = False
     # Streaming update prompt length

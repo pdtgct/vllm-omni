@@ -745,6 +745,7 @@ class CommitPlan:
     bindings: tuple[PreparedRowBinding, ...]
     capture: CapturePlan | None
     records: tuple[CaptureRecord, ...] = ()
+    progress: torch.Tensor | None = None
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -2519,6 +2520,7 @@ def advance_model_rows(
         encoder_geometry_shape,
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
+        CTR_EXPECTED_CHUNK_SEQUENCE,
         CTR_FINALIZED,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
@@ -3415,6 +3417,17 @@ def advance_model_rows(
         capture_plan: CapturePlan | None = CapturePlan(rows=len(records), payload_bytes=payload_bytes)
     else:
         capture_plan = None
+    # @spec PORT-SESS-016: publish committed queue state through the mandatory
+    # status handoff. Preparation is fallible; staging after scatter is no-fail.
+    progress_sequence = counters_small[:, CTR_EXPECTED_CHUNK_SEQUENCE].clone()
+    for ex in executed:
+        progress_sequence.index_copy_(0, ex["rows_dev"], ex["state"].frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE])
+    progress_phase = torch.where(projection.book[:, BOOK_PENDING_ECHO] == 0, 2, 1)
+    progress_phase = torch.where((roles == ROLE_FLUSH) & ~park_echo, 3, progress_phase)
+    progress_phase = torch.where(roles == ROLE_EOU, progress_phase + 3, progress_phase)
+    terminal_park_echo = (roles == ROLE_FLUSH) & (ids_dev == park_id)
+    progress_phase = torch.where(park_echo | terminal_park_echo, 0, progress_phase)
+    progress = torch.stack((progress_sequence, projection.book[:, QUEUE_HEAD].long(), progress_phase), dim=1)
     prepared_records = tuple(records)
     reservation: CommitReservation | None = None
     cancel_reservation: Callable[[], None] | None = None
@@ -3425,6 +3438,7 @@ def advance_model_rows(
                 bindings=plan.bindings,
                 capture=capture_plan,
                 records=prepared_records,
+                progress=progress,
             )
         )
         cancel_candidate = getattr(reservation, "cancel", None)

@@ -101,6 +101,10 @@ class AcceptedAudioAuthority:
         self.cadence_ns = cadence_ns
 
         self._lock = threading.Lock()
+        self._terminal_cause: str | None = None
+        self._progress_key = (-1, -1, -1)
+        self._last_model_progress: tuple[int, int, int] | None = None
+        self._tail_parked_sequence: int | None = None
         self._pieces: deque[np.ndarray] = deque()
         self._head = 0
         self._residual_samples = 0
@@ -118,6 +122,81 @@ class AcceptedAudioAuthority:
         self._cleared = False
         self._force_pending = False
         self._locale: str | None = None
+
+    # @spec PORT-SESS-018
+    def claim_terminal(self, cause: str, *, lease_generation: int) -> bool:
+        """Linearize all terminal causes with acceptance and finalize."""
+        with self._lock:
+            if lease_generation != self.lease_generation or self._terminal_cause is not None:
+                return False
+            self._terminal_cause = cause
+            return True
+
+    @property
+    def terminal_cause(self) -> str | None:
+        with self._lock:
+            return self._terminal_cause
+
+    # @spec PORT-SESS-016
+    def observe_model_progress(
+        self,
+        request_id: str,
+        generation: int,
+        raw: tuple[int, int, int],
+    ) -> tuple[int, int, int] | None:
+        with self._lock:
+            if (
+                request_id != self.request_id
+                or generation != self.lease_generation
+                or self._terminal_cause is not None
+                or raw == self._last_model_progress
+            ):
+                return None
+            sequence, cursor, phase = raw
+            if cursor < 0 or phase not in (1, 2, 3):
+                return None
+            unit = self._in_flight
+            if phase == 3:
+                if not self._finalizing or self._tail_parked_sequence is None or unit is not None:
+                    return None
+                logical = self._tail_parked_sequence + 1
+                if sequence != logical:
+                    return None
+            elif unit is None:
+                return None
+            else:
+                if sequence != unit.logical_sequence:
+                    return None
+                logical = unit.logical_sequence
+            key = (logical, cursor, phase)
+            if key <= self._progress_key:
+                return None
+            self._last_model_progress = raw
+            self._progress_key = key
+            return key
+
+    @property
+    def finalization_drained(self) -> bool:
+        with self._lock:
+            return (
+                self._finalizing
+                and self._tail_parked_sequence is not None
+                and self._outstanding_samples() == 0
+                and not self._ready
+                and self._in_flight is None
+            )
+
+    def finalization_work(self) -> tuple[int, float]:
+        """Regular work excludes the residual already minted as final tail."""
+        with self._lock:
+            units = list(self._ready)
+            if self._in_flight is not None:
+                units.append(self._in_flight)
+            samples = sum(unit.sample_count for unit in units if unit.kind == "regular")
+            delay = 0.0
+            if self.cadence_ns is not None and self._prior_ordinary_submission_ns is not None:
+                delay = max(0, self._prior_ordinary_submission_ns + self.cadence_ns - time.monotonic_ns()) / 1e9
+            return samples, delay
 
     @property
     def ready_units(self) -> tuple[ReadyAudioUnit, ...]:
@@ -144,7 +223,7 @@ class AcceptedAudioAuthority:
     def next_eligibility_ns(self) -> int | None:
         """Earliest release of the FIFO head under the cadence clock."""
         with self._lock:
-            if self._cleared or self._in_flight is not None or not self._ready:
+            if self._cleared or self._terminal_cause is not None or self._in_flight is not None or not self._ready:
                 return None
             return self._eligibility_ns(self._ready[0])
 
@@ -216,7 +295,7 @@ class AcceptedAudioAuthority:
         sample_count = int(owned.shape[0])
 
         with self._lock:
-            if self._cleared:
+            if self._cleared or self._terminal_cause is not None:
                 raise ValueError("session is cleared")
             if self._finalizing:
                 raise ValueError("session is finalizing")
@@ -246,7 +325,7 @@ class AcceptedAudioAuthority:
     # @spec PORT-SEG-004, PORT-SESS-014
     def force_segment(self) -> None:
         with self._lock:
-            if self._cleared:
+            if self._cleared or self._terminal_cause is not None:
                 raise ValueError("session is cleared")
             if self._finalizing:
                 raise ValueError("session is finalizing")
@@ -266,7 +345,7 @@ class AcceptedAudioAuthority:
     # @spec PORT-LID-001, PORT-SESS-014
     def update_locale(self, locale: str) -> str:
         with self._lock:
-            if self._cleared:
+            if self._cleared or self._terminal_cause is not None:
                 raise ValueError("session is cleared")
             if self._finalizing:
                 raise ValueError("session is finalizing")
@@ -284,7 +363,7 @@ class AcceptedAudioAuthority:
         if admission_ms_mod is None:
             admission_ms_mod = int(time.time() * 1000) % ADMISSION_EPOCH_MODULUS_MS
         with self._lock:
-            if self._cleared:
+            if self._cleared or self._terminal_cause is not None:
                 raise ValueError("session is cleared")
             if self._finalizing:
                 return
@@ -302,7 +381,7 @@ class AcceptedAudioAuthority:
     # @spec PORT-SESS-001, PORT-SESS-013
     def dispatch_next(self, *, now_ns: int | None = None) -> ReadyAudioUnit | None:
         with self._lock:
-            if self._cleared or self._in_flight is not None or not self._ready:
+            if self._cleared or self._terminal_cause is not None or self._in_flight is not None or not self._ready:
                 return None
             eligibility_ns = self._eligibility_ns(self._ready[0])
             if eligibility_ns is not None:
@@ -365,6 +444,8 @@ class AcceptedAudioAuthority:
                 raise ValueError("park identity or generation mismatch")
             if self.cadence_ns is not None and not self._in_flight_submitted:
                 raise ValueError("paced unit reached park before submission")
+            if unit.kind == "final_tail":
+                self._tail_parked_sequence = unit.logical_sequence
             self._parked_samples += unit.sample_count
             if unit.kind == "forced_eou":
                 self._force_pending = False

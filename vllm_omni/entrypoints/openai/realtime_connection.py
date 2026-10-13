@@ -35,6 +35,10 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.session_lifecycle import (
     SessionLifecycleDeadline,
     SessionLifecycleKind,
+    arm_session_finalization,
+    claim_session_terminal,
+    consume_session_progress,
+    record_finalization_expiry,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.streaming_transport import observe_safely
@@ -758,6 +762,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             is_streaming=True,
         )
 
+        terminal_delivery: asyncio.Task | None = None
         result_gen = None
         try:
             if getattr(self, "_state_lease", None) is not None:
@@ -782,6 +787,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if any(getattr(o, "finish_reason", None) == "error" for o in (getattr(output, "outputs", None) or ())):
                     error_finish = True
                     break
+                consume_session_progress(self._session_lifecycle, getattr(self, "_nemotron_session", None), output)
                 stage_id = getattr(output, "stage_id", None)
                 if stage_id == 0 and output.outputs:
                     first_output = output.outputs[0]
@@ -860,15 +866,28 @@ class RealtimeConnection(VllmRealtimeConnection):
                 # so MODEL completion is decided here, before any
                 # terminal send: transport delivery is not part of model
                 # completion (PORT-OBS-006; review round F3).
+                authority = getattr(getattr(self, "_nemotron_session", None), "accepted_audio", None)
+                if authority is not None and not authority.finalization_drained:
+                    raise RuntimeError("generation ended before final-tail and FLUSH completion")
+                if not claim_session_terminal(
+                    getattr(self, "_nemotron_session", None), "completed", getattr(self, "_state_lease", None)
+                ):
+                    return
                 model_finalized = True
+                self._streaming_finish_reason = "completed"
                 await self._cancel_session_lifecycle_timeout()
 
             if error_finish:
-                self._streaming_finish_reason = "error"
-                logger.error("Realtime generation finished with an engine error: %s", request_id)
-                if self._is_connected:
-                    await self.send_error("generation failed", "processing_error")
-            elif self._is_connected:
+                if claim_session_terminal(
+                    getattr(self, "_nemotron_session", None), "error", getattr(self, "_state_lease", None)
+                ):
+                    self._streaming_finish_reason = "error"
+                    logger.error("Realtime generation finished with an engine error: %s", request_id)
+                    if self._is_connected:
+                        terminal_delivery = asyncio.create_task(
+                            self.send_error("generation failed", "processing_error")
+                        )
+            elif self._is_connected and model_finalized:
                 usage = UsageInfo(
                     prompt_tokens=prompt_token_ids_len,
                     completion_tokens=completion_tokens_len,
@@ -893,20 +912,28 @@ class RealtimeConnection(VllmRealtimeConnection):
                     )
                     audio_done_sent = True
         except asyncio.CancelledError as error:
+            claim_session_terminal(
+                getattr(self, "_nemotron_session", None), "cancelled", getattr(self, "_state_lease", None)
+            )
             cancelled = error
         except OutputCapacityExceeded:
-            self._streaming_finish_reason = "error"
-            logger.exception("Realtime transcript capacity exhausted")
-            if self._is_connected:
-                await self.send_error(
-                    "output_capacity_exceeded",
-                    "output_capacity_exceeded",
-                )
+            if claim_session_terminal(
+                getattr(self, "_nemotron_session", None), "error", getattr(self, "_state_lease", None)
+            ):
+                self._streaming_finish_reason = "error"
+                logger.exception("Realtime transcript capacity exhausted")
+                if self._is_connected:
+                    terminal_delivery = asyncio.create_task(
+                        self.send_error("output_capacity_exceeded", "output_capacity_exceeded")
+                    )
         except Exception as e:
-            self._streaming_finish_reason = "error"
-            logger.exception("Error in generation: %s", e)
-            if self._is_connected:
-                await self.send_error(str(e), "processing_error")
+            if claim_session_terminal(
+                getattr(self, "_nemotron_session", None), "error", getattr(self, "_state_lease", None)
+            ):
+                self._streaming_finish_reason = "error"
+                logger.exception("Error in generation: %s", e)
+                if self._is_connected:
+                    terminal_delivery = asyncio.create_task(self.send_error(str(e), "processing_error"))
         finally:
             # Close the generator explicitly so AsyncOmni.generate's cleanup
             # (input-pump cancellation and engine-side abort) runs now rather
@@ -942,7 +969,17 @@ class RealtimeConnection(VllmRealtimeConnection):
             #     (lifecycle divergence): the remaining work is cleared
             #     as error and the session finishes as error.
             if observer is not None:
-                if cancelled is not None or disconnected:
+                authority = getattr(getattr(self, "_nemotron_session", None), "accepted_audio", None)
+                winner = getattr(authority, "terminal_cause", None)
+                if winner == "completed":
+                    outcome, reason = "error", "completed"
+                elif winner in {"finalization_timeout", "pending_claim_timeout", "error"}:
+                    outcome, reason = "error", "error"
+                elif (
+                    winner in {"idle_timeout", "disconnect", "cancelled", "abort"}
+                    or cancelled is not None
+                    or disconnected
+                ):
                     outcome, reason = "aborted", "aborted"
                 elif model_finalized:
                     # Classified from finalization state, NOT from
@@ -967,6 +1004,20 @@ class RealtimeConnection(VllmRealtimeConnection):
                         reason=reason,
                     )
                     self._streaming_session_finished = True
+            session = getattr(self, "_nemotron_session", None)
+            authority = getattr(session, "accepted_audio", None)
+            if authority is not None:
+                claim_session_terminal(
+                    session, "disconnect" if disconnected else "error", getattr(self, "_state_lease", None)
+                )
+                authority.clear(RuntimeError("generation ended"))
+            if getattr(self, "_state_lease", None) is not None and not self._state_cleanup_lock.locked():
+                await self._release_state_lease(getattr(self, "_terminal_code", None) or "generation_terminal")
+            if terminal_delivery is not None:
+                try:
+                    await asyncio.wait_for(terminal_delivery, timeout=0.1)
+                except Exception:
+                    pass
             if cancelled is not None:
                 raise cancelled
 
@@ -1020,22 +1071,44 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         kind: SessionLifecycleKind,
     ) -> None:
-        self._session_lifecycle.arm(kind)
+        session = getattr(self, "_nemotron_session", None)
+        if kind == "finalization" and getattr(session, "accepted_audio", None) is not None:
+            arm_session_finalization(self._session_lifecycle, session, self._persistent_state_service)
+        else:
+            self._session_lifecycle.arm(kind)
 
     async def _expire_session_lifecycle(
         self,
         kind: SessionLifecycleKind,
     ) -> None:
         code = "idle_timeout" if kind == "idle" else "finalization_timeout"
+        if not claim_session_terminal(self._nemotron_session, code, self._state_lease):
+            return
         self._streaming_finish_reason = "aborted" if kind == "idle" else "error"
         self._terminal_code = code
-        if self._is_connected:
-            await self.send_error(code, code)
-        await self.cleanup()
-        self._is_connected = False
-        close = getattr(self.websocket, "close", None)
-        if close is not None:
-            await close(code=1008)
+        if kind == "finalization":
+            record_finalization_expiry(self._session_lifecycle, self._observer)
+        # Delivery owns no lease resources. Start it concurrently, then finish
+        # exact cleanup before allowing a bounded best-effort send/close.
+        delivery = asyncio.create_task(self.send_error(code, code)) if self._is_connected else None
+        try:
+            await self.cleanup()
+            self._is_connected = False
+            if delivery is not None:
+                try:
+                    await asyncio.wait_for(delivery, timeout=0.1)
+                except (Exception, asyncio.CancelledError):
+                    pass
+            close = getattr(self.websocket, "close", None)
+            if close is not None:
+                try:
+                    await asyncio.wait_for(close(code=1008), timeout=0.1)
+                except Exception:
+                    pass
+        finally:
+            if delivery is not None and not delivery.done():
+                delivery.cancel()
+                await asyncio.gather(delivery, return_exceptions=True)
 
     def _finish_streaming_session_once(self, reason: str) -> None:
         session = self._nemotron_session
@@ -1096,12 +1169,19 @@ class RealtimeConnection(VllmRealtimeConnection):
         lease = self._state_lease
         if service is None or lease is None or self._state_release_done:
             return
+        authority = getattr(self._nemotron_session, "accepted_audio", None)
+        if authority is not None and authority.terminal_cause is not None:
+            return
         async with self._state_cleanup_lock:
             if self._state_release_done:
                 return
             won = await service.claim_pending_cleanup(lease)
             if not won:
                 return
+            if not claim_session_terminal(self._nemotron_session, "pending_claim_timeout", lease):
+                return
+            self._streaming_finish_reason = "error"
+            self._terminal_code = "pending_claim_timeout"
             generation_task = self.generation_task
             await super().cleanup()
             if generation_task is not None:
@@ -1118,8 +1198,15 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
             self._state_release_done = True
 
+        await self._cancel_session_lifecycle_timeout()
+
     async def cleanup(self):
         """Release resident state exactly once after transport cleanup begins."""
+        session = getattr(self, "_nemotron_session", None)
+        claim_session_terminal(session, "disconnect", self._state_lease)
+        authority = getattr(session, "accepted_audio", None)
+        if authority is not None:
+            authority.clear(RuntimeError(self._terminal_code or "disconnect"))
         await self._cancel_session_lifecycle_timeout()
         generation_task = self.generation_task
         await super().cleanup()

@@ -246,6 +246,12 @@ async def prepare_persistent_state_service(
                     "runtime_tombstone_allowance": (runtime_config.runtime_tombstone_allowance),
                     "resolved_max_tombstones": runtime_config.max_tombstones,
                     "startup_priming_timeout_s": (runtime_config.startup_priming_timeout_s),
+                    "session_finalization_stall_timeout": getattr(
+                        runtime_config, "session_finalization_stall_timeout", 10.0
+                    ),
+                    "session_finalization_response_bound_s": getattr(
+                        runtime_config, "session_finalization_response_bound_s", 10.0
+                    ),
                 }
             )
             compile_kwargs["startup_priming_receipt"] = startup_receipt

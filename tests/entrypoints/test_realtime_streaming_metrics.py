@@ -1424,3 +1424,59 @@ async def test_keyless_generation_with_observer_disables_observation_loudly(
 
     assert any("correlation" in rec.message for rec in caplog.records)
     assert [c for c in observer.calls if c[0] in ("unit_parked", "unit_cleared", "session_finished")] == []
+
+
+# @spec PORT-SESS-016
+@pytest.mark.asyncio
+async def test_native_reads_model_progress_with_observer_disabled() -> None:
+    import numpy as np
+
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    authority = AcceptedAudioAuthority(
+        request_id="progress",
+        engine_epoch="e",
+        lease_generation=3,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    authority.accept(np.zeros(160, dtype=np.float32))
+    authority.dispatch_next()
+    output = _generation_output("", [])
+    output.outputs[0].finalization_progress = ("progress", 3, (0, 0, 1))
+    engine = _RealtimeGenerationEngine([output])
+    connection, events, _ = _connection(engine, observer=None)
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, eou_token_id=9003)
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="progress")
+    assert connection._session_lifecycle._high_water == (0, 0, 1)
+    assert all(type(event).__name__ != "TranscriptionDone" for event in events)
+
+
+# @spec PORT-SESS-018
+@pytest.mark.asyncio
+async def test_late_engine_error_cannot_replace_disconnect_winner() -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    authority = AcceptedAudioAuthority(
+        request_id="late",
+        engine_epoch="e",
+        lease_generation=3,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    authority.claim_terminal("disconnect", lease_generation=3)
+    output = _generation_output("", [])
+    output.outputs[0].finish_reason = "error"
+    connection, _, _ = _connection(_RealtimeGenerationEngine([output]), observer=None)
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, eou_token_id=9003)
+    errors = []
+
+    async def send_error(*args):
+        errors.append(args)
+
+    connection.send_error = send_error
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="late")
+    assert errors == []
+    assert authority.terminal_cause == "disconnect"

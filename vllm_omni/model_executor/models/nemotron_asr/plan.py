@@ -211,6 +211,10 @@ class _Session:
     geometry_id: int
     prompt_index: int
     pending_prompt_index: int | None = None
+    progress_unit: int = -1
+    progress_counter: int = 0
+    progress_key: tuple[int, int, int] = (-1, -1, -1)
+    progress_flushed: bool = False
 
 
 def reject_unsupported_outer_graph_mode(compilation_config: object) -> None:
@@ -270,6 +274,46 @@ class SessionRegistry:
         for req_id in [r for r in self._sessions if r not in keep]:
             session = self._sessions.pop(req_id)
             self._blocks.pop(session.block_id, None)
+
+    # @spec PORT-SESS-016
+    def publish_progress(
+        self,
+        request_id: str,
+        generation: int,
+        raw: tuple[int, int, int],
+        *,
+        starts_chunk: bool,
+    ) -> tuple[int, int, int] | None:
+        """Consume one status-clean transaction after registry lease validation.
+
+        The worker's consume-once commit sink is the authority for control
+        commits. Logical units include forced controls as well as CHUNKs;
+        frontend counters alone cannot identify those ticketless units.
+        """
+        session = self._sessions.get(request_id)
+        if session is None or session.generation != generation or session.progress_flushed:
+            return None
+        sequence, cursor, phase = raw
+        if starts_chunk:
+            if sequence <= session.progress_counter:
+                return None
+            session.progress_counter = sequence
+            session.progress_unit += 1
+        elif phase in (4, 5):
+            session.progress_unit += 1
+            phase -= 3
+            if phase == 1:
+                # Forced EOU commit alone is not a CHUNK, cursor advance,
+                # or legal park. Retain its unit identity without progress.
+                return None
+        elif phase == 3:
+            session.progress_unit += 1
+            session.progress_flushed = True
+        key = (session.progress_unit, cursor, phase)
+        if key <= session.progress_key:
+            return None
+        session.progress_key = key
+        return key
 
     def live_block_ids(self) -> list[int]:
         """The registry's allocated-block liveness authority, sorted."""

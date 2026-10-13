@@ -42,6 +42,7 @@ class OmniConnectorOutput:
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
     model_status: dict[str, int] = field(default_factory=dict)
+    finalization_progress: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     model_failed_req_ids: set[str] = field(default_factory=set)
 
 

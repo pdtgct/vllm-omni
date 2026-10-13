@@ -741,11 +741,19 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         )
 
         # Delegate text/pooling outputs to upstream.
+        progress = {
+            self.request_states[eco.request_id].external_req_id: getattr(eco, "finalization_progress", None)
+            for eco in engine_core_outputs
+            if eco.request_id in self.request_states
+        }
         upstream_processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
+        for result in upstream_processed.request_outputs:
+            for completion in getattr(result, "outputs", ()):
+                completion.finalization_progress = progress.get(result.request_id)
         return OutputProcessorOutput(
             request_outputs=mm_request_outputs + upstream_processed.request_outputs,
             reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,

@@ -231,6 +231,9 @@ class GPUARModelRunnerV2(GPUModelRunner):
             raise TypeError("model-runner output carries an invalid Omni result")
         if connector_output.model_status or connector_output.model_failed_req_ids:
             raise RuntimeError("model transaction status was attached twice")
+        consume_progress = getattr(self.model, "consume_committed_progress", None)
+        if callable(consume_progress):
+            connector_output.finalization_progress = consume_progress()
         connector_output.model_status = model_status
         connector_output.model_failed_req_ids = failed_req_ids
         model_runner_output.omni_connector_output = connector_output
