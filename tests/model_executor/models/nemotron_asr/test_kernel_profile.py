@@ -21,12 +21,12 @@ PACKET = "v030-requal-a100-encoder-fp16"
 CORE = ("gemm", "bmm", "layer_norm", "depthwise_conv1d", "strided_conv2d", "pointwise_conv")
 
 
-def _fingerprint(lane: bool = True) -> dict[str, Any]:
+def _fingerprint(lane: bool = True, *, compiled: bool = False, graph_replay: bool = False) -> dict[str, Any]:
     return {
         "precision_policy": "encoder-fp16-v1",
         "batch_invariant_mode": "on",
-        "optimization_selection": {"fp16_sdpa_lane": lane, "compile": True},
-        "software": {"torch": "2.9.0", "vllm": "0.29.0"},
+        "optimization_selection": {"fp16_sdpa_lane": lane, "compiled": compiled, "graph_replay": graph_replay},
+        "software": {"torch": "2.9.0", "cuda": "12.8", "cudnn": "9.10", "triton": "3.4.0"},
     }
 
 
@@ -38,6 +38,7 @@ def _capture(**overrides: Any) -> dict[str, Any]:
         "kernel_map_sha256": "sha256:" + DIGEST,
         "compiled": False,
         "graph_replay": False,
+        "batch_invariant_mode": "on",
         "startup_scope": False,
         "eager_fallback": False,
         "purpose": "qualification",
@@ -60,6 +61,8 @@ def _evidence(operator: str, *, kind: str = "dispatch", accumulator: str = "floa
     }
     if operator == "pointwise_conv":
         evidence["bias_before_cast"] = True
+    if kind == "pinned_backend":
+        evidence["pinned_build"] = {"torch": "2.9.0"}
     evidence.update(extra)
     return evidence
 
@@ -88,6 +91,12 @@ def _build(
     reduced_precision=None,
     declarations=None,
 ) -> dict[str, Any]:
+    capture = capture if capture is not None else _capture()
+    fingerprint = (
+        fingerprint
+        if fingerprint is not None
+        else _fingerprint(compiled=capture["compiled"], graph_replay=capture["graph_replay"])
+    )
     return kp.build_kernel_profile(
         execution_fingerprint=fingerprint if fingerprint is not None else _fingerprint(),
         capture=capture if capture is not None else _capture(),
@@ -107,7 +116,19 @@ def _build(
 def _qualified(profile, fingerprint=None, packet: str = PACKET):
     return kp.kernel_profile_qualified(
         profile,
-        verdict_fingerprint=fingerprint if fingerprint is not None else _fingerprint(),
+        verdict_fingerprint=fingerprint
+        if fingerprint is not None
+        else _fingerprint(compiled=profile["capture"]["compiled"], graph_replay=profile["capture"]["graph_replay"]),
+        qualification_packet=packet,
+    )
+
+
+def _prec021(profile, fingerprint=None, packet: str = PACKET):
+    return kp.prec021_evidence_complete(
+        profile,
+        verdict_fingerprint=fingerprint
+        if fingerprint is not None
+        else _fingerprint(compiled=profile["capture"]["compiled"], graph_replay=profile["capture"]["graph_replay"]),
         qualification_packet=packet,
     )
 
@@ -281,7 +302,7 @@ def test_fully_valid_profile_qualifies():
     profile = _build()
     assert all(profile["rows"][name]["resolved"] for name in (*CORE, "sdpa"))
     assert _qualified(profile) == (True, [])
-    assert kp.prec021_evidence_complete(profile) == (True, [])
+    assert _prec021(profile) == (True, [])
 
 
 def test_operand_dtype_only_claim_unresolved():
@@ -351,7 +372,7 @@ def test_compiled_capture_with_eager_startup_projection_qualifies():
     entry = profile["rows"]["positional_projection"]["evidence"][0]
     assert entry["execution"] == "eager" and entry["operator"] == "gemm"
     assert _qualified(profile) == (True, [])
-    assert kp.prec021_evidence_complete(profile) == (True, [])
+    assert _prec021(profile) == (True, [])
 
 
 def test_symbol_with_compiled_and_eager_entries_allowed():
@@ -367,7 +388,7 @@ def test_symbol_with_compiled_and_eager_entries_allowed():
     assert row["resolved"] and row["accumulator"] == "float32"
     assert kp.validate_kernel_profile(profile) == []
     assert _qualified(profile) == (True, [])
-    assert kp.prec021_evidence_complete(profile) == (True, [])
+    assert _prec021(profile) == (True, [])
 
 
 # -- qualification (PORT-PREC-032) -------------------------------------------
@@ -430,7 +451,7 @@ def test_float16_accumulator_prec014_qualified_but_not_prec021():
     profile = _build(observations)
     assert profile["rows"]["sdpa"]["resolved"] and profile["rows"]["sdpa"]["accumulator"] == "float16"
     assert _qualified(profile) == (True, [])
-    ok, reasons = kp.prec021_evidence_complete(profile)
+    ok, reasons = _prec021(profile)
     assert not ok and any("sdpa" in r for r in reasons)
 
 
@@ -438,7 +459,7 @@ def test_prec021_positional_projection_checked_as_gemm():
     observations = [*_valid_observations(), _obs("positional_projection", kind="pinned_backend")]
     profile = _build(observations, capture=_capture(startup_scope=True))
     assert profile["rows"]["positional_projection"]["evidence"][0]["operator"] == "gemm"
-    assert kp.prec021_evidence_complete(profile) == (True, [])
+    assert _prec021(profile) == (True, [])
 
 
 def test_prec021_pointwise_requires_bias_before_cast():
@@ -446,14 +467,14 @@ def test_prec021_pointwise_requires_bias_before_cast():
     observations[CORE.index("pointwise_conv")] = _obs("pointwise_conv", bias_before_cast=False)
     profile = _build(observations)
     assert profile["rows"]["pointwise_conv"]["resolved"]
-    ok, reasons = kp.prec021_evidence_complete(profile)
+    ok, reasons = _prec021(profile)
     assert not ok and any("pointwise_conv" in r for r in reasons)
 
 
 def test_prec021_requires_resolved_rows():
     observations = _valid_observations()
     observations[1] = kp.KernelObservation("bmm", "bmm_kernel", None)
-    ok, reasons = kp.prec021_evidence_complete(_build(observations))
+    ok, reasons = _prec021(_build(observations))
     assert not ok and any("bmm" in r for r in reasons)
 
 
@@ -494,3 +515,118 @@ def test_cpu_smoke_zero_observations():
     assert not ok
     assert any("purpose" in r for r in reasons)
     assert any("executed" in r and "expected" in r for r in reasons)
+
+
+@pytest.mark.parametrize("symbols", [[], ["unknown_kernel"]])
+def test_generator_inputs_equal_lists(symbols):
+    """@spec PORT-PREC-030: single-pass inputs preserve all observations."""
+    observations = _valid_observations()
+    profile = _build((o for o in observations), unattributed=(s for s in symbols))
+    assert profile == _build(observations, unattributed=symbols)
+    assert _qualified(profile)[0] is (not symbols)
+
+
+@pytest.mark.parametrize("component", ["torch", "cuda", "cudnn", "triton"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_verdict_software_must_match_profile(component, missing):
+    """@spec PORT-PREC-031, PORT-PREC-032: digest alone cannot bind the build."""
+    fingerprint = _fingerprint()
+    if missing:
+        del fingerprint["software"]
+    else:
+        fingerprint["software"][component] = "another-build"
+    profile = _build(fingerprint=fingerprint)
+    ok, reasons = _qualified(profile, fingerprint)
+    assert not ok and any("software" in r for r in reasons)
+
+
+@pytest.mark.parametrize(
+    "pin", [None, {}, {"torch": "2.9."}, {"torch": "2.9.0+cu128"}, {"torch": "2.9.0", "unknown_component": "x"}]
+)
+def test_pinned_backend_requires_exact_build(pin):
+    """@spec PORT-PREC-031: every pin component must exist and match."""
+    observations = _valid_observations()
+    observations[0] = _obs("gemm", kind="pinned_backend", pinned_build=pin)
+    profile = _build(observations)
+    ok, reasons = _qualified(profile)
+    assert not ok and any("pinned_build" in r for r in reasons)
+
+
+def test_pinned_backend_preserves_matching_build():
+    """@spec PORT-PREC-031: backend evidence records its exact pin."""
+    observations = _valid_observations()
+    observations[0] = _obs("gemm", kind="pinned_backend")
+    profile = _build(observations)
+    assert profile["rows"]["gemm"]["evidence"][0]["pinned_build"] == {"torch": "2.9.0"}
+    assert _qualified(profile) == (True, [])
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("device", "name"),
+        ("device", "compute_capability"),
+        *(("software", k) for k in ("torch", "cuda", "cudnn", "triton")),
+    ],
+)
+def test_required_identity_keys(section, key):
+    """@spec PORT-PREC-030: identity mappings must carry the required keys."""
+    profile = _build()
+    del profile[section][key]
+    assert any(f"{section}.{key}" in r for r in kp.validate_kernel_profile(profile))
+
+
+@pytest.mark.parametrize("key", ["compiled", "graph_replay", "batch_invariant_mode"])
+def test_capture_configuration_must_match_verdict(key):
+    """@spec PORT-PREC-025, PORT-PREC-032: a matching digest is insufficient."""
+    fingerprint = _fingerprint()
+    overrides = {key: "off" if key == "batch_invariant_mode" else True}
+    profile = _build(fingerprint=fingerprint, capture=_capture(**overrides))
+    ok, reasons = _qualified(profile, fingerprint)
+    assert not ok and any(key in r for r in reasons)
+
+
+@pytest.mark.parametrize("key", ["compiled", "graph_replay"])
+def test_missing_verdict_configuration_is_unqualified(key):
+    """@spec PORT-PREC-032: qualification requires an explicit selection."""
+    fingerprint = _fingerprint()
+    del fingerprint["optimization_selection"][key]
+    ok, reasons = _qualified(_build(fingerprint=fingerprint), fingerprint)
+    assert not ok and any(key in r for r in reasons)
+
+
+def test_missing_capture_mode_is_unqualified():
+    """@spec PORT-PREC-025: capture must record the mode actually run."""
+    profile = _build()
+    del profile["capture"]["batch_invariant_mode"]
+    ok, reasons = _qualified(profile)
+    assert not ok and any("batch_invariant_mode" in r for r in reasons)
+
+
+def test_mode_off_profile_rejected_for_mode_on_verdict():
+    """@spec PORT-PREC-025: no mode-off artifact reuse for mode-on."""
+    fingerprint = _fingerprint()
+    del fingerprint["batch_invariant_mode"]
+    profile = _build(fingerprint=fingerprint, capture=_capture(batch_invariant_mode="off"))
+    assert _qualified(profile, fingerprint) == (True, [])
+    assert not _qualified(profile, _fingerprint())[0]
+    # Even relabelling the digest cannot turn a mode-off capture into mode-on.
+    profile["fingerprint_digest"] = kp.execution_fingerprint_digest(_fingerprint())
+    ok, reasons = _qualified(profile, _fingerprint())
+    assert not ok and any("batch_invariant_mode" in r for r in reasons)
+
+
+@pytest.mark.parametrize("empty", [True, False])
+def test_prec021_requires_qualified_profile(empty):
+    """@spec PORT-PREC-021, PORT-PREC-032: no vacuous FP32 evidence pass."""
+    profile = _build([]) if empty else _build(unattributed=["mystery"])
+    ok, reasons = _prec021(profile)
+    assert not ok and any("expected" in r or "unattributed" in r for r in reasons)
+
+
+def test_malformed_backend_evidence_is_unqualified():
+    """@spec PORT-PREC-031, PORT-PREC-032: malformed evidence fails closed."""
+    profile = _build()
+    profile["rows"]["gemm"]["evidence"] = None
+    ok, reasons = _qualified(profile)
+    assert not ok and any("evidence" in r for r in reasons)
