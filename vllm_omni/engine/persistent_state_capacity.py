@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from math import floor, gcd
 from types import MappingProxyType
@@ -316,6 +316,13 @@ class ServiceProfileReceipt:
     fragmentation_table_sha256: str
     homogeneous_capacity_by_interval: Mapping[int, int]
     admission_policy: AdmissionPolicy
+    advisory: bool
+    measured_capacity: int
+    aligned_frontier_by_interval: Mapping[int, int]
+    fragmentation_frontier_by_interval: Mapping[int, int]
+    upper_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
+    fragmentation_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
+    observations: tuple[ServiceRoundExecution, ...]
     startup_priming: Mapping[str, object] | None = None
 
 
@@ -347,14 +354,14 @@ class StartupServiceProfile:
 
 @dataclass(frozen=True)
 class HardCapAuthority:
-    """Static, profile-free authority for bring-up and characterization."""
+    """Static hard limits and optional advisory identity for characterization."""
 
     served_intervals_ms: tuple[int, ...]
     effective_state_slots: int
     configured_resident_limit: int
     max_num_seqs: int
     model_profile_id: str
-    service_profile_identity: None
+    service_profile_identity: str | None
     execution_environment_key: str
     precision_policy: str
     hard_cap_envelope_sha256: str = ""
@@ -791,8 +798,6 @@ def compile_provisional_service_profile(
     """Compile complete post-JIT legal-park rounds into startup authority."""
     if admission_policy not in {"profile", "hard_cap"}:
         raise ValueError("unknown persistent-state admission policy")
-    if admission_policy == "hard_cap":
-        raise ValueError("hard_cap is profile-free and cannot invoke the service-profile compiler")
     if max_population <= 0 or trailing_rounds <= 0:
         raise ValueError("population and trailing-round counts must be positive")
     if derating_factor <= 0:
@@ -1113,8 +1118,10 @@ def compile_provisional_service_profile(
     # periodic authority may correctly report a zero homogeneous frontier;
     # keep the retired scalar denominator defined without turning it into a
     # serving gate.
-    provisional = max(1, homogeneous_capacity[reference_interval_ms])
-    reference_demand = Fraction(1, provisional)
+    if admission_policy == "profile" and any(value == 0 for value in homogeneous_capacity.values()):
+        raise ValueError("zero homogeneous frontier cannot support a served geometry under profile")
+    provisional = homogeneous_capacity[reference_interval_ms]
+    reference_demand = Fraction(1, max(1, provisional))
     demand_model = OnePointServiceDemand(reference_interval_ms, reference_demand)
     demand_source = tuple(
         (
@@ -1151,6 +1158,11 @@ def compile_provisional_service_profile(
         "homogeneous_capacity_by_interval": homogeneous_capacity,
         "evidence_class": evidence_class,
         "admission_policy": admission_policy,
+        "advisory": admission_policy == "hard_cap",
+        "measured_capacity": measured_capacity,
+        "aligned_frontier_by_interval": aligned_frontier,
+        "fragmentation_frontier_by_interval": fragmentation_frontier,
+        "observations": [asdict(sample) for sample in samples],
         "mixed_composition_policy": context.mixed_composition_policy,
         "scale": compiled.scale,
         "demand_units": compiled.demand_units,
@@ -1201,6 +1213,13 @@ def compile_provisional_service_profile(
         homogeneous_capacity_by_interval=MappingProxyType(dict(homogeneous_capacity)),
         startup_priming=(None if startup_priming_receipt is None else MappingProxyType(dict(startup_priming_receipt))),
         admission_policy=admission_policy,
+        advisory=admission_policy == "hard_cap",
+        measured_capacity=measured_capacity,
+        aligned_frontier_by_interval=MappingProxyType(dict(aligned_frontier)),
+        fragmentation_frontier_by_interval=MappingProxyType(dict(fragmentation_frontier)),
+        upper_duration_ns_by_geometry_and_population=MappingProxyType(dict(expanded)),
+        fragmentation_duration_ns_by_geometry_and_population=MappingProxyType(dict(fragmentation)),
+        observations=samples,
     )
     return StartupServiceProfile(
         upper_duration_ns_by_geometry_and_population=expanded,
@@ -1228,6 +1247,73 @@ def compile_provisional_service_profile(
         qualified=False,
         qualified_support_by_interval=MappingProxyType({interval: False for interval in geometry_intervals.values()}),
     )
+
+
+# @spec PORT-PERF-006 / PORT-STATE-026
+def conservative_service_lower_bound(
+    profile: StartupServiceProfile,
+    *,
+    service_interval_ms: int,
+) -> Fraction | None:
+    """Audio seconds per wall second at maximum admitted population.
+
+    Sum the derated fragmentation uppers for every competing geometry at
+    its maximum permitted population. This deliberately overbounds mixed
+    histograms (their simultaneous maxima need not be admissible), and
+    never divides aggregate throughput by the current resident count.
+    Regulated releases cap the rate at one audio second per wall second.
+    Explicit control envelopes contribute their largest compiled charge.
+
+    Profile maxima use predicate-derived frontiers and the physical/count/
+    execution/search limits. Hard-cap maxima use physical/count/execution
+    limits; no value is inferred outside measured search coverage. A probe
+    yields only a provisional estimate, not a qualified service guarantee
+    or a starvation bound when hard-cap schedulability fails. The caller
+    must retain the receipt's evidence class and advisory policy.
+    """
+    receipt = profile.receipt
+    if service_interval_ms not in profile.service_interval_ms_by_geometry.values():
+        return None
+    population = min(
+        receipt.allocated_pool,
+        receipt.execution_claim_ceiling,
+        receipt.count_cap if receipt.count_cap is not None else receipt.allocated_pool,
+    )
+    if population <= 0:
+        return None
+    if receipt.admission_policy == "hard_cap":
+        if population > receipt.maximum_charged_population:
+            return None
+    else:
+        population = min(population, receipt.maximum_charged_population)
+        if profile.homogeneous_capacity_by_interval[service_interval_ms] <= 0:
+            return None
+    work_ns = 0
+    for geometry, interval in profile.service_interval_ms_by_geometry.items():
+        maximum = (
+            population
+            if receipt.admission_policy == "hard_cap"
+            else min(population, profile.homogeneous_capacity_by_interval[interval])
+        )
+        if maximum == 0:
+            continue
+        table = profile.fragmentation_duration_ns_by_geometry_and_population[geometry]
+        if maximum > len(table):
+            return None
+        work_ns += table[maximum - 1]
+    if profile.control_upper_ns_by_window_and_population is not None:
+        for table in profile.control_upper_ns_by_window_and_population.values():
+            if population > len(table):
+                return None
+        work_ns += max(
+            (table[population - 1] for table in profile.control_upper_ns_by_window_and_population.values()),
+            default=0,
+        )
+    if work_ns <= 0 or profile.derating_factor <= 0:
+        return None
+    round_ns = Fraction(work_ns) / profile.derating_factor
+    cadence_ns = service_interval_ms * 1_000_000
+    return Fraction(cadence_ns) / max(Fraction(cadence_ns), round_ns)
 
 
 # @spec PORT-STATE-026, PORT-PERF-008
@@ -1284,8 +1370,8 @@ def project_fixed_dispatch_capacity(
     """
 
     if startup_authority is not None:
-        if profile is not None or inventory is not None:
-            raise ValueError("hard-cap and profile projection inputs cannot mix")
+        if profile is None and inventory is not None:
+            raise ValueError("hard-cap inventory requires an advisory profile")
         values = (
             state_resident,
             state_submitted,
@@ -1308,6 +1394,29 @@ def project_fixed_dispatch_capacity(
                 startup_authority.max_num_seqs - execution_used,
             ),
         )
+        if profile is not None:
+            hard = min(hard, max(0, profile.receipt.maximum_charged_population - max(state_used, execution_used)))
+            diagnostic = project_fixed_dispatch_capacity(
+                profile=profile,
+                inventory=inventory,
+                resident_counts_by_interval=resident_counts_by_interval,
+                submitted_counts_by_interval=submitted_counts_by_interval,
+                authority_open=authority_open,
+                admission_policy="hard_cap",
+            )
+            assert isinstance(diagnostic, FixedDispatchCapacity)
+            visible = hard if authority_open else 0
+            return replace(
+                diagnostic,
+                hard_headroom=visible,
+                nominal_dispatchable_by_interval={
+                    interval: min(value, visible)
+                    for interval, value in diagnostic.nominal_dispatchable_by_interval.items()
+                },
+                dispatchable_by_interval=dict.fromkeys(startup_authority.served_intervals_ms, visible),
+                execution_claims=execution_used,
+                max_num_seqs=startup_authority.max_num_seqs,
+            )
         visible = hard if authority_open else 0
         return HardCapDispatchCapacity(
             hard_headroom=visible,
@@ -1328,7 +1437,7 @@ def project_fixed_dispatch_capacity(
         raise ValueError("profile projection requires profile and inventory")
     if resident_counts_by_interval is None or submitted_counts_by_interval is None:
         raise ValueError("profile projection requires cadence counters")
-    if admission_policy != "profile":
+    if admission_policy not in {"profile", "hard_cap"}:
         raise ValueError("unknown persistent-state admission policy")
     intervals = profile.compiled_demand.intervals_ms
     if (
@@ -1406,7 +1515,7 @@ def project_fixed_dispatch_capacity(
             profile=profile,
             population_by_interval=candidate,
         ).schedulable
-        supported[interval] = candidate_supported
+        supported[interval] = candidate_supported or admission_policy == "hard_cap"
         nominal_dispatchable[interval] = (
             periodic_admission_headroom(
                 profile=profile,
@@ -1417,7 +1526,11 @@ def project_fixed_dispatch_capacity(
             if authority_open and candidate_supported
             else 0
         )
-    dispatchable = nominal_dispatchable
+    dispatchable = (
+        dict.fromkeys(intervals, hard if authority_open else 0)
+        if admission_policy == "hard_cap"
+        else nominal_dispatchable
+    )
     return FixedDispatchCapacity(
         hard_headroom=hard if authority_open else 0,
         candidate_supported_by_interval=supported,

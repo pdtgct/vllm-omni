@@ -288,7 +288,11 @@ def _geometry_rounds(
             _service_round(
                 tier_id="single",
                 active_population=1,
-                elapsed_ns=single_elapsed_ns,
+                # Keep each short served cadence startup-feasible; the
+                # reference geometry retains the exact arithmetic fixture.
+                elapsed_ns=(
+                    single_elapsed_ns if geometry_id == 4 else min(single_elapsed_ns, service_interval_ms * 250_000)
+                ),
                 service_interval_ms=service_interval_ms,
                 geometry_id=geometry_id,
                 completed_model_rows=single_model_rows,

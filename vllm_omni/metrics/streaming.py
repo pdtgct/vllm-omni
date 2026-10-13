@@ -128,6 +128,11 @@ _persistent_state_slots_family = Gauge(
     "Manager-sourced persistent-state resident inventory and capacity limits.",
     labelnames=_persistent_state_slot_labels,
 )
+_persistent_state_profile_advisory_family = Gauge(
+    defs.PERSISTENT_STATE_PROFILE_ADVISORY,
+    "Whether measured service demand and nominal headroom are advisory.",
+    labelnames=["model_name", "stage", "replica"],
+)
 _persistent_state_service_demand_family = Gauge(
     defs.PERSISTENT_STATE_SERVICE_DEMAND_RATIO,
     "Normalized persistent-state service budget and charged demand.",
@@ -274,7 +279,13 @@ class OmniStreamingMetrics:
             return
         if admission_policy not in {"profile", "hard_cap"}:
             return
-        if admission_policy == "profile":
+        has_profile = service_source is not None and service_budget is not None and charged_demand is not None
+        if has_profile:
+            _persistent_state_profile_advisory_family.labels(
+                model_name=self._model_name,
+                stage=stage,
+                replica=replica,
+            ).set(int(admission_policy == "hard_cap"))
             if (
                 service_source not in defs.PERSISTENT_STATE_SERVICE_DEMAND_SOURCES
                 or service_budget is None
@@ -305,9 +316,7 @@ class OmniStreamingMetrics:
         for cadence_ms, headroom in headroom_by_cadence.items():
             if cadence_ms not in defs.STREAMING_CADENCE_MS_VALUES:
                 continue
-            expected_kinds = (
-                set(defs.PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS) if admission_policy == "profile" else {"hard"}
-            )
+            expected_kinds = set(defs.PERSISTENT_STATE_ADMISSION_HEADROOM_KINDS) if has_profile else {"hard"}
             if set(headroom) != expected_kinds:
                 continue
             for kind, value in headroom.items():

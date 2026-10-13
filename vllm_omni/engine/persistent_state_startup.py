@@ -55,6 +55,7 @@ def derive_hard_cap_authority(
     max_num_seqs: int,
     safety_reserve: int,
     controller_identity: str,
+    service_profile_identity: str | None = None,
 ) -> HardCapAuthority:
     """Derive one immutable hard-cap seal; dynamic occupancy is not input."""
 
@@ -62,6 +63,7 @@ def derive_hard_cap_authority(
     effective_state_slots = effective_capacity
     static = {
         "controller_identity": controller_identity,
+        "service_profile_identity": service_profile_identity,
         "configured_resident_limit": configured_resident_limit,
         "effective_state_slots": effective_state_slots,
         "execution_environment_key": execution_environment_key,
@@ -83,7 +85,7 @@ def derive_hard_cap_authority(
         configured_resident_limit=configured_resident_limit,
         max_num_seqs=max_num_seqs,
         model_profile_id=model_profile_id,
-        service_profile_identity=None,
+        service_profile_identity=service_profile_identity,
         execution_environment_key=execution_environment_key,
         precision_policy=precision_policy,
         hard_cap_envelope_sha256=digest,
@@ -200,59 +202,6 @@ async def prepare_persistent_state_service(
         missing_inventory = sorted(_REQUIRED_STARTUP_INVENTORY - inventory.keys())
         if missing_inventory:
             raise RuntimeError("persistent-state startup inventory is incomplete: " + ", ".join(missing_inventory))
-        if runtime_config.admission_policy == "hard_cap":
-            intervals = tuple(startup_provider.served_intervals_ms(model_config=engine_client.model_config))
-            service.configure_bootstrap_intervals(intervals)
-            provisional_config = derive_admission_controller_config(
-                runtime_config,
-                supported_intervals_ms=intervals,
-            )
-            authority = derive_hard_cap_authority(
-                served_intervals_ms=intervals,
-                model_profile_id=str(inventory["profile_id"]),
-                execution_environment_key=str(inventory["execution_environment_key"]),
-                precision_policy=str(inventory["precision_policy"]),
-                schema_id=str(inventory["schema_id"]),
-                slot_bytes=int(inventory["slot_bytes"]),
-                stage=int(inventory.get("stage", 0)),
-                replica=int(inventory.get("replica", 0)),
-                physical_capacity=int(inventory["physical_capacity"]),
-                configured_limit=int(inventory["configured_limit"]),
-                effective_capacity=int(inventory["effective_capacity"]),
-                max_num_seqs=int(inventory["execution_claim_ceiling"]),
-                safety_reserve=int(inventory.get("safety_reserve", 0)),
-                controller_identity=repr(provisional_config),
-            )
-            admission_config = derive_admission_controller_config(
-                runtime_config,
-                supported_intervals_ms=intervals,
-                hard_cap_capacity=min(
-                    authority.effective_state_slots,
-                    authority.configured_resident_limit,
-                    authority.max_num_seqs,
-                ),
-            )
-            authority = derive_hard_cap_authority(
-                served_intervals_ms=intervals,
-                model_profile_id=str(inventory["profile_id"]),
-                execution_environment_key=str(inventory["execution_environment_key"]),
-                precision_policy=str(inventory["precision_policy"]),
-                schema_id=str(inventory["schema_id"]),
-                slot_bytes=int(inventory["slot_bytes"]),
-                stage=int(inventory.get("stage", 0)),
-                replica=int(inventory.get("replica", 0)),
-                physical_capacity=int(inventory["physical_capacity"]),
-                configured_limit=int(inventory["configured_limit"]),
-                effective_capacity=int(inventory["effective_capacity"]),
-                max_num_seqs=int(inventory["execution_claim_ceiling"]),
-                safety_reserve=int(inventory.get("safety_reserve", 0)),
-                controller_identity=repr(admission_config),
-            )
-            service.seal_startup_authority(
-                admission_config=admission_config,
-                authority=authority,
-            )
-            return service
         plan = startup_provider.build_priming_plan(
             runtime_config=runtime_config,
             inventory=inventory,
@@ -307,6 +256,41 @@ async def prepare_persistent_state_service(
             _service_executions(observations),
             **compile_kwargs,
         )
+        if runtime_config.admission_policy == "hard_cap":
+            intervals = compiled.compiled_demand.intervals_ms
+            admission_config = derive_admission_controller_config(
+                runtime_config,
+                supported_intervals_ms=intervals,
+                hard_cap_capacity=min(
+                    int(inventory["effective_capacity"]),
+                    int(inventory["configured_limit"]),
+                    int(inventory["execution_claim_ceiling"]),
+                    int(plan.compile_kwargs.get("max_population", inventory["effective_capacity"])),
+                ),
+            )
+            authority = derive_hard_cap_authority(
+                served_intervals_ms=intervals,
+                model_profile_id=str(inventory["profile_id"]),
+                execution_environment_key=str(inventory["execution_environment_key"]),
+                precision_policy=str(inventory["precision_policy"]),
+                schema_id=str(inventory["schema_id"]),
+                slot_bytes=int(inventory["slot_bytes"]),
+                stage=int(inventory.get("stage", 0)),
+                replica=int(inventory.get("replica", 0)),
+                physical_capacity=int(inventory["physical_capacity"]),
+                configured_limit=int(inventory["configured_limit"]),
+                effective_capacity=int(inventory["effective_capacity"]),
+                max_num_seqs=int(inventory["execution_claim_ceiling"]),
+                safety_reserve=int(inventory.get("safety_reserve", 0)),
+                controller_identity=repr(admission_config),
+                service_profile_identity=compiled.receipt.receipt_sha256,
+            )
+            service.seal_startup_authority(
+                admission_config=admission_config,
+                authority=authority,
+                compiled_service_profile=compiled,
+            )
+            return service
         admission_config = derive_admission_controller_config(
             runtime_config,
             supported_intervals_ms=compiled.compiled_demand.intervals_ms,
