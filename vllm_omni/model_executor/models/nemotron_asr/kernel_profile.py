@@ -354,6 +354,14 @@ def _declarations_present(declarations: Any) -> bool:
     )
 
 
+def _valid_pin(pin: Any) -> bool:
+    return (
+        isinstance(pin, Mapping)
+        and bool(pin)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in pin.items())
+    )
+
+
 def _validate_row(name: str, row: Any, capture: Mapping[str, Any], reduced: Mapping[str, Any]) -> list[str]:
     if not isinstance(row, Mapping) or set(row) != _ROW_KEYS:
         return [f"rows.{name}: fields must be {sorted(_ROW_KEYS)}"]
@@ -373,7 +381,14 @@ def _validate_row(name: str, row: Any, capture: Mapping[str, Any], reduced: Mapp
     for entry in evidence:
         allowed_keys = entry_keys | ({"pinned_build"} if "pinned_build" in entry else set())
         if set(entry) != allowed_keys:
-            errors.append(f"rows.{name}: evidence entry fields must be {sorted(entry_keys)}")
+            errors.append(
+                f"rows.{name}: evidence entry fields must be {sorted(entry_keys)} "
+                "(plus 'pinned_build' only on kind 'pinned_backend' evidence)"
+            )
+        elif "pinned_build" in entry and entry["kind"] != "pinned_backend":
+            errors.append(f"rows.{name}: pinned_build is allowed only on 'pinned_backend' evidence")
+        elif "pinned_build" in entry and not _valid_pin(entry["pinned_build"]):
+            errors.append(f"rows.{name}: pinned_build must be a non-empty mapping of str to str")
         elif entry["operator"] != _contract_operator(name):
             errors.append(f"rows.{name}: evidence operator must be {_contract_operator(name)!r}")
         elif entry["execution"] not in _KINDS:
@@ -488,6 +503,11 @@ def kernel_profile_qualified(
     if not isinstance(verdict_software, Mapping) or not verdict_software:
         reasons.append("verdict fingerprint software is missing or empty")
     else:
+        reasons += [
+            f"verdict fingerprint software is missing {component!r}"
+            for component in ("torch", "cuda", "cudnn", "triton")
+            if component not in verdict_software
+        ]
         for component, version in verdict_software.items():
             if component not in software or software[component] != version:
                 reasons.append(f"software.{component} does not match the verdict fingerprint")
