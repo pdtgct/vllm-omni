@@ -227,6 +227,8 @@ def _entry(observation: KernelObservation, evidence: Mapping[str, Any]) -> dict[
         "symbol": observation.symbol,
         "source_sha256": evidence.get("source_sha256"),
     }
+    if "pinned_build" in evidence:
+        entry["pinned_build"] = evidence["pinned_build"]
     if observation.operator == "pointwise_conv":
         entry["bias_before_cast"] = evidence.get("bias_before_cast")
     return entry
@@ -249,6 +251,8 @@ def build_kernel_profile(
     a record that does not validate. Output is deterministic in observation
     and unattributed order.
     """
+    observations = tuple(observations)
+    unattributed = tuple(unattributed)
     digest = execution_fingerprint_digest(execution_fingerprint)
     capture_plain = _plain(capture, "capture")
     reduced_plain = _plain(reduced_precision, "reduced_precision")
@@ -329,6 +333,8 @@ def _validate_capture(capture: Any) -> list[str]:
     errors += [f"capture.{key} must be a bool" for key in _CAPTURE_BOOLS if not isinstance(capture.get(key), bool)]
     if not isinstance(capture.get("sdpa_backends"), Mapping):
         errors.append("capture.sdpa_backends must be a mapping")
+    if capture.get("batch_invariant_mode") not in ("on", "off"):
+        errors.append("capture.batch_invariant_mode must be 'on' or 'off'")
     purpose = capture.get("purpose")
     packet = capture.get("qualification_packet")
     if purpose == "qualification":
@@ -365,7 +371,8 @@ def _validate_row(name: str, row: Any, capture: Mapping[str, Any], reduced: Mapp
         return [*errors, f"rows.{name}: evidence must be a list of entries"]
     entry_keys = _ENTRY_KEYS | ({"bias_before_cast"} if name == "pointwise_conv" else set())
     for entry in evidence:
-        if set(entry) != entry_keys:
+        allowed_keys = entry_keys | ({"pinned_build"} if "pinned_build" in entry else set())
+        if set(entry) != allowed_keys:
             errors.append(f"rows.{name}: evidence entry fields must be {sorted(entry_keys)}")
         elif entry["operator"] != _contract_operator(name):
             errors.append(f"rows.{name}: evidence operator must be {_contract_operator(name)!r}")
@@ -408,6 +415,13 @@ def validate_kernel_profile(profile: Mapping[str, Any]) -> list[str]:
     for key in ("device", "software", "reduced_precision"):
         if not isinstance(profile.get(key), Mapping):
             errors.append(f"{key} must be a mapping")
+    for section, required in (
+        ("device", ("name", "compute_capability")),
+        ("software", ("torch", "cuda", "cudnn", "triton")),
+    ):
+        identity = profile.get(section)
+        if isinstance(identity, Mapping):
+            errors += [f"{section}.{key} is missing" for key in required if key not in identity]
     if not _declarations_present(profile.get("declarations")):
         errors.append(f"declarations must name {list(_DECLARATIONS)}")
     rows = profile.get("rows")
@@ -446,7 +460,7 @@ def _executed_rows(profile: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 def kernel_profile_qualified(
     profile: Mapping[str, Any], *, verdict_fingerprint: Mapping[str, Any], qualification_packet: str
 ) -> tuple[bool, list[str]]:
-    """@spec PORT-PREC-014, PORT-PREC-032: qualified only when every condition holds.
+    """@spec PORT-PREC-014, PORT-PREC-025, PORT-PREC-032: every condition must hold.
 
     Collects every failing reason. A resolved float16 accumulator is a
     declaration here, not a failure; PORT-PREC-021 is a separate adapter.
@@ -468,6 +482,34 @@ def kernel_profile_qualified(
         reasons.append(f"verdict fingerprint digest unavailable: {error}")
     executed = _executed_rows(profile)
     selection = verdict_fingerprint.get("optimization_selection")
+    software = profile.get("software")
+    software = software if isinstance(software, Mapping) else {}
+    verdict_software = verdict_fingerprint.get("software")
+    if not isinstance(verdict_software, Mapping) or not verdict_software:
+        reasons.append("verdict fingerprint software is missing or empty")
+    else:
+        for component, version in verdict_software.items():
+            if component not in software or software[component] != version:
+                reasons.append(f"software.{component} does not match the verdict fingerprint")
+    for name, row in executed.items():
+        evidence = row.get("evidence")
+        for entry in evidence if isinstance(evidence, list) else ():
+            if not isinstance(entry, Mapping) or entry.get("kind") != "pinned_backend":
+                continue
+            pin = entry.get("pinned_build")
+            if not isinstance(pin, Mapping) or not pin:
+                reasons.append(f"{name}: pinned_build is missing or empty")
+            elif any(component not in software or software[component] != version for component, version in pin.items()):
+                reasons.append(f"{name}: pinned_build does not match profile software")
+    for key in ("compiled", "graph_replay"):
+        selected = selection.get(key) if isinstance(selection, Mapping) else None
+        if not isinstance(selected, bool):
+            reasons.append(f"verdict fingerprint optimization_selection.{key} is missing or not a bool")
+        elif capture.get(key) is not selected:
+            reasons.append(f"capture.{key} does not match the verdict fingerprint")
+    mode = verdict_fingerprint.get("batch_invariant_mode", "off")
+    if mode not in ("on", "off") or capture.get("batch_invariant_mode") != mode:
+        reasons.append("capture.batch_invariant_mode does not match the verdict fingerprint")
     lane = selection.get("fp16_sdpa_lane") if isinstance(selection, Mapping) else None
     if not isinstance(lane, bool):
         reasons.append("verdict fingerprint optimization_selection.fp16_sdpa_lane is missing")
@@ -494,13 +536,19 @@ def profile_identity(profile: Mapping[str, Any]) -> tuple[str, str]:
     return profile["fingerprint_digest"], manifest_hash(profile)
 
 
-def prec021_evidence_complete(profile: Mapping[str, Any]) -> tuple[bool, list[str]]:
+def prec021_evidence_complete(
+    profile: Mapping[str, Any], *, verdict_fingerprint: Mapping[str, Any], qualification_packet: str
+) -> tuple[bool, list[str]]:
     """@spec PORT-PREC-021: float32 accumulation evidence for every executed row.
 
     ``positional_projection`` is checked as ``gemm``; its entries carry the
     contract operator name.
     """
-    reasons = [f"not well-formed: {error}" for error in validate_kernel_profile(profile)]
+    qualified, reasons = kernel_profile_qualified(
+        profile, verdict_fingerprint=verdict_fingerprint, qualification_packet=qualification_packet
+    )
+    if not qualified:
+        return False, reasons
     for name, row in sorted(_executed_rows(profile).items()):
         if not row.get("resolved"):
             reasons.append(f"{name}: executed row unresolved")
