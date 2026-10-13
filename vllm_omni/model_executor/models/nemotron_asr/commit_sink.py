@@ -43,6 +43,8 @@ class SessionStatusReport:
     request_id: str
     admission_generation: int
     row_status: int
+    progress_key: tuple[int, int, int] | None = None
+    starts_chunk: bool = False
 
 
 def resolve_status_reports(
@@ -130,6 +132,7 @@ class BoundedCommitSink:
         self._cuda = device is not None and device.type == "cuda"
         # Preallocated once: staging never allocates (no-fail stage).
         self._status_host = torch.zeros(max_rows, dtype=torch.int32, pin_memory=self._cuda)
+        self._progress_host = torch.zeros((max_rows, 3), dtype=torch.int64, pin_memory=self._cuda)
         self._event: torch.cuda.Event | None = torch.cuda.Event() if self._cuda else None
         self._reserved: CommitPlan | None = None
         self._staged: CommitPlan | None = None
@@ -191,6 +194,8 @@ class BoundedCommitSink:
             )
             if plan.capture.payload_bytes != actual_payload_bytes:
                 raise ValueError("capture plan payload bytes do not match its frozen records")
+        if plan.progress is not None and (plan.progress.shape != (rows, 3) or plan.progress.dtype != torch.int64):
+            raise ValueError("commit progress must have three int64 columns per row")
         # Pin the lease: every binding must be CURRENT in the registry.
         self._registry.validate_lease(plan.bindings)
         self._reserved = plan
@@ -203,6 +208,8 @@ class BoundedCommitSink:
     ) -> None:
         rows = len(plan.bindings)
         self._status_host[:rows].copy_(row_status, non_blocking=True)
+        if plan.progress is not None:
+            self._progress_host[:rows].copy_(plan.progress, non_blocking=True)
         if self._event is not None:
             self._event.record()
         # Stage-time lease REVALIDATION is a recorded fact, never a
@@ -240,11 +247,18 @@ class BoundedCommitSink:
             self._event.synchronize()
         rows = len(plan.bindings)
         status = self._status_host[:rows].tolist()
+        progress = self._progress_host[:rows].tolist() if plan.progress is not None else None
         reports = [
             SessionStatusReport(
                 request_id=binding.request_id,
                 admission_generation=binding.admission_generation,
                 row_status=int(status[i]),
+                starts_chunk=binding.is_chunk,
+                progress_key=(
+                    (int(progress[i][0]), int(progress[i][1]), int(progress[i][2]))
+                    if progress is not None and status[i] == 0 and self._staged_lease_ok and progress[i][2] > 0
+                    else None
+                ),
             )
             for i, binding in enumerate(plan.bindings)
         ]

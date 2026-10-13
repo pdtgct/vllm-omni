@@ -502,7 +502,7 @@ STREAMING_CADENCE_MS_VALUES = ("80", "160", "320", "560", "1120")
 STREAMING_CHUNK_TYPES = ("regular", "final_tail")
 STREAMING_CHUNK_OUTCOMES = ("parked", "aborted", "error")
 STREAMING_FINISHED_REASONS = ("completed", "aborted", "error")
-STREAMING_OVERFLOW_KINDS = ("input_queue", "carrier", "receipt")
+STREAMING_OVERFLOW_KINDS = ("input_queue", "carrier", "receipt", "finalization_stall", "finalization_absolute")
 STREAMING_OPEN_REJECTION_REASONS = ("model", "cadence", "locale", "config")
 STREAMING_ADMISSION_REJECTION_REASONS = (
     "capacity",

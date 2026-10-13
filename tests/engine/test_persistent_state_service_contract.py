@@ -1036,8 +1036,13 @@ def test_runtime_config_rejects_null_invalid_and_unsafe_values() -> None:
 
     too_short = dict(_EXPLICIT_A36_ENVELOPE)
     too_short["streaming_session_finalization_timeout_s"] = 32.0
-    with pytest.raises(ValueError, match="safe drain bound"):
-        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=too_short))
+    # PORT-SESS-017: the session-derived max is applied at finalize.
+    assert (
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config=too_short)
+        ).session_finalization_timeout_s
+        == 32.0
+    )
 
     with pytest.raises(ValueError, match="must be a mapping"):
         PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config="not-a-mapping"))

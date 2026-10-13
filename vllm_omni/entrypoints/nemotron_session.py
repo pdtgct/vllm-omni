@@ -23,6 +23,10 @@ from uuid import uuid4
 from vllm_omni.entrypoints.session_lifecycle import (
     SessionLifecycleDeadline,
     SessionLifecycleKind,
+    arm_session_finalization,
+    claim_session_terminal,
+    consume_session_progress,
+    record_finalization_expiry,
 )
 from vllm_omni.model_executor.models.nemotron_asr.transcript import (
     SegmentCompletion,
@@ -283,8 +287,11 @@ class NemotronSessionLease:
 
     async def abort(self) -> None:
         """Abort the request and fail every blocked ledger waiter."""
-        if self._aborted:
+        authority = self._session.accepted_audio
+        if authority.terminal_cause == "completed" or self._aborted:
             return
+        claim_session_terminal(self._session, "abort", self._state_lease)
+        authority.clear(RuntimeError("the session was aborted"))
         self._aborted = True
         self._ledger.fail(RuntimeError("the session was aborted"))
         if self._task is None:
@@ -304,6 +311,7 @@ class NemotronSessionLease:
 
     async def release(self) -> None:
         """Release the exact manager lease once through its cleanup lane."""
+        await self._cancel_session_lifecycle_timeout()
         async with self._state_cleanup_lock:
             if self._released:
                 return
@@ -311,9 +319,9 @@ class NemotronSessionLease:
             if timer is not None and timer is not asyncio.current_task():
                 timer.cancel()
                 await asyncio.gather(timer, return_exceptions=True)
-            await self._cancel_session_lifecycle_timeout()
             if self._task is not None and not self._task.done():
                 await self.abort()
+            self._session.accepted_audio.clear(RuntimeError(self._terminal_code or "session_release"))
             self._observe_session_finished_once(
                 self._terminal_reason or ("aborted" if self._aborted or not self._ended else "completed")
             )
@@ -336,18 +344,23 @@ class NemotronSessionLease:
         self,
         kind: SessionLifecycleKind,
     ) -> None:
-        self._session_lifecycle.arm(kind)
+        if kind == "finalization":
+            arm_session_finalization(self._session_lifecycle, self._session, self._persistent_state_service)
+        else:
+            self._session_lifecycle.arm(kind)
 
     async def _expire_session_lifecycle(
         self,
         kind: SessionLifecycleKind,
     ) -> None:
         code = "idle_timeout" if kind == "idle" else "finalization_timeout"
+        if not claim_session_terminal(self._session, code, self._state_lease):
+            return
+        if kind == "finalization":
+            record_finalization_expiry(self._session_lifecycle, self._session.observer)
         self._terminal_reason = "aborted" if kind == "idle" else "error"
         self._terminal_code = code
         self._error = TimeoutError(code)
-        if kind == "idle":
-            self._aborted = True
         await self.release()
 
     def _observe_session_finished_once(self, reason: str) -> None:
@@ -378,12 +391,19 @@ class NemotronSessionLease:
         lease = self._state_lease
         if service is None or lease is None:
             return
+        authority = getattr(self._session, "accepted_audio", None)
+        if authority is not None and authority.terminal_cause is not None:
+            return
         async with self._state_cleanup_lock:
             if self._released:
                 return
             won = await service.claim_pending_cleanup(lease)
             if not won:
                 return
+            if not claim_session_terminal(self._session, "pending_claim_timeout", lease):
+                return
+            self._terminal_reason = "error"
+            self._terminal_code = "pending_claim_timeout"
             await self.abort()
             self._observe_session_finished_once("error")
             assert self._release_operation_id is not None
@@ -393,6 +413,8 @@ class NemotronSessionLease:
                 reason="pending_claim_timeout",
             )
             self._released = True
+
+        await self._cancel_session_lifecycle_timeout()
 
     def _ensure_started(self) -> None:
         """Start the background engine consumer on first use."""
@@ -493,6 +515,7 @@ class NemotronSessionLease:
             async for output in outputs:
                 if getattr(output, "stage_id", 0) not in (None, 0):
                     continue
+                consume_session_progress(self._session_lifecycle, self._session, output)
                 stage_outputs = getattr(output, "outputs", None)
                 if not stage_outputs:
                     continue
@@ -549,10 +572,17 @@ class NemotronSessionLease:
                         self._flush_parked = True
                     else:
                         raise RuntimeError("park arrived without a carrier ticket or terminal FLUSH (PORT-RTC-002)")
-            self._terminal_result = self._session.transcript.finish_terminal()
-            self._ended = True
+            finalized = self._audio_closed and not self._ledger.pending and self._flush_parked
+            if finalized and claim_session_terminal(self._session, "completed", self._state_lease):
+                self._terminal_result = self._session.transcript.finish_terminal()
+                self._ended = True
+        except asyncio.CancelledError:
+            if claim_session_terminal(self._session, "cancelled", self._state_lease):
+                self._aborted = True
+            raise
         except Exception as error:
-            self._error = error
+            if claim_session_terminal(self._session, "error", self._state_lease):
+                self._error = error
         finally:
             self._done.set()
             # Explicit finalization state (review round 2026-07-28, F2):
@@ -566,6 +596,7 @@ class NemotronSessionLease:
             if self._error is not None:
                 self._ledger.fail(self._error)
             elif not finalized:
+                claim_session_terminal(self._session, "error", self._state_lease)
                 self._ledger.fail(RuntimeError("generation ended before the session's normal finalization"))
             # PORT-OBS-006: the lease's single idempotent terminal-
             # disposition section — this coroutine body runs exactly

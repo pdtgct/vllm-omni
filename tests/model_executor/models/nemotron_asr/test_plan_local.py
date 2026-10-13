@@ -835,3 +835,40 @@ def test_nonrecoverable_status_is_terminal() -> None:
 
     assert statuses == {"a": 512}
     assert failed == {"a"}
+
+
+# @spec PORT-SESS-016
+def test_commit_sink_publishes_progress_only_after_clean_commit() -> None:
+    registry, sink, plan = _sink_and_plan()
+    progress = torch.tensor([[1, 0, 2]], dtype=torch.int64)
+    ticket = sink.reserve(advance.CommitPlan(bindings=plan.bindings, capture=None, progress=progress))
+    ticket.stage(torch.zeros(1, dtype=torch.int32))
+    reports, _, lease_ok = sink.collect()
+    assert lease_ok
+    assert reports[0].progress_key == (1, 0, 2)
+
+
+# @spec PORT-SESS-016
+def test_model_progress_orders_chunk_forced_control_replay_and_flush() -> None:
+    registry, sink, plan = _sink_and_plan()
+    generation = plan.bindings[0].admission_generation
+    publish = registry.publish_progress
+    assert publish("a", generation, (1, 0, 2), starts_chunk=True) == (0, 0, 2)
+    # An empty forced control still owns its own logical sequence.
+    assert publish("a", generation, (1, 0, 5), starts_chunk=False) == (1, 0, 2)
+    assert publish("a", generation, (2, 1, 1), starts_chunk=True) == (2, 1, 1)
+    assert publish("a", generation, (2, 3, 1), starts_chunk=False) == (2, 3, 1)
+    assert publish("a", generation, (2, 2, 1), starts_chunk=False) is None
+    assert publish("a", generation, (2, 3, 2), starts_chunk=False) == (2, 3, 2)
+    assert publish("a", generation, (2, 3, 3), starts_chunk=False) == (3, 3, 3)
+    assert publish("a", generation, (2, 3, 3), starts_chunk=False) is None
+    assert publish("a", generation + 1, (3, 0, 2), starts_chunk=True) is None
+
+
+# @spec PORT-SESS-016
+def test_forced_control_commit_waits_for_legal_park_to_raise_progress() -> None:
+    registry, _, plan = _sink_and_plan()
+    generation = plan.bindings[0].admission_generation
+    assert registry.publish_progress("a", generation, (1, 3, 2), starts_chunk=True) == (0, 3, 2)
+    assert registry.publish_progress("a", generation, (1, 1, 4), starts_chunk=False) is None
+    assert registry.publish_progress("a", generation, (1, 1, 2), starts_chunk=False) == (1, 1, 2)

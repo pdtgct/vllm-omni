@@ -17,6 +17,8 @@ _UNPREFIXED_STREAMING_KEYS = frozenset(
         "session_configuration_timeout_s",
         "session_idle_timeout_s",
         "session_finalization_timeout_s",
+        "session_finalization_stall_timeout",
+        "session_finalization_response_bound_s",
         "accepted_audio_capacity_samples",
         "max_retained_transcript_bytes",
         "max_session_duration_s",
@@ -299,6 +301,8 @@ class PersistentStateRuntimeConfig:
     priming_configured_population_ceiling: int
     bootstrap_operation_budget: int
     runtime_tombstone_allowance: int
+    session_finalization_stall_timeout: float = 10.0
+    session_finalization_response_bound_s: float = 10.0
 
     @property
     def cleanup_queue_capacity(self) -> int:
@@ -320,12 +324,10 @@ class PersistentStateRuntimeConfig:
 
     @property
     def safe_finalization_timeout_s(self) -> float:
-        """Conservative drain floor for the installed RFC-1 profile.
+        """Legacy operator default retained for configuration compatibility.
 
-        Accepted audio can occupy the full sample-counted FIFO. One largest
-        cadence service interval is reserved for the final tail and one for
-        FLUSH. Hardware qualification may select a larger value, but never a
-        smaller one.
+        This is not a service bound. Finalize resolves both effective clocks
+        from outstanding work and the measured or configured response upper.
         """
 
         return self.accepted_audio_budget_s + (_RFC1_FINALIZATION_SERVICE_INTERVALS * _RFC1_MAX_CADENCE_S)
@@ -342,6 +344,9 @@ class PersistentStateRuntimeConfig:
             raw = {}
         if not isinstance(raw, Mapping):
             raise ValueError("additional_config must be a mapping when provided")
+        for name in ("streaming_session_finalization_stall_timeout", "streaming_session_finalization_response_bound_s"):
+            if name in raw:
+                _validated_duration(name, raw[name])
         unprefixed = sorted(_UNPREFIXED_STREAMING_KEYS.intersection(raw))
         if unprefixed:
             raise ValueError(f"streaming serving keys in additional_config require the streaming_ prefix: {unprefixed}")
@@ -496,6 +501,16 @@ class PersistentStateRuntimeConfig:
                 "streaming_session_finalization_timeout_s",
                 default=max(_DEFAULT_FINALIZATION_FLOOR_S, safe_finalization_floor_s),
             ),
+            session_finalization_stall_timeout=_resolved_duration(
+                raw,
+                "streaming_session_finalization_stall_timeout",
+                default=10.0,
+            ),
+            session_finalization_response_bound_s=_resolved_duration(
+                raw,
+                "streaming_session_finalization_response_bound_s",
+                default=10.0,
+            ),
             accepted_audio_capacity_samples=accepted_audio_capacity_samples,
             max_retained_transcript_bytes=_resolved_int(
                 raw,
@@ -529,12 +544,6 @@ class PersistentStateRuntimeConfig:
             bootstrap_operation_budget=bootstrap_operation_budget,
             runtime_tombstone_allowance=runtime_tombstone_allowance,
         )
-        if resolved.session_finalization_timeout_s < resolved.safe_finalization_timeout_s:
-            raise ValueError(
-                "streaming_session_finalization_timeout_s must be at least "
-                "the safe "
-                f"drain bound {resolved.safe_finalization_timeout_s:.3f}s"
-            )
         if not (
             1
             <= resolved.admission_dispatch_budget

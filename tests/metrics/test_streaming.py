@@ -172,7 +172,13 @@ class TestEnumCompleteness:
 
     # @spec PORT-OBS-001, PORT-OBS-005
     def test_overflow_kinds(self) -> None:
-        assert defs.STREAMING_OVERFLOW_KINDS == ("input_queue", "carrier", "receipt")
+        assert defs.STREAMING_OVERFLOW_KINDS == (
+            "input_queue",
+            "carrier",
+            "receipt",
+            "finalization_stall",
+            "finalization_absolute",
+        )
 
     # @spec PORT-OBS-001, PORT-OBS-007
     def test_open_rejection_reasons(self) -> None:

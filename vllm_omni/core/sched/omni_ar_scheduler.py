@@ -368,6 +368,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, CoreEngineCoreOutputs]:
+        connector = getattr(model_runner_output, "omni_connector_output", None)
+        progress = getattr(connector, "finalization_progress", {})
+        bindings = getattr(self, "_claimed_state_bindings", {})
+        progress_receipts = {
+            request_id: (request_id, bindings[request_id].generation, key)
+            for request_id, key in progress.items()
+            if request_id in bindings
+        }
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -775,6 +783,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             perf_stats,
         )
 
+        for batch in engine_core_outputs.values():
+            for result in batch.outputs:
+                if isinstance(result, OmniEngineCoreOutput) and result.request_id in progress_receipts:
+                    result.finalization_progress = progress_receipts[result.request_id]
         self._forward_streaming_batch_stats(engine_core_outputs, model_runner_output)
 
         self._capture_omni_connector_output(model_runner_output)

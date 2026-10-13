@@ -3536,3 +3536,23 @@ def test_gather_zero_rows_preserves_empty_layout() -> None:
     assert gathered.dtype == pool.dtype
     assert gathered.device == pool.device
     assert gathered.is_contiguous()
+
+
+# @spec PORT-SESS-016
+def test_post_final_tail_park_echo_cannot_publish_flush_progress() -> None:
+    core = _tiny_core()
+    pools = _fresh_pools()
+    pools["frontend_counter_pool"][1, _CTR["finalized"]] = 1
+    pools["frontend_counter_pool"][1, _CTR["expected_chunk_sequence"]] = 1
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    status = _CommitRecorder()
+    _call(
+        core,
+        pools,
+        torch.tensor([PARK_ID], dtype=torch.long),
+        torch.zeros(1, CARRIER_HIDDEN),
+        _plan(decodes=[1]),
+        commit_sink=status,
+    )
+    assert int(status.staged[0][0]) == 0
+    assert status.plans[0].progress[0, 2].item() == 0

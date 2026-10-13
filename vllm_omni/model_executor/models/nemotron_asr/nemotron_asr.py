@@ -883,11 +883,25 @@ class NemotronASRForRNNT(nn.Module):
         if sink is None or not sink.has_staged:
             return {}, set()
         reports, _records, lease_ok = sink.collect()
-        return resolve_status_reports(
-            self._registry,
-            reports,
-            lease_ok=lease_ok,
-        )
+        statuses, failed = resolve_status_reports(self._registry, reports, lease_ok=lease_ok)
+        self._committed_progress = {}
+        for report in reports:
+            if statuses.get(report.request_id) != 0 or report.progress_key is None:
+                continue
+            key = self._registry.publish_progress(
+                report.request_id,
+                report.admission_generation,
+                report.progress_key,
+                starts_chunk=report.starts_chunk,
+            )
+            if key is not None:
+                self._committed_progress[report.request_id] = key
+        return statuses, failed
+
+    def consume_committed_progress(self) -> dict[str, tuple[int, int, int]]:
+        progress = getattr(self, "_committed_progress", {})
+        self._committed_progress = {}
+        return progress
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         audios = kwargs.get("audio")

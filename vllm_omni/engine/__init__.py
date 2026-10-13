@@ -132,6 +132,7 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
     # and retains its original vLLM semantics for pooling/embedding tasks.
     multimodal_output: dict[str, torch.Tensor] | None = None
+    finalization_progress: tuple[str, int, tuple[int, int, int]] | None = None
     # Finished flag for streaming input segment
     is_segment_finished: bool | None = False
     # Streaming update prompt length

@@ -1054,3 +1054,91 @@ async def test_failed_inventory_never_installs_service(
         )
 
     assert engine._persistent_state_service is None
+
+
+# @spec PORT-SESS-018
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_expiry_releases_even_if_error_delivery_fails_or_blocks(blocked) -> None:
+    connection, websocket, service = _connection()
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    started = asyncio.Event()
+
+    async def bad_send(*args, **kwargs):
+        started.set()
+        if blocked:
+            await asyncio.Event().wait()
+        raise RuntimeError("broken transport")
+
+    connection.send_error = bad_send
+    task = asyncio.create_task(connection._expire_session_lifecycle("finalization"))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if service.release_calls:
+                break
+        assert len(service.release_calls) == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+# @spec PORT-SESS-018
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["completed", "disconnect", "finalization_timeout"])
+async def test_terminal_winner_fences_later_expiry_and_completion(winner) -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    connection, websocket, service = _connection()
+    authority = AcceptedAudioAuthority(
+        request_id="a",
+        engine_epoch="e",
+        lease_generation=service.lease.generation,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, session_key="a")
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    if winner == "finalization_timeout":
+        await connection._expire_session_lifecycle("finalization")
+        assert not authority.claim_terminal("completed", lease_generation=service.lease.generation)
+        assert websocket.sent[-1]["code"] == "finalization_timeout"
+    elif winner == "disconnect":
+        await connection.cleanup()
+    else:
+        assert authority.claim_terminal(winner, lease_generation=service.lease.generation)
+    sent = len(websocket.sent)
+    await connection._expire_session_lifecycle("finalization")
+    assert len(websocket.sent) == sent
+    assert authority.terminal_cause == winner
+    await connection.cleanup()
+    assert len(service.release_calls) == 1
+
+
+# @spec PORT-SESS-018
+@pytest.mark.asyncio
+async def test_pending_claim_timeout_cannot_replace_terminal_winner() -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    connection, _, service = _connection()
+    authority = AcceptedAudioAuthority(
+        request_id="a",
+        engine_epoch="e",
+        lease_generation=service.lease.generation,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, session_key="a")
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    assert authority.claim_terminal("completed", lease_generation=service.lease.generation)
+    await connection._expire_pending_claim(0)
+    assert service.release_calls == []
+    assert authority.terminal_cause == "completed"
+    await connection.cleanup()
+    assert len(service.release_calls) == 1
