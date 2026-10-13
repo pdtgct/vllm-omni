@@ -766,8 +766,8 @@ def test_runtime_config_requires_and_fingerprints_profile_policy() -> None:
     assert core_runtime.admission_policy == "profile"
 
 
-def test_hard_cap_rejects_profile_only_runtime_fields() -> None:
-    """@spec ENV-MIG-011: hard-cap has no empty or retained profile arm."""
+def test_hard_cap_accepts_advisory_profile_runtime_fields() -> None:
+    """@spec ENV-MIG-012 / PORT-PERF-006: hard-cap retains profiling."""
     from vllm_omni.engine.persistent_state_config import (
         PersistentStateRuntimeConfig,
     )
@@ -776,51 +776,37 @@ def test_hard_cap_rejects_profile_only_runtime_fields() -> None:
         **_EXPLICIT_A36_ENVELOPE,
         "persistent_state_admission_policy": "hard_cap",
     }
-    with pytest.raises(ValueError, match="hard_cap|profile-only|profile"):
-        PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
+    runtime = PersistentStateRuntimeConfig.from_vllm_config(SimpleNamespace(additional_config=values))
+    assert runtime.service_profile_trailing_rounds == 3
+    assert runtime.service_profile_derating_factor == 0.5
 
 
-def test_hard_cap_defaults_equal_the_equivalent_explicit_envelope() -> None:
-    """@spec ENV-MIG-009/011: canonical values, not keystrokes, fingerprint."""
-    from vllm_omni.engine.persistent_state_config import (
-        PersistentStateRuntimeConfig,
-    )
+def test_hard_cap_requires_explicit_profile_fields_and_funds_priming() -> None:
+    """@spec ENV-MIG-012 / PORT-PERF-006: both processes fund the same plan."""
+    from vllm_omni.engine.persistent_state_config import PersistentStateRuntimeConfig
+    from vllm_omni.model_executor.models.nemotron_asr.startup import NEMOTRON_PERSISTENT_STATE_STARTUP
 
-    profile_only = {
-        "persistent_state_service_profile_trailing_rounds",
-        "persistent_state_startup_priming_round_timeout_s",
-        "persistent_state_startup_priming_timeout_s",
-        "persistent_state_service_profile_derating_factor",
-    }
-    explicit_values = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key not in profile_only}
-    explicit_values["persistent_state_admission_policy"] = "hard_cap"
-    explicit_values["streaming_unadmitted_connection_timeout_s"] = 30.125
     common = dict(
         model_config=SimpleNamespace(architectures=("Nemotron3_5AsrForRNNT",)),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
-
-    defaults = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(
-            additional_config={"persistent_state_admission_policy": "hard_cap"},
-            **common,
-        ),
-        startup_provider=object(),
-    )
-    explicit = PersistentStateRuntimeConfig.from_vllm_config(
-        SimpleNamespace(additional_config=explicit_values, **common),
-        startup_provider=object(),
-    )
-
-    assert defaults == explicit
-    assert defaults.admission_policy == "hard_cap"
-    assert defaults.service_profile_trailing_rounds is None
-    assert defaults.startup_priming_round_timeout_s is None
-    assert defaults.startup_priming_timeout_s is None
-    assert defaults.service_profile_derating_factor is None
-    assert defaults.priming_budget_descriptor is None
-    assert defaults.priming_budget_sha256 is None
-    assert defaults.bootstrap_operation_budget == 0
+    with pytest.raises(ValueError, match="service_profile_trailing_rounds"):
+        PersistentStateRuntimeConfig.from_vllm_config(
+            SimpleNamespace(additional_config={"persistent_state_admission_policy": "hard_cap"}, **common),
+            startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP,
+        )
+    values = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key != "persistent_state_max_tombstones"}
+    values["persistent_state_admission_policy"] = "hard_cap"
+    config = SimpleNamespace(additional_config=values, **common)
+    api = PersistentStateRuntimeConfig.from_vllm_config(config, startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP)
+    core = PersistentStateRuntimeConfig.from_vllm_config(config, startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP)
+    assert api == core
+    assert api.service_profile_trailing_rounds == 3
+    assert api.service_profile_derating_factor == 0.5
+    assert api.priming_budget_descriptor is not None
+    assert api.priming_budget_sha256 is not None
+    assert api.bootstrap_operation_budget == 3840
+    assert api.max_tombstones == 3872
 
 
 def test_explicit_profile_still_requires_every_profile_authority() -> None:
@@ -850,7 +836,7 @@ def test_explicit_profile_still_requires_every_profile_authority() -> None:
     (
         {
             "persistent_state_admission_policy": "hard_cap",
-            "persistent_state_startup_priming_round_timeout_s": 2.0,
+            "persistent_state_startup_priming_round_timeout_s": 0.0,
         },
         {
             "persistent_state_admission_policy": "hard_cap",
@@ -858,7 +844,7 @@ def test_explicit_profile_still_requires_every_profile_authority() -> None:
         },
     ),
 )
-def test_hard_cap_rejects_profile_only_and_unknown_raw_keys(
+def test_hard_cap_rejects_invalid_profile_and_unknown_raw_keys(
     values: dict[str, object],
 ) -> None:
     """@spec ENV-MIG-011: advanced additional_config fails closed."""
@@ -867,7 +853,7 @@ def test_hard_cap_rejects_profile_only_and_unknown_raw_keys(
         PersistentStateRuntimeConfig,
     )
 
-    with pytest.raises(ValueError, match="profile-only|unknown"):
+    with pytest.raises(ValueError, match="invalid|unknown"):
         PersistentStateRuntimeConfig.from_vllm_config(
             SimpleNamespace(
                 additional_config=values,
@@ -1262,3 +1248,17 @@ def test_claimed_state_cannot_be_released_until_scheduler_terminality() -> None:
     core.mark_terminal(binding)
     released = core.persistent_state_release("release-a", lease, "cleanup")
     assert released["resident_count"] == 0
+
+
+def test_typed_hard_cap_deploy_accepts_advisory_profile_settings() -> None:
+    """@spec ENV-MIG-012 / PORT-PERF-006: typed and raw settings agree."""
+    from vllm_omni.config.stage_config import PersistentStateDeployConfig
+
+    values = {
+        "persistent_state_admission_policy": "hard_cap",
+        "persistent_state_service_profile_trailing_rounds": 3,
+        "persistent_state_startup_priming_round_timeout_s": 2.0,
+        "persistent_state_startup_priming_timeout_s": 120.0,
+        "persistent_state_service_profile_derating_factor": 0.5,
+    }
+    assert PersistentStateDeployConfig.from_mapping(values).as_additional_config() == values

@@ -220,8 +220,8 @@ def test_admission_reason_enum_adds_unsupported_without_renaming() -> None:
     ), "PORT-OBS-001 missing the approved three-class rejection taxonomy"
 
 
-def test_hard_cap_projection_omits_every_profile_only_series() -> None:
-    """@spec PORT-OBS-001/012: absence is not a fabricated zero profile."""
+def test_hard_cap_projection_exposes_advisory_demand_and_nominal_headroom() -> None:
+    """@spec PORT-OBS-012: advisory nominal demand is distinct from dispatch."""
 
     model = "capacity-metrics-hard-cap"
     metrics = OmniStreamingMetrics(model_name=model, log_stats=True)
@@ -235,26 +235,29 @@ def test_hard_cap_projection_omits_every_profile_only_series() -> None:
         "0",
         "0",
         admission_policy="hard_cap",
-        service_source=None,
-        service_budget=None,
-        charged_demand=None,
+        service_source="measured_fallback",
+        service_budget=0.5,
+        charged_demand=2.0,
         execution_claims=2,
         max_num_seqs=8,
         headroom_by_cadence={
-            "80": {"hard": 1},
-            "320": {"hard": 2},
-            "560": {"hard": 2},
-            "1120": {"hard": 2},
+            "80": {"hard": 1, "nominal": 0},
+            "320": {"hard": 2, "nominal": 0},
+            "560": {"hard": 2, "nominal": 0},
+            "1120": {"hard": 2, "nominal": 0},
         },
         pending_by_cadence={},
     )
 
-    output = generate_latest(REGISTRY).decode()
     demand = _required(defs, "PERSISTENT_STATE_SERVICE_DEMAND_RATIO")
     headroom = _required(defs, "PERSISTENT_STATE_ADMISSION_HEADROOM")
-    assert not any(line.startswith(demand) and f'model_name="{model}"' in line for line in output.splitlines())
-    assert not any(
-        line.startswith(headroom) and f'model_name="{model}"' in line and 'kind="nominal"' in line
-        for line in output.splitlines()
+    assert (
+        _sample(
+            f'{demand}{{kind="charged_demand",model_name="{model}",replica="0",source="measured_fallback",stage="0"}}'
+        )
+        == 2.0
     )
+    assert _sample(f'{headroom}{{cadence_ms="1120",kind="nominal",model_name="{model}",replica="0",stage="0"}}') == 0.0
     assert _sample(f'{headroom}{{cadence_ms="1120",kind="hard",model_name="{model}",replica="0",stage="0"}}') == 2.0
+    advisory = _required(defs, "PERSISTENT_STATE_PROFILE_ADVISORY")
+    assert _sample(f'{advisory}{{model_name="{model}",replica="0",stage="0"}}') == 1.0

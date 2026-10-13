@@ -441,25 +441,26 @@ class PersistentStateDeployConfig:
             raise ValueError("persistent_state_max_tombstones must be a positive integer")
 
         profile_values = {key: getattr(self, key) for key in _PERSISTENT_STATE_PROFILE_KEYS}
-        if self.persistent_state_admission_policy == "hard_cap":
-            if any(value is not None for value in profile_values.values()):
-                raise ValueError("hard_cap persistent_state deploy must not carry profile-only settings")
-            return
-
         missing = sorted(key for key, value in profile_values.items() if value is None)
-        if missing:
+        if missing and self.persistent_state_admission_policy == "profile":
             raise ValueError(f"profile persistent_state deploy is missing {missing}")
-        if (
+        if self.persistent_state_service_profile_trailing_rounds is not None and (
             not isinstance(self.persistent_state_service_profile_trailing_rounds, int)
             or isinstance(self.persistent_state_service_profile_trailing_rounds, bool)
             or self.persistent_state_service_profile_trailing_rounds < 3
         ):
             raise ValueError("persistent_state_service_profile_trailing_rounds must be at least 3")
-        if not _is_positive_finite_number(self.persistent_state_startup_priming_round_timeout_s):
+        if self.persistent_state_startup_priming_round_timeout_s is not None and not _is_positive_finite_number(
+            self.persistent_state_startup_priming_round_timeout_s
+        ):
             raise ValueError("persistent_state_startup_priming_round_timeout_s must be positive")
-        if not _is_positive_finite_number(self.persistent_state_startup_priming_timeout_s):
+        if self.persistent_state_startup_priming_timeout_s is not None and not _is_positive_finite_number(
+            self.persistent_state_startup_priming_timeout_s
+        ):
             raise ValueError("persistent_state_startup_priming_timeout_s must be positive")
         derating = self.persistent_state_service_profile_derating_factor
+        if derating is None:
+            return
         if not _is_positive_finite_number(derating):
             raise ValueError("persistent_state_service_profile_derating_factor must be in (0, 1]")
         assert isinstance(derating, (int, float))

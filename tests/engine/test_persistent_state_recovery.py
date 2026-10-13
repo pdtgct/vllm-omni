@@ -257,7 +257,9 @@ def _compiled_admission_profile(
             # At the two-session fixture, the 1120-ms bucket admits one
             # under f=1/2 but fragmentation rejects two.  The c=4/J test
             # selects its own f=1 profile and retains the fast table.
-            elapsed_ns=(300_000_000 if maximum_population == 2 and interval == 1120 else 50_000_000),
+            elapsed_ns=(
+                300_000_000 if maximum_population == 2 and interval == 1120 else min(50_000_000, interval * 375_000)
+            ),
             service_interval_ms=interval,
             geometry_id=geometry,
             completed_legal_parks=maximum_population,
@@ -1402,6 +1404,88 @@ def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
         with pytest.raises(PersistentStateServiceUnavailable):
             await service.check_health()
         assert len(fatal_errors) == 1
+        service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery() -> None:
+    """@spec PORT-PERF-006 / PORT-OBS-012 / PORT-STATE-026: receipt survives recovery."""
+    from dataclasses import replace
+
+    from vllm_omni.engine.persistent_state_startup import derive_hard_cap_authority
+
+    class Metrics:
+        def __init__(self) -> None:
+            self.values: dict[str, Any] = {}
+
+        def observe_persistent_state_admission_wait(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def observe_persistent_state_slots(self, *args: Any) -> None:
+            pass
+
+        def observe_persistent_state_capacity(self, *args: Any, **values: Any) -> None:
+            self.values = values
+
+    async def scenario() -> None:
+        stage = _RecoveryStage()
+        service = _recovering_service(stage, _Clock())
+        inventory = await service.bootstrap_handshake()
+        profile = _compiled_admission_profile(admitted_geometry_ids=(4,))
+        profile = replace(profile, receipt=replace(profile.receipt, admission_policy="hard_cap", advisory=True))
+        service.configure_bootstrap_intervals((1120,))
+        config = replace(service._admission_config, admission_policy="hard_cap", supported_intervals_ms=(1120,))
+        authority = derive_hard_cap_authority(
+            served_intervals_ms=(1120,),
+            model_profile_id=inventory["profile_id"],
+            execution_environment_key=inventory["execution_environment_key"],
+            precision_policy=inventory["precision_policy"],
+            schema_id=inventory["schema_id"],
+            slot_bytes=inventory["slot_bytes"],
+            stage=inventory["stage"],
+            replica=inventory["replica"],
+            physical_capacity=inventory["physical_capacity"],
+            configured_limit=inventory["configured_limit"],
+            effective_capacity=inventory["effective_capacity"],
+            max_num_seqs=inventory["execution_claim_ceiling"],
+            safety_reserve=inventory["safety_reserve"],
+            controller_identity=repr(config),
+            service_profile_identity=profile.receipt.receipt_sha256,
+        )
+        service.seal_startup_authority(authority=authority, admission_config=config, compiled_service_profile=profile)
+        metrics = Metrics()
+        service.install_metrics(metrics)
+        assert service.ready
+        assert service.inventory["service_profile_identity"] == profile.receipt.receipt_sha256
+        assert service.inventory["service_profile_advisory"] is True
+        assert metrics.values["service_budget"] == 0.5
+        assert metrics.values["headroom_by_cadence"]["1120"]["nominal"] == 1
+        assert metrics.values["headroom_by_cadence"]["1120"]["hard"] == 2
+        await service._perform_handshake(open_admission=True)
+        assert service.compiled_service_profile is profile
+        assert service.ready
+        leases = []
+        for index in (1, 2):
+            leases.append(
+                await asyncio.wait_for(
+                    service.reserve(
+                        operation_id=f"advisory-reserve-{index}",
+                        session_key=f"advisory-{index}",
+                        schema_id="schema-a",
+                        profile_id="profile-a",
+                        service_interval_ms=1120,
+                    ),
+                    timeout=0.2,
+                )
+            )
+        # The second reserve crosses the one-session nominal frontier.
+        assert stage.reserve_calls == 2
+        assert metrics.values["headroom_by_cadence"]["1120"]["nominal"] == 0
+        assert service.inventory["charged_demand"] > 1
+        for index, lease in enumerate(leases):
+            await service.release(operation_id=f"advisory-release-{index}", lease=lease, reason="test")
+        assert stage.resident == 0
         service.shutdown()
 
     asyncio.run(scenario())

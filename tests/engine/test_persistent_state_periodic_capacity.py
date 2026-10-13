@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import math
 import random
+from dataclasses import replace
 from fractions import Fraction
 from types import ModuleType
 from typing import Any, NoReturn
@@ -165,6 +166,7 @@ def _compile_with_canaries(
     omit_scenario: str | None = None,
     completed_legal_parks: int = 2,
     derating_factor: Fraction = Fraction(1, 2),
+    admission_policy: str = "profile",
 ) -> Any:
     execution_type = _symbol("ServiceRoundExecution", "PORT-PERF-006")
     executions = [
@@ -254,6 +256,7 @@ def _compile_with_canaries(
         control_upper_ns_by_window_and_population=None,
         control_dominance_sha256=None,
         evidence_class="probe",
+        admission_policy=admission_policy,
     )
 
 
@@ -483,29 +486,67 @@ def test_hard_cap_dispatches_from_disjoint_hard_counters_without_profile() -> No
     assert authority.model_profile_id == "profile-a"
 
 
-def test_service_profile_compiler_rejects_hard_cap_instead_of_minting_advice() -> None:
-    """@spec PORT-STATE-026 / PORT-PERF-006: hard_cap never compiles."""
+@pytest.mark.parametrize("duration_ms", (600, 1130))
+def test_zero_capacity_is_retained_only_as_advisory(duration_ms: int) -> None:
+    """@spec PORT-STATE-026 / PORT-PERF-006: zero frontiers are evidence."""
+    kwargs: dict[str, Any] = dict(intervals_ms=(1120,), tables_ms=((duration_ms,),), derating_factor=Fraction(1, 2))
+    with pytest.raises(ValueError, match="cannot support|zero.*frontier"):
+        _compile(**kwargs, admission_policy="profile")
+    profile = _compile(**kwargs, admission_policy="hard_cap")
+    assert profile.receipt.advisory is True
+    assert profile.receipt.admission_policy == "hard_cap"
+    assert profile.provisional_capacity == 0
+    assert profile.homogeneous_capacity_by_interval == {1120: 0}
+    assert profile.measured_capacity == (1 if duration_ms == 600 else 0)
+    assert profile.receipt.aligned_frontier_by_interval == profile.aligned_frontier_by_interval
+    assert profile.receipt.fragmentation_frontier_by_interval == profile.fragmentation_frontier_by_interval
+    assert len(profile.receipt.receipt_sha256) == 64
+    assert not _evaluate(profile, 1).schedulable
 
-    with pytest.raises(ValueError, match="cannot support one session"):
-        _compile(
-            intervals_ms=(1_120,),
-            tables_ms=((1_130,),),
-            admission_policy="profile",
-        )
 
-    with pytest.raises(ValueError, match="profile.*only|hard_cap.*compile"):
-        _compile(
-            intervals_ms=(1_120,),
-            tables_ms=((1_130,),),
-            admission_policy="hard_cap",
-        )
+def test_hard_cap_advice_never_suppresses_hard_feasible_dispatch() -> None:
+    """@spec PORT-STATE-026 / PORT-OBS-012: nominal stays diagnostic."""
+    profile = _compile(intervals_ms=(80,), tables_ms=((100, 200),), admission_policy="hard_cap")
+    project = _symbol("project_fixed_dispatch_capacity")
+    kwargs = dict(
+        profile=profile,
+        inventory={"resident_count": 1, "effective_capacity": 9, "configured_limit": 9},
+        resident_counts_by_interval={80: 1},
+        submitted_counts_by_interval={80: 0},
+        authority_open=True,
+        admission_policy="hard_cap",
+    )
+    projection = project(**kwargs)
+    assert projection.candidate_supported_by_interval == {80: True}
+    assert projection.nominal_dispatchable_by_interval == {80: 0}
+    assert projection.dispatchable_by_interval == {80: 1}  # P_search, not nine slots.
+    assert projection.charged_units > projection.service_budget_units
+    assert project(**{**kwargs, "authority_open": False}).dispatchable_by_interval == {80: 0}
 
-    with pytest.raises(ValueError, match="admission policy"):
-        _compile(
-            intervals_ms=(1_120,),
-            tables_ms=((1_130,),),
-            admission_policy="unsafe",
-        )
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+def test_service_lower_bound_uses_maximum_population_and_derating(policy: str) -> None:
+    """@spec PORT-PERF-006 / PORT-STATE-026: read-only D1 service floor."""
+    profile = _compile(
+        intervals_ms=(320,), tables_ms=((50, 100, 200),), derating_factor=Fraction(1, 2), admission_policy=policy
+    )
+    lower_bound = _symbol("conservative_service_lower_bound")
+    # F(1..3) = 50,100,200ms; profile frontier=2, hard cap=3.
+    assert lower_bound(profile, service_interval_ms=320) == (Fraction(1) if policy == "profile" else Fraction(4, 5))
+    assert lower_bound(profile, service_interval_ms=80) is None
+    wider = replace(profile, receipt=replace(profile.receipt, allocated_pool=4, count_cap=4, execution_claim_ceiling=4))
+    assert lower_bound(wider, service_interval_ms=320) == (Fraction(1) if policy == "profile" else None)
+
+
+def test_service_lower_bound_covers_competing_geometries_and_regulated_release() -> None:
+    """@spec PORT-PERF-006 / PORT-STATE-026: per-session, never rows/s."""
+    profile = _compile(intervals_ms=(80, 320), tables_ms=((10, 20), (100, 200)), admission_policy="hard_cap")
+    lower_bound = _symbol("conservative_service_lower_bound")
+    # Conservatively sum each geometry's worst fragmentation at P=2.
+    assert lower_bound(profile, service_interval_ms=80) == Fraction(4, 11)
+    assert lower_bound(profile, service_interval_ms=320) == 1
+    assert profile.receipt.advisory
+    assert profile.qualified is False
 
 
 def test_dispatch_projection_rejects_unknown_admission_policy() -> None:
@@ -606,6 +647,7 @@ def test_derating_uses_exact_cross_multiplication(
         intervals_ms=(80,),
         tables_ns=((duration_ns,),),
         derating_factor=Fraction(2, 3),
+        admission_policy="hard_cap",
     )
 
     assert _evaluate(profile, 1).schedulable is expected
@@ -621,6 +663,7 @@ def test_control_work_is_not_free_or_double_counted() -> None:
     with_control = _compile(
         intervals_ms=(80,),
         tables_ms=((80,),),
+        admission_policy="hard_cap",
         control_ms={80: (1,)},
         control_dominance_sha256=None,
     )
@@ -694,14 +737,16 @@ def test_bulk_canary_still_gates_a_partly_feasible_population_step() -> None:
         ),
     ],
 )
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
 def test_exceptional_control_canaries_fail_closed(
+    policy: str,
     kwargs: dict[str, Any],
     match: str,
 ) -> None:
     """@spec PORT-PERF-006 / PORT-PERF-008: no missing or weak proof."""
 
     with pytest.raises(ValueError, match=match):
-        _compile_with_canaries(**kwargs)
+        _compile_with_canaries(**kwargs, admission_policy=policy)
 
 
 def test_exceptional_control_leading_round_is_not_the_upper() -> None:
@@ -826,3 +871,52 @@ def test_headroom_uses_bounded_bisection_at_population_1000() -> None:
 
     assert result.headroom == population
     assert result.predicate_evaluations <= 11
+
+
+def test_advisory_receipt_preserves_ordinary_and_canary_evidence() -> None:
+    """@spec PORT-PERF-006: complete evidence differs only in policy stamp."""
+    profile = _compile_with_canaries()
+    advisory = _compile_with_canaries(admission_policy="hard_cap")
+    assert not profile.receipt.advisory
+    assert advisory.receipt.advisory
+    assert advisory.receipt.observations == profile.receipt.observations
+    assert advisory.receipt.control_dominance_evidence == profile.receipt.control_dominance_evidence
+    assert advisory.receipt.homogeneous_capacity_by_interval == profile.receipt.homogeneous_capacity_by_interval
+    assert (
+        advisory.receipt.upper_duration_ns_by_geometry_and_population
+        == profile.receipt.upper_duration_ns_by_geometry_and_population
+    )
+    assert (
+        advisory.receipt.fragmentation_duration_ns_by_geometry_and_population
+        == profile.receipt.fragmentation_duration_ns_by_geometry_and_population
+    )
+    assert advisory.receipt.receipt_sha256 != profile.receipt.receipt_sha256
+
+
+def test_service_lower_bound_includes_explicit_control_envelope() -> None:
+    """@spec PORT-STATE-026: a separately supplied control charge is not free."""
+    profile = _compile(
+        intervals_ms=(80,),
+        tables_ms=((20, 40),),
+        admission_policy="hard_cap",
+        derating_factor=Fraction(1, 2),
+        control_ms={80: (10, 20)},
+    )
+    assert _symbol("conservative_service_lower_bound")(profile, service_interval_ms=80) == Fraction(2, 3)
+
+
+def test_zero_advisory_retains_irrelevant_failed_canary() -> None:
+    """@spec PORT-PERF-006: no lost or promoted zero-headroom evidence."""
+    profile = _compile_with_canaries(
+        ordinary_ns=81_000_000, forced_ns=170_000_000, terminal_ns=170_000_000, admission_policy="hard_cap"
+    )
+    assert profile.measured_capacity == 0
+    assert profile.homogeneous_capacity_by_interval == {80: 0}
+    cells = profile.receipt.control_dominance_evidence["cells"]
+    assert all(not cell["admission_relevant"] and not cell["dominance_passed"] for cell in cells)
+
+
+def test_service_compiler_rejects_unknown_policy() -> None:
+    """@spec PORT-STATE-026: advice does not introduce a third policy."""
+    with pytest.raises(ValueError, match="admission policy"):
+        _compile(admission_policy="unsafe")

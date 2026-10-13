@@ -156,17 +156,6 @@ def _resolve_a36_envelope(
         raise ValueError(
             "persistent-state A36 admission envelope is incomplete or invalid: " + ", ".join(parts)
         ) from error
-    profile_keys = {
-        "persistent_state_service_profile_trailing_rounds",
-        "persistent_state_startup_priming_round_timeout_s",
-        "persistent_state_startup_priming_timeout_s",
-        "persistent_state_service_profile_derating_factor",
-    }
-    if policy == "hard_cap" and profile_keys.intersection(values):
-        raise ValueError(
-            "hard_cap rejects profile-only persistent-state fields: "
-            + ", ".join(sorted(profile_keys.intersection(values)))
-        )
     defaults: dict[str, Any] = {}
     if policy == "hard_cap":
         defaults = {
@@ -184,11 +173,7 @@ def _resolve_a36_envelope(
                 + (_DEFAULT_ADMISSION_RETRY_FLOOR_MS + _DEFAULT_ADMISSION_RETRY_JITTER_MS) / 1000
             ),
         }
-    required = tuple(
-        name
-        for name in _A36_REQUIRED_KEYS
-        if name != "persistent_state_admission_policy" and (policy == "profile" or name not in profile_keys)
-    )
+    required = tuple(name for name in _A36_REQUIRED_KEYS if name != "persistent_state_admission_policy")
     missing = [name for name in required if name not in values and name not in defaults]
     invalid: list[str] = []
     resolved: dict[str, Any] = {"persistent_state_admission_policy": policy}
@@ -430,7 +415,7 @@ class PersistentStateRuntimeConfig:
         priming_budget_sha256: str | None = None
         priming_configured_population_ceiling = 0
         bootstrap_operation_budget = 0
-        if startup_provider is not None and a36["persistent_state_admission_policy"] == "profile":
+        if startup_provider is not None:
             scheduler_config = getattr(vllm_config, "scheduler_config", None)
             execution_ceiling = _validated_int(
                 "scheduler.max_num_seqs",
@@ -533,18 +518,10 @@ class PersistentStateRuntimeConfig:
             recovery_backoff_s=a36["persistent_state_recovery_backoff_s"],
             release_convergence_timeout_s=a36["persistent_state_release_convergence_timeout_s"],
             unadmitted_connection_timeout_s=a36["streaming_unadmitted_connection_timeout_s"],
-            service_profile_trailing_rounds=a36["persistent_state_service_profile_trailing_rounds"]
-            if a36["persistent_state_admission_policy"] == "profile"
-            else None,
-            startup_priming_round_timeout_s=a36["persistent_state_startup_priming_round_timeout_s"]
-            if a36["persistent_state_admission_policy"] == "profile"
-            else None,
-            startup_priming_timeout_s=a36["persistent_state_startup_priming_timeout_s"]
-            if a36["persistent_state_admission_policy"] == "profile"
-            else None,
-            service_profile_derating_factor=a36["persistent_state_service_profile_derating_factor"]
-            if a36["persistent_state_admission_policy"] == "profile"
-            else None,
+            service_profile_trailing_rounds=a36["persistent_state_service_profile_trailing_rounds"],
+            startup_priming_round_timeout_s=a36["persistent_state_startup_priming_round_timeout_s"],
+            startup_priming_timeout_s=a36["persistent_state_startup_priming_timeout_s"],
+            service_profile_derating_factor=a36["persistent_state_service_profile_derating_factor"],
             admission_policy=a36["persistent_state_admission_policy"],
             priming_budget_descriptor=priming_budget_descriptor,
             priming_budget_sha256=priming_budget_sha256,

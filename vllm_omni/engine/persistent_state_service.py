@@ -349,6 +349,10 @@ class PersistentStateService:
         if authority is not None:
             projection = project_fixed_dispatch_capacity(
                 startup_authority=authority,
+                profile=profile,
+                inventory=inventory if profile is not None else None,
+                resident_counts_by_interval=self._resident_interval_counts,
+                submitted_counts_by_interval=self._submitted_interval_counts,
                 state_resident=int(inventory["resident_count"]),
                 state_submitted=sum(self._submitted_interval_counts.values()),
                 execution_committed=len(self._service_intervals),
@@ -388,6 +392,10 @@ class PersistentStateService:
         if authority is not None:
             projection = project_fixed_dispatch_capacity(
                 startup_authority=authority,
+                profile=profile,
+                inventory=inventory if profile is not None else None,
+                resident_counts_by_interval=self._resident_interval_counts,
+                submitted_counts_by_interval=self._submitted_interval_counts,
                 state_resident=int(inventory["resident_count"]),
                 state_submitted=sum(self._submitted_interval_counts.values()),
                 execution_committed=len(self._service_intervals),
@@ -790,6 +798,8 @@ class PersistentStateService:
             receipt_hash = getattr(receipt, "receipt_sha256", None)
             if receipt_hash is not None:
                 inventory["service_profile_receipt_sha256"] = str(receipt_hash)
+                inventory["service_profile_identity"] = str(receipt_hash)
+                inventory["service_profile_advisory"] = bool(getattr(receipt, "advisory", False))
         admission_config = self._admission_config
         if admission_config is not None:
             inventory["admission_policy"] = admission_config.admission_policy
@@ -803,6 +813,10 @@ class PersistentStateService:
             if authority is not None:
                 projection = project_fixed_dispatch_capacity(
                     startup_authority=authority,
+                    profile=profile,
+                    inventory=inventory if profile is not None else None,
+                    resident_counts_by_interval=self._resident_interval_counts,
+                    submitted_counts_by_interval=self._submitted_interval_counts,
                     state_resident=int(inventory["resident_count"]),
                     state_submitted=sum(self._submitted_interval_counts.values()),
                     execution_committed=len(self._service_intervals),
@@ -1163,6 +1177,7 @@ class PersistentStateService:
                     max_num_seqs=int(snapshot["execution_claim_ceiling"]),
                     safety_reserve=int(snapshot["safety_reserve"]),
                     controller_identity=authority.controller_identity,
+                    service_profile_identity=authority.service_profile_identity,
                 )
             )
             if recovered is None or (recovered.hard_cap_envelope_sha256 != authority.hard_cap_envelope_sha256):
@@ -1345,8 +1360,9 @@ class PersistentStateService:
         *,
         authority: Any,
         admission_config: Any | None = None,
+        compiled_service_profile: Any | None = None,
     ) -> None:
-        """Seal a profile-free hard-cap authority after one handshake."""
+        """Seal static hard limits with their immutable advisory receipt."""
 
         from vllm_omni.engine.persistent_state_capacity import HardCapAuthority
 
@@ -1364,6 +1380,15 @@ class PersistentStateService:
             raise ValueError("hard-cap authority and admission controller intervals disagree")
         if tuple(self._resident_interval_counts) != intervals:
             raise ValueError("bootstrap and hard-cap intervals disagree")
+        if compiled_service_profile is not None:
+            receipt = compiled_service_profile.receipt
+            if (
+                tuple(compiled_service_profile.compiled_demand.intervals_ms) != intervals
+                or receipt.admission_policy != "hard_cap"
+                or not receipt.advisory
+                or receipt.receipt_sha256 != authority.service_profile_identity
+            ):
+                raise ValueError("hard-cap advisory profile and authority disagree")
         inventory_static = {
             "model_profile_id": str(self._inventory["profile_id"]),
             "execution_environment_key": str(self._inventory["execution_environment_key"]),
@@ -1392,6 +1417,7 @@ class PersistentStateService:
             raise RuntimeError("persistent-state bootstrap authority is not empty at seal")
         self._admission_config = resolved_admission
         self._startup_authority = authority
+        self._compiled_service_profile = compiled_service_profile
         hard_capacity = min(
             authority.effective_state_slots,
             authority.configured_resident_limit,
