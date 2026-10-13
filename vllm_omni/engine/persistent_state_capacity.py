@@ -1265,7 +1265,7 @@ def conservative_service_lower_bound(
     Explicit control envelopes contribute their largest compiled charge.
 
     Profile maxima use predicate-derived frontiers and the physical/count/
-    execution/search limits. Hard-cap maxima use physical/count/execution
+    execution/search limits. Hard-cap maxima use physical/count/execution/search
     limits; no value is inferred outside measured search coverage. A probe
     yields only a provisional estimate, not a qualified service guarantee
     or a starvation bound when hard-cap schedulability fails. The caller
@@ -1278,14 +1278,11 @@ def conservative_service_lower_bound(
         receipt.allocated_pool,
         receipt.execution_claim_ceiling,
         receipt.count_cap if receipt.count_cap is not None else receipt.allocated_pool,
+        receipt.maximum_charged_population,
     )
     if population <= 0:
         return None
-    if receipt.admission_policy == "hard_cap":
-        if population > receipt.maximum_charged_population:
-            return None
-    else:
-        population = min(population, receipt.maximum_charged_population)
+    if receipt.admission_policy == "profile":
         if profile.homogeneous_capacity_by_interval[service_interval_ms] <= 0:
             return None
     work_ns = 0

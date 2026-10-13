@@ -137,7 +137,7 @@ def test_terminal_claim_fences_generation_and_first_wins():
         ("profile", True, False, "profile"),
         ("profile", True, True, "profile"),
         ("hard_cap", True, False, "advisory"),
-        ("hard_cap", False, False, "configured"),
+        ("hard_cap", False, False, "advisory"),
     ],
 )
 def test_response_sources(policy, covered, qualified, source):
@@ -163,7 +163,7 @@ def test_response_sources(policy, covered, qualified, source):
         observations=(
             SimpleNamespace(
                 scenario_id="final_tail_then_flush",
-                active_population=2,
+                active_population=2 if covered else 1,
                 elapsed_ns=500000000,
                 censored=False,
                 post_jit=True,
@@ -173,7 +173,9 @@ def test_response_sources(policy, covered, qualified, source):
     result = finalization_response_bounds(profile, service_interval_ms=160, configured_s=7)
     assert result.source == source
     assert result.unqualified is (source != "profile" or not qualified)
-    assert result.response_s == pytest.approx(7 if source == "configured" else 0.16 if qualified else 1.2)
+    assert result.response_s == pytest.approx(
+        7 if source == "configured" else 0.16 if qualified else 1.2 if covered else 0.8
+    )
     assert result.tail_s == pytest.approx(14 if source == "configured" else 1)
 
 
@@ -325,3 +327,75 @@ def test_terminal_claim_closes_acceptance_before_cleanup_await():
     with pytest.raises(ValueError):
         authority.accept(np.zeros(160, dtype=np.float32))
     assert authority.snapshot().accepted_samples == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operator_absolute,expected_warning", [(40, True), (10000, False)])
+@pytest.mark.parametrize("adapter", ["native", "leased"])
+async def test_adapter_receipt_warns_on_winning_configured_assumption(
+    caplog, operator_absolute, expected_warning, adapter
+):
+    """@spec PORT-SESS-017: fallback stays 10s and its winning bound is visible."""
+    import json
+
+    from vllm_omni.entrypoints.nemotron_session import NemotronSessionLease
+    from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+
+    async def expire(kind):
+        pass
+
+    deadline = SessionLifecycleDeadline(idle_timeout_s=60, finalization_timeout_s=operator_absolute, on_expire=expire)
+    authority = SimpleNamespace(chunk_samples=1280, finalization_work=lambda: (640000, 0))
+    session = SimpleNamespace(accepted_audio=authority)
+    service = SimpleNamespace(
+        runtime_config=SimpleNamespace(session_finalization_stall_timeout=10 if expected_warning else 10000)
+    )
+    owner = SimpleNamespace(
+        _session_lifecycle=deadline, _persistent_state_service=service, _session=session, _nemotron_session=session
+    )
+    adapter_type = RealtimeConnection if adapter == "native" else NemotronSessionLease
+    with caplog.at_level("INFO"):
+        adapter_type._arm_session_lifecycle_timeout(owner, "finalization")
+    await deadline.close()
+    receipt = json.loads(
+        next(
+            r.message.removeprefix("Finalization receipt ")
+            for r in caplog.records
+            if r.message.startswith("Finalization receipt ")
+        )
+    )
+    assert receipt["response_s"] == 10
+    assert receipt["stall_winner"] == ("derived" if expected_warning else "operator")
+    assert receipt["absolute_winner"] == ("derived" if expected_warning else "operator")
+    assert receipt["absolute_from_configured_fallback"] is expected_warning
+    assert receipt["unqualified"] is True
+    assert "unqualified operational assumption" in receipt["assumption_note"]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert bool(warnings) is expected_warning
+    if expected_warning:
+        assert "configured" in warnings[0].message
+        assert receipt["absolute_s"] == pytest.approx(5020.1)
+
+
+@pytest.mark.asyncio
+async def test_adapter_derives_clock_operands_from_installed_modes(monkeypatch):
+    """@spec PORT-SESS-016, PORT-SESS-017: installed sample rate/cadences own timing."""
+    from vllm_omni.entrypoints import session_lifecycle as lifecycle
+    from vllm_omni.model_executor.models.nemotron_asr import manifests
+
+    monkeypatch.setitem(manifests.FRONTEND_CONSTANTS, "sample_rate", 8000)
+    monkeypatch.setattr(manifests, "RAW_SAMPLES_PER_CHUNK", {"test": 24000})
+
+    async def expire(kind):
+        pass
+
+    deadline = SessionLifecycleDeadline(idle_timeout_s=60, finalization_timeout_s=1, on_expire=expire)
+    authority = SimpleNamespace(chunk_samples=16000, finalization_work=lambda: (32000, 0))
+    service = SimpleNamespace(
+        runtime_config=SimpleNamespace(session_finalization_response_bound_s=0.5, session_finalization_stall_timeout=1)
+    )
+    lifecycle.arm_session_finalization(deadline, SimpleNamespace(accepted_audio=authority), service)
+    await deadline.close()
+    assert deadline.receipt["absolute_s"] == pytest.approx(5.1)
+    assert deadline.receipt["stall_s"] == pytest.approx(3.6)
+    assert deadline.receipt["adapter_margin_s"] == lifecycle.FINALIZATION_ADAPTER_MARGIN_S

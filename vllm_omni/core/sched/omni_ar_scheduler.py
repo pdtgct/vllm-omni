@@ -777,11 +777,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or pooler_output is not None
                 or kv_transfer_params
                 or stopped
+                or req_id in progress_receipts
             )
             if has_stage_output and _should_emit_engine_output(
                 self.vllm_config.model_config,
                 stopped=stopped,
-                has_control=kv_transfer_params is not None,
+                has_control=kv_transfer_params is not None or req_id in progress_receipts,
             ):
                 OmniSchedulerMixin._append_request_output(
                     self,

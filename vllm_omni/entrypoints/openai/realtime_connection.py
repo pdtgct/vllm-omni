@@ -972,6 +972,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 authority = getattr(getattr(self, "_nemotron_session", None), "accepted_audio", None)
                 winner = getattr(authority, "terminal_cause", None)
                 if winner == "completed":
+                    # Only still-outstanding units are cleared here; any such
+                    # units at completion are lifecycle divergence, hence error.
                     outcome, reason = "error", "completed"
                 elif winner in {"finalization_timeout", "pending_claim_timeout", "error"}:
                     outcome, reason = "error", "error"
@@ -1178,10 +1180,21 @@ class RealtimeConnection(VllmRealtimeConnection):
             won = await service.claim_pending_cleanup(lease)
             if not won:
                 return
-            if not claim_session_terminal(self._nemotron_session, "pending_claim_timeout", lease):
-                return
-            self._streaming_finish_reason = "error"
-            self._terminal_code = "pending_claim_timeout"
+            # Once cleanup is claimed, this lock owns release even when another
+            # terminal cause won during the manager await.
+            if claim_session_terminal(self._nemotron_session, "pending_claim_timeout", lease):
+                self._streaming_finish_reason = "error"
+                self._terminal_code = "pending_claim_timeout"
+            else:
+                assert authority is not None
+                self._terminal_code = authority.terminal_cause
+                self._streaming_finish_reason = (
+                    "completed"
+                    if self._terminal_code == "completed"
+                    else "aborted"
+                    if self._terminal_code in {"disconnect", "cancelled", "abort", "idle_timeout"}
+                    else "error"
+                )
             generation_task = self.generation_task
             await super().cleanup()
             if generation_task is not None:
@@ -1189,12 +1202,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                     generation_task,
                     return_exceptions=True,
                 )
-            self._finish_streaming_session_once("error")
+            self._finish_streaming_session_once(self._streaming_finish_reason)
             assert self._state_operation_id is not None
             await service.release(
                 operation_id=self._state_operation_id,
                 lease=lease,
-                reason="pending_claim_timeout",
+                reason=self._terminal_code,
             )
             self._state_release_done = True
 

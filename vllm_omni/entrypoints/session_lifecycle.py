@@ -12,6 +12,8 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal
 
+FINALIZATION_ADAPTER_MARGIN_S = 0.1
+
 SessionLifecycleKind = Literal["idle", "finalization"]
 ExpiryCallback = Callable[
     [SessionLifecycleKind],
@@ -245,9 +247,8 @@ def finalization_response_bounds(
         receipt.allocated_pool,
         receipt.execution_claim_ceiling,
         receipt.count_cap if receipt.count_cap is not None else receipt.allocated_pool,
+        receipt.maximum_charged_population,
     )
-    if receipt.admission_policy == "profile":
-        population = min(population, receipt.maximum_charged_population)
     tails = [
         sample.elapsed_ns
         for sample in profile.observations
@@ -271,10 +272,17 @@ def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, s
     """Shared adapter integration; snapshot regular work once at acceptance."""
     if deadline.absolute_deadline is not None:
         return
+    from vllm_omni.model_executor.models.nemotron_asr.manifests import (
+        FRONTEND_CONSTANTS,
+        RAW_SAMPLES_PER_CHUNK,
+    )
+
     authority = session.accepted_audio
     runtime = getattr(service, "runtime_config", None)
     try:
-        cadence_s = authority.chunk_samples / 16000
+        sample_rate = FRONTEND_CONSTANTS["sample_rate"]
+        cadence_s = authority.chunk_samples / sample_rate
+        largest_gap_s = max(RAW_SAMPLES_PER_CHUNK.values()) / sample_rate
         response = finalization_response_bounds(
             getattr(service, "compiled_service_profile", None),
             service_interval_ms=round(cadence_s * 1000),
@@ -285,17 +293,36 @@ def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, s
             regular_samples=regular_samples,
             chunk_samples=authority.chunk_samples,
             cadence_s=cadence_s,
-            largest_eligibility_gap_s=1.12,
+            largest_eligibility_gap_s=largest_gap_s,
             response_bound_s=response.response_s,
             initial_eligibility_delay_s=initial_delay_s,
             final_tail_then_flush_s=response.tail_s,
-            adapter_margin_s=0.1,
+            adapter_margin_s=FINALIZATION_ADAPTER_MARGIN_S,
             operator_stall_s=getattr(runtime, "session_finalization_stall_timeout", 10.0),
             operator_absolute_s=deadline._finalization_timeout_s or 40.0,
         )
         deadline.configure_finalization(bounds)
         deadline.receipt.update(vars(response))
-        deadline.receipt["adapter_margin_s"] = 0.1
+        fallback_won = response.source == "configured" and bounds.absolute_winner == "derived"
+        deadline.receipt.update(
+            adapter_margin_s=FINALIZATION_ADAPTER_MARGIN_S,
+            absolute_from_configured_fallback=fallback_won,
+            assumption_note=(
+                "unqualified operational assumption; configured response bound can permit "
+                "long drains while progress continues"
+                if response.source == "configured"
+                else "unqualified operational assumption from provisional service measurements"
+                if response.unqualified
+                else "qualified profile schedule"
+            ),
+        )
+        if fallback_won:
+            logging.getLogger(__name__).warning(
+                "Finalization absolute bound %.3fs uses configured fallback %.3fs per unit; "
+                "unqualified operational assumption",
+                bounds.absolute_s,
+                response.response_s,
+            )
         deadline.arm("finalization")
         logging.getLogger(__name__).info("Finalization receipt %s", json.dumps(deadline.receipt, sort_keys=True))
     except (ValueError, OverflowError, ArithmeticError):

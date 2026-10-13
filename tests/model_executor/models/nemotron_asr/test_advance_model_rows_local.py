@@ -3556,3 +3556,58 @@ def test_post_final_tail_park_echo_cannot_publish_flush_progress() -> None:
     )
     assert int(status.staged[0][0]) == 0
     assert status.plans[0].progress[0, 2].item() == 0
+
+
+# @spec PORT-SESS-016
+def test_forced_eou_replay_and_park_echo_keep_unit_identity():
+    """The installed forced EOU emits one label; its echo is REPLAY, not EOU."""
+    from tests.model_executor.models.nemotron_asr.test_plan_local import _sink_and_plan
+
+    core = _tiny_core()
+    pools = _fresh_pools()
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        _envelope(torch.zeros(REG_SAMPLES), final=False, seq=0).unsqueeze(0),
+        _plan(prefills=[1]),
+    )
+    _set_drained_book(pools, 1, blank=core.blank_id)
+    pools["endpoint_history_pool"] = torch.zeros(3, 8, dtype=torch.int32)
+    pools["endpoint_book_pool"] = torch.zeros(3, 6, dtype=torch.int32)
+    pools["endpoint_book_pool"][1, 4] = 1
+    eou = VOCAB + 3
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id)
+    roles = []
+
+    def record_adapter(result, ctx):
+        roles.append(int(ctx.roles[0]))
+        return adapter(result, ctx)
+
+    registry, _, registry_plan = _sink_and_plan()
+    generation = registry_plan.bindings[0].admission_generation
+    assert registry.publish_progress("a", generation, (1, 0, 2), starts_chunk=True) == (0, 0, 2)
+    keys, phases = [], []
+    for token in (eou, eou, PARK_ID):
+        status = _CommitRecorder()
+        advance.advance_model_rows(
+            core,
+            torch.tensor([token]),
+            torch.zeros(1, CARRIER_HIDDEN),
+            _plan(decodes=[1]),
+            adapter=record_adapter,
+            decode_resolver=_fixed_resolver(),
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            eou_token_id=eou,
+            commit_sink=status,
+            **pools,
+        )
+        assert int(status.staged[0][0]) == 0
+        raw = tuple(status.plans[0].progress[0].tolist())
+        phases.append(raw[2])
+        keys.append(registry.publish_progress("a", generation, raw, starts_chunk=False))
+    assert roles == [advance.ROLE_EOU, advance.ROLE_REPLAY, advance.ROLE_FLUSH]
+    assert phases == [4, 2, 0]
+    assert keys == [None, (1, 1, 2), None]
+    assert registry.publish_progress("a", generation, (2, 0, 2), starts_chunk=True) == (2, 0, 2)
