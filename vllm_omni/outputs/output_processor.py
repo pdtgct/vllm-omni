@@ -101,6 +101,7 @@ class OmniRequestState(RequestState):
         # both audio and latent outputs, the modality type would flip on each
         # add_multimodal_tensor() call. Consider tracking per-key modality
         # types (e.g. dict[str, str]) for future multi-output models.
+        self.finalization_progress: tuple[str, int, tuple[int, int, int]] | None = None
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 
@@ -237,6 +238,9 @@ class OmniRequestState(RequestState):
         external_req_id = self.external_req_id
 
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
+        # @spec PORT-SESS-016: stamp before either queue or return delivery,
+        # including MM-only outputs and terminal outputs that remove state.
+        setattr(output, "finalization_progress", self.finalization_progress)
 
         if self.parent_req is None:
             outputs = [output]
@@ -696,6 +700,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                req_state.finalization_progress = getattr(eco, "finalization_progress", None)
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
@@ -716,19 +721,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         )
 
         # Delegate text/pooling outputs to upstream.
-        progress = {
-            self.request_states[eco.request_id].external_req_id: getattr(eco, "finalization_progress", None)
-            for eco in engine_core_outputs
-            if eco.request_id in self.request_states
-        }
         processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
-        for result in processed.request_outputs:
-            for completion in getattr(result, "outputs", ()):
-                completion.finalization_progress = progress.get(result.request_id)
         processed.request_outputs.extend(mm_request_outputs)
         return processed
 

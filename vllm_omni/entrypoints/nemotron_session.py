@@ -400,17 +400,28 @@ class NemotronSessionLease:
             won = await service.claim_pending_cleanup(lease)
             if not won:
                 return
-            if not claim_session_terminal(self._session, "pending_claim_timeout", lease):
-                return
-            self._terminal_reason = "error"
-            self._terminal_code = "pending_claim_timeout"
+            # Winning cleanup owns release even if a terminal cause won during
+            # the manager await. Preserve that cause and finish under this lock.
+            if claim_session_terminal(self._session, "pending_claim_timeout", lease):
+                self._terminal_reason = "error"
+                self._terminal_code = "pending_claim_timeout"
+            else:
+                assert authority is not None
+                self._terminal_code = authority.terminal_cause
+                self._terminal_reason = (
+                    "completed"
+                    if self._terminal_code == "completed"
+                    else "aborted"
+                    if self._terminal_code in {"disconnect", "cancelled", "abort", "idle_timeout"}
+                    else "error"
+                )
             await self.abort()
-            self._observe_session_finished_once("error")
+            self._observe_session_finished_once(self._terminal_reason)
             assert self._release_operation_id is not None
             await service.release(
                 operation_id=self._release_operation_id,
                 lease=lease,
-                reason="pending_claim_timeout",
+                reason=self._terminal_code,
             )
             self._released = True
 

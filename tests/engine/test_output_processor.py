@@ -3,6 +3,7 @@
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -759,3 +760,87 @@ def test_abort_snapshot_leaves_state_until_commit():
     assert "0_parent" not in processor.request_states
     assert "parent" not in processor.parent_requests
     assert "parent" not in processor.external_req_ids
+
+
+# @spec PORT-SESS-016
+@pytest.mark.parametrize("mm_only", [False, True])
+@pytest.mark.parametrize("queued", [False, True])
+def test_no_token_progress_runner_scheduler_output_processor(monkeypatch, mm_only, queued):
+    """Run the real CPU metadata hops, including a no-token REPLAY step."""
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from tests.core.sched.test_omni_ar_scheduler_logprobs import (
+        _bind_request_lifecycle,
+        _make_scheduler_stub,
+        _Request,
+    )
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+    from vllm_omni.worker.gpu_ar_model_runner_v2 import GPUARModelRunnerV2
+
+    key = (0, 2, 1)
+    pending = {"r": key}
+
+    def consume_committed_progress():
+        result = dict(pending)
+        pending.clear()
+        return result
+
+    runner_output = SimpleNamespace(
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"r": 0},
+        routed_experts=None,
+    )
+    monkeypatch.setattr(GPUModelRunner, "sample_tokens", lambda *args: runner_output)
+    runner = object.__new__(GPUARModelRunnerV2)
+    runner.model = SimpleNamespace(
+        collect_commit_status=lambda: ({"r": 0}, set()), consume_committed_progress=consume_committed_progress
+    )
+    output = runner.sample_tokens(None)
+    assert pending == {}
+    request = _Request("r")
+    request.num_in_flight_tokens = 1
+    scheduler = _make_scheduler_stub([request])
+    scheduler._claimed_state_bindings = {"r": SimpleNamespace(generation=3)}
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"r": 1}, scheduled_spec_decode_tokens={}, num_invalid_spec_tokens=0
+    )
+    batches = OmniARScheduler.update_from_output(scheduler, scheduled, output)
+    assert 0 in batches, "no-token step lost its committed progress at the scheduler"
+    assert len(batches[0].outputs) == 1
+    assert batches[0].outputs[0].new_token_ids == []
+    state = _make_no_detok_state(RequestOutputKind.DELTA) if mm_only else _make_state(RequestOutputKind.DELTA)
+    if not mm_only:
+        state.detokenizer = MagicMock(
+            output_token_ids=[],
+            get_next_output_text=MagicMock(return_value=""),
+            update=MagicMock(return_value=None),
+            num_output_tokens=MagicMock(return_value=0),
+        )
+    delivered: list[Any] = []
+    if queued:
+        state.queue = SimpleNamespace(put=delivered.append)
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, engine_core_output_type=AUDIO)
+    processor.request_states["r"] = state
+    processor.external_req_ids["r"].append("r")
+    processed = processor.process_outputs(batches[0].outputs)
+    results = delivered if queued else processed.request_outputs
+    assert len(results) == 1
+    assert results[0].outputs[0].token_ids == []
+    assert results[0].outputs[0].finalization_progress == ("r", 3, key)
+
+
+# @spec PORT-SESS-016
+def test_mm_terminal_progress_survives_state_removal(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+    eco = _audio_engine_output(is_segment_finished=False, is_last_chunk=True)
+    eco.finalization_progress = ("r", 3, (1, 0, 3))
+    result = processor.process_outputs([eco])
+    assert "r" not in processor.request_states
+    assert result.request_outputs[0].outputs[0].finalization_progress == eco.finalization_progress

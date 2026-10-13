@@ -1038,3 +1038,35 @@ def test_lease_reads_model_progress_with_observer_disabled() -> None:
         await lease.release()
 
     _run(scenario())
+
+
+# @spec PORT-SESS-018
+def test_leased_pending_cleanup_interleaving_still_releases_exact_lease(monkeypatch) -> None:
+    async def scenario():
+        engine = FakeAsyncOmni()
+        lease = await NemotronSessionFactory(engine=engine).open(cadence=_CADENCE, locale="en-US")
+        lease._pending_claim_task.cancel()
+        await asyncio.gather(lease._pending_claim_task, return_exceptions=True)
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        async def claim(state_lease):
+            entered.set()
+            await resume.wait()
+            return True
+
+        monkeypatch.setattr(engine, "claim_pending_cleanup", claim)
+        expiry = asyncio.create_task(lease._expire_pending_claim(0))
+        lease._pending_claim_task = expiry
+        await entered.wait()
+        authority = lease._session.accepted_audio
+        authority.claim_terminal("disconnect", lease_generation=lease._state_lease.generation)
+        resume.set()
+        await expiry
+        assert len(engine.state_releases) == 1
+        assert engine.state_releases[0]["lease"] is lease._state_lease
+        assert engine.state_releases[0]["operation_id"] == lease._release_operation_id
+        assert authority.terminal_cause == "disconnect"
+        await lease.release()
+        assert len(engine.state_releases) == 1
+
+    _run(scenario())

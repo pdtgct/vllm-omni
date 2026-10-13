@@ -1142,3 +1142,41 @@ async def test_pending_claim_timeout_cannot_replace_terminal_winner() -> None:
     assert authority.terminal_cause == "completed"
     await connection.cleanup()
     assert len(service.release_calls) == 1
+
+
+# @spec PORT-SESS-018
+@pytest.mark.asyncio
+async def test_pending_cleanup_interleaving_still_releases_exact_lease(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    connection, _, service = _connection()
+    authority = AcceptedAudioAuthority(
+        request_id="a",
+        engine_epoch="e",
+        lease_generation=1,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, session_key="a")
+    connection._state_lease = service.lease
+    connection._state_operation_id = "release-op"
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def claim(lease):
+        entered.set()
+        await resume.wait()
+        return True
+
+    monkeypatch.setattr(service, "claim_pending_cleanup", claim)
+    expiry = asyncio.create_task(connection._expire_pending_claim(0))
+    await entered.wait()
+    authority.claim_terminal("disconnect", lease_generation=1)
+    resume.set()
+    await expiry
+    assert len(service.release_calls) == 1
+    assert service.release_calls[0]["lease"] is service.lease
+    assert service.release_calls[0]["operation_id"] == "release-op"
+    assert authority.terminal_cause == "disconnect"
+    await connection.cleanup()
+    assert len(service.release_calls) == 1

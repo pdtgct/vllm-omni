@@ -872,3 +872,17 @@ def test_forced_control_commit_waits_for_legal_park_to_raise_progress() -> None:
     assert registry.publish_progress("a", generation, (1, 3, 2), starts_chunk=True) == (0, 3, 2)
     assert registry.publish_progress("a", generation, (1, 1, 4), starts_chunk=False) is None
     assert registry.publish_progress("a", generation, (1, 1, 2), starts_chunk=False) == (1, 1, 2)
+
+
+# @spec PORT-SESS-016
+def test_forced_eou_across_two_replay_waves_counts_one_unit():
+    """A forced-control unit retains its identity across multiple cursor advances."""
+    registry, _, plan = _sink_and_plan()
+    generation = plan.bindings[0].admission_generation
+    publish = registry.publish_progress
+    assert publish("a", generation, (1, 3, 2), starts_chunk=True) == (0, 3, 2)
+    assert publish("a", generation, (1, 1, 4), starts_chunk=False) is None
+    assert publish("a", generation, (1, 2, 1), starts_chunk=False) == (1, 2, 1)
+    assert publish("a", generation, (1, 3, 1), starts_chunk=False) == (1, 3, 1)
+    assert publish("a", generation, (1, 3, 2), starts_chunk=False) == (1, 3, 2)
+    assert publish("a", generation, (2, 0, 2), starts_chunk=True) == (2, 0, 2)

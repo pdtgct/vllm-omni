@@ -697,7 +697,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            # @spec PORT-SESS-016: committed progress needs a carrier even on
+            # silent REPLAY/park steps with no sampled tokens or payload.
+            if (
+                new_token_ids
+                or mm_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+                or req_id in progress_receipts
+            ):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,

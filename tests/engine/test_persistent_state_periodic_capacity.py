@@ -526,7 +526,7 @@ def test_hard_cap_advice_never_suppresses_hard_feasible_dispatch() -> None:
 
 @pytest.mark.parametrize("policy", ("profile", "hard_cap"))
 def test_service_lower_bound_uses_maximum_population_and_derating(policy: str) -> None:
-    """@spec PORT-PERF-006 / PORT-STATE-026: read-only D1 service floor."""
+    """@spec PORT-PERF-006 / PORT-STATE-026 / PORT-SESS-016: D1 service floor."""
     profile = _compile(
         intervals_ms=(320,), tables_ms=((50, 100, 200),), derating_factor=Fraction(1, 2), admission_policy=policy
     )
@@ -535,7 +535,10 @@ def test_service_lower_bound_uses_maximum_population_and_derating(policy: str) -
     assert lower_bound(profile, service_interval_ms=320) == (Fraction(1) if policy == "profile" else Fraction(4, 5))
     assert lower_bound(profile, service_interval_ms=80) is None
     wider = replace(profile, receipt=replace(profile.receipt, allocated_pool=4, count_cap=4, execution_claim_ceiling=4))
-    assert lower_bound(wider, service_interval_ms=320) == (Fraction(1) if policy == "profile" else None)
+    # Dispatch itself is clamped by P_search, so a larger physical pool
+    # still uses the measured advisory bound at that admitted population.
+    assert wider.receipt.maximum_charged_population == 3
+    assert lower_bound(wider, service_interval_ms=320) == (Fraction(1) if policy == "profile" else Fraction(4, 5))
 
 
 def test_service_lower_bound_covers_competing_geometries_and_regulated_release() -> None:

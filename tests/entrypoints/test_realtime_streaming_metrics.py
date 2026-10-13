@@ -1480,3 +1480,102 @@ async def test_late_engine_error_cannot_replace_disconnect_winner() -> None:
     await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="late")
     assert errors == []
     assert authority.terminal_cause == "disconnect"
+
+
+# @spec PORT-SESS-016, PORT-SESS-017
+@pytest.mark.asyncio
+async def test_native_nonadvancing_replay_keeps_stall_deadline(monkeypatch):
+    import numpy as np
+
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    authority = AcceptedAudioAuthority(
+        request_id="replay",
+        engine_epoch="e",
+        lease_generation=3,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    authority.accept(np.zeros(160, dtype=np.float32))
+    authority.dispatch_next()
+    output = _generation_output("", [])
+    output.outputs[0].finalization_progress = ("replay", 3, (0, 2, 1))
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    observed = []
+
+    def record():
+        observed.append(
+            (
+                connection._session_lifecycle._stall_deadline,
+                connection._session_lifecycle.absolute_deadline,
+                connection._session_lifecycle.generation,
+            )
+        )
+        now[0] += 1
+
+    engine = _RealtimeGenerationEngine([output, record, output, record])
+    connection, _, _ = _connection(engine, observer=None)
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, eou_token_id=9003)
+    connection._session_lifecycle._finalization_timeout_s = 100
+    connection._session_lifecycle._stall_timeout_s = 10
+    connection._session_lifecycle.arm("finalization")
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="replay")
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
+    assert connection._session_lifecycle._high_water == (0, 2, 1)
+    await connection._session_lifecycle.close()
+
+
+# @spec PORT-SESS-005, PORT-SESS-018
+@pytest.mark.asyncio
+async def test_native_undrained_generation_end_errors_without_final():
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import AcceptedAudioAuthority
+
+    authority = AcceptedAudioAuthority(
+        request_id="undrained",
+        engine_epoch="e",
+        lease_generation=3,
+        chunk_samples=160,
+        capacity_samples=1600,
+        carrier_sequence_modulus=100,
+    )
+    authority.begin_finalize()
+    assert not authority.finalization_drained
+    connection, events, _ = _connection(_RealtimeGenerationEngine([]), observer=None)
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, eou_token_id=9003)
+    errors = []
+
+    async def send_error(*args):
+        errors.append(args)
+
+    connection.send_error = send_error
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="undrained")
+    assert authority.terminal_cause == "error"
+    assert connection._streaming_finish_reason == "error"
+    assert len(errors) == 1
+    assert "before final-tail and FLUSH completion" in errors[0][0]
+    assert all(type(event).__name__ != "TranscriptionDone" for event in events)
+
+
+# @spec PORT-SESS-018, PORT-OBS-006
+@pytest.mark.asyncio
+async def test_completed_winner_clears_only_outstanding_units_as_error():
+    observer = _RecordingObserver()
+    observer.seed_ready("completed", n=1)
+    connection, _, _ = _connection(_RealtimeGenerationEngine([]), observer=observer)
+    # Completion already owns disposition; a residual observed unit is
+    # lifecycle divergence, not a second successful unit completion.
+    authority = SimpleNamespace(
+        terminal_cause="completed",
+        finalization_drained=True,
+        lease_generation=3,
+        claim_terminal=lambda *args, **kwargs: False,
+        clear=lambda *args: None,
+    )
+    connection._nemotron_session = SimpleNamespace(accepted_audio=authority, eou_token_id=9003)
+    await connection._run_generation(_empty_streaming_input(), asyncio.Queue(), request_id="completed")
+    assert [c[1]["outcome"] for c in observer.calls if c[0] == "unit_cleared"] == ["error"]
+    assert [c[1]["reason"] for c in observer.calls if c[0] == "session_finished"] == ["error"]
