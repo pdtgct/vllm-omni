@@ -541,7 +541,7 @@ def test_verdict_software_must_match_profile(component, missing):
 
 
 @pytest.mark.parametrize(
-    "pin", [None, {}, {"torch": "2.9."}, {"torch": "2.9.0+cu128"}, {"torch": "2.9.0", "unknown_component": "x"}]
+    "pin", [{"torch": "2.9."}, {"torch": "2.9.0+cu128"}, {"torch": "2.9.0", "unknown_component": "x"}]
 )
 def test_pinned_backend_requires_exact_build(pin):
     """@spec PORT-PREC-031: every pin component must exist and match."""
@@ -550,6 +550,37 @@ def test_pinned_backend_requires_exact_build(pin):
     profile = _build(observations)
     ok, reasons = _qualified(profile)
     assert not ok and any("pinned_build" in r for r in reasons)
+
+
+@pytest.mark.parametrize("pin", [None, {}, "torch==2.9.0", ["torch"], {"torch": 2.9}])
+def test_malformed_pinned_build_rejected_at_validation(pin):
+    """@spec PORT-PREC-031: a pin is a non-empty str-to-str mapping."""
+    observations = _valid_observations()
+    observations[0] = _obs("gemm", kind="pinned_backend", pinned_build=pin)
+    with pytest.raises(ValueError, match="pinned_build"):
+        _build(observations)
+    profile = _build()
+    profile["rows"]["gemm"]["evidence"][0]["kind"] = "pinned_backend"
+    profile["rows"]["gemm"]["evidence"][0]["pinned_build"] = pin
+    assert any("pinned_build" in e for e in kp.validate_kernel_profile(profile))
+
+
+def test_pinned_build_on_dispatch_evidence_is_a_validation_error():
+    """@spec PORT-PREC-031: only pinned_backend evidence carries a pin."""
+    observations = _valid_observations()
+    observations[0] = _obs("gemm", kind="dispatch", pinned_build={"torch": "2.9.0"})
+    with pytest.raises(ValueError, match="pinned_build"):
+        _build(observations)
+
+
+@pytest.mark.parametrize("present", ["torch", "cuda", "cudnn", "triton"])
+def test_verdict_software_must_contain_every_component(present):
+    """@spec PORT-PREC-032: a partial verdict software block cannot qualify."""
+    fingerprint = _fingerprint()
+    fingerprint["software"] = {present: fingerprint["software"][present]}
+    profile = _build()
+    ok, reasons = _qualified(profile, fingerprint)
+    assert not ok and any("missing" in r and "software" in r for r in reasons)
 
 
 def test_pinned_backend_preserves_matching_build():
