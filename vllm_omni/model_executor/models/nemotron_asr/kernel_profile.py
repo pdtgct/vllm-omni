@@ -475,7 +475,7 @@ def _executed_rows(profile: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 def kernel_profile_qualified(
     profile: Mapping[str, Any], *, verdict_fingerprint: Mapping[str, Any], qualification_packet: str
 ) -> tuple[bool, list[str]]:
-    """@spec PORT-PREC-014, PORT-PREC-025, PORT-PREC-032: every condition must hold.
+    """@spec PORT-PREC-014, PORT-PREC-025, PORT-PREC-032, PORT-PREC-033: every condition must hold.
 
     Collects every failing reason. A resolved float16 accumulator is a
     declaration here, not a failure; PORT-PREC-021 is a separate adapter.

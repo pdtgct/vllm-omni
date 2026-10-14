@@ -137,6 +137,7 @@ class SessionLifecycleDeadline:
             self.arm("finalization")
         return True
 
+    # @spec PORT-SESS-022
     def configure_finalization(self, bounds: FinalizationBounds) -> None:
         if self.absolute_deadline is not None:
             return
@@ -224,7 +225,7 @@ class FinalizationResponseBounds:
     unqualified: bool
 
 
-# @spec PORT-SESS-016, PORT-SESS-017
+# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-019
 def finalization_response_bounds(
     profile: Any,
     *,
@@ -267,7 +268,7 @@ def finalization_response_bounds(
     )
 
 
-# @spec PORT-SESS-016, PORT-SESS-017
+# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-021
 def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, service: Any) -> None:
     """Shared adapter integration; snapshot regular work once at acceptance."""
     if deadline.absolute_deadline is not None:
