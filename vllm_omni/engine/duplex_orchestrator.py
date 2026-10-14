@@ -17,7 +17,7 @@ import threading
 import time as _time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
@@ -422,7 +422,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         return DuplexStageSubmissionResult(
             request_id=context.request_id,
             stage_id=context.stage_id,
-            replica_id=replica_id,
+            # This submission is resumable; terminal updates alone return StageUpdateResult.
+            replica_id=cast(int, replica_id),
         )
 
     async def _route_output(
