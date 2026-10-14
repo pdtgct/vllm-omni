@@ -13,6 +13,38 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+# @spec PORT-OBS-006
+@pytest.mark.parametrize(
+    "cause,expected",
+    [
+        ("completed", "completed"),
+        ("disconnect", "aborted"),
+        ("cancelled", "aborted"),
+        ("abort", "aborted"),
+        ("idle_timeout", "aborted"),
+        ("finalization_timeout", "error"),
+        ("pending_claim_timeout", "error"),
+        ("error", "error"),
+        ("output_capacity_exceeded", "error"),
+        ("engine_epoch_changed", "error"),
+        ("engine_error", "error"),
+        ("protocol_error", "error"),
+        ("lifecycle_divergence", "error"),
+        ("downstream_deadline", "error"),
+        ("unknown_cause", "error"),
+        ("aborted", "error"),
+        ("Completed", "error"),
+        (" completed ", "error"),
+        ("", "error"),
+        (None, "error"),
+    ],
+)
+def test_terminal_cause_finish_reason_mapping(cause: str | None, expected: str) -> None:
+    from vllm_omni.entrypoints.session_lifecycle import terminal_cause_finish_reason
+
+    assert terminal_cause_finish_reason(cause) == expected
+
+
 def _fail(message: str) -> NoReturn:
     pytest.fail(message, pytrace=False)
     raise AssertionError

@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.session_lifecycle import (
     claim_session_terminal,
     consume_session_progress,
     record_finalization_expiry,
+    terminal_cause_finish_reason,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.streaming_transport import observe_safely
@@ -1191,13 +1192,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             else:
                 assert authority is not None
                 self._terminal_code = authority.terminal_cause
-                self._streaming_finish_reason = (
-                    "completed"
-                    if self._terminal_code == "completed"
-                    else "aborted"
-                    if self._terminal_code in {"disconnect", "cancelled", "abort", "idle_timeout"}
-                    else "error"
-                )
+                self._streaming_finish_reason = terminal_cause_finish_reason(self._terminal_code)
             generation_task = self.generation_task
             await super().cleanup()
             if generation_task is not None:

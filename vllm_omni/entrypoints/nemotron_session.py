@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.session_lifecycle import (
     claim_session_terminal,
     consume_session_progress,
     record_finalization_expiry,
+    terminal_cause_finish_reason,
 )
 from vllm_omni.model_executor.models.nemotron_asr.transcript import (
     SegmentCompletion,
@@ -408,13 +409,7 @@ class NemotronSessionLease:
             else:
                 assert authority is not None
                 self._terminal_code = authority.terminal_cause
-                self._terminal_reason = (
-                    "completed"
-                    if self._terminal_code == "completed"
-                    else "aborted"
-                    if self._terminal_code in {"disconnect", "cancelled", "abort", "idle_timeout"}
-                    else "error"
-                )
+                self._terminal_reason = terminal_cause_finish_reason(self._terminal_code)
             await self.abort()
             self._observe_session_finished_once(self._terminal_reason)
             assert self._release_operation_id is not None

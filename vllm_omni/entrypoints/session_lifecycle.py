@@ -346,6 +346,16 @@ def consume_session_progress(deadline: SessionLifecycleDeadline, session: Any, o
                 deadline.observe_progress(key)
 
 
+# @spec PORT-OBS-006
+def terminal_cause_finish_reason(cause: str | None) -> Literal["completed", "aborted", "error"]:
+    """Map the winning terminal cause to the session's published outcome."""
+    if cause == "completed":
+        return "completed"
+    if cause in {"disconnect", "cancelled", "abort", "idle_timeout"}:
+        return "aborted"
+    return "error"
+
+
 def claim_session_terminal(session: Any, cause: str, lease: Any) -> bool:
     authority = getattr(session, "accepted_audio", None)
     if authority is None:
