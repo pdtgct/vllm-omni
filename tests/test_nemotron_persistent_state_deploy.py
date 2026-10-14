@@ -8,7 +8,7 @@ import importlib.resources
 import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
 
@@ -51,7 +51,7 @@ def _persistent_state(stage: Any) -> dict[str, Any]:
         _fail("ENV-MIG-011 missing typed StageDeployConfig.persistent_state")
     if isinstance(value, type) or not is_dataclass(value) or type(value).__name__ != "PersistentStateDeployConfig":
         _fail("ENV-MIG-011 persistent_state is not PersistentStateDeployConfig")
-    return {key: item for key, item in asdict(value).items() if item is not None}
+    return {key: item for key, item in asdict(cast(Any, value)).items() if item is not None}
 
 
 def _resolved_stage(

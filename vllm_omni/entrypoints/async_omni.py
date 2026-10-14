@@ -1248,7 +1248,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Return the task set exposed by the orchestrator-backed engine."""
         return tuple(self.engine.supported_tasks)
 
-    async def check_health(self) -> None:
+    async def check_health(self) -> None:  # type: ignore[override]
         """Check engine health by verifying the Orchestrator process is alive."""
         await super().check_health()
         persistent_state = self._persistent_state_service

@@ -80,6 +80,9 @@ class RealtimeConnection(VllmRealtimeConnection):
     generation output handling to emit audio deltas.
     """
 
+    _is_model_validated: bool
+    generation_task: asyncio.Task | None
+
     def __init__(self, *args, observer: Any = None, park_token_id: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)

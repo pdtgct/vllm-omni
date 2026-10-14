@@ -52,9 +52,9 @@ def test_output_processor_receives_the_flag() -> None:
 
 # @spec PORT-OBS-008
 def test_engine_passes_its_flag_into_the_runtime_factory() -> None:
-    from vllm_omni.engine import async_omni_engine as m
+    from vllm_omni.engine import omni_engine_base as m
 
-    src = inspect.getsource(m.AsyncOmniEngine)
+    src = inspect.getsource(m.OmniEngineBase)
     start = src.index("create_stage_runtime(")
     call = src[start : src.index(")", src.index("request_queue", start))]
     assert "log_stats=self._log_stats" in call

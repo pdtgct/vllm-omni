@@ -1571,6 +1571,7 @@ def test_scheduler_rewrap_preserves_v2_prefill_tokens(
 ) -> None:
     # @spec PORT-MIG-005 / PORT-MIG-006
     scheduler = _make_scheduler()
+    scheduler.max_num_running_reqs = 8
     scheduler.waiting = []
     scheduler.running = []
     scheduler.input_coordinator = None

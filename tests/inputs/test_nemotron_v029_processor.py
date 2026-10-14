@@ -24,6 +24,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 PLACEHOLDER = 13089
 
 
+class _Tokenizer:
+    def encode(self, text, **kwargs):
+        assert text == ""
+        return []
+
+
 @pytest.fixture
 def processor(monkeypatch):
     mm_config = MultiModalConfig()
@@ -33,7 +39,7 @@ def processor(monkeypatch):
         multimodal_config=mm_config,
         get_multimodal_config=lambda: mm_config,
     )
-    context = InputProcessingContext(cast(ModelConfig, model_config), tokenizer=SimpleNamespace())
+    context = InputProcessingContext(cast(ModelConfig, model_config), tokenizer=_Tokenizer())
     info = NemotronASRProcessingInfo(context)
 
     def forbid_hf_processor(**kwargs):

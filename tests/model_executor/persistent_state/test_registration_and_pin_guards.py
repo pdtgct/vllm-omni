@@ -220,26 +220,28 @@ def _called_names(function: Any) -> set[str]:
     return names
 
 
-def test_vllm_v029_source_guard_covers_state_sensitive_core_seams() -> None:
+def test_vllm_v030_source_guard_covers_state_sensitive_core_seams() -> None:
     """@spec PORT-MIG-006: core source drift blocks re-qualification.
 
-    Audited against v0.29.0 source 98dff2a81d747d1dba01a47f939f48c3526d4206.
+    Audited against v0.30.0 source ced6857af.
     This is a source compatibility guard, not installed-wheel/GPU qualification.
+    The audited v0.30 changes add raw-storage branches (not selected here),
+    JIT warmup scopes and microbatch setup (rejected for persistent models).
     V1's removed reshape hook is now the shared byte-layout allocator, reached
     through initialize_kv_cache_tensors. Pin both ends of that replacement.
     """
 
     expected_digests = {
         "v1.get_kv_cache_spec": "9942da0efdf23c20af79d0707fddf0712e71dfe8884ce1d2b3019a235fb40bd9",
-        "v1.initialize_kv_cache": "abf417d0b3bcef6ef61aa373bb6469b61c5ec6854086d27dd6ffcfa98e6a2b66",
-        "v1.initialize_kv_cache_tensors": "97b72e9f6a9d1ee2b67d53bc24308360bb4019a97b098f26897e15aa5dd6ebde",
+        "v1.initialize_kv_cache": "12531924bb9707ec5a6e19de8682d34d14c99e17e4a30484915ea03b03541cea",
+        "v1.initialize_kv_cache_tensors": "17a79a872648a15051360ae52742930832fe3137d0ebf5740f8c727515efaded",
         "v2.get_kv_cache_spec": "9307d484402f25986a64c645b9da713939e698e71595b46c4338b40c10c0620b",
-        "v2.initialize_kv_cache": "fcb8388b0a24e9b81a49d27e25f96a090eddd27f29da914c7d477cb58a8896f5",
-        "prepare_kernel_block_sizes": "2fe8d5c03098041cfe7e4c5b6320d290a41c8d110acbc9f4f97084f2e7be891d",
+        "v2.initialize_kv_cache": "53d26a0656e85b8b937b122fc433ea4aa5d828791d78fb35d1ae7d7ab6102d9d",
+        "prepare_kernel_block_sizes": "df2781ea559c24cdda26c2f0129caf56daa108a72a91d2b9fe2dab0ce8bdea0d",
         "v1.initialize_attn_backend": "e7446cc68d31de806a7edc9adc99746ed3edc0908604e7a0d41c7754b4e5e465",
-        "v2.init_attn_backend": "07074ed6cc04d6c9aeb542dba5991099bde0c211e298c3860fad4d0c297de80f",
+        "v2.init_attn_backend": "955606b28d6aea76a22d208611cc39734f8191d8974f58234bd46909f4c94664",
     }
-    expected_digests["allocate_kv_cache"] = "567365d6ba1f8cfbf8e87d070e116d81984bc4a03ab7bd50517345e4e16363a2"
+    expected_digests["allocate_kv_cache"] = "945448107157ec94f1e2eabe41d48cb74aa07a78bfcf2adbe14002b139a6e08c"
     functions = {
         "v1.get_kv_cache_spec": GPUModelRunnerV1.get_kv_cache_spec,
         "v1.initialize_kv_cache": GPUModelRunnerV1.initialize_kv_cache,

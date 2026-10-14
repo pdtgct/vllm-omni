@@ -298,8 +298,6 @@ async def omni_run_server_worker(
     """Run a single API server worker."""
     api_server_count = _resolve_api_server_count(args, client_config)
 
-    api_server_count = getattr(args, "api_server_count", None)
-
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
@@ -1009,7 +1007,9 @@ async def omni_init_app_state(
         from vllm.model_executor.model_loader import get_model_cls
 
         if bool(getattr(get_model_cls(vllm_config.model_config), "supports_persistent_state", False)):
-            streaming_install.assert_single_api_server_invariant(getattr(args, "api_server_count", None) or 1)
+            streaming_install.assert_single_api_server_invariant(
+                getattr(state, "api_server_count", None) or getattr(args, "api_server_count", None) or 1
+            )
         state.persistent_state_service = await _install_persistent_state_service(
             engine_client,
             vllm_config,

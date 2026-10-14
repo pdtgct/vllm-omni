@@ -827,17 +827,20 @@ def test_realtime_serving_accepts_one_immutable_runtime_envelope() -> None:
 
 
 def test_async_omni_engine_declares_the_orchestrator_binding() -> None:
-    """`AsyncOmniEngine.__init__` must initialize ``self.orchestrator``
+    """`OmniEngineBase.__init__` must initialize ``self.orchestrator``
     and the bootstrap must bind the constructed instance — the attach
     seam above depends on this attribute existing on the real engine,
     which is exactly what the pre-fix code lacked."""
     import inspect
 
-    from vllm_omni.engine import async_omni_engine as eng_mod
+    from vllm_omni.engine import omni_engine_base as eng_mod
 
-    src = inspect.getsource(eng_mod.AsyncOmniEngine)
-    assert "self.orchestrator: Orchestrator | None = None" in src
+    src = inspect.getsource(eng_mod.OmniEngineBase)
+    assert "self.orchestrator: OrchestratorBase | None = None" in src
     assert "self.orchestrator = orchestrator" in src
+    bootstrap = inspect.getsource(eng_mod.OmniEngineBase._bootstrap_orchestrator)
+    assert bootstrap.index("self._create_orchestrator(") < bootstrap.index("self.orchestrator = orchestrator")
+    assert bootstrap.index("self.orchestrator = orchestrator") < bootstrap.index("startup_future.set_result(")
 
 
 # @spec PORT-OBS-008, PORT-OBS-009

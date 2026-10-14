@@ -227,8 +227,10 @@ def test_finish_only_zero_token_update_reconciles_in_the_same_step(
     )
 
 
+@pytest.mark.parametrize("valid_dummy_state_slots", [False, True])
 def test_execute_model_brackets_super_with_projection(
     monkeypatch: pytest.MonkeyPatch,
+    valid_dummy_state_slots: bool,
 ) -> None:
     # @spec PORT-MIG-005
     state = _ProjectionState()
@@ -237,6 +239,7 @@ def test_execute_model_brackets_super_with_projection(
     result = object()
 
     def execute(self: Any, value: object, **kwargs: object) -> object:
+        assert kwargs["valid_dummy_state_slots"] is valid_dummy_state_slots
         state.events.append(("super-execute", None))
         return result
 
@@ -245,6 +248,7 @@ def test_execute_model_brackets_super_with_projection(
     actual = type(runner).execute_model(
         runner,
         output,
+        valid_dummy_state_slots=valid_dummy_state_slots,
         dummy_run=False,
         is_profile=False,
     )
@@ -530,7 +534,7 @@ def test_worker_selects_v2_before_model_state_layers_exist(monkeypatch: pytest.M
     from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
     worker = object.__new__(GPUARWorker)
-    worker.vllm_config = SimpleNamespace(model_config=object())
+    worker.vllm_config = SimpleNamespace(model_config=object(), parallel_config=SimpleNamespace(enable_dbo=False))
     worker.use_v2_model_runner = True
     monkeypatch.setattr(model_loader, "get_model_cls", lambda config: NemotronASRForRNNT)
 
@@ -552,11 +556,15 @@ def test_worker_preserves_upstream_runner_for_other_models(monkeypatch: pytest.M
     from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
     worker = object.__new__(GPUARWorker)
-    worker.vllm_config = SimpleNamespace(model_config=object())
+    worker.vllm_config = SimpleNamespace(model_config=object(), parallel_config=SimpleNamespace(enable_dbo=False))
     worker.use_v2_model_runner = True
     monkeypatch.setattr(model_loader, "get_model_cls", lambda config: torch.nn.Linear)
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    assert worker._select_model_runner_cls() is OmniARModelRunner
+    assert worker.use_v2_model_runner is True
+    worker.use_v2_model_runner = False
     assert worker._select_model_runner_cls() is GPUARWorker.model_runner_cls
-    assert worker.use_v2_model_runner is False
 
 
 def _worker(*, persistent: bool, ordinary_groups: int) -> Any:
@@ -829,8 +837,8 @@ def test_core_warmup_pin_guard_keeps_the_persistent_only_divergence_narrow() -> 
     ordered = (
         "self.model_runner.maybe_remove_all_loras",
         "kernel_warmup(self)",
-        "self.model_runner.capture_model()",
         "warmup_kernels(self.model_runner",
+        "self.model_runner.capture_model()",
         "set_random_seed(self.model_config.seed)",
         "activate_jit_monitor(",
         "freeze_gc_heap()",
@@ -874,3 +882,21 @@ def test_postamble_failure_does_not_attest_resident_warmup(monkeypatch: pytest.M
     with pytest.raises(RuntimeError, match="postamble failed"):
         type(worker)._compile_or_warm_up_persistent_only_model(worker)
     assert worker.persistent_state_warmup_attestation() is False
+
+
+@pytest.mark.parametrize("enable_dbo,ubatch_size", [(True, 0), (False, 2)])
+def test_persistent_worker_rejects_multiple_microbatches(monkeypatch, enable_dbo, ubatch_size):
+    # @spec PORT-MIG-005 / PORT-MIG-006
+    from vllm.model_executor import model_loader
+
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+    worker = object.__new__(GPUARWorker)
+    worker.use_v2_model_runner = True
+    worker.vllm_config = SimpleNamespace(
+        model_config=object(),
+        parallel_config=SimpleNamespace(enable_dbo=enable_dbo, ubatch_size=ubatch_size),
+    )
+    monkeypatch.setattr(model_loader, "get_model_cls", lambda _: SimpleNamespace(supports_persistent_state=True))
+    with pytest.raises(RuntimeError, match="more than one microbatch"):
+        worker._select_model_runner_cls()

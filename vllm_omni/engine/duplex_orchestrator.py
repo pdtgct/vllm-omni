@@ -41,6 +41,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     build_engine_core_request_from_tokens,
 )
+from vllm_omni.engine.stage_pool import StageUpdateResult
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -115,7 +116,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self,
         stage_id: int,
         request_id: str,
-        replica_id: int,
+        replica_id: int | StageUpdateResult,
         req_state: OrchestratorRequestState,
     ) -> None:
         del replica_id

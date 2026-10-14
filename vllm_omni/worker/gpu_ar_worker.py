@@ -50,7 +50,8 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if bool(getattr(model_cls, "supports_persistent_state", False)):
             if not self.use_v2_model_runner:
                 raise RuntimeError("persistent state requires Model Runner v2")
-            if self.vllm_config.parallel_config.enable_dbo:
+            parallel_config = self.vllm_config.parallel_config
+            if parallel_config.enable_dbo or getattr(parallel_config, "ubatch_size", 0) > 1:
                 raise RuntimeError("persistent state does not support more than one microbatch (DBO)")
             return GPUARModelRunnerV2
         if self.use_v2_model_runner:

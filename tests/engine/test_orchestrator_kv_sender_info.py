@@ -73,7 +73,8 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
         (DPLBStageEngineCoreClient, DPLBAsyncMPClient),
     ],
 )
-def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
+@pytest.mark.asyncio
+async def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
     monkeypatch, client_class, base_client_class
 ):
     vllm_config = SimpleNamespace(

@@ -122,11 +122,12 @@ def test_core_constructed_pool_has_exact_aggregate_byte_placement(layout):
     """@spec PORT-STATE-002: exercise the core allocation constructor itself."""
     config = _config()
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         cache_config=SimpleNamespace(
             get_resolved_kv_cache_layout=lambda: layout,
             num_gpu_blocks_override=None,
             prefix_cache_retention_interval=None,
-        )
+        ),
     )
     built = get_kv_cache_config_from_groups(
         vllm_config,

@@ -34,6 +34,7 @@ def test_stale_model_failure_identity_is_ignored() -> None:
     scheduler = OmniSchedulerMixin.__new__(OmniSchedulerMixin)
     scheduler.requests = {"healthy": object()}
     scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=False,
         update_request_metadata=lambda *args, **kwargs: None,
         process_pending_full_payload_inputs=lambda *args, **kwargs: None,
     )

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -65,7 +65,7 @@ class _StageTransport:
 
 
 def _new_service(stage: _StageTransport) -> Any:
-    return _service(stage, _Clock(), max_tombstones=4)
+    return _service(cast(Any, stage), _Clock(), max_tombstones=4)
 
 
 async def _reserve(service: Any, stage: _StageTransport) -> Any:

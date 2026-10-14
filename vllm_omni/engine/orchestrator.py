@@ -593,7 +593,7 @@ class OrchestratorBase:
         self,
         stage_id: int,
         request_id: str,
-        replica_id: int,
+        replica_id: int | StageUpdateResult,
         req_state: OrchestratorRequestState,
     ) -> None:
         """Called after every successful ``submit_initial`` / ``submit_update``."""

@@ -524,7 +524,11 @@ def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_ch
         with pytest.raises(RuntimeError, match=expected_error):
             await asyncio.wait_for(consume(), timeout=1.0)
         assert error_metadata.call_count == 1
-        assert submissions == ([("add", True), ("update", False)] if has_chunk else [("add", False)])
+        # @spec PORT-INT-012: failed input never fabricates a terminal request.
+        if input_fails:
+            assert submissions == ([("add", True)] if has_chunk else [])
+        else:
+            assert submissions == ([("add", True), ("update", False)] if has_chunk else [("add", False)])
         assert omni.request_states == {}
 
     asyncio.run(run_test())
