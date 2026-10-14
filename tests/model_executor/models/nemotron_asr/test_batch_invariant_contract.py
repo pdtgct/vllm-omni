@@ -331,7 +331,7 @@ def test_prec023_qualification_identity(field, value):
 
 @pytest.mark.parametrize(
     "missing",
-    ["128", "geometry", "reset", "mixed", "014", "016", "020", "021", "022", "024", "026", "027", "transcript"],
+    ["128", "geometry", "reset", "mixed", "014", "016", "020", "021", "024", "026", "027", "transcript"],
 )
 def test_prec023_qualification_failure_isolation(missing):
     """@spec PORT-PREC-023, PORT-PREC-024: functional and numerical misses are local, not startup errors."""
@@ -367,6 +367,34 @@ def test_prec023_qualification_failure_isolation(missing):
     unknown = _fingerprint(gpu="NVIDIA H100")
     result = qualify(unknown, _evidence(unknown), served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
     assert result.ready and not result.qualified
+
+
+@pytest.mark.parametrize("disclosure", ["missing", "false"])
+def test_prec022_disclosure_does_not_gate_verdict_or_readiness(disclosure):
+    """@spec PORT-PREC-022, PORT-PREC-023: disclosure gates publication only."""
+    fp = _fingerprint()
+    evidence = _evidence(fp)
+    if disclosure == "missing":
+        del evidence["gates"]["PORT-PREC-022"]
+    else:
+        evidence["gates"]["PORT-PREC-022"] = False
+    result = api().qualification_verdict(fp, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
+    assert result.ready and result.qualified and not result.default and not result.supported
+
+
+@pytest.mark.parametrize("gate", [14, 16, 20, 21, 24, 26, 27])
+@pytest.mark.parametrize("attestation", ["missing", "false"])
+def test_prec023_each_qualification_gate_is_required(gate, attestation):
+    """@spec PORT-PREC-023: each required gate independently controls qualification."""
+    fp = _fingerprint()
+    evidence = _evidence(fp)
+    name = f"PORT-PREC-{gate:03}"
+    if attestation == "missing":
+        del evidence["gates"][name]
+    else:
+        evidence["gates"][name] = False
+    result = api().qualification_verdict(fp, evidence, served_geometries=(0, 1, 2, 3, 4), deployment_cap=20)
+    assert result.ready and not result.qualified and not result.default and not result.supported
 
 
 @pytest.mark.parametrize("failure", ["compile", "capture", "replay"])

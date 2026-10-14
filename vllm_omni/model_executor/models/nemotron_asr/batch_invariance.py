@@ -493,11 +493,13 @@ def qualification_verdict(
     served_geometries: Sequence[int],
     deployment_cap: int,
 ) -> QualificationVerdict:
-    """@spec PORT-PREC-020, PORT-PREC-022, PORT-PREC-023, PORT-PREC-024,
-    PORT-PREC-026, PORT-PREC-027: accept only a complete, identity-bound envelope.
+    """@spec PORT-PREC-014, PORT-PREC-016, PORT-PREC-020, PORT-PREC-021,
+    PORT-PREC-023, PORT-PREC-024, PORT-PREC-026, PORT-PREC-027:
+    accept only a complete, identity-bound qualification envelope.
 
     Gates are the lab's verified evidence attestations, not inferred from mode
     selection. The deployment cap never reduces the B128 qualification envelope.
+    PORT-PREC-022 disclosure gates publication only, not qualification or readiness.
     """
     ready = evidence.get("executable") is True and not evidence.get("execution_failure")
     gates = evidence.get("gates", {})
@@ -511,6 +513,6 @@ def qualification_verdict(
         and set(served_geometries) <= set(evidence.get("geometries", ()))
         and {"repeated", "mixed"} <= set(evidence.get("compositions", ()))
         and evidence.get("independent_b128_runs", 0) >= 2
-        and all(gates.get(f"PORT-PREC-{number:03}") is True for number in (14, 16, 20, 21, 22, 24, 26, 27))
+        and all(gates.get(f"PORT-PREC-{number:03}") is True for number in (14, 16, 20, 21, 24, 26, 27))
     )
     return QualificationVerdict(ready=ready, qualified=qualified)
