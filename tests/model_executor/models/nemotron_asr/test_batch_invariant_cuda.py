@@ -6,23 +6,20 @@ Run in a fresh process: installing vLLM overrides is process-wide. The synthetic
 matrix uses the production optimized graph owner and real encoder dimensions.
 It is a necessary numerical falsifier, never a complete qualification verdict.
 
-NeMo and cost tests consume raw lab evidence, not synthetic substitutes:
-NEMOTRON_BI_PARITY_MANIFEST names JSON with fingerprint, immutable golden hashes
-and tensor pairs (actual/golden safetensors paths and tensor keys).
-NEMOTRON_BI_COST_MANIFEST names JSON with matched identity, a discarded warmup
-per arm, four or more alternating paired repetitions, raw replay durations and
-ready/park/audio/wall observations, reported medians, and the side-effect list.
-Missing evidence is a failure on CUDA, never an xfail or a newly pinned golden.
+Transcript and cost tests validate supplied lab packets, not synthetic substitutes.
+NEMOTRON_BI_TRANSCRIPT_IDENTITY_MANIFEST names the matched FP32 arms' exact
+20-cell final transcripts, fingerprints, receipts and mode-off NeMo parity.
+NEMOTRON_BI_COST_MANIFEST names matched unprofiled raw observations and medians.
+Missing transcript evidence leaves the verdict unqualified; missing/invalid cost
+disclosure blocks publication only, without changing readiness or the verdict.
 """
 
 from __future__ import annotations
 
 import copy
-import hashlib
 import importlib
 import json
 import os
-import statistics
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import combinations, product
@@ -343,142 +340,35 @@ def _manifest(variable):
     return json.loads(path.read_text()), path.parent
 
 
-def _file(base, relative):
-    path = (base / relative).resolve()
-    assert path.name != ".env"
-    return path
-
-
-@torch.inference_mode()
 @pytest.mark.cuda
 @cuda_only
-def test_prec024_fp32_nemo_parity(mode_on):
-    """@spec PORT-PREC-024: unchanged goldens, complete shapes, exact 5e-5 gate."""
-    from safetensors.torch import load_file
+def test_prec024_fp32_mode_transcript_identity():
+    """@spec PORT-PREC-024: validate supplied 20-cell, byte-identical FP32 finals.
 
-    manifest, base = _manifest("NEMOTRON_BI_PARITY_MANIFEST")
-    assert manifest["fingerprint"]["batch_invariant_mode"] == "on"
-    assert manifest["fingerprint"]["precision"] == "fp32"
-    assert manifest["golden_revision"] == manifest["mode_off_golden_revision"]
-    assert set(manifest["geometries"]) == set(GEOMETRIES)
-    assert manifest["pairs"]
-    covered = set()
-    for pair in manifest["pairs"]:
-        actual_path, golden_path = _file(base, pair["actual"]), _file(base, pair["golden"])
-        assert actual_path != golden_path
-        before = golden_path.read_bytes()
-        assert hashlib.sha256(before).hexdigest() == pair["mode_off_golden_sha256"]
-        assert hashlib.sha256(actual_path.read_bytes()).hexdigest() == pair["actual_sha256"]
-        actual, golden = load_file(str(actual_path)), load_file(str(golden_path))
-        assert set(pair["keys"]) == set(golden), "no selective tensor comparison"
-        for key in pair["keys"]:
-            torch.testing.assert_close(actual[key], golden[key], atol=5e-5, rtol=5e-5, equal_nan=False)
-        assert golden_path.read_bytes() == before
-        covered.add(pair["geometry"])
-    assert covered == set(GEOMETRIES)
+    No mode-on NeMo tensor gate, WER tolerance, experiment or mode installation.
+    """
+    from batch_invariant_packet import validate_transcript_identity
 
-
-# Exact installed aten overrides and other process-wide mutations at 98dff2a81.
-SIDE_EFFECTS = {
-    "aten::mm",
-    "aten::addmm",
-    "aten::matmul",
-    "aten::linear",
-    "aten::bmm",
-    "aten::softmax",
-    "aten::_softmax",
-    "aten::_log_softmax",
-    "aten::mean.dim",
-    "torch.bmm",
-    "torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction",
-    "torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction",
-    "torch.backends.cuda.preferred_blas_library",
-    "torch.backends.cuda.matmul.fp32_precision",
-    "torch.backends.cudnn.conv.fp32_precision",
-    "torch.backends.cudnn.rnn.fp32_precision",
-    "VLLM_ALLREDUCE_USE_SYMM_MEM",
-    "CUBLAS_WORKSPACE_CONFIG",
-    "NCCL_LAUNCH_MODE",
-    "NCCL_COLLNET_ENABLE",
-    "NCCL_NVLS_ENABLE",
-    "NCCL_P2P_NET_DISABLE",
-    "NCCL_MIN_NCHANNELS",
-    "NCCL_MAX_NCHANNELS",
-    "NCCL_PROTO",
-    "NCCL_ALGO",
-    "NCCL_NTHREADS",
-    "NCCL_SOCKET_NTHREADS",
-    "VLLM_USE_AOT_COMPILE",
-}
-
-
-# Port-owned schema compatibility is additional to every pinned vLLM effect.
-SIDE_EFFECTS.update(
-    {
-        "nemotron_bi.aten_schema_adapters",
-        "aten::mm.out",
-        "aten::mm.dtype",
-        "aten::mm.dtype_out",
-        "aten::addmm.out",
-        "aten::addmm.dtype",
-        "aten::addmm.dtype_out",
-        "aten::bmm.out",
-        "aten::bmm.dtype",
-        "aten::bmm.dtype_out",
-        "aten::matmul.out",
-        "aten::linear.out",
-        "aten::softmax.int",
-        "aten::softmax.int_out",
-        "aten::_softmax.out",
-        "aten::_log_softmax.out",
-        "aten::mean.out",
-    }
-)
+    manifest, _ = _manifest("NEMOTRON_BI_TRANSCRIPT_IDENTITY_MANIFEST")
+    validate_transcript_identity(manifest)
 
 
 @pytest.mark.cuda
 @cuda_only
 def test_prec022_disclosure_manifest():
-    """@spec PORT-PREC-022: matched unprofiled alternating pairs, no speed threshold."""
-    manifest, _ = _manifest("NEMOTRON_BI_COST_MANIFEST")
-    assert set(manifest["side_effects"]) == SIDE_EFFECTS
-    assert manifest["threshold"] is None
-    assert manifest["default_changed"] is False and manifest["supported_changed"] is False
-    arms = manifest["arms"]
-    assert set(arms) == {"off", "on"}
-    off_id, on_id = copy.deepcopy(arms["off"]["identity"]), copy.deepcopy(arms["on"]["identity"])
-    assert "batch_invariant_mode" not in off_id
-    assert on_id.pop("batch_invariant_mode") == "on"
-    assert off_id == on_id
-    for field in ("gpu", "audio_sha256", "cadence", "concurrency", "software", "precision", "optimizations"):
-        assert field in off_id
-    pairs = manifest["pairs"]
-    assert len(pairs) >= 4
-    samples: dict[str, dict[str, list[float]]] = {
-        arm: {key: [] for key in ("replay_ms", "service_ms", "throughput")} for arm in arms
-    }
-    for arm in arms:
-        assert len(arms[arm]["warmup"]) == 1
-        assert arms[arm]["warmup"][0]["discarded"] is True
-    for index, pair in enumerate(pairs):
-        assert pair["order"] == (["off", "on"] if index % 2 == 0 else ["on", "off"])
-        for arm in pair["order"]:
-            run = pair[arm]
-            assert not run["profiled"] and not run["discarded"]
-            assert run["encoder_replay_ns"] and run["chunks"]
-            samples[arm]["replay_ms"].extend(value / 1e6 for value in run["encoder_replay_ns"])
-            audio_seconds = 0.0
-            for chunk in run["chunks"]:
-                assert chunk["park_ns"] >= chunk["ready_ns"]
-                samples[arm]["service_ms"].append((chunk["park_ns"] - chunk["ready_ns"]) / 1e6)
-                audio_seconds += chunk["audio_seconds"]
-            start, end = run["window_start_ns"], run["window_end_ns"]
-            assert end > start
-            assert all(start <= c["ready_ns"] <= c["park_ns"] <= end for c in run["chunks"])
-            samples[arm]["throughput"].append(audio_seconds / ((end - start) / 1e9))
-    for arm, metrics in samples.items():
-        for metric, values in metrics.items():
-            assert arms[arm]["reported"][metric] == pytest.approx(statistics.median(values))
+    """@spec PORT-PREC-022: invalid disclosure blocks publication only.
+
+    Failure does not invalidate PREC-024 evidence, change readiness or change
+    the verdict. Supplied unprofiled paired cost has no performance threshold.
+    """
+    from batch_invariant_packet import PUBLICATION_ONLY, installed_inventory, validate_cost_disclosure
+
+    try:
+        manifest, _ = _manifest("NEMOTRON_BI_COST_MANIFEST")
+        inventory, source_sha256 = installed_inventory()
+        validate_cost_disclosure(manifest, inventory, source_sha256)
+    except (AssertionError, OSError, ValueError) as error:
+        raise AssertionError(f"{PUBLICATION_ONLY}: {error}") from error
 
 
 @pytest.mark.parametrize("ndim", [1, 2])
