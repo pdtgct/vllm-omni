@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from fractions import Fraction
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.engine.persistent_state_capacity import (
     ServiceExecutionTier,
@@ -25,6 +26,9 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
     RAW_SAMPLES_PER_CHUNK,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.nemotron_asr.priming_trace import PrimingLegTrace
 
 _PRIMING_SCENARIOS = (
     "ordinary",
@@ -253,6 +257,17 @@ class NemotronPersistentStateStartupProvider:
         if not isinstance(prompts, dict) or not prompts:
             raise RuntimeError("persistent-state priming requires the served prompt dictionary")
         locale = str(next(iter(prompts)))
+        # Diagnostic experiment: no collector, RPC, or extra clocks when disabled.
+        trace_enabled = os.environ.get("VLLM_OMNI_PRIMING_LEG_TRACE") == "1"
+        preexpire = (
+            round_spec.scenario_id == "forced_eou_then_chunk"
+            and os.environ.get("VLLM_OMNI_PRIMING_CANARY_PREEXPIRE") == "1"
+        )
+        legs: list[PrimingLegTrace] | None = None
+        if trace_enabled or preexpire:
+            from vllm_omni.model_executor.models.nemotron_asr import priming_trace
+
+            legs = []
         bound: list[NemotronSessionLease] = []
         for state_lease in leases:
             session = NemotronRealtimeSession.from_model_config(
@@ -264,6 +279,10 @@ class NemotronPersistentStateStartupProvider:
                 engine_epoch=str(state_lease.engine_epoch),
                 lease_generation=int(state_lease.generation),
             )
+            if legs is not None:
+                leg = priming_trace.PrimingLegTrace(round_spec.scenario_id, str(state_lease.session_key))
+                session._priming_leg_trace = leg  # type: ignore[attr-defined]  # Diagnostic-only attachment.
+                legs.append(leg)
             bound.append(
                 NemotronSessionLease(
                     engine=engine_client,
@@ -276,7 +295,12 @@ class NemotronPersistentStateStartupProvider:
             RAW_SAMPLES_PER_CHUNK[cadence],
             dtype=np.float32,
         )
+        if trace_enabled:
+            await priming_trace.worker_trace_rpc(engine_client, tuple(str(lease.session_key) for lease in leases))
         started_ns = time.monotonic_ns()
+        if legs is not None:
+            for leg in legs:
+                leg.timestamps["t0"] = started_ns
         try:
             if round_spec.scenario_id == "ordinary":
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
@@ -286,7 +310,13 @@ class NemotronPersistentStateStartupProvider:
                 # request through the ordinary CHUNK path first; that common
                 # setup work is deliberately outside the two-park canary.
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                if preexpire:
+                    assert legs is not None
+                    await priming_trace.preexpire_setup(legs, round_spec.service_interval_ms * 1_000_000)
                 started_ns = time.monotonic_ns()
+                if legs is not None:
+                    for leg in legs:
+                        leg.timestamps["t0"] = started_ns
                 await asyncio.gather(*(lease.force_segment() for lease in bound))
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
                 completed_legal_parks = 2 * len(bound)
@@ -302,6 +332,11 @@ class NemotronPersistentStateStartupProvider:
                 *(lease.abort() for lease in bound),
                 return_exceptions=True,
             )
+            if trace_enabled:
+                role_counts = await priming_trace.worker_trace_rpc(engine_client, None)
+        if trace_enabled:
+            assert legs is not None
+            priming_trace.log_trace(round_spec, legs, started_ns, elapsed_ns, preexpire, role_counts)
         return SimpleNamespace(
             completed_legal_parks=completed_legal_parks,
             elapsed_ns=elapsed_ns,

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_omni.model_executor.models.nemotron_asr import priming_trace
 from vllm_omni.model_executor.models.nemotron_asr.advance import (
     CaptureRecord,
     CommitPlan,
@@ -248,6 +249,15 @@ class BoundedCommitSink:
         rows = len(plan.bindings)
         status = self._status_host[:rows].tolist()
         progress = self._progress_host[:rows].tolist() if plan.progress is not None else None
+        # Diagnostic only: reuse the completed host copy, never read the device.
+        if priming_trace.worker_counts is not None:
+            for i, binding in enumerate(plan.bindings):
+                priming_trace.count_worker_row(
+                    binding.request_id,
+                    binding.is_chunk,
+                    int(progress[i][2]) if progress is not None else None,
+                    int(status[i]) if self._staged_lease_ok else -1,
+                )
         reports = [
             SessionStatusReport(
                 request_id=binding.request_id,

@@ -155,6 +155,8 @@ async def buffer_stream(
                 return
 
     authority = session.accepted_audio
+    # Diagnostic collector is attached only to opted-in startup sessions.
+    leg_trace = getattr(session, "_priming_leg_trace", None)
     # Optional capability; custom/no-op observers need no additional API.
     # Cache once, preserving disabled per-unit clocks and scheduling calls.
     timing = None
@@ -201,7 +203,13 @@ async def buffer_stream(
                 eligibility_ns = authority.next_eligibility_ns
                 if eligibility_ns is None:
                     raise RuntimeError("ready audio could not become in-flight")
-                await asyncio.sleep(max(0, eligibility_ns - now_ns) / 1e9)
+                if leg_trace is None:
+                    await asyncio.sleep(max(0, eligibility_ns - now_ns) / 1e9)
+                else:
+                    requested_ns = max(0, eligibility_ns - now_ns)
+                    sleep_started_ns = time.monotonic_ns()
+                    await asyncio.sleep(requested_ns / 1e9)
+                    leg_trace.slept(requested_ns, time.monotonic_ns() - sleep_started_ns)
                 continue
             handle = session.take_ready_handle(unit.logical_sequence)
             if active_observer is not None and handle is not None:
@@ -212,6 +220,8 @@ async def buffer_stream(
                 unit,
                 submitted_at_ns=submitted_ns,
             )
+            if leg_trace is not None:
+                leg_trace.submitted(unit.kind, submitted_ns)
             if timing is not None:
                 try:
                     timing.submitted(
@@ -289,6 +299,8 @@ async def buffer_stream(
     # without guaranteeing a model step. PORT therefore submits its
     # model-level FLUSH explicitly, after the final-tail transaction
     # has committed at legal park.
+    if leg_trace is not None:
+        leg_trace.submitted("flush", time.monotonic_ns())
     yield {"prompt_token_ids": [session.flush_token_id]}
     # The generic AsyncOmni end marker is queued only after this
     # model-level barrier has itself committed. Otherwise a lifecycle

@@ -507,6 +507,8 @@ class NemotronSessionLease:
         from vllm_omni.metrics.streaming_transport import observe_safely
 
         observer = self._session.observer
+        # Diagnostic startup hook; output ids are already host-side DELTAs.
+        leg_trace = getattr(self._session, "_priming_leg_trace", None)
         try:
             render = self._render or _render_factory(self._engine)
             outputs = self._engine.generate(
@@ -529,6 +531,8 @@ class NemotronSessionLease:
                 ids = list(first.token_ids)
                 in_flight = self._session.accepted_audio.in_flight_unit
                 in_flight_kind = getattr(in_flight, "kind", None)
+                if leg_trace is not None:
+                    leg_trace.output(in_flight_kind, len(ids), self._park_id in ids)
                 if ids:
                     self._input_stream.put_nowait(ids)
                 self._session.transcript.commit_result(first.text or "")

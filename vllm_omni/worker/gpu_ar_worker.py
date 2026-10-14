@@ -39,6 +39,14 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     model_runner_cls = GPUARModelRunner
 
+    def priming_leg_trace(self, request_ids: tuple[str, ...] | None = None):
+        # Diagnostic startup RPC: bounded registration / consume-and-clear only.
+        if os.environ.get("VLLM_OMNI_PRIMING_LEG_TRACE") != "1":
+            return None
+        from vllm_omni.model_executor.models.nemotron_asr.priming_trace import worker_trace_control
+
+        return worker_trace_control(request_ids)
+
     def _select_model_runner_cls(self):
         """Require MRv2 for persistent models; retain upstream choices otherwise."""
         from vllm.model_executor.model_loader import get_model_cls

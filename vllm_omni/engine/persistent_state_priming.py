@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
@@ -310,6 +312,11 @@ async def run_service_priming_round(
             continuously_loaded=round_spec.continuously_loaded,
             scenario_id=round_spec.scenario_id,
         )
+        # Diagnostic raw evidence survives a later profile dominance failure.
+        if os.environ.get("VLLM_OMNI_PRIMING_LEG_TRACE") == "1":
+            logging.getLogger(__name__).info(
+                "PRIMING_OBSERVATION %s", json.dumps(asdict(observation), separators=(",", ":"))
+            )
     except BaseException as error:
         primary = error
     cleanup_task = asyncio.create_task(
