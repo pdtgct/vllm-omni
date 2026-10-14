@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import random
 from dataclasses import replace
@@ -13,6 +14,8 @@ from types import ModuleType
 from typing import Any, NoReturn
 
 import pytest
+
+from tests.engine.persistent_state_helpers import compile_with_canaries
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -158,113 +161,12 @@ def _compile_ns(
         _fail(f"PORT-STATE-026 missing periodic arguments on the existing service-profile compiler: {error}")
 
 
-def _compile_with_canaries(
-    *,
-    ordinary_ns: int = 100,
-    forced_ns: int = 200,
-    terminal_ns: int = 200,
-    omit_scenario: str | None = None,
-    completed_legal_parks: int = 2,
-    derating_factor: Fraction = Fraction(1, 2),
-    admission_policy: str = "profile",
-) -> Any:
-    execution_type = _symbol("ServiceRoundExecution", "PORT-PERF-006")
-    executions = [
-        execution_type(
-            scenario_id="ordinary",
-            tier_id="single",
-            active_population=1,
-            elapsed_ns=ordinary_ns,
-            service_interval_ms=80,
-            geometry_id=0,
-            completed_legal_parks=1,
-            completed_model_rows=None,
-            post_jit=True,
-            continuously_loaded=True,
-            dummy_run=False,
-            is_profile=False,
-        )
-    ]
-    for scenario_id, elapsed_ns in (
-        ("forced_eou_then_chunk", forced_ns),
-        ("final_tail_then_flush", terminal_ns),
-    ):
-        if scenario_id == omit_scenario:
-            continue
-        executions.extend(
-            (
-                execution_type(
-                    scenario_id=scenario_id,
-                    tier_id="single",
-                    active_population=1,
-                    elapsed_ns=10_000,
-                    service_interval_ms=80,
-                    geometry_id=0,
-                    completed_legal_parks=completed_legal_parks,
-                    completed_model_rows=None,
-                    post_jit=False,
-                    continuously_loaded=True,
-                    dummy_run=False,
-                    is_profile=False,
-                ),
-                execution_type(
-                    scenario_id=scenario_id,
-                    tier_id="single",
-                    active_population=1,
-                    elapsed_ns=elapsed_ns,
-                    service_interval_ms=80,
-                    geometry_id=0,
-                    completed_legal_parks=completed_legal_parks,
-                    completed_model_rows=None,
-                    post_jit=True,
-                    continuously_loaded=True,
-                    dummy_run=False,
-                    is_profile=False,
-                ),
-            )
-        )
-    context = _symbol("ServiceProfileContext", "PORT-PERF-006")(
-        pre_override_physical_bound=2,
-        allocated_pool=1,
-        count_cap=1,
-        execution_claim_ceiling=1,
-        service_budget_source="measured_fallback",
-        service_budget_coefficients=(),
-        derating_factor=derating_factor,
-        slot_bytes=6_314_936,
-        execution_environment_key="control-canary-test",
-        precision_policy="fp32",
-        state_profile="nemotron-asr-fp32-v1",
-        compiler_version="persistent-state-capacity-v3",
-        mixed_composition_policy="periodic_limited_preemption_edf",
-    )
-    return _symbol("compile_provisional_service_profile", "PORT-PERF-006")(
-        tuple(executions),
-        execution_tiers=(
-            _symbol("ServiceExecutionTier", "PORT-PERF-006")(
-                tier_id="single",
-                max_active_population=1,
-            ),
-        ),
-        max_population=1,
-        reference_interval_ms=80,
-        reference_geometry_id=0,
-        admitted_geometry_ids=(0,),
-        trailing_rounds=1,
-        derating_factor=derating_factor,
-        context=context,
-        control_upper_ns_by_window_and_population=None,
-        control_dominance_sha256=None,
-        evidence_class="probe",
-        admission_policy=admission_policy,
-    )
-
-
 def _compile_with_bulk_canary(
     *,
     single_ordinary_ns: int = 50_000_000,
     bulk_ordinary_ns: int = 397_265_692,
     bulk_terminal_ns: int = 823_425_490,
+    admission_policy: str = "profile",
 ) -> Any:
     execution_type = _symbol("ServiceRoundExecution", "PORT-PERF-006")
     tiers = (
@@ -355,6 +257,7 @@ def _compile_with_bulk_canary(
         control_upper_ns_by_window_and_population=None,
         control_dominance_sha256=None,
         evidence_class="probe",
+        admission_policy=admission_policy,
     )
 
 
@@ -688,7 +591,7 @@ def test_control_work_is_not_free_or_double_counted() -> None:
 def test_exceptional_control_canaries_derive_zero_control_identity() -> None:
     """@spec PORT-STATE-026 / PORT-PERF-006: measured margin is authority."""
 
-    profile = _compile_with_canaries()
+    profile = compile_with_canaries()
 
     assert profile.control_upper_ns_by_window_and_population is None
     assert profile.control_dominance_sha256 is not None
@@ -727,10 +630,10 @@ def test_bulk_canary_still_gates_a_partly_feasible_population_step() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"forced_ns": 201}, "forced_eou_then_chunk|dominance|201"),
-        ({"terminal_ns": 201}, "final_tail_then_flush|dominance|201"),
         ({"omit_scenario": "forced_eou_then_chunk"}, "forced_eou_then_chunk|missing"),
         ({"completed_legal_parks": 1}, "park|two"),
+        ({"continuously_loaded": False}, "continuously loaded"),
+        ({"canary_interval_ms": 160}, "interval"),
         (
             {
                 "forced_ns": _INT64_MAX,
@@ -746,16 +649,16 @@ def test_exceptional_control_canaries_fail_closed(
     kwargs: dict[str, Any],
     match: str,
 ) -> None:
-    """@spec PORT-PERF-006 / PORT-PERF-008: no missing or weak proof."""
+    """@spec PORT-PERF-006, PORT-PERF-008: no missing or weak proof."""
 
     with pytest.raises(ValueError, match=match):
-        _compile_with_canaries(**kwargs, admission_policy=policy)
+        compile_with_canaries(**kwargs, admission_policy=policy)
 
 
 def test_exceptional_control_leading_round_is_not_the_upper() -> None:
     """@spec PORT-PERF-006: JIT-establishing canaries remain excluded."""
 
-    profile = _compile_with_canaries()
+    profile = compile_with_canaries()
 
     assert profile.control_dominance_sha256 is not None
 
@@ -878,8 +781,8 @@ def test_headroom_uses_bounded_bisection_at_population_1000() -> None:
 
 def test_advisory_receipt_preserves_ordinary_and_canary_evidence() -> None:
     """@spec PORT-PERF-006: complete evidence differs only in policy stamp."""
-    profile = _compile_with_canaries()
-    advisory = _compile_with_canaries(admission_policy="hard_cap")
+    profile = compile_with_canaries()
+    advisory = compile_with_canaries(admission_policy="hard_cap")
     assert not profile.receipt.advisory
     assert advisory.receipt.advisory
     assert advisory.receipt.observations == profile.receipt.observations
@@ -910,7 +813,7 @@ def test_service_lower_bound_includes_explicit_control_envelope() -> None:
 
 def test_zero_advisory_retains_irrelevant_failed_canary() -> None:
     """@spec PORT-PERF-006: no lost or promoted zero-headroom evidence."""
-    profile = _compile_with_canaries(
+    profile = compile_with_canaries(
         ordinary_ns=81_000_000, forced_ns=170_000_000, terminal_ns=170_000_000, admission_policy="hard_cap"
     )
     assert profile.measured_capacity == 0
@@ -923,3 +826,137 @@ def test_service_compiler_rejects_unknown_policy() -> None:
     """@spec PORT-STATE-026: advice does not introduce a third policy."""
     with pytest.raises(ValueError, match="admission policy"):
         _compile(admission_policy="unsafe")
+
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+@pytest.mark.parametrize("scenario", ("forced_ns", "terminal_ns"))
+@pytest.mark.parametrize("excess", (0, 1))
+def test_control_dominance_boundary_is_policy_scoped(policy, scenario, excess, caplog, monkeypatch):
+    """@spec PORT-PERF-006, PORT-PERF-008: control dominance boundary is policy scoped"""
+    logger = logging.getLogger(_MODULE)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    kwargs = {scenario: 200 + excess, "admission_policy": policy}
+    if policy == "profile" and excess:
+        with pytest.raises(ValueError, match="control-dominance failed"):
+            compile_with_canaries(**kwargs)
+        return
+    profile = compile_with_canaries(**kwargs)
+    expected = "unproven" if excess else "proven_zero"
+    assert profile.receipt.control_charge_status == expected
+    assert profile.receipt.control_dominance_evidence["control_charge_status"] == expected
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == int(bool(excess))
+    cells = profile.receipt.control_dominance_evidence["cells"]
+    assert all(cell["admission_relevant"] for cell in cells)
+    assert sum(not cell["dominance_passed"] for cell in cells) == excess
+    assert profile.control_upper_ns_by_window_and_population is None
+    assert _evaluate(profile, 1).control_ns == 0
+
+
+@pytest.mark.parametrize("policy,status", (("profile", "proven_zero"), ("hard_cap", "unproven")))
+def test_irrelevant_failed_cell_status_depends_on_policy(policy, status, caplog, monkeypatch):
+    """@spec PORT-PERF-006, PORT-PERF-008: irrelevant failed cell status depends on policy"""
+    logger = logging.getLogger(_MODULE)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    profile = _compile_with_bulk_canary(admission_policy=policy)
+    assert profile.receipt.control_charge_status == status
+    failed = [cell for cell in profile.receipt.control_dominance_evidence["cells"] if not cell["dominance_passed"]]
+    assert failed and all(not cell["admission_relevant"] for cell in failed)
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == int(policy == "hard_cap")
+
+
+def test_hard_cap_warning_names_every_failed_cell_once(caplog, monkeypatch):
+    """@spec PORT-PERF-006: hard cap warning names every failed cell once"""
+    logger = logging.getLogger(_MODULE)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    profile = compile_with_canaries(forced_ns=201, terminal_ns=202, admission_policy="hard_cap")
+    warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    for cell in profile.receipt.control_dominance_evidence["cells"]:
+        assert cell["dominance_passed"] is False
+        for value in (cell["scenario_id"], "geometry 0", "tier single", str(cell["left"]), str(cell["right"])):
+            assert value in warnings[0]
+
+
+def test_control_charge_status_participates_in_both_hashes(monkeypatch):
+    """@spec PORT-PERF-006, PORT-STATE-027: control charge status participates in both hashes"""
+    module = _module()
+    original_hash = module._hash_json
+    captured = []
+
+    def capture(payload):
+        if "control_charge_status" in payload:
+            captured.append((dict(payload), original_hash(payload)))
+        return original_hash(payload)
+
+    monkeypatch.setattr(module, "_hash_json", capture)
+    profile = compile_with_canaries(admission_policy="hard_cap")
+    assert len(captured) == 2
+    assert {digest for _, digest in captured} == {
+        profile.receipt.receipt_sha256,
+        profile.receipt.control_dominance_sha256,
+    }
+    for payload, digest in captured:
+        assert payload["control_charge_status"] == "proven_zero"
+        assert original_hash({**payload, "control_charge_status": "unproven"}) != digest
+
+
+def test_explicit_table_status_and_unproven_service_bound():
+    """@spec PORT-PERF-006, PORT-SESS-016: explicit table status and unproven service bound"""
+    explicit = _compile(
+        intervals_ms=(80,),
+        tables_ms=((20, 40),),
+        admission_policy="hard_cap",
+        derating_factor=Fraction(1, 2),
+        control_ms={80: (10, 20)},
+    )
+    assert explicit.receipt.control_charge_status == "explicit_table"
+    assert _symbol("conservative_service_lower_bound")(explicit, service_interval_ms=80) == Fraction(2, 3)
+    unproven = compile_with_canaries(terminal_ns=201, admission_policy="hard_cap")
+    assert _symbol("conservative_service_lower_bound")(unproven, service_interval_ms=80) is None
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    (
+        ("missing", "no_applicable_table"),
+        ("interval_unproven", "no_applicable_table"),
+        ("unproven_coverage", "control_unproven"),
+        ("coverage", "outside_measured_coverage"),
+        ("control_coverage", "outside_measured_coverage"),
+        ("zero_population", "no_applicable_table"),
+        ("zero_frontier", "no_applicable_table"),
+        ("zero_work", "no_applicable_table"),
+        ("valid", None),
+    ),
+)
+def test_service_lower_bound_owns_fallback_reason(case, reason):
+    """@spec PORT-SESS-016, PORT-SESS-022: one capacity resolver owns fallback precedence."""
+    profile = compile_with_canaries(admission_policy="hard_cap", terminal_ns=201 if "unproven" in case else 200)
+    interval = 80
+    if case == "missing":
+        profile = None
+    elif case == "interval_unproven":
+        interval = 160
+    elif case in ("coverage", "unproven_coverage"):
+        profile = replace(profile, fragmentation_duration_ns_by_geometry_and_population={0: ()})
+    elif case == "control_coverage":
+        profile = compile_with_canaries(
+            admission_policy="hard_cap", control_upper_ns_by_window_and_population={80_000_000: (1,)}
+        )
+        profile = replace(profile, control_upper_ns_by_window_and_population={80_000_000: ()})
+    elif case == "zero_population":
+        profile = replace(profile, receipt=replace(profile.receipt, allocated_pool=0))
+    elif case == "zero_frontier":
+        profile = compile_with_canaries()
+        profile = replace(profile, homogeneous_capacity_by_interval={80: 0})
+    elif case == "zero_work":
+        profile = replace(profile, fragmentation_duration_ns_by_geometry_and_population={0: (0,)})
+    rate, actual_reason = _symbol("conservative_service_lower_bound_with_reason")(profile, service_interval_ms=interval)
+    assert actual_reason == reason
+    assert rate == (Fraction(1) if reason is None else None)
+    if profile is not None:
+        assert _symbol("conservative_service_lower_bound")(profile, service_interval_ms=interval) == rate

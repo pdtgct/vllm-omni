@@ -2,6 +2,7 @@
 """@spec PORT-SESS-005, PORT-SESS-016, PORT-SESS-017, PORT-SESS-018."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -153,6 +154,7 @@ def test_response_sources(policy, covered, qualified, source):
             count_cap=2,
             maximum_charged_population=2 if covered else 1,
             admission_policy=policy,
+            control_charge_status="proven_zero",
         ),
         service_interval_ms_by_geometry={0: 160, 1: 320},
         homogeneous_capacity_by_interval={160: 2, 320: 2},
@@ -163,6 +165,7 @@ def test_response_sources(policy, covered, qualified, source):
         observations=(
             SimpleNamespace(
                 scenario_id="final_tail_then_flush",
+                service_interval_ms=160,
                 active_population=2 if covered else 1,
                 elapsed_ns=500000000,
                 censored=False,
@@ -170,6 +173,7 @@ def test_response_sources(policy, covered, qualified, source):
             ),
         ),
     )
+    profile.receipt.observations = profile.observations
     result = finalization_response_bounds(profile, service_interval_ms=160, configured_s=7)
     assert result.source == source
     assert result.unqualified is (source != "profile" or not qualified)
@@ -399,3 +403,140 @@ async def test_adapter_derives_clock_operands_from_installed_modes(monkeypatch):
     assert deadline.receipt["absolute_s"] == pytest.approx(5.1)
     assert deadline.receipt["stall_s"] == pytest.approx(3.6)
     assert deadline.receipt["adapter_margin_s"] == lifecycle.FINALIZATION_ADAPTER_MARGIN_S
+
+
+@pytest.mark.parametrize("status", ("proven_zero", "unproven", "explicit_table"))
+@pytest.mark.parametrize("tail_present", (True, False))
+@pytest.mark.asyncio
+async def test_finalization_resolves_response_and_tail_independently(status, tail_present, caplog, monkeypatch):
+    """@spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-019, PORT-SESS-022: finalization resolves response and tail independently"""
+    from dataclasses import replace
+
+    from tests.engine.persistent_state_helpers import compile_with_canaries
+    from vllm_omni.entrypoints.session_lifecycle import arm_session_finalization, finalization_response_bounds
+
+    logger = logging.getLogger("vllm_omni.entrypoints.session_lifecycle")
+    caplog.set_level("WARNING", logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+
+    profile = compile_with_canaries(
+        ordinary_ns=20_000_000,
+        forced_ns=40_000_000,
+        terminal_ns=40_000_001 if status == "unproven" else 40_000_000,
+        admission_policy="hard_cap",
+        control_upper_ns_by_window_and_population={80_000_000: (30_000_000,)} if status == "explicit_table" else None,
+    )
+    assert profile.receipt.control_charge_status == status
+    if not tail_present:
+        profile = replace(profile, receipt=replace(profile.receipt, observations=()))
+    result = finalization_response_bounds(profile, service_interval_ms=80, configured_s=7)
+    assert result.response_s == pytest.approx(
+        7 if status == "unproven" else 0.1 if status == "explicit_table" else 0.08
+    )
+    assert result.tail_s == pytest.approx((0.080000002 if status == "unproven" else 0.08) if tail_present else 14)
+    assert result.tail_source == ("measured" if tail_present else "configured")
+    assert result.configured_reason == ("control_unproven" if status == "unproven" else None)
+    assert result.unqualified
+
+    async def expire(kind):
+        pass
+
+    deadline = SessionLifecycleDeadline(idle_timeout_s=60, finalization_timeout_s=1, on_expire=expire)
+    service = SimpleNamespace(
+        compiled_service_profile=profile,
+        runtime_config=SimpleNamespace(session_finalization_response_bound_s=7, session_finalization_stall_timeout=1),
+    )
+    authority = SimpleNamespace(chunk_samples=1280, finalization_work=lambda: (2560, 0))
+    caplog.clear()
+    arm_session_finalization(deadline, SimpleNamespace(accepted_audio=authority), service)
+    await deadline.close()
+    fallback_won = status == "unproven" or not tail_present
+    assert deadline.receipt["absolute_from_configured_fallback"] is fallback_won
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert bool(warnings) is fallback_won
+    if not tail_present:
+        assert "configured tail" in deadline.receipt["assumption_note"]
+        assert "configured tail" in warnings[0]
+    assert deadline.receipt["tail_source"] == result.tail_source
+    assert deadline.receipt["configured_reason"] == result.configured_reason
+    assert deadline.receipt["response_s"] == result.response_s
+    assert deadline.receipt["tail_s"] == result.tail_s
+    assert deadline.receipt["absolute_winner"] == (
+        "derived" if status == "unproven" or not tail_present else "operator"
+    )
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    (
+        ("missing", "no_applicable_table"),
+        ("interval", "no_applicable_table"),
+        ("coverage", "outside_measured_coverage"),
+    ),
+)
+def test_configured_response_records_reason(case, reason):
+    """@spec PORT-SESS-016, PORT-SESS-019, PORT-SESS-022: configured response records reason"""
+    from dataclasses import replace
+
+    from tests.engine.persistent_state_helpers import compile_with_canaries
+    from vllm_omni.entrypoints.session_lifecycle import finalization_response_bounds
+
+    profile = compile_with_canaries(admission_policy="hard_cap")
+    if case == "missing":
+        profile = None
+    elif case == "coverage":
+        profile = replace(profile, fragmentation_duration_ns_by_geometry_and_population={0: ()})
+    result = finalization_response_bounds(
+        profile, service_interval_ms=160 if case == "interval" else 80, configured_s=7
+    )
+    assert result.response_s == 7
+    assert result.configured_reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("qualified", (False, True))
+@pytest.mark.parametrize("operator_absolute", (1, 100))
+async def test_profile_response_with_configured_tail(qualified, operator_absolute, caplog, monkeypatch):
+    """@spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-019, PORT-SESS-022: tail fallback preserves the profile response."""
+    from dataclasses import replace
+
+    from tests.engine.persistent_state_helpers import compile_with_canaries
+    from vllm_omni.entrypoints.session_lifecycle import arm_session_finalization, finalization_response_bounds
+
+    logger = logging.getLogger("vllm_omni.entrypoints.session_lifecycle")
+    caplog.set_level("WARNING", logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+
+    profile = compile_with_canaries(ordinary_ns=20_000_000, forced_ns=40_000_000, terminal_ns=40_000_000)
+    # Qualification is injected only to exercise the qualified schedule branch.
+    profile = replace(profile, qualified=qualified, receipt=replace(profile.receipt, observations=()))
+    result = finalization_response_bounds(profile, service_interval_ms=80, configured_s=7)
+    assert result.response_s == pytest.approx(0.08)
+    assert result.source == "profile"
+    assert result.tail_s == 14
+    assert result.tail_source == "configured"
+    assert result.configured_reason is None
+    assert result.unqualified
+
+    async def expire(kind):
+        pass
+
+    deadline = SessionLifecycleDeadline(idle_timeout_s=60, finalization_timeout_s=operator_absolute, on_expire=expire)
+    service = SimpleNamespace(
+        compiled_service_profile=profile,
+        runtime_config=SimpleNamespace(session_finalization_response_bound_s=7, session_finalization_stall_timeout=1),
+    )
+    authority = SimpleNamespace(chunk_samples=1280, finalization_work=lambda: (0, 0))
+    arm_session_finalization(deadline, SimpleNamespace(accepted_audio=authority), service)
+    await deadline.close()
+    fallback_won = operator_absolute == 1
+    assert deadline.receipt["absolute_s"] == pytest.approx(14.1 if fallback_won else 100)
+    assert deadline.receipt["absolute_from_configured_fallback"] is fallback_won
+    assert "configured tail" in deadline.receipt["assumption_note"]
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert bool(warnings) is fallback_won
+    if fallback_won:
+        assert "configured tail" in warnings[0]
+        assert "configured response" not in warnings[0]

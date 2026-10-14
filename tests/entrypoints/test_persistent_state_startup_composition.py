@@ -861,3 +861,119 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
     assert events[-1] == ("abort", "session-0")
     if scenario_id == "forced_eou_then_chunk":
         assert result.elapsed_ns == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, policy):
+    """@spec PORT-PERF-006, PORT-STATE-027: preparation handles failed valid canary by policy"""
+    from dataclasses import replace
+    from fractions import Fraction
+    from unittest.mock import Mock
+
+    from vllm_omni.engine.persistent_state_capacity import (
+        ServiceExecutionTier,
+        ServiceProfileContext,
+        ServiceRoundExecution,
+    )
+
+    module = _startup_module()
+    # Spy on the compiler bound at startup, including across module reloads.
+    logger = module.compile_provisional_service_profile.__globals__["logger"]
+    warning = Mock(wraps=logger.warning)
+    monkeypatch.setattr(logger, "warning", warning)
+    runtime = _runtime()
+    runtime.admission_policy = policy
+    events = []
+    ordinary = ServiceRoundExecution(
+        tier_id="single",
+        active_population=1,
+        elapsed_ns=100,
+        service_interval_ms=80,
+        geometry_id=0,
+        completed_legal_parks=1,
+        completed_model_rows=None,
+        post_jit=True,
+        continuously_loaded=True,
+        dummy_run=False,
+        is_profile=False,
+    )
+    rounds = (
+        ordinary,
+        *(
+            replace(ordinary, scenario_id=scenario, elapsed_ns=201, completed_legal_parks=2)
+            for scenario in ("forced_eou_then_chunk", "final_tail_then_flush")
+        ),
+    )
+
+    class Provider:
+        def build_priming_plan(self, **kwargs):
+            return SimpleNamespace(
+                rounds=rounds,
+                served_intervals_ms=(80,),
+                compile_kwargs=dict(
+                    execution_tiers=(ServiceExecutionTier("single", 1),),
+                    max_population=1,
+                    reference_interval_ms=80,
+                    reference_geometry_id=0,
+                    admitted_geometry_ids=(0,),
+                    trailing_rounds=1,
+                    derating_factor=Fraction(1, 2),
+                    context=ServiceProfileContext(
+                        pre_override_physical_bound=5,
+                        allocated_pool=4,
+                        count_cap=4,
+                        execution_claim_ceiling=8,
+                        service_budget_source="measured_fallback",
+                        service_budget_coefficients=(),
+                        derating_factor=Fraction(1, 2),
+                        slot_bytes=6_314_936,
+                        execution_environment_key="env-a",
+                        precision_policy="torch.float32",
+                        state_profile="profile-a",
+                        compiler_version="test-v1",
+                        mixed_composition_policy="periodic_limited_preemption_edf",
+                    ),
+                ),
+            )
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            self.ready = False
+
+        async def bootstrap_handshake(self):
+            return _startup_inventory()
+
+        def configure_bootstrap_intervals(self, intervals):
+            assert intervals == (80,)
+
+        def seal_startup_authority(self, *, authority, admission_config, compiled_service_profile):
+            assert authority.service_profile_identity == compiled_service_profile.receipt.receipt_sha256
+            assert compiled_service_profile.receipt.control_charge_status == "unproven"
+            self.ready = True
+            events.append("seal")
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    async def prime(**kwargs):
+        assert not kwargs["service"].ready
+        return kwargs["round_spec"]
+
+    monkeypatch.setattr(module, "PersistentStateService", Service)
+    monkeypatch.setattr(module, "run_service_priming_round", prime)
+    kwargs = dict(
+        engine_client=SimpleNamespace(model_config=None),
+        stage_client=None,
+        runtime_config=runtime,
+        startup_provider=Provider(),
+        host_fatal_callback=lambda error: None,
+    )
+    if policy == "profile":
+        with pytest.raises(ValueError, match="control-dominance failed"):
+            await module.prepare_persistent_state_service(**kwargs)
+        assert events == ["shutdown"]
+    else:
+        service = await module.prepare_persistent_state_service(**kwargs)
+        assert service.ready and events == ["seal"]
+        assert warning.call_count == 1

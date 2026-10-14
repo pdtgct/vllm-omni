@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
@@ -16,6 +17,8 @@ from typing import Literal, Protocol
 _INT64_MAX = 2**63 - 1
 _SERVICE_INTERVALS_MS = (80, 160, 320, 560, 1_120)
 AdmissionPolicy = Literal["profile", "hard_cap"]
+ControlChargeStatus = Literal["proven_zero", "unproven", "explicit_table"]
+logger = logging.getLogger(__name__)
 
 
 class ServiceDemand(Protocol):
@@ -313,6 +316,7 @@ class ServiceProfileReceipt:
     window_ns: tuple[int, ...]
     control_dominance_sha256: str | None
     control_dominance_evidence: Mapping[str, object] | None
+    control_charge_status: ControlChargeStatus
     fragmentation_table_sha256: str
     homogeneous_capacity_by_interval: Mapping[int, int]
     admission_policy: AdmissionPolicy
@@ -777,7 +781,7 @@ def periodic_admission_headroom(
     )
 
 
-# @spec PORT-PERF-006, PORT-PERF-008
+# @spec PORT-PERF-006, PORT-PERF-008, PORT-STATE-027
 def compile_provisional_service_profile(
     executions: Sequence[ServiceRoundExecution],
     *,
@@ -930,9 +934,12 @@ def compile_provisional_service_profile(
                 return False
         return True
 
+    control_charge_status: ControlChargeStatus = "proven_zero"
+    failed_cells: list[dict[str, object]] = []
     control_table: dict[int, tuple[int, ...]] | None = None
     control_dominance_evidence: dict[str, object] | None = None
     if control_upper_ns_by_window_and_population is not None:
+        control_charge_status = "explicit_table"
         if set(control_upper_ns_by_window_and_population) != set(window_ns):
             raise ValueError("control table must cover every periodic window")
         control_table = {}
@@ -1010,7 +1017,7 @@ def compile_provisional_service_profile(
                         "control-dominance ordinary multiply",
                     )
                     dominance_passed = left <= right
-                    if admission_relevant and not dominance_passed:
+                    if admission_policy == "profile" and admission_relevant and not dominance_passed:
                         raise ValueError(
                             "control-dominance failed for "
                             f"{scenario_id} geometry {geometry_id} tier "
@@ -1035,7 +1042,11 @@ def compile_provisional_service_profile(
                             "dominance_passed": dominance_passed,
                         }
                     )
+        failed_cells = [cell for cell in evidence_cells if not cell["dominance_passed"]]
+        if admission_policy == "hard_cap" and failed_cells:
+            control_charge_status = "unproven"
         control_dominance_evidence = {
+            "control_charge_status": control_charge_status,
             "version": "derated-control-dominance-v2",
             "compiler_version": context.compiler_version,
             "execution_environment_key": (context.execution_environment_key),
@@ -1153,6 +1164,7 @@ def compile_provisional_service_profile(
         "fragmentation_sha256": fragmentation_hash,
         "hyperperiod_ns": hyperperiod_ns,
         "window_ns": window_ns,
+        "control_charge_status": control_charge_status,
         "control_dominance_sha256": control_dominance_sha256,
         "control_dominance_evidence": control_dominance_evidence,
         "homogeneous_capacity_by_interval": homogeneous_capacity,
@@ -1206,6 +1218,7 @@ def compile_provisional_service_profile(
         hyperperiod_ns=hyperperiod_ns,
         window_ns=window_ns,
         control_dominance_sha256=control_dominance_sha256,
+        control_charge_status=control_charge_status,
         control_dominance_evidence=(
             None if control_dominance_evidence is None else MappingProxyType(dict(control_dominance_evidence))
         ),
@@ -1221,6 +1234,15 @@ def compile_provisional_service_profile(
         fragmentation_duration_ns_by_geometry_and_population=MappingProxyType(dict(fragmentation)),
         observations=samples,
     )
+    if control_charge_status == "unproven":
+        logger.warning(
+            "hard_cap control-dominance unproven; zero control is advisory only: %s",
+            "; ".join(
+                f"{cell['scenario_id']} geometry {cell['geometry_id']} tier {cell['tier_id']}: "
+                f"left={cell['left']} > right={cell['right']}"
+                for cell in failed_cells
+            ),
+        )
     return StartupServiceProfile(
         upper_duration_ns_by_geometry_and_population=expanded,
         upper_duration_ns_by_geometry_and_tier=upper_by_tier,
@@ -1249,12 +1271,26 @@ def compile_provisional_service_profile(
     )
 
 
-# @spec PORT-PERF-006 / PORT-STATE-026
+ServiceBoundFallbackReason = Literal["no_applicable_table", "control_unproven", "outside_measured_coverage"]
+
+
+# @spec PORT-PERF-006, PORT-STATE-026, PORT-SESS-016
 def conservative_service_lower_bound(
     profile: StartupServiceProfile,
     *,
     service_interval_ms: int,
 ) -> Fraction | None:
+    """Return the conservative rate, preserving the rate-only public API."""
+    rate, _ = conservative_service_lower_bound_with_reason(profile, service_interval_ms=service_interval_ms)
+    return rate
+
+
+# @spec PORT-PERF-006, PORT-STATE-026, PORT-SESS-016
+def conservative_service_lower_bound_with_reason(
+    profile: StartupServiceProfile | None,
+    *,
+    service_interval_ms: int,
+) -> tuple[Fraction | None, ServiceBoundFallbackReason | None]:
     """Audio seconds per wall second at maximum admitted population.
 
     Sum the derated fragmentation uppers for every competing geometry at
@@ -1270,10 +1306,16 @@ def conservative_service_lower_bound(
     yields only a provisional estimate, not a qualified service guarantee
     or a starvation bound when hard-cap schedulability fails. The caller
     must retain the receipt's evidence class and advisory policy.
+
+    Missing profiles or unserved intervals take precedence over unproven
+    control, which takes precedence over insufficient measured coverage.
+    The rate-only public helper delegates here so callers share one decision.
     """
+    if profile is None or service_interval_ms not in profile.service_interval_ms_by_geometry.values():
+        return None, "no_applicable_table"
     receipt = profile.receipt
-    if service_interval_ms not in profile.service_interval_ms_by_geometry.values():
-        return None
+    if receipt.admission_policy == "hard_cap" and receipt.control_charge_status == "unproven":
+        return None, "control_unproven"
     population = min(
         receipt.allocated_pool,
         receipt.execution_claim_ceiling,
@@ -1281,10 +1323,10 @@ def conservative_service_lower_bound(
         receipt.maximum_charged_population,
     )
     if population <= 0:
-        return None
+        return None, "no_applicable_table"
     if receipt.admission_policy == "profile":
         if profile.homogeneous_capacity_by_interval[service_interval_ms] <= 0:
-            return None
+            return None, "no_applicable_table"
     work_ns = 0
     for geometry, interval in profile.service_interval_ms_by_geometry.items():
         maximum = (
@@ -1296,21 +1338,21 @@ def conservative_service_lower_bound(
             continue
         table = profile.fragmentation_duration_ns_by_geometry_and_population[geometry]
         if maximum > len(table):
-            return None
+            return None, "outside_measured_coverage"
         work_ns += table[maximum - 1]
     if profile.control_upper_ns_by_window_and_population is not None:
         for table in profile.control_upper_ns_by_window_and_population.values():
             if population > len(table):
-                return None
+                return None, "outside_measured_coverage"
         work_ns += max(
             (table[population - 1] for table in profile.control_upper_ns_by_window_and_population.values()),
             default=0,
         )
     if work_ns <= 0 or profile.derating_factor <= 0:
-        return None
+        return None, "no_applicable_table"
     round_ns = Fraction(work_ns) / profile.derating_factor
     cadence_ns = service_interval_ms * 1_000_000
-    return Fraction(cadence_ns) / max(Fraction(cadence_ns), round_ns)
+    return Fraction(cadence_ns) / max(Fraction(cadence_ns), round_ns), None
 
 
 # @spec PORT-STATE-026, PORT-PERF-008

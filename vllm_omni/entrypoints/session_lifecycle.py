@@ -223,25 +223,29 @@ class FinalizationResponseBounds:
     tail_s: float
     source: str
     unqualified: bool
+    tail_source: Literal["measured", "configured"]
+    configured_reason: str | None = None
 
 
-# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-019
+# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-019, PORT-SESS-022
 def finalization_response_bounds(
     profile: Any,
     *,
     service_interval_ms: int,
     configured_s: float,
 ) -> FinalizationResponseBounds:
-    """Resolve a per-session upper at the maximum admissible population."""
-    from vllm_omni.engine.persistent_state_capacity import conservative_service_lower_bound
+    """Resolve per-unit and directly measured terminal-chain terms separately."""
+    from vllm_omni.engine.persistent_state_capacity import conservative_service_lower_bound_with_reason
 
     if not math.isfinite(configured_s) or configured_s <= 0:
         raise ValueError("session_finalization_response_bound_s must be finite and positive")
-    fallback = FinalizationResponseBounds(configured_s, 2 * configured_s, "configured", True)
-    if profile is None:
-        return fallback
-    rate = conservative_service_lower_bound(profile, service_interval_ms=service_interval_ms)
-    if rate is None:
+    rate, configured_reason = conservative_service_lower_bound_with_reason(
+        profile, service_interval_ms=service_interval_ms
+    )
+    fallback = FinalizationResponseBounds(
+        configured_s, 2 * configured_s, "configured", True, "configured", configured_reason
+    )
+    if profile is None or service_interval_ms not in profile.service_interval_ms_by_geometry.values():
         return fallback
     receipt = profile.receipt
     population = min(
@@ -250,25 +254,34 @@ def finalization_response_bounds(
         receipt.count_cap if receipt.count_cap is not None else receipt.allocated_pool,
         receipt.maximum_charged_population,
     )
+    qualified = profile.qualified and receipt.admission_policy == "profile"
+    response = (
+        configured_s
+        if rate is None
+        else (service_interval_ms / 1000 if qualified else float(service_interval_ms / 1000 / rate))
+    )
     tails = [
         sample.elapsed_ns
-        for sample in profile.observations
+        for sample in receipt.observations
         if sample.scenario_id == "final_tail_then_flush"
+        and sample.service_interval_ms == service_interval_ms
         and sample.post_jit
-        and sample.active_population >= population
+        and sample.active_population >= population > 0
         and not getattr(sample, "censored", False)
     ]
-    if not tails:
-        return fallback
-    qualified = profile.qualified and receipt.admission_policy == "profile"
-    response = service_interval_ms / 1000 if qualified else float(service_interval_ms / 1000 / rate)
-    tail = float(max(tails) / profile.derating_factor / 1_000_000_000)
+    tail = float(max(tails) / profile.derating_factor / 1_000_000_000) if tails else 2 * configured_s
+    source = "configured" if rate is None else "profile" if receipt.admission_policy == "profile" else "advisory"
     return FinalizationResponseBounds(
-        response, tail, "profile" if receipt.admission_policy == "profile" else "advisory", not qualified
+        response,
+        tail,
+        source,
+        not qualified or rate is None or not tails,
+        "measured" if tails else "configured",
+        configured_reason,
     )
 
 
-# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-021
+# @spec PORT-SESS-016, PORT-SESS-017, PORT-SESS-021, PORT-SESS-022
 def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, service: Any) -> None:
     """Shared adapter integration; snapshot regular work once at acceptance."""
     if deadline.absolute_deadline is not None:
@@ -304,14 +317,20 @@ def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, s
         )
         deadline.configure_finalization(bounds)
         deadline.receipt.update(vars(response))
-        fallback_won = response.source == "configured" and bounds.absolute_winner == "derived"
+        configured_terms = []
+        if response.source == "configured":
+            configured_terms.append(f"configured response bound {response.response_s:.3f}s per unit")
+        if response.tail_source == "configured":
+            configured_terms.append(f"configured tail bound {response.tail_s:.3f}s")
+        fallback_description = " and ".join(configured_terms)
+        fallback_won = bool(configured_terms) and bounds.absolute_winner == "derived"
         deadline.receipt.update(
             adapter_margin_s=FINALIZATION_ADAPTER_MARGIN_S,
             absolute_from_configured_fallback=fallback_won,
             assumption_note=(
-                "unqualified operational assumption; configured response bound can permit "
+                f"unqualified operational assumption; {fallback_description} can permit "
                 "long drains while progress continues"
-                if response.source == "configured"
+                if configured_terms
                 else "unqualified operational assumption from provisional service measurements"
                 if response.unqualified
                 else "qualified profile schedule"
@@ -319,10 +338,9 @@ def arm_session_finalization(deadline: SessionLifecycleDeadline, session: Any, s
         )
         if fallback_won:
             logging.getLogger(__name__).warning(
-                "Finalization absolute bound %.3fs uses configured fallback %.3fs per unit; "
-                "unqualified operational assumption",
+                "Finalization absolute bound %.3fs uses %s; unqualified operational assumption",
                 bounds.absolute_s,
-                response.response_s,
+                fallback_description,
             )
         deadline.arm("finalization")
         logging.getLogger(__name__).info("Finalization receipt %s", json.dumps(deadline.receipt, sort_keys=True))
