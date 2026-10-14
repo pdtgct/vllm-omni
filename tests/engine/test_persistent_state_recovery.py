@@ -241,6 +241,8 @@ def _compiled_admission_profile(
     derating_factor: Fraction = Fraction(1, 2),
     maximum_population: int = 2,
     admitted_geometry_ids: tuple[int, ...] = (0, 1, 2, 3, 4),
+    admission_policy: str = "profile",
+    canary_excess_ns: int | None = None,
 ) -> Any:
     from vllm_omni.engine.persistent_state_capacity import (
         ServiceExecutionTier,
@@ -272,6 +274,19 @@ def _compiled_admission_profile(
         for geometry, interval in enumerate(intervals)
         if geometry in admitted_geometry_ids
     )
+    if canary_excess_ns is not None:
+        from dataclasses import replace
+
+        executions += tuple(
+            replace(
+                sample,
+                scenario_id=scenario,
+                completed_legal_parks=2 * sample.active_population,
+                elapsed_ns=2 * sample.elapsed_ns + canary_excess_ns,
+            )
+            for sample in executions
+            for scenario in ("forced_eou_then_chunk", "final_tail_then_flush")
+        )
     return compile_provisional_service_profile(
         executions,
         execution_tiers=(ServiceExecutionTier("all", maximum_population),),
@@ -298,8 +313,8 @@ def _compiled_admission_profile(
         ),
         # Recovery tests isolate controller lifecycle with synthetic regular
         # rounds; role/control compilation has its own exact contract suite.
-        control_dominance_sha256="d" * 64,
-        admission_policy="profile",
+        control_dominance_sha256="d" * 64 if canary_excess_ns is None else None,
+        admission_policy=admission_policy,
     )
 
 
@@ -1409,11 +1424,19 @@ def test_nonconverging_release_requests_host_fatal_exit_exactly_once() -> None:
     asyncio.run(scenario())
 
 
-def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery() -> None:
-    """@spec PORT-PERF-006 / PORT-OBS-012 / PORT-STATE-026: receipt survives recovery."""
+@pytest.mark.parametrize("excess,status", ((0, "proven_zero"), (1, "unproven")))
+def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery(
+    excess, status, monkeypatch, caplog
+) -> None:
+    """@spec PORT-PERF-006, PORT-STATE-022, PORT-STATE-027, PORT-OBS-012, PORT-STATE-026: receipt survives recovery."""
+    import logging
     from dataclasses import replace
 
     from vllm_omni.engine.persistent_state_startup import derive_hard_cap_authority
+
+    logger = logging.getLogger("vllm_omni.engine.persistent_state_capacity")
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
 
     class Metrics:
         def __init__(self) -> None:
@@ -1432,8 +1455,9 @@ def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery(
         stage = _RecoveryStage()
         service = _recovering_service(stage, _Clock())
         inventory = await service.bootstrap_handshake()
-        profile = _compiled_admission_profile(admitted_geometry_ids=(4,))
-        profile = replace(profile, receipt=replace(profile.receipt, admission_policy="hard_cap", advisory=True))
+        profile = _compiled_admission_profile(
+            admitted_geometry_ids=(4,), admission_policy="hard_cap", canary_excess_ns=excess
+        )
         service.configure_bootstrap_intervals((1120,))
         config = replace(service._admission_config, admission_policy="hard_cap", supported_intervals_ms=(1120,))
         authority = derive_hard_cap_authority(
@@ -1453,6 +1477,25 @@ def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery(
             controller_identity=repr(config),
             service_profile_identity=profile.receipt.receipt_sha256,
         )
+        for invalid_status in ("unknown", "explicit_table", "unproven" if status == "proven_zero" else "proven_zero"):
+            tampered = replace(profile, receipt=replace(profile.receipt, control_charge_status=invalid_status))
+            with pytest.raises(ValueError, match="advisory profile and authority disagree"):
+                service.seal_startup_authority(
+                    authority=authority, admission_config=config, compiled_service_profile=tampered
+                )
+        for mutation in ("flip_cells", "missing_status"):
+            evidence = dict(profile.receipt.control_dominance_evidence)
+            if mutation == "flip_cells":
+                evidence["cells"] = tuple(
+                    {**cell, "dominance_passed": not cell["dominance_passed"]} for cell in evidence["cells"]
+                )
+            else:
+                del evidence["control_charge_status"]
+            tampered = replace(profile, receipt=replace(profile.receipt, control_dominance_evidence=evidence))
+            with pytest.raises(ValueError, match="advisory profile and authority disagree"):
+                service.seal_startup_authority(
+                    authority=authority, admission_config=config, compiled_service_profile=tampered
+                )
         service.seal_startup_authority(authority=authority, admission_config=config, compiled_service_profile=profile)
         metrics = Metrics()
         service.install_metrics(metrics)
@@ -1462,7 +1505,14 @@ def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery(
         assert metrics.values["service_budget"] == 0.5
         assert metrics.values["headroom_by_cadence"]["1120"]["nominal"] == 1
         assert metrics.values["headroom_by_cadence"]["1120"]["hard"] == 2
-        await service._perform_handshake(open_admission=True)
+        assert service.inventory["service_profile_control_charge_status"] == status
+        service._demote()
+        await _wait_until(lambda: service.ready)
+        assert service.inventory["service_profile_control_charge_status"] == status
+        assert service.compiled_service_profile.receipt.control_charge_status == status
+        assert (
+            len([r for r in caplog.records if "control-dominance" in r.message and r.levelname == "WARNING"]) == excess
+        )
         assert service.compiled_service_profile is profile
         assert service.ready
         leases = []
@@ -1487,5 +1537,33 @@ def test_hard_cap_advisory_seal_preserves_profile_identity_metrics_and_recovery(
             await service.release(operation_id=f"advisory-release-{index}", lease=lease, reason="test")
         assert stage.resident == 0
         service.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("invalid", ("hard_cap", "advisory", "unproven", "unknown", "controller_policy"))
+def test_profile_seal_rejects_non_profile_authority(invalid) -> None:
+    """@spec PORT-STATE-027, PORT-PERF-006: advisory authority cannot enter the profile seal."""
+    from dataclasses import replace
+
+    async def scenario() -> None:
+        service = _recovering_service(_RecoveryStage(), _Clock())
+        await service.bootstrap_handshake()
+        profile = _compiled_admission_profile(admission_policy="hard_cap" if invalid == "hard_cap" else "profile")
+        config = service._admission_config
+        if invalid == "advisory":
+            profile = replace(profile, receipt=replace(profile.receipt, advisory=True))
+        elif invalid in ("unproven", "unknown"):
+            profile = replace(profile, receipt=replace(profile.receipt, control_charge_status=invalid))
+        elif invalid == "controller_policy":
+            config = replace(config, admission_policy="hard_cap")
+        try:
+            with pytest.raises(ValueError, match="profile.*admission|profile.*authority"):
+                service.seal_startup_profile(compiled_service_profile=profile, admission_config=config)
+            assert not service.ready
+            assert not service._startup_profile_sealed
+            assert service.compiled_service_profile is None
+        finally:
+            service.shutdown()
 
     asyncio.run(scenario())

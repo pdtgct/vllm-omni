@@ -800,6 +800,9 @@ class PersistentStateService:
                 inventory["service_profile_receipt_sha256"] = str(receipt_hash)
                 inventory["service_profile_identity"] = str(receipt_hash)
                 inventory["service_profile_advisory"] = bool(getattr(receipt, "advisory", False))
+                status = getattr(receipt, "control_charge_status", None)
+                if status is not None:
+                    inventory["service_profile_control_charge_status"] = status
         admission_config = self._admission_config
         if admission_config is not None:
             inventory["admission_policy"] = admission_config.admission_policy
@@ -1316,6 +1319,14 @@ class PersistentStateService:
         resolved_admission = admission_config or self._admission_config
         if resolved_admission is None:
             raise RuntimeError("persistent-state admission configuration is required at seal")
+        receipt = compiled_service_profile.receipt
+        if (
+            receipt.admission_policy != "profile"
+            or receipt.advisory
+            or receipt.control_charge_status not in {"proven_zero", "explicit_table"}
+            or resolved_admission.admission_policy != "profile"
+        ):
+            raise ValueError("profile seal requires proven profile admission authority")
         profile_intervals = tuple(compiled_service_profile.compiled_demand.intervals_ms)
         admission_intervals = tuple(resolved_admission.supported_intervals_ms)
         if profile_intervals != admission_intervals:
@@ -1355,6 +1366,7 @@ class PersistentStateService:
         self._project_inventory()
         self._schedule_admission_drain()
 
+    # @spec PORT-STATE-027, PORT-PERF-006
     def seal_startup_authority(
         self,
         *,
@@ -1386,6 +1398,19 @@ class PersistentStateService:
                 tuple(compiled_service_profile.compiled_demand.intervals_ms) != intervals
                 or receipt.admission_policy != "hard_cap"
                 or not receipt.advisory
+                or receipt.control_charge_status not in {"proven_zero", "unproven", "explicit_table"}
+                or (receipt.control_charge_status == "explicit_table")
+                != (compiled_service_profile.control_upper_ns_by_window_and_population is not None)
+                or (
+                    receipt.control_dominance_evidence is not None
+                    and (
+                        receipt.control_dominance_evidence.get("control_charge_status") != receipt.control_charge_status
+                        or (receipt.control_charge_status == "unproven")
+                        != any(
+                            not cell["dominance_passed"] for cell in receipt.control_dominance_evidence.get("cells", ())
+                        )
+                    )
+                )
                 or receipt.receipt_sha256 != authority.service_profile_identity
             ):
                 raise ValueError("hard-cap advisory profile and authority disagree")
