@@ -344,6 +344,7 @@ class PersistentStateRuntimeConfig:
             raw = {}
         if not isinstance(raw, Mapping):
             raise ValueError("additional_config must be a mapping when provided")
+        # @spec PORT-SESS-020: reject a non-positive or non-finite response bound or clock at startup.
         for name in ("streaming_session_finalization_stall_timeout", "streaming_session_finalization_response_bound_s"):
             if name in raw:
                 _validated_duration(name, raw[name])

@@ -159,7 +159,9 @@ def _number(value, *, positive=False):
 
 def cost_metrics(runs):
     """Medians of pooled replay/chunk samples and per-window audio/wall ratios."""
-    replay, service, throughput = [], [], []
+    replay: list[float] = []
+    service: list[float] = []
+    throughput: list[float] = []
     for run in runs:
         _require(run["purpose"] == "PORT-PREC-022", "exploratory and PORT-PREC-029 timings are not disclosure")
         _require(run["profiled"] is False, "profiled timings are not disclosure")
@@ -267,13 +269,11 @@ def inventory_from_source(source):
                     pending.append(node.func.id)
                 symbol = ast.unparse(node.func)
                 if isinstance(node.func, ast.Attribute) and node.func.attr == "impl":
-                    _require(
-                        bool(node.args)
-                        and isinstance(node.args[0], ast.Constant)
-                        and isinstance(node.args[0].value, str),
-                        "nonliteral aten registration needs inventory review",
-                    )
-                    symbols.add(node.args[0].value)
+                    first = node.args[0] if node.args else None
+                    value = first.value if isinstance(first, ast.Constant) else None
+                    _require(isinstance(value, str), "nonliteral aten registration needs inventory review")
+                    assert isinstance(value, str)
+                    symbols.add(value)
                 elif symbol.startswith("torch.backends."):
                     symbols.add(symbol)
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -291,7 +291,9 @@ def installed_inventory(source_path=None):
     """Read the installed version's source, independent of line numbers or imports."""
     if source_path is None:
         spec = importlib.util.find_spec("vllm")
-        _require(spec is not None and spec.origin is not None, "installed vLLM source required")
-        source_path = Path(spec.origin).parent / "model_executor/determinism/batch_invariant.py"
+        origin = spec.origin if spec is not None else None
+        _require(origin is not None, "installed vLLM source required")
+        assert origin is not None
+        source_path = Path(origin).parent / "model_executor/determinism/batch_invariant.py"
     source = Path(source_path).read_bytes()
     return inventory_from_source(source.decode("utf-8")) | PORT_SIDE_EFFECTS, hashlib.sha256(source).hexdigest()
