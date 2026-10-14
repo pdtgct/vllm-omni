@@ -468,18 +468,22 @@ def test_host_fatal_records_engine_state_before_termination_supervision(
     engine = SimpleNamespace(report_persistent_state_fatal=lambda error: events.append("report"))
     server = object()
     state = SimpleNamespace(server=server)
-    monkeypatch.setattr(
-        api_server,
-        "terminate_if_errored",
-        lambda *, server, engine: events.append("terminate"),
-    )
+    error = RuntimeError("release recovery exhausted")
+
+    def request_shutdown(app_state: Any, engine_client: Any, cause: BaseException) -> None:
+        assert app_state is state
+        assert engine_client is engine
+        assert cause is error
+        events.append("shutdown")
+
+    monkeypatch.setattr(api_server, "request_application_shutdown", request_shutdown)
 
     callback = api_server._persistent_state_host_fatal_callback(
         state=state,
         engine_client=engine,
     )
-    callback(RuntimeError("release recovery exhausted"))
-    assert events == ["report", "terminate"]
+    callback(error)
+    assert events == ["report", "shutdown"]
 
 
 def test_nemotron_provider_resolves_hard_cap_intervals_without_a_priming_plan() -> None:
