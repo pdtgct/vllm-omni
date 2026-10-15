@@ -20,13 +20,13 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
-    MAX_SYMBOLS_PER_STEP,
+    realtime_token_budget,
 )
 
 #: Worst-case per-burst budget: the largest chunk config (1120 ms,
-#: 14 frames) times the per-frame emission cap, plus the park token
-#: (PORT-INT-002; realtime_token_budget(frames_per_chunk=14)).
-_MAX_BURST_TOKENS = 14 * MAX_SYMBOLS_PER_STEP + 1
+#: 14 frames) times the per-frame emission cap, plus optional EOU and PARK.
+#: @spec PORT-DEC-005, PORT-INT-002
+_MAX_BURST_TOKENS = realtime_token_budget(frames_per_chunk=14)
 
 NEMOTRON_ASR_PIPELINE = PipelineConfig(
     model_type="nemotron_asr",

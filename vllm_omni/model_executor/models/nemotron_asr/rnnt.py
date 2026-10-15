@@ -499,13 +499,14 @@ def park_token_id(hf_config: Any) -> int:
 
 
 def realtime_token_budget(*, frames_per_chunk: int, max_symbols: int = MAX_SYMBOLS_PER_STEP) -> int:
-    """Constant per-burst budget: queue capacity plus the park token.
+    """@spec PORT-DEC-005, PORT-INT-002: labels, optional EOU and PARK.
 
-    ``realtime_max_tokens = frames_per_chunk × max_symbols + 1``
-    (PORT-INT-002; the output counter clears per update, so the budget
-    is per-burst, not per-session).
+    The output counter clears per update, so this bound applies to each
+    burst rather than the session. Reuse the endpoint admission authority.
     """
-    return frames_per_chunk * max_symbols + 1
+    from vllm_omni.model_executor.models.nemotron_asr.endpointing import max_emission_tokens
+
+    return max_emission_tokens(max_valid_frames=frames_per_chunk, max_symbols_per_step=max_symbols)
 
 
 def forced_logits_rows(chosen: torch.Tensor, *, num_logits: int) -> torch.Tensor:
