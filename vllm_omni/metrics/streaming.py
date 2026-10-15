@@ -128,10 +128,17 @@ _persistent_state_slots_family = Gauge(
     "Manager-sourced persistent-state resident inventory and capacity limits.",
     labelnames=_persistent_state_slot_labels,
 )
+# @spec PORT-OBS-014
 _persistent_state_profile_advisory_family = Gauge(
     defs.PERSISTENT_STATE_PROFILE_ADVISORY,
     "Whether measured service demand and nominal headroom are advisory.",
     labelnames=["model_name", "stage", "replica"],
+)
+# @spec PORT-OBS-013
+_persistent_state_control_charge_family = Gauge(
+    defs.PERSISTENT_STATE_CONTROL_CHARGE,
+    "Control-charge status of the sealed persistent-state service profile.",
+    labelnames=["model_name", "stage", "replica", "status"],
 )
 _persistent_state_service_demand_family = Gauge(
     defs.PERSISTENT_STATE_SERVICE_DEMAND_RATIO,
@@ -257,7 +264,22 @@ class OmniStreamingMetrics:
                 kind=kind,
             ).set(inventory[kind])
 
-    # @spec PORT-OBS-012
+    # @spec PORT-OBS-013
+    def observe_persistent_state_control_charge(self, stage: str, replica: str, status: str) -> None:
+        """Publish the complete bounded state vector from one sealed receipt."""
+        if not self._log_stats:
+            return
+        if not stage or not replica or status not in defs.PERSISTENT_STATE_CONTROL_CHARGE_STATUSES:
+            return
+        for state in defs.PERSISTENT_STATE_CONTROL_CHARGE_STATUSES:
+            _persistent_state_control_charge_family.labels(
+                model_name=self._model_name,
+                stage=stage,
+                replica=replica,
+                status=state,
+            ).set(int(state == status))
+
+    # @spec PORT-OBS-012, PORT-OBS-014
     def observe_persistent_state_capacity(
         self,
         stage: str,
