@@ -277,9 +277,14 @@ def _compiled_admission_profile(
     if canary_excess_ns is not None:
         from dataclasses import replace
 
+        from tests.engine.persistent_state_helpers import canary_timing_kwargs
+
         executions += tuple(
             replace(
                 sample,
+                **canary_timing_kwargs(
+                    scenario, interval_ms=sample.service_interval_ms, population=sample.active_population
+                ),
                 scenario_id=scenario,
                 completed_legal_parks=2 * sample.active_population,
                 elapsed_ns=2 * sample.elapsed_ns + canary_excess_ns,
@@ -1565,5 +1570,55 @@ def test_profile_seal_rejects_non_profile_authority(invalid) -> None:
             assert service.compiled_service_profile is None
         finally:
             service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_measured_unsupported_rejects_before_enqueue_and_survives_recovery(monkeypatch):
+    """@spec PORT-STATE-026, PORT-OBS-012: unsupported FIFO stays empty with zero hard headroom after recovery."""
+    from dataclasses import replace
+
+    import vllm_omni.engine.persistent_state_capacity as capacity
+    from tests.engine.test_persistent_state_periodic_capacity import _compile
+
+    class Metrics:
+        def observe_persistent_state_capacity(self, *args, **values):
+            self.values = values
+
+    async def scenario():
+        stage = _RecoveryStage()
+        service = _recovering_service(stage, _Clock())
+        await service.bootstrap_handshake()
+        profile = _compile(intervals_ms=(80, 160), tables_ms=((90, 180), (10, 20)))
+        service.configure_bootstrap_intervals((80, 160))
+        config = replace(service._admission_config, supported_intervals_ms=(80, 160))
+        service.seal_startup_profile(admission_config=config, compiled_service_profile=profile)
+        metrics = Metrics()
+        service.install_metrics(metrics)
+        monkeypatch.setattr(capacity, "compile_provisional_service_profile", lambda *a, **k: pytest.fail("recompiled"))
+        for recover in (False, True):
+            if recover:
+                service._demote()
+                await _wait_until(lambda: service.ready)
+            assert service.ready and service.compiled_service_profile is profile
+            assert set(service._resident_interval_counts) == {80, 160}
+            assert metrics.values["headroom_by_cadence"]["80"] == {"hard": 0, "nominal": 0}
+            assert metrics.values["headroom_by_cadence"]["160"]["hard"] == 2
+            controller = service._admission_controller
+            with monkeypatch.context() as patch:
+                patch.setattr(type(controller), "enqueue", lambda *a, **k: pytest.fail("unsupported enqueued"))
+                with pytest.raises(PersistentStateUnsupportedServiceInterval) as error:
+                    await service.reserve(
+                        operation_id="unsupported",
+                        session_key="unsupported",
+                        schema_id="schema-a",
+                        profile_id="profile-a",
+                        service_interval_ms=80,
+                    )
+                assert error.value.retryable is False
+            assert stage.reserve_calls == 0
+            assert service._resident_interval_counts[80] == service._submitted_interval_counts[80] == 0
+            assert set(service.compiled_service_profile.receipt.measured_unsupported_by_geometry) == {0}
+        service.shutdown()
 
     asyncio.run(scenario())

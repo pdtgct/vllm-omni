@@ -167,6 +167,11 @@ def _service_executions(observations: list[Any]) -> list[Any]:
                 dummy_run=bool(observation.dummy_run),
                 is_profile=bool(observation.is_profile),
                 scenario_id=str(getattr(observation, "scenario_id", "ordinary")),
+                censored=bool(getattr(observation, "censored", False)),
+                canary_wait_ns=int(getattr(observation, "canary_wait_ns", 0)),
+                canary_wait_start_ns=getattr(observation, "canary_wait_start_ns", None),
+                canary_timer_start_ns=getattr(observation, "canary_timer_start_ns", None),
+                following_chunk_timings=tuple(getattr(observation, "following_chunk_timings", ())),
             )
         )
     return converted
@@ -207,6 +212,12 @@ async def prepare_persistent_state_service(
             inventory=inventory,
             model_config=engine_client.model_config,
         )
+        largest_interval_ms = max(plan.served_intervals_ms)
+        if Fraction(str(runtime_config.startup_priming_round_timeout_s)) * 1000 <= largest_interval_ms:
+            raise ValueError(
+                "persistent_state_startup_priming_round_timeout_s must exceed "
+                f"the largest canaried service interval ({largest_interval_ms}ms)"
+            )
         service.configure_bootstrap_intervals(plan.served_intervals_ms)
 
         async def run_plan() -> list[Any]:
@@ -246,6 +257,7 @@ async def prepare_persistent_state_service(
                     "runtime_tombstone_allowance": (runtime_config.runtime_tombstone_allowance),
                     "resolved_max_tombstones": runtime_config.max_tombstones,
                     "startup_priming_timeout_s": (runtime_config.startup_priming_timeout_s),
+                    "startup_priming_round_timeout_s": runtime_config.startup_priming_round_timeout_s,
                     "session_finalization_stall_timeout": getattr(
                         runtime_config, "session_finalization_stall_timeout", 10.0
                     ),

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from vllm_omni.engine.persistent_state_capacity import (
+    CanaryChunkTiming,
     ServiceExecutionTier,
     ServiceProfileContext,
 )
@@ -192,7 +193,7 @@ class NemotronPersistentStateStartupProvider:
             execution_environment_key=str(inventory["execution_environment_key"]),
             precision_policy=str(inventory["precision_policy"]),
             state_profile=str(inventory["profile_id"]),
-            compiler_version="persistent-state-service-v1",
+            compiler_version="persistent-state-service-v2",
             mixed_composition_policy="periodic_limited_preemption_edf",
         )
         reference_geometry_id, reference_cadence = max(
@@ -223,6 +224,7 @@ class NemotronPersistentStateStartupProvider:
             served_intervals_ms=tuple(int(cadence.removesuffix("ms")) for _, cadence in admitted_geometries),
         )
 
+    # @spec PORT-STATE-026, PORT-PERF-005, PORT-PERF-006
     async def execute_priming_round(
         self,
         *,
@@ -277,6 +279,10 @@ class NemotronPersistentStateStartupProvider:
             dtype=np.float32,
         )
         started_ns = time.monotonic_ns()
+        canary_wait_ns = 0
+        canary_wait_start_ns = None
+        canary_timer_start_ns = None
+        following_chunk_timings: tuple[CanaryChunkTiming, ...] = ()
         try:
             if round_spec.scenario_id == "ordinary":
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
@@ -286,9 +292,18 @@ class NemotronPersistentStateStartupProvider:
                 # request through the ordinary CHUNK path first; that common
                 # setup work is deliberately outside the two-park canary.
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                await asyncio.gather(*(lease.wait_for_legal_park() for lease in bound))
+                release_timings = tuple(lease.stage_forced_eou_then_chunk(samples) for lease in bound)
+                eligible_ns = max(timing.eligible_ns for timing in release_timings)
+                canary_wait_start_ns = time.monotonic_ns()
+                now_ns = canary_wait_start_ns
+                while now_ns < eligible_ns:
+                    await asyncio.sleep((eligible_ns - now_ns) / 1_000_000_000)
+                    now_ns = time.monotonic_ns()
                 started_ns = time.monotonic_ns()
-                await asyncio.gather(*(lease.force_segment() for lease in bound))
-                await asyncio.gather(*(lease.feed(samples) for lease in bound))
+                canary_wait_ns = started_ns - canary_wait_start_ns
+                canary_timer_start_ns = started_ns
+                await asyncio.gather(*(lease.dispatch_staged_priming_chain() for lease in bound))
                 completed_legal_parks = 2 * len(bound)
             elif round_spec.scenario_id == "final_tail_then_flush":
                 await asyncio.gather(*(lease.feed(samples[:-1]) for lease in bound))
@@ -297,6 +312,22 @@ class NemotronPersistentStateStartupProvider:
             else:
                 raise ValueError(f"unknown persistent-state priming scenario {round_spec.scenario_id}")
             elapsed_ns = time.monotonic_ns() - started_ns
+            if round_spec.scenario_id == "forced_eou_then_chunk":
+                timings = []
+                for lease, timing in zip(bound, release_timings):
+                    submitted_ns = lease.session.accepted_audio.prior_actual_submission_ns
+                    if submitted_ns is None:
+                        raise RuntimeError("canary following CHUNK lacks a submission timestamp")
+                    timings.append(
+                        CanaryChunkTiming(
+                            true_ready_ns=timing.true_ready_ns,
+                            prior_actual_submission_ns=timing.prior_actual_submission_ns,
+                            cadence_ns=timing.cadence_ns,
+                            eligible_ns=timing.eligible_ns,
+                            submitted_ns=submitted_ns,
+                        )
+                    )
+                following_chunk_timings = tuple(timings)
         finally:
             await asyncio.gather(
                 *(lease.abort() for lease in bound),
@@ -305,6 +336,10 @@ class NemotronPersistentStateStartupProvider:
         return SimpleNamespace(
             completed_legal_parks=completed_legal_parks,
             elapsed_ns=elapsed_ns,
+            canary_wait_ns=canary_wait_ns,
+            canary_wait_start_ns=canary_wait_start_ns,
+            canary_timer_start_ns=canary_timer_start_ns,
+            following_chunk_timings=following_chunk_timings,
             completed_model_rows=None,
             dummy_run=False,
             is_profile=False,

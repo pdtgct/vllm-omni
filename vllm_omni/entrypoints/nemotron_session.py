@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+    from vllm_omni.model_executor.models.nemotron_asr.accepted_audio import OrdinaryReleaseTiming
     from vllm_omni.model_executor.models.nemotron_asr.endpointing import (
         EndpointPolicy,
     )
@@ -184,6 +185,9 @@ class NemotronSessionLease:
         self._error: BaseException | None = None
         self._ended = False
         self._audio_closed = False
+        self._priming_chain_staged = False
+        self._priming_staged_samples = 0
+        self._priming_prior_samples = 0
         self._flush_parked = False
         self._segment_generation = 0
         self._aborted = False
@@ -223,7 +227,10 @@ class NemotronSessionLease:
         on_accepted: AcceptanceCallback | None = None,
         on_segment: SegmentCallback | None = None,
     ) -> list[str]:
-        """Submit one whole piece and await its completed carriers.
+        """Submit one nonempty piece and await its completed carriers.
+
+        Empty pieces are never accepted by feed; internal control wakes use
+        the audio queue directly and do not publish a piece receipt.
 
         Args:
             samples: One contiguous normalized audio piece.
@@ -235,6 +242,8 @@ class NemotronSessionLease:
             One cumulative hypothesis per completed carrier, in order.
         """
         self._require_live()
+        if len(samples) == 0:
+            raise ValueError("feed does not accept an empty audio piece")
         self._ensure_started()
         if self._active_segment_callback is not None:
             raise RuntimeError("feed calls must be serialized")
@@ -256,6 +265,79 @@ class NemotronSessionLease:
                 for ticket in receipt.tickets:
                     if ticket.done.done() and not ticket.done.cancelled():
                         ticket.done.exception()
+
+    # @spec PORT-STATE-026, PORT-PERF-005
+    async def wait_for_legal_park(self) -> None:
+        """@spec PORT-PERF-005: surface consumer failure without waiting for a round timeout."""
+        self._require_live()
+        parked = asyncio.create_task(self._session.accepted_audio.wait_until_parked())
+        done = asyncio.create_task(self._done.wait())
+        try:
+            await asyncio.wait((parked, done), return_when=asyncio.FIRST_COMPLETED)
+            # Prefer the original consumer error even if both events fired.
+            if self._done.is_set() and self._error is not None:
+                raise self._error
+            self._require_live()
+            await parked
+        finally:
+            for task in (parked, done):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(parked, done, return_exceptions=True)
+
+    # @spec PORT-STATE-026, PORT-PERF-005
+    def stage_forced_eou_then_chunk(self, samples: FloatSamples) -> OrdinaryReleaseTiming:
+        """Stage a priming chain on a registered, drained lease without a wake."""
+        from vllm_omni.model_executor.models.nemotron_asr.streaming import accept_audio_piece
+
+        self._require_live()
+        authority = self._session.accepted_audio
+        if (
+            self._priming_chain_staged
+            or authority.in_flight_unit is not None
+            or authority.ready_units
+            or authority.snapshot().outstanding_samples
+            or authority.prior_actual_submission_ns is None
+        ):
+            raise RuntimeError("priming staging requires a registered lease at legal park")
+        self._priming_prior_samples = authority.snapshot().accepted_samples
+        self._session.force_segment()
+        accept_audio_piece(
+            self._session,
+            samples,
+            before_audio_accept=lambda: self._require_unexpired_lifecycle(),
+            on_audio_accepted=lambda: self._arm_session_lifecycle_timeout("idle"),
+        )
+        units = authority.ready_units
+        if len(units) != 2 or tuple(unit.kind for unit in units) != ("forced_eou", "regular"):
+            raise RuntimeError("priming chain requires exactly EOU and one following CHUNK")
+        timing = authority.release_timing(units[1])
+        self._priming_staged_samples = len(samples)
+        self._priming_chain_staged = True
+        return timing
+
+    # @spec PORT-STATE-026, PORT-PERF-005
+    async def dispatch_staged_priming_chain(self) -> None:
+        """Wake the ordinary stream and await the staged CHUNK's ledger park."""
+        import numpy as np
+
+        if not self._priming_chain_staged:
+            raise RuntimeError("no staged priming chain")
+        self._priming_chain_staged = False
+        # Empty input wakes dispatch; acceptance and its piece receipt were
+        # already published by the same authority used for normal input.
+        self._require_live()
+        self._ensure_started()
+        self._audio.put_nowait(np.empty(0, dtype=np.float32))
+        receipt = await self._ledger.next_piece()
+        # PieceReceipt counts are cumulative; compare this staged piece
+        # against the accepted total immediately before staging.
+        assert receipt.samples_consumed - self._priming_prior_samples == self._priming_staged_samples, (
+            "staged piece receipt sample mismatch"
+        )
+        assert len(receipt.tickets) == 1, "staged CHUNK must have exactly one ticket"
+        await receipt.tickets[0].done
+        await self.wait_for_legal_park()
 
     async def force_segment(self) -> None:
         """Queue one ordered semantic boundary without accepting samples."""

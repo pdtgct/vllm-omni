@@ -234,6 +234,31 @@ class ServiceExecutionTier:
 
 
 @dataclass(frozen=True)
+class CanaryChunkTiming:
+    """One following CHUNK's canonical release-clock witnesses."""
+
+    true_ready_ns: int
+    prior_actual_submission_ns: int
+    cadence_ns: int
+    eligible_ns: int
+    submitted_ns: int
+
+
+@dataclass(frozen=True)
+class MeasuredUnsupportedGeometry:
+    """First failing installed candidate-alone window, retained at seal."""
+
+    service_interval_ms: int
+    window_ns: int
+    dbf_ns: int
+    block_ns: int
+    control_ns: int
+    derating_numerator: int
+    derating_denominator: int
+    population_one_censored: bool
+
+
+@dataclass(frozen=True)
 class ServiceRoundExecution:
     tier_id: str
     active_population: int
@@ -247,6 +272,11 @@ class ServiceRoundExecution:
     dummy_run: bool
     is_profile: bool
     scenario_id: str = "ordinary"
+    censored: bool = False
+    canary_wait_ns: int = 0
+    canary_wait_start_ns: int | None = None
+    canary_timer_start_ns: int | None = None
+    following_chunk_timings: tuple[CanaryChunkTiming, ...] = ()
 
     def __post_init__(self) -> None:
         if self.active_population <= 0 or self.elapsed_ns <= 0:
@@ -327,6 +357,7 @@ class ServiceProfileReceipt:
     upper_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
     fragmentation_duration_ns_by_geometry_and_population: Mapping[int, tuple[int, ...]]
     observations: tuple[ServiceRoundExecution, ...]
+    measured_unsupported_by_geometry: Mapping[int, MeasuredUnsupportedGeometry]
     startup_priming: Mapping[str, object] | None = None
 
 
@@ -781,7 +812,45 @@ def periodic_admission_headroom(
     )
 
 
-# @spec PORT-PERF-006, PORT-PERF-008, PORT-STATE-027
+def _validate_canary_timing(sample: ServiceRoundExecution) -> None:
+    if sample.scenario_id != "forced_eou_then_chunk":
+        return
+    start = sample.canary_timer_start_ns
+    if start is None or len(sample.following_chunk_timings) != sample.active_population:
+        raise ValueError("control-dominance canary lacks following-CHUNK eligibility witnesses")
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError("canary timer start must be integer nanoseconds")
+    if isinstance(sample.canary_wait_ns, bool) or not isinstance(sample.canary_wait_ns, int):
+        raise ValueError("canary eligibility wait must be integer nanoseconds")
+    _checked_int64(start, "canary timer start")
+    _checked_int64(sample.canary_wait_ns, "canary eligibility wait")
+    wait_start = sample.canary_wait_start_ns
+    if isinstance(wait_start, bool) or not isinstance(wait_start, int):
+        raise ValueError("canary eligibility wait start must be integer nanoseconds")
+    _checked_int64(wait_start, "canary eligibility wait start")
+    if start - wait_start != sample.canary_wait_ns:
+        raise ValueError("canary eligibility wait must equal timer start minus wait start")
+    end = _checked_add(start, sample.elapsed_ns, "canary timer end")
+    for timing in sample.following_chunk_timings:
+        for value in asdict(timing).values():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("canary eligibility witness must be integer nanoseconds")
+            _checked_int64(value, "canary eligibility witness")
+        if timing.cadence_ns != sample.service_interval_ms * 1_000_000:
+            raise ValueError("canary eligibility cadence disagrees with interval")
+        expected = max(
+            timing.true_ready_ns,
+            _checked_add(timing.prior_actual_submission_ns, timing.cadence_ns, "canary eligibility add"),
+        )
+        if timing.eligible_ns != expected or timing.true_ready_ns < timing.prior_actual_submission_ns:
+            raise ValueError("canary eligibility disagrees with release-clock operands")
+        if timing.eligible_ns > start:
+            raise ValueError("following-CHUNK eligibility is after canary timer start")
+        if not start <= timing.submitted_ns <= end:
+            raise ValueError("following-CHUNK submission is outside canary timer")
+
+
+# @spec PORT-STATE-026, PORT-PERF-006, PORT-PERF-008, PORT-STATE-027
 def compile_provisional_service_profile(
     executions: Sequence[ServiceRoundExecution],
     *,
@@ -819,6 +888,9 @@ def compile_provisional_service_profile(
     samples = tuple(executions)
     if any(sample.dummy_run or sample.is_profile for sample in samples):
         raise ValueError("service priming cannot use dummy/profile executions")
+
+    for sample in samples:
+        _validate_canary_timing(sample)
 
     upper_by_tier: dict[int, dict[str, int]] = {}
     row_rates: dict[int, dict[str, Fraction]] = {}
@@ -909,30 +981,36 @@ def compile_provisional_service_profile(
         for geometry_id in geometries
     }
 
-    def ordinary_homogeneous_schedulable(
+    def first_failing_homogeneous_window(
         geometry_id: int,
         population: int,
-    ) -> bool:
+        controls: Mapping[int, tuple[int, ...]] | None,
+    ) -> tuple[int, int, int, int] | None:
+        """Return the first failed window and its demand, blocking and control operands."""
         cadence_ns = interval_ns_by_geometry[geometry_id]
         for window in window_ns:
             demand = _checked_multiply(
                 window // cadence_ns,
                 fragmentation[geometry_id][population - 1],
-                "ordinary homogeneous periodic demand",
+                "homogeneous periodic demand",
             )
             if demand == 0:
                 continue
+            blocking = expanded[geometry_id][population - 1] if cadence_ns > window else 0
+            control = 0 if controls is None else controls[window][population - 1]
+            combined = _checked_add(
+                _checked_add(demand, blocking, "homogeneous work add"),
+                control,
+                "homogeneous control add",
+            )
             if _checked_multiply(
-                derating_factor.denominator,
-                demand,
-                "ordinary derating comparison multiply",
-            ) > _checked_multiply(
-                derating_factor.numerator,
-                window,
-                "ordinary derating budget multiply",
-            ):
-                return False
-        return True
+                derating_factor.denominator, combined, "derating comparison multiply"
+            ) > _checked_multiply(derating_factor.numerator, window, "derating budget multiply"):
+                return window, demand, blocking, control
+        return None
+
+    def ordinary_homogeneous_schedulable(geometry_id: int, population: int) -> bool:
+        return first_failing_homogeneous_window(geometry_id, population, None) is None
 
     control_charge_status: ControlChargeStatus = "proven_zero"
     failed_cells: list[dict[str, object]] = []
@@ -1031,6 +1109,15 @@ def compile_provisional_service_profile(
                             "active_population": tier.max_active_population,
                             "scenario_upper_ns": scenario_upper,
                             "trailing_observations_ns": tuple(sample.elapsed_ns for sample in trailing),
+                            "trailing_timing_observations": tuple(
+                                {
+                                    "canary_wait_ns": sample.canary_wait_ns,
+                                    "canary_wait_start_ns": sample.canary_wait_start_ns,
+                                    "canary_timer_start_ns": sample.canary_timer_start_ns,
+                                    "following_chunk_timings": tuple(asdict(w) for w in sample.following_chunk_timings),
+                                }
+                                for sample in trailing
+                            ),
                             "ordinary_upper_ns": ordinary_upper,
                             "derating_numerator": (derating_factor.numerator),
                             "derating_denominator": (derating_factor.denominator),
@@ -1065,38 +1152,7 @@ def compile_provisional_service_profile(
         raise ValueError("measured control-dominance identity must be sha256")
 
     def homogeneous_schedulable(geometry_id: int, population: int) -> bool:
-        if control_table is None:
-            return ordinary_homogeneous_schedulable(
-                geometry_id,
-                population,
-            )
-        cadence_ns = interval_ns_by_geometry[geometry_id]
-        for window in window_ns:
-            demand = _checked_multiply(
-                window // cadence_ns,
-                fragmentation[geometry_id][population - 1],
-                "homogeneous periodic demand",
-            )
-            if demand == 0:
-                continue
-            blocking = expanded[geometry_id][population - 1] if cadence_ns > window else 0
-            control = 0 if control_table is None else control_table[window][population - 1]
-            combined = _checked_add(
-                _checked_add(demand, blocking, "homogeneous work add"),
-                control,
-                "homogeneous control add",
-            )
-            if _checked_multiply(
-                derating_factor.denominator,
-                combined,
-                "derating comparison multiply",
-            ) > _checked_multiply(
-                derating_factor.numerator,
-                window,
-                "derating budget multiply",
-            ):
-                return False
-        return True
+        return first_failing_homogeneous_window(geometry_id, population, control_table) is None
 
     homogeneous_capacity = {
         geometry_intervals[geometry_id]: max(
@@ -1118,19 +1174,47 @@ def compile_provisional_service_profile(
         (population for population, duration in enumerate(reference_upper, start=1) if duration <= interval_ns),
         default=0,
     )
-    if measured_capacity == 0 and admission_policy == "profile":
-        raise ValueError(
-            "reference service interval "
-            f"{reference_interval_ms}ms cannot support one session; "
-            "measured population-one upper duration is "
-            f"{reference_upper[0]}ns"
+    measured_unsupported: dict[int, MeasuredUnsupportedGeometry] = {}
+    if admission_policy == "profile":
+        for geometry_id in geometries:
+            interval = geometry_intervals[geometry_id]
+            if homogeneous_capacity[interval] != 0:
+                continue
+            witness = first_failing_homogeneous_window(geometry_id, 1, control_table)
+            if witness is None:
+                raise RuntimeError(f"zero-capacity geometry {geometry_id} lacks a failing-window witness")
+            window, demand, blocking, control = witness
+            # U(1) is the smallest measured tier's upper step. A censor
+            # on any selected trailing sample in that tier is disclosed.
+            population_one_samples = tuple(
+                sample
+                for sample in samples
+                if sample.geometry_id == geometry_id
+                and sample.scenario_id == "ordinary"
+                and sample.tier_id == tiers[0].tier_id
+                and sample.post_jit
+                and sample.active_population == tiers[0].max_active_population
+            )[-trailing_rounds:]
+            measured_unsupported[geometry_id] = MeasuredUnsupportedGeometry(
+                service_interval_ms=interval,
+                window_ns=window,
+                dbf_ns=demand,
+                block_ns=blocking,
+                control_ns=control,
+                derating_numerator=derating_factor.numerator,
+                derating_denominator=derating_factor.denominator,
+                # The current provider does not produce censored observations.
+                population_one_censored=any(sample.censored for sample in population_one_samples),
+            )
+        unsupported_description = "; ".join(
+            f"geometry {geometry_id} ({w.service_interval_ms}ms): l={w.window_ns}ns "
+            f"dbf={w.dbf_ns}ns block={w.block_ns}ns control={w.control_ns}ns "
+            f"a/b={w.derating_numerator}/{w.derating_denominator} U(1)_censored={w.population_one_censored}"
+            for geometry_id, w in measured_unsupported.items()
         )
-    # The legacy scalar fields remain serialization compatibility only.  The
-    # periodic authority may correctly report a zero homogeneous frontier;
-    # keep the retired scalar denominator defined without turning it into a
-    # serving gate.
-    if admission_policy == "profile" and any(value == 0 for value in homogeneous_capacity.values()):
-        raise ValueError("zero homogeneous frontier cannot support a served geometry under profile")
+        if len(measured_unsupported) == len(geometries):
+            raise ValueError("all served geometries are measured-unsupported: " + unsupported_description)
+    # Retired reference/scalar fields are serialization compatibility only.
     provisional = homogeneous_capacity[reference_interval_ms]
     reference_demand = Fraction(1, max(1, provisional))
     demand_model = OnePointServiceDemand(reference_interval_ms, reference_demand)
@@ -1168,6 +1252,7 @@ def compile_provisional_service_profile(
         "control_dominance_sha256": control_dominance_sha256,
         "control_dominance_evidence": control_dominance_evidence,
         "homogeneous_capacity_by_interval": homogeneous_capacity,
+        "measured_unsupported_by_geometry": {str(g): asdict(w) for g, w in measured_unsupported.items()},
         "evidence_class": evidence_class,
         "admission_policy": admission_policy,
         "advisory": admission_policy == "hard_cap",
@@ -1233,7 +1318,10 @@ def compile_provisional_service_profile(
         upper_duration_ns_by_geometry_and_population=MappingProxyType(dict(expanded)),
         fragmentation_duration_ns_by_geometry_and_population=MappingProxyType(dict(fragmentation)),
         observations=samples,
+        measured_unsupported_by_geometry=MappingProxyType(dict(measured_unsupported)),
     )
+    if measured_unsupported:
+        logger.warning("profile measured-unsupported served geometries: %s", unsupported_description)
     if control_charge_status == "unproven":
         logger.warning(
             "hard_cap control-dominance unproven; zero control is advisory only: %s",

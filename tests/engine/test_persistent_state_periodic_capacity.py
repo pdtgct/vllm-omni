@@ -15,7 +15,7 @@ from typing import Any, NoReturn
 
 import pytest
 
-from tests.engine.persistent_state_helpers import compile_with_canaries
+from tests.engine.persistent_state_helpers import canary_timing_kwargs, compile_with_canaries
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -212,6 +212,7 @@ def _compile_with_bulk_canary(
         ):
             executions.append(
                 execution_type(
+                    **canary_timing_kwargs(scenario_id, interval_ms=320, population=tier.max_active_population),
                     scenario_id=scenario_id,
                     tier_id=tier.tier_id,
                     active_population=tier.max_active_population,
@@ -390,10 +391,10 @@ def test_hard_cap_dispatches_from_disjoint_hard_counters_without_profile() -> No
 
 
 @pytest.mark.parametrize("duration_ms", (600, 1130))
-def test_zero_capacity_is_retained_only_as_advisory(duration_ms: int) -> None:
+def test_all_zero_capacity_still_fails_profile_but_is_retained_as_advisory(duration_ms: int) -> None:
     """@spec PORT-STATE-026 / PORT-PERF-006: zero frontiers are evidence."""
     kwargs: dict[str, Any] = dict(intervals_ms=(1120,), tables_ms=((duration_ms,),), derating_factor=Fraction(1, 2))
-    with pytest.raises(ValueError, match="cannot support|zero.*frontier"):
+    with pytest.raises(ValueError, match="all served geometries are measured-unsupported"):
         _compile(**kwargs, admission_policy="profile")
     profile = _compile(**kwargs, admission_policy="hard_cap")
     assert profile.receipt.advisory is True
@@ -960,3 +961,200 @@ def test_service_lower_bound_owns_fallback_reason(case, reason):
     assert rate == (Fraction(1) if reason is None else None)
     if profile is not None:
         assert _symbol("conservative_service_lower_bound")(profile, service_interval_ms=interval) == rate
+
+
+@pytest.mark.parametrize("control", (False, True))
+def test_measured_unsupported_geometry_keeps_tables_and_failing_operands(control, monkeypatch, caplog):
+    """@spec PORT-STATE-026, PORT-PERF-008: one impossible cadence preserves the sealed layout."""
+    logger = logging.getLogger(_MODULE)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    profile = _compile(
+        intervals_ms=(80, 160),
+        tables_ms=((20 if control else 50,), (20,)),
+        derating_factor=Fraction(1, 2),
+        control_ms={80: (30,), 160: (30,)} if control else None,
+    )
+    assert profile.homogeneous_capacity_by_interval == {80: 0, 160: 1}
+    assert profile.window_ns == (80_000_000, 160_000_000)
+    assert set(profile.upper_duration_ns_by_geometry_and_population) == {0, 1}
+    witness = profile.receipt.measured_unsupported_by_geometry[0]
+    assert witness.service_interval_ms == 80
+    assert witness.window_ns == 80_000_000
+    assert witness.dbf_ns == (20 if control else 50) * 1_000_000
+    assert witness.block_ns == 0
+    assert witness.control_ns == (30_000_000 if control else 0)
+    assert (witness.derating_numerator, witness.derating_denominator) == (1, 2)
+    assert witness.population_one_censored is False
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "measured-unsupported" in warnings[0] and "80ms" in warnings[0]
+    assert not _evaluate(profile, 1, 0).schedulable
+    assert _evaluate(profile, 0, 1).schedulable
+    with pytest.raises(TypeError):
+        profile.receipt.measured_unsupported_by_geometry[1] = witness
+
+
+def test_measured_unsupported_reference_is_serialization_only():
+    """@spec PORT-STATE-026: a zero reference scalar cannot reject a supported shorter cadence."""
+    profile = _compile(intervals_ms=(80, 160), tables_ms=((10,), (170,)))
+    assert profile.measured_capacity == profile.provisional_capacity == 0
+    assert profile.homogeneous_capacity_by_interval == {80: 1, 160: 0}
+    assert set(profile.receipt.measured_unsupported_by_geometry) == {1}
+
+
+def test_all_measured_unsupported_names_every_failure():
+    """@spec PORT-STATE-026: startup fails only for an empty measured-feasible served set."""
+    with pytest.raises(ValueError) as error:
+        _compile(intervals_ms=(80, 160), tables_ms=((90,), (170,)))
+    message = str(error.value)
+    assert "all served geometries are measured-unsupported" in message
+    for token in (
+        "geometry 0",
+        "geometry 1",
+        "80ms",
+        "160ms",
+        "dbf=90000000",
+        "dbf=170000000",
+        "block=0",
+        "control=0",
+        "a/b=1/1",
+    ):
+        assert token in message
+
+
+def test_measured_unsupported_set_participates_in_receipt_hash(monkeypatch):
+    """@spec PORT-STATE-026: recovery identity binds the unsupported set and its operands."""
+    module = _module()
+    original = module._hash_json
+    payloads = []
+
+    def capture(payload):
+        if "measured_unsupported_by_geometry" in payload:
+            payloads.append(dict(payload))
+        return original(payload)
+
+    monkeypatch.setattr(module, "_hash_json", capture)
+    profile = _compile(intervals_ms=(80, 160), tables_ms=((90,), (10,)))
+    assert len(payloads) == 1
+    assert original(payloads[0]) == profile.receipt.receipt_sha256
+    assert original({**payloads[0], "measured_unsupported_by_geometry": {}}) != profile.receipt.receipt_sha256
+
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+@pytest.mark.parametrize("excess", (0, 1))
+def test_canary_eligibility_must_precede_timer_even_if_submission_is_eligible(policy, excess):
+    """@spec PORT-PERF-006, PORT-PERF-008: a one-nanosecond inherited wait invalidates either policy."""
+    if excess:
+        with pytest.raises(ValueError, match="eligib.*timer|timer.*eligib"):
+            compile_with_canaries(admission_policy=policy, eligibility_excess_ns=excess)
+    else:
+        profile = compile_with_canaries(admission_policy=policy, eligibility_excess_ns=excess)
+        observation = next(s for s in profile.receipt.observations if s.scenario_id == "forced_eou_then_chunk")
+        assert observation.following_chunk_timings[0].eligible_ns == observation.canary_timer_start_ns
+        assert observation.canary_wait_ns > 0
+
+
+def test_measured_unsupported_records_censored_population_one(monkeypatch):
+    """@spec PORT-STATE-026: a censored population-one upper remains disclosed in the failing-window receipt."""
+    module = _module()
+    original = module.compile_provisional_service_profile
+
+    def compile_censored(executions, **kwargs):
+        return original(tuple(replace(s, censored=True) if s.geometry_id == 0 else s for s in executions), **kwargs)
+
+    monkeypatch.setattr(module, "compile_provisional_service_profile", compile_censored)
+    profile = _compile(intervals_ms=(80, 160), tables_ms=((90,), (10,)))
+    assert profile.receipt.measured_unsupported_by_geometry[0].population_one_censored is True
+
+
+@pytest.mark.parametrize("policy", ("profile", "hard_cap"))
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "missing",
+        "operand",
+        "cadence",
+        "overflow",
+        "submission",
+        "negative_wait",
+        "wait_mismatch",
+        "missing_wait_start",
+        "future_wait_start",
+    ),
+)
+def test_canary_release_witnesses_are_structurally_checked(policy, defect, monkeypatch):
+    """@spec PORT-PERF-006: malformed timing evidence cannot establish dominance under either policy."""
+    import tests.engine.persistent_state_helpers as helpers
+
+    original = helpers.canary_timing_kwargs
+
+    def broken(scenario_id, **kwargs):
+        values = original(scenario_id, **kwargs)
+        if not values:
+            return values
+        witness = values["following_chunk_timings"][0]
+        if defect == "missing":
+            values["following_chunk_timings"] = ()
+        elif defect == "negative_wait":
+            values["canary_wait_ns"] = -1
+        elif defect == "wait_mismatch":
+            values["canary_wait_ns"] -= 1
+        elif defect == "missing_wait_start":
+            values["canary_wait_start_ns"] = None
+        elif defect == "future_wait_start":
+            values["canary_wait_start_ns"] = values["canary_timer_start_ns"] + 1
+        else:
+            updates = {
+                "operand": {"eligible_ns": witness.eligible_ns - 1},
+                "cadence": {"cadence_ns": witness.cadence_ns + 1},
+                "overflow": {"prior_actual_submission_ns": 2**63 - 1},
+                "submission": {"submitted_ns": values["canary_timer_start_ns"] - 1},
+            }[defect]
+            values["following_chunk_timings"] = (replace(witness, **updates),)
+        return values
+
+    monkeypatch.setattr(helpers, "canary_timing_kwargs", broken)
+    with pytest.raises(ValueError, match="canary|CHUNK"):
+        helpers.compile_with_canaries(admission_policy=policy)
+
+
+def test_unsupported_warning_groups_multiple_geometries_once(monkeypatch, caplog):
+    """@spec PORT-STATE-026: one startup warning identifies every unsupported cadence."""
+    logger = logging.getLogger(_MODULE)
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    profile = _compile(intervals_ms=(80, 160, 320), tables_ms=((90,), (170,), (10,)))
+    assert set(profile.receipt.measured_unsupported_by_geometry) == {0, 1}
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "80ms" in warnings[0] and "160ms" in warnings[0]
+
+
+def test_unsupported_canary_failure_is_admission_irrelevant_with_zero_control(monkeypatch):
+    """@spec PORT-STATE-026, PORT-PERF-006: unsupported cadence dominance is diagnostic under profile."""
+    module = _module()
+    compile_profile = module.compile_provisional_service_profile
+
+    def with_canaries(executions, **kwargs):
+        canaries = tuple(
+            replace(
+                sample,
+                scenario_id=scenario,
+                completed_legal_parks=2,
+                elapsed_ns=2 * sample.elapsed_ns + (1 if sample.geometry_id == 0 else 0),
+                **canary_timing_kwargs(scenario, interval_ms=sample.service_interval_ms),
+            )
+            for sample in executions
+            for scenario in ("forced_eou_then_chunk", "final_tail_then_flush")
+        )
+        kwargs["control_dominance_sha256"] = None
+        return compile_profile((*executions, *canaries), **kwargs)
+
+    monkeypatch.setattr(module, "compile_provisional_service_profile", with_canaries)
+    profile = _compile(intervals_ms=(80, 160), tables_ms=((50,), (20,)), derating_factor=Fraction(1, 2))
+    assert profile.homogeneous_capacity_by_interval == {80: 0, 160: 1}
+    assert profile.receipt.control_charge_status == "proven_zero"
+    assert profile.receipt.measured_unsupported_by_geometry[0].control_ns == 0
+    failed = [c for c in profile.receipt.control_dominance_evidence["cells"] if not c["dominance_passed"]]
+    assert len(failed) == 2
+    assert all(c["geometry_id"] == 0 and not c["admission_relevant"] for c in failed)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections import deque
@@ -38,6 +39,16 @@ class ReadyAudioUnit:
     @property
     def sample_count(self) -> int:
         return int(self.samples.shape[0])
+
+
+@dataclass(frozen=True)
+class OrdinaryReleaseTiming:
+    """Canonical operands captured before an ordinary unit is dispatched."""
+
+    true_ready_ns: int
+    prior_actual_submission_ns: int
+    cadence_ns: int
+    eligible_ns: int
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,8 @@ class AcceptedAudioAuthority:
         self._ready: deque[ReadyAudioUnit] = deque()
         self._in_flight: ReadyAudioUnit | None = None
         self._in_flight_submitted = False
+        self._parked = asyncio.Event()
+        self._parked.set()
         self.capture_service_timing = False
         self.observed_eligibility_ns: int | None = None
         self._prior_ordinary_submission_ns: int | None = None
@@ -208,6 +221,38 @@ class AcceptedAudioAuthority:
         """The ordered unit awaiting legal park, if one exists."""
         with self._lock:
             return self._in_flight
+
+    async def wait_until_parked(self) -> None:
+        """Wait for the stream consumer to acknowledge the current legal park."""
+        await self._parked.wait()
+        with self._lock:
+            if self._cleared or self._terminal_cause is not None:
+                raise RuntimeError("accepted audio terminated before legal park")
+
+    @property
+    def prior_actual_submission_ns(self) -> int | None:
+        with self._lock:
+            return self._prior_ordinary_submission_ns
+
+    # @spec PORT-STATE-026
+    def release_timing(self, unit: ReadyAudioUnit) -> OrdinaryReleaseTiming:
+        """Snapshot readiness and pacing without dispatching a queued CHUNK."""
+        with self._lock:
+            if (
+                unit.kind == "forced_eou"
+                or not any(queued is unit for queued in self._ready)
+                or self._prior_ordinary_submission_ns is None
+                or self.cadence_ns is None
+            ):
+                raise ValueError("release timing requires a queued ordinary CHUNK after registration")
+            eligible = self._eligibility_ns(unit)
+            assert eligible is not None
+            return OrdinaryReleaseTiming(
+                true_ready_ns=unit.ready_at_ns,
+                prior_actual_submission_ns=self._prior_ordinary_submission_ns,
+                cadence_ns=self.cadence_ns,
+                eligible_ns=eligible,
+            )
 
     def _eligibility_ns(self, unit: ReadyAudioUnit) -> int | None:
         if self.cadence_ns is None or unit.kind == "forced_eou":
@@ -390,6 +435,7 @@ class AcceptedAudioAuthority:
                     return None
             if self.capture_service_timing:
                 self.observed_eligibility_ns = eligibility_ns
+            self._parked.clear()
             self._in_flight = self._ready.popleft()
             self._in_flight_submitted = False
             return self._in_flight
@@ -451,6 +497,7 @@ class AcceptedAudioAuthority:
                 self._force_pending = False
             self._in_flight = None
             self._in_flight_submitted = False
+            self._parked.set()
 
     # @spec PORT-SESS-013
     def clear(self, error: BaseException) -> None:
@@ -465,6 +512,7 @@ class AcceptedAudioAuthority:
             self._ready.clear()
             self._in_flight = None
             self._in_flight_submitted = False
+            self._parked.set()
             self._force_pending = False
             self._cleared = True
 

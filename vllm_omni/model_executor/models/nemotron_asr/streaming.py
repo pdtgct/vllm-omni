@@ -64,6 +64,34 @@ def mint_envelope(
     return np.concatenate([header, samples.astype(np.float32, copy=False)])
 
 
+# @spec PORT-SESS-001, PORT-STATE-026
+def accept_audio_piece(
+    session: NemotronRealtimeSession,
+    frame: np.ndarray,
+    *,
+    before_audio_accept: Callable[[], None] | None = None,
+    on_audio_accepted: Callable[[], None] | None = None,
+) -> None:
+    """Stage accepted audio and its ledger receipt without dispatching work."""
+    if before_audio_accept is not None:
+        before_audio_accept()
+    authority = session.accepted_audio
+    prior_sequences = {unit.logical_sequence for unit in authority.ready_units}
+    session.accept_audio(frame)
+    if on_audio_accepted is not None:
+        on_audio_accepted()
+    ledger = session.ledger
+    if ledger is not None:
+        for unit in authority.ready_units:
+            if unit.logical_sequence not in prior_sequences and unit.kind != "forced_eou":
+                ledger.mint(
+                    final_tail=unit.kind == "final_tail",
+                    admission_ms_mod=unit.admission_ms_mod,
+                    handle=session.ready_handle(unit.logical_sequence),
+                )
+        ledger.acknowledge_piece(int(frame.shape[0]))
+
+
 async def buffer_stream(
     audio_stream: Any,
     input_stream: Any,
@@ -246,23 +274,7 @@ async def buffer_stream(
             async for rendered in dispatch_ready():
                 yield rendered
             continue
-        prior_sequences = {unit.logical_sequence for unit in authority.ready_units}
-        if before_audio_accept is not None:
-            before_audio_accept()
-        session.accept_audio(frame)
-        if on_audio_accepted is not None:
-            on_audio_accepted()
-        new_units = tuple(unit for unit in authority.ready_units if unit.logical_sequence not in prior_sequences)
-        if ledger is not None:
-            for unit in new_units:
-                if unit.kind != "forced_eou":
-                    ledger.mint(
-                        final_tail=unit.kind == "final_tail",
-                        admission_ms_mod=unit.admission_ms_mod,
-                        handle=session.ready_handle(unit.logical_sequence),
-                    )
-        if ledger is not None:
-            ledger.acknowledge_piece(int(frame.shape[0]))
+        accept_audio_piece(session, frame, before_audio_accept=before_audio_accept, on_audio_accepted=on_audio_accepted)
         async for rendered in dispatch_ready():
             yield rendered
     # Finalization is an explicit protocol transaction even when the

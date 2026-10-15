@@ -9,6 +9,7 @@ from typing import Any
 
 def compile_with_canaries(
     *,
+    eligibility_excess_ns: int = 0,
     ordinary_ns: int = 100,
     forced_ns: int = 200,
     terminal_ns: int = 200,
@@ -48,6 +49,9 @@ def compile_with_canaries(
         executions.extend(
             (
                 execution_type(
+                    **canary_timing_kwargs(
+                        scenario_id, interval_ms=canary_interval_ms, excess_ns=eligibility_excess_ns
+                    ),
                     scenario_id=scenario_id,
                     tier_id="single",
                     active_population=1,
@@ -62,6 +66,9 @@ def compile_with_canaries(
                     is_profile=False,
                 ),
                 execution_type(
+                    **canary_timing_kwargs(
+                        scenario_id, interval_ms=canary_interval_ms, excess_ns=eligibility_excess_ns
+                    ),
                     scenario_id=scenario_id,
                     tier_id="single",
                     active_population=1,
@@ -111,4 +118,28 @@ def compile_with_canaries(
         control_dominance_sha256=None,
         evidence_class="probe",
         admission_policy=admission_policy,
+    )
+
+
+def canary_timing_kwargs(scenario_id, *, interval_ms=80, population=1, excess_ns=0):
+    """Synthetic, internally consistent eligibility witnesses for compiler fixtures."""
+    if scenario_id != "forced_eou_then_chunk":
+        return {}
+    module = importlib.import_module("vllm_omni.engine.persistent_state_capacity")
+    cadence = interval_ms * 1_000_000
+    timer = cadence + 100
+    return dict(
+        canary_timer_start_ns=timer,
+        canary_wait_ns=cadence - 100,
+        canary_wait_start_ns=200,
+        following_chunk_timings=tuple(
+            module.CanaryChunkTiming(
+                true_ready_ns=200,
+                prior_actual_submission_ns=100 + excess_ns,
+                cadence_ns=cadence,
+                eligible_ns=timer + excess_ns,
+                submitted_ns=timer + excess_ns + 1,
+            )
+            for _ in range(population)
+        ),
     )
