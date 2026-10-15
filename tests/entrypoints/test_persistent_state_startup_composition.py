@@ -1044,7 +1044,17 @@ def startup_correlation_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(logger, "warning", warning)
     events: list[tuple[str, Any]] = []
     failures: dict[str, BaseException] = {}
+    body_errors: list[BaseException] = []
+    real_gather = asyncio.gather
     clock_calls = 0
+
+    async def observe_gather(*awaitables: Any, **kwargs: Any) -> Any:
+        try:
+            return await real_gather(*awaitables, **kwargs)
+        except BaseException as error:
+            if not kwargs.get("return_exceptions", False):
+                body_errors.append(error)
+            raise
 
     def range_start(name: str) -> int:
         events.append(("start", name))
@@ -1100,6 +1110,7 @@ def startup_correlation_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(profiling.torch.cuda.nvtx, "range_start", range_start)
     monkeypatch.setattr(profiling.torch.cuda.nvtx, "range_end", range_end)
     monkeypatch.setattr(startup.time, "monotonic_ns", clock)
+    monkeypatch.setattr(startup.asyncio, "gather", observe_gather)
 
     async def run(
         geometry: int = 0, repeat: int = 1, scenario: str = "ordinary", tier: str = "single", enabled: bool = True
@@ -1125,7 +1136,7 @@ def startup_correlation_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
             ),
         )
 
-    return SimpleNamespace(run=run, events=events, failures=failures, warning=warning)
+    return SimpleNamespace(run=run, events=events, failures=failures, warning=warning, body_errors=body_errors)
 
 
 # @spec PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
@@ -1209,7 +1220,14 @@ async def test_startup_correlation_failures_close_once_and_always_abort(
         probe.failures["end"] = RuntimeError("secondary NVTX end")
     with pytest.raises(type(primary)) as caught:
         await probe.run()
-    assert caught.value is primary
+    if failure_point in ("feed", "cancel"):
+        # gather may normalize a child's cancellation differently by Python
+        # version; preserve the exact error delivered to the provider body.
+        assert len(probe.body_errors) == 1
+        assert caught.value is probe.body_errors[0]
+    else:
+        assert probe.body_errors == []
+        assert caught.value is primary
     actions = [action for action, _ in probe.events]
     assert probe.events[:2] == [
         ("construct", "session-0"),
