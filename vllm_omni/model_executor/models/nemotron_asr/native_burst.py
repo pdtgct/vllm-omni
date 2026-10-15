@@ -199,8 +199,24 @@ class NativeBurstSampler:
         )
 
 
-def validate_native_burst_config(config: Any, *, hf_config: Any | None = None) -> None:
-    """Reject every native selection outside the initial 160-ms profile."""
+NATIVE_BURST_160MS_PROFILE = "fp32-sync-single-device-160ms-v1"
+NATIVE_BURST_FIVE_CADENCE_PROFILE = "fp32-sync-single-device-five-cadence-v1"
+
+
+def validate_native_burst_config(config: Any, *, hf_config: Any | None = None, profile: str | None = None) -> str:
+    """@spec PORT-DEC-011, PORT-DEC-014: validate an explicit execution profile.
+
+    Omission retains the initial 160-ms guard, including its independent use
+    by the compatibility CHUNK graph pilot. Native precision is checked at
+    model construction against the actual resolved policy.
+    """
+    selected = NATIVE_BURST_160MS_PROFILE if profile is None else profile
+    if selected == NATIVE_BURST_160MS_PROFILE:
+        supported_lookaheads = (1,)
+    elif selected == NATIVE_BURST_FIVE_CADENCE_PROFILE:
+        supported_lookaheads = (0, 1, 3, 6, 13)
+    else:
+        raise ValueError(f"unknown native burst profile: {selected!r}")
     parallel = config.parallel_config
     if (
         config.scheduler_config.async_scheduling is not False
@@ -225,8 +241,9 @@ def validate_native_burst_config(config: Any, *, hf_config: Any | None = None) -
             lookaheads = tuple(int(value) for value in declared)
         except TypeError:
             lookaheads = ()
-        if lookaheads != (1,):
-            raise ValueError("native burst requires the declared 160-ms lookahead profile")
+        if lookaheads != supported_lookaheads:
+            raise ValueError(f"native burst profile {selected!r} requires declared lookaheads {supported_lookaheads}")
+    return selected
 
 
 def validate_native_burst_sampling(params: Any, *, park_id: int, capacity: int) -> None:

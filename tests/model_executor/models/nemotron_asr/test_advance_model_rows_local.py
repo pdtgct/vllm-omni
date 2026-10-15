@@ -363,6 +363,7 @@ def _call(
     graph_covers_decode: bool = False,
     memory_profile: bool = False,
     staging: Any = None,
+    native_burst_handoff: Any = None,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = advance.make_mrv1_adapter(
@@ -384,6 +385,7 @@ def _call(
         graph_covers_decode=graph_covers_decode,
         memory_profile=memory_profile,
         staging=staging,
+        native_burst_handoff=native_burst_handoff,
         **pools,
     )
     return out
@@ -3611,3 +3613,733 @@ def test_forced_eou_replay_and_park_echo_keep_unit_identity():
     assert phases == [4, 2, 0]
     assert keys == [None, (1, 1, 2), None]
     assert registry.publish_progress("a", generation, (2, 0, 2), starts_chunk=True) == (2, 0, 2)
+
+
+@pytest.mark.parametrize("labels", [[], [2], [2, 3, 2], *[[2, 3] * (n // 2) for n in (10, 20, 40, 70, 140)]])
+def test_experimental_native_burst_matches_replay_state_at_legal_park(labels: list[int]) -> None:
+    # @spec PORT-DEC-010 / PORT-DEC-011 / PORT-DEC-012
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import finalize_native_burst
+
+    capacity = 141
+    queue = torch.zeros(1, capacity, dtype=torch.int32)
+    book = torch.zeros(1, 7, dtype=torch.int64)
+    book[0, _BOOK["last_label"]] = labels[-1] if labels else VOCAB
+    result = advance.AdvanceResult(
+        token_ids=torch.tensor([labels + [0] * (capacity - len(labels))], dtype=torch.int32),
+        token_lengths=torch.tensor([len(labels)], dtype=torch.int32),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    context = advance.EmissionContext(
+        roles=torch.tensor([advance.ROLE_CHUNK]),
+        input_ids=torch.tensor([PLACEHOLDER_ID]),
+        chunk_rows=torch.tensor([0]),
+        queue=queue,
+        book=book,
+        prompt_index=torch.zeros(1, dtype=torch.int64),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB)
+    first = adapter(result, context)
+    initial_queue, initial_book = first.queue.clone(), first.book.clone()
+    native = finalize_native_burst(first, context, park_id=PARK_ID, blank_id=VOCAB)
+    assert native.sampled_token_ids.shape == (1, capacity + 1)
+    assert native.num_sampled.tolist() == [len(labels) + 1]
+    assert native.sampled_token_ids[0, : len(labels) + 1].tolist() == labels + [PARK_ID]
+    assert torch.all(native.sampled_token_ids[0, len(labels) + 1 :] == -1)
+    assert torch.equal(first.queue, initial_queue) and torch.equal(first.book, initial_book)
+
+    current = first
+    observed = [_decision(current.rows)[0]]
+    while observed[-1] != PARK_ID:
+        replay_context = advance.EmissionContext(
+            roles=torch.tensor([advance.ROLE_REPLAY]),
+            input_ids=torch.tensor([observed[-1]]),
+            chunk_rows=torch.empty(0, dtype=torch.int64),
+            queue=current.queue,
+            book=current.book,
+            prompt_index=context.prompt_index,
+            row_status=context.row_status,
+        )
+        current = adapter(result, replay_context)
+        observed.append(_decision(current.rows)[0])
+    assert observed == labels + [PARK_ID]
+    assert torch.equal(native.queue, current.queue)
+    assert torch.equal(native.book, current.book)
+    retained = native.sampled_token_ids.clone()
+    first.queue.fill_(7)
+    assert torch.equal(native.sampled_token_ids, retained)
+
+
+def test_experimental_native_burst_failed_row_emits_only_park_without_state_change() -> None:
+    # @spec PORT-DEC-010 / PORT-STATE-008
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import finalize_native_burst
+
+    queue = torch.tensor([[2, 3, 0]], dtype=torch.int32)
+    book = torch.tensor([[1, 2, 3, 0, 0, 1, 2]], dtype=torch.int64)
+    context = advance.EmissionContext(
+        roles=torch.tensor([advance.ROLE_CHUNK]),
+        input_ids=torch.tensor([PLACEHOLDER_ID]),
+        chunk_rows=torch.tensor([0]),
+        queue=queue,
+        book=book,
+        prompt_index=torch.tensor([0]),
+        row_status=torch.tensor([advance.ROW_STATUS_ENVELOPE], dtype=torch.int32),
+    )
+    projection = advance.EmissionProjection(
+        rows=torch.zeros(1, CARRIER_HIDDEN),
+        queue=queue.clone(),
+        book=book.clone(),
+        row_status=context.row_status.clone(),
+    )
+    native = finalize_native_burst(projection, context, park_id=PARK_ID, blank_id=VOCAB)
+    assert native.sampled_token_ids.tolist() == [[PARK_ID, -1, -1, -1]]
+    assert native.num_sampled.tolist() == [1]
+    assert torch.equal(native.queue, queue) and torch.equal(native.book, book)
+    assert torch.equal(native.row_status, context.row_status)
+
+
+@pytest.mark.parametrize("head", [1, 2, 3])
+def test_experimental_native_burst_drains_partly_replayed_queue(head: int) -> None:
+    # @spec PORT-DEC-010 / PORT-DEC-011
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import finalize_native_burst
+
+    labels = [2, 3, 2]
+    queue = torch.tensor([labels], dtype=torch.int32)
+    book = torch.zeros(1, 7, dtype=torch.int64)
+    book[0, _BOOK["queue_head"]] = head
+    book[0, _BOOK["queue_length"]] = 3
+    book[0, _BOOK["pending_echo"]] = 1
+    book[0, _BOOK["expected_label"]] = labels[head - 1]
+    book[0, _BOOK["last_label"]] = labels[-1]
+    context = advance.EmissionContext(
+        roles=torch.tensor([advance.ROLE_REPLAY]),
+        input_ids=torch.tensor([labels[head - 1]]),
+        chunk_rows=torch.empty(0, dtype=torch.int64),
+        queue=queue,
+        book=book,
+        prompt_index=torch.zeros(1, dtype=torch.int64),
+        row_status=torch.zeros(1, dtype=torch.int32),
+    )
+    result = advance.AdvanceResult(token_ids=queue, token_lengths=torch.tensor([3]), row_status=context.row_status)
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB)
+    first = adapter(result, context)
+    native = finalize_native_burst(first, context, park_id=PARK_ID, blank_id=VOCAB)
+    assert native.sampled_token_ids[0, : native.num_sampled[0]].tolist() == labels[head:] + [PARK_ID]
+    current = first
+    while _decision(current.rows)[0] != PARK_ID:
+        context = advance.EmissionContext(
+            roles=context.roles,
+            input_ids=torch.tensor([_decision(current.rows)[0]]),
+            chunk_rows=context.chunk_rows,
+            queue=current.queue,
+            book=current.book,
+            prompt_index=context.prompt_index,
+            row_status=context.row_status,
+        )
+        current = adapter(result, context)
+    assert torch.equal(native.book, current.book)
+    assert torch.equal(native.queue, current.queue)
+
+
+def test_experimental_native_burst_transaction_matches_all_replayed_pools(
+    device: str = "cpu",
+    geometry: int = GEOM_FINAL,
+    samples_count: int = FINAL_SAMPLES,
+    max_tokens: int = 142,
+    return_receipt: bool = False,
+) -> dict[str, Any] | None:
+    # @spec PORT-DEC-010 / PORT-DEC-012 / PORT-STATE-008
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff
+
+    core = _tiny_core(seed=1)
+    for module in vars(core).values():
+        if isinstance(module, torch.nn.Module):
+            module.to(device)
+    torch.manual_seed(5)
+    samples = torch.randn(samples_count) * 0.01
+    carrier = _envelope(samples, final=True, seq=0, geometry=geometry, hidden=CARRIER_HIDDEN).unsqueeze(0).to(device)
+    replay_pools = {
+        name: [t.to(device) for t in value] if isinstance(value, list) else value.to(device)
+        for name, value in _fresh_pools().items()
+    }
+    native_pools = _clone_pools(replay_pools)
+    if torch.device(device).type == "cuda":
+        advance.warmup_advance_model_rows_scatter(**replay_pools)
+        advance.warmup_advance_model_rows_scatter(**native_pools)
+    output = _call(
+        core,
+        replay_pools,
+        torch.tensor([PLACEHOLDER_ID], device=device),
+        carrier,
+        _plan(prefills=[1], geometries=[geometry]),
+    )
+    expected = [_decision(output)[0]]
+    while expected[-1] != PARK_ID:
+        output = _call(
+            core,
+            replay_pools,
+            torch.tensor([expected[-1]], device=device),
+            torch.zeros(1, CARRIER_HIDDEN, device=device),
+            _plan(decodes=[1], geometries=[geometry]),
+        )
+        expected.append(_decision(output)[0])
+    batch = SimpleNamespace(req_ids=["a"], idx_mapping_np=[0])
+    snapshot = SimpleNamespace(
+        epoch=1,
+        req_ids=("a",),
+        input_batch=batch,
+        bindings=(SimpleNamespace(request_id="a", generation=1, slot_id=1),),
+        block_ids=((1,),),
+        req_states=SimpleNamespace(req_id_to_index={"a": 0}),
+    )
+    handoff = NativeBurstHandoff(max_tokens=max_tokens)
+    handoff.prepare(snapshot)
+    _call(
+        core,
+        native_pools,
+        torch.tensor([PLACEHOLDER_ID], device=device),
+        carrier,
+        _plan(prefills=[1], geometries=[geometry]),
+        native_burst_handoff=handoff,
+    )
+    payload = handoff.consume(batch)
+    assert payload.row_status.tolist() == [0]
+    assert len(expected) > 1, "transaction discriminator must emit labels before PARK"
+    assert payload.sampled_token_ids[0, : payload.num_sampled[0]].tolist() == expected
+    _assert_pools_equal(native_pools, replay_pools)
+    if return_receipt:
+        assert len(expected) > 1, "CUDA discriminator must emit labels before PARK"
+        return {
+            "emitted_labels": len(expected) - 1,
+            "payload_count_including_park": int(payload.num_sampled[0]),
+            "compatibility_transaction_calls": len(expected),
+            "native_transaction_calls": 1,
+            "payload_token_ids": payload.sampled_token_ids[0, : payload.num_sampled[0]].tolist(),
+            "nontrivial_replay_drain": True,
+            "cuda_scatter_layouts_warmed": torch.device(device).type == "cuda",
+        }
+    return None
+
+
+@pytest.mark.parametrize("defect", ["blank", "declared-bound"])
+def test_experimental_native_burst_invalid_payload_parks_and_suppresses_store(monkeypatch: Any, defect: str) -> None:
+    # @spec PORT-DEC-010 / PORT-STATE-008
+    from vllm_omni.model_executor.models.nemotron_asr import native_burst
+
+    core = _tiny_core(seed=1)
+    pools = _fresh_pools()
+    original = _clone_pools(pools)
+    torch.manual_seed(5)
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    carrier = _envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0)
+    batch = SimpleNamespace(req_ids=["a"], idx_mapping_np=[0])
+    snapshot = SimpleNamespace(
+        epoch=1,
+        req_ids=("a",),
+        input_batch=batch,
+        bindings=(SimpleNamespace(request_id="a", generation=1, slot_id=1),),
+        block_ids=((1,),),
+        req_states=SimpleNamespace(req_id_to_index={"a": 0}),
+    )
+    handoff = native_burst.NativeBurstHandoff(max_tokens=1 if defect == "declared-bound" else 142)
+    handoff.prepare(snapshot)
+    original_finalize = native_burst.finalize_native_burst
+
+    def corrupt(*args: Any, **kwargs: Any) -> Any:
+        result = original_finalize(*args, **kwargs)
+        if defect == "blank":
+            result.sampled_token_ids[:, 0] = VOCAB
+        return result
+
+    monkeypatch.setattr(native_burst, "finalize_native_burst", corrupt)
+    sink = _CommitRecorder()
+    out = _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID]),
+        carrier,
+        _plan(prefills=[1], geometries=[GEOM_FINAL]),
+        native_burst_handoff=handoff,
+        commit_sink=sink,
+    )
+    payload = handoff.consume(batch)
+    assert _decision(out) == [PARK_ID]
+    assert payload.num_sampled.tolist() == [1]
+    assert payload.sampled_token_ids[0, :2].tolist() == [PARK_ID, -1]
+    assert int(sink.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+    _assert_pools_equal(pools, original)
+
+
+@pytest.mark.parametrize("geometry,samples_count", [(0, 1280), (1, 2560), (2, 5120), (3, 8960), (4, 17920)])
+def test_native_all_cadence_transaction_matches_complete_compatibility_drain(
+    monkeypatch, geometry, samples_count, native_device
+):
+    # @spec PORT-DEC-010, PORT-DEC-011, PORT-DEC-012
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "CAP", 141)
+    monkeypatch.setattr(module, "CARRIER_HIDDEN", 17927)
+    test_experimental_native_burst_transaction_matches_all_replayed_pools(
+        device=str(native_device),
+        geometry=geometry,
+        samples_count=samples_count - 1,
+        max_tokens=142,
+    )
+
+
+@pytest.mark.parametrize("geometry,bound", [(0, 12), (1, 22), (2, 42), (3, 72), (4, 142)])
+@pytest.mark.parametrize("extra_eou", [False, True])
+@pytest.mark.parametrize("full", [False, True])
+def test_native_exact_geometry_payload_equals_complete_drain_with_optional_eou(
+    geometry, bound, extra_eou, full, native_device
+):
+    # @spec PORT-DEC-010, PORT-INT-002
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+        finalize_native_burst,
+        native_burst_invariant_rows,
+    )
+
+    with torch.device(native_device):
+        labels = ([2, 3] * ((bound - 2) // 2) if full else []) + ([VOCAB + 3] if extra_eou else [])
+        queue = torch.zeros(1, 141, dtype=torch.int32)
+        book = torch.zeros(1, BOOK_WIDTH, dtype=torch.int64)
+        book[0, _BOOK["last_label"]] = 3
+        book[0, _BOOK["geometry"]] = geometry
+        result = advance.AdvanceResult(
+            token_ids=torch.tensor([labels + [0] * (141 - len(labels))], dtype=torch.int32),
+            token_lengths=torch.tensor([len(labels)], dtype=torch.int32),
+            row_status=torch.zeros(1, dtype=torch.int32),
+        )
+        context = advance.EmissionContext(
+            torch.tensor([advance.ROLE_CHUNK]),
+            torch.tensor([PLACEHOLDER_ID]),
+            torch.tensor([0]),
+            queue,
+            book,
+            torch.zeros(1, dtype=torch.long),
+            result.row_status,
+        )
+        adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB)
+        current = adapter(result, context)
+        native = finalize_native_burst(current, context, park_id=PARK_ID, blank_id=VOCAB)
+        assert not native_burst_invariant_rows(
+            current,
+            context,
+            native,
+            park_id=PARK_ID,
+            blank_id=VOCAB,
+            eou_token_id=VOCAB + 3,
+        ).any()
+        observed = [_decision(current.rows)[0]]
+        while observed[-1] != PARK_ID:
+            current = adapter(
+                result,
+                replace(
+                    context,
+                    roles=torch.tensor([advance.ROLE_REPLAY]),
+                    input_ids=torch.tensor([observed[-1]]),
+                    chunk_rows=torch.empty(0, dtype=torch.long),
+                    queue=current.queue,
+                    book=current.book,
+                ),
+            )
+            observed.append(_decision(current.rows)[0])
+        assert observed == labels + [PARK_ID]
+        assert native.num_sampled.tolist() == [len(labels) + 1]
+        if full:
+            assert len(labels) + 1 == (bound if extra_eou else bound - 1)
+        assert native.sampled_token_ids[0, : len(observed)].tolist() == observed
+        torch.testing.assert_close(native.book, current.book, rtol=0, atol=0)
+        torch.testing.assert_close(native.queue, current.queue, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("geometry,bound", [(0, 12), (1, 22), (2, 42), (3, 72), (4, 142)])
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact-bound", "overflow"])
+def test_native_row_budget_is_geometry_specific_even_when_global_budget_is_wider(
+    monkeypatch, geometry, bound, native_device, overflow
+):
+    # @spec PORT-DEC-010, PORT-INT-002, PORT-STATE-008
+    # Inject a corrupt finalizer and isolate the independent geometry budget
+    # guard; separate legacy tests exercise the full structural validator.
+    import sys
+
+    from vllm_omni.model_executor.models.nemotron_asr import native_burst
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "CAP", 141)
+    monkeypatch.setattr(module, "CARRIER_HIDDEN", 17927)
+    core = _tiny_core(seed=1)
+    pools = _native_pool_device(core, _sentinel_pools(value=77), native_device)
+    prior = _clone_pools(pools)
+    finalize = native_burst.finalize_native_burst
+
+    def over_bound(*args, **kwargs):
+        payload = finalize(*args, **kwargs)
+        payload.num_sampled.fill_(bound + int(overflow))
+        return payload
+
+    monkeypatch.setattr(native_burst, "finalize_native_burst", over_bound)
+    monkeypatch.setattr(
+        native_burst,
+        "native_burst_invariant_rows",
+        lambda source, *args, **kwargs: torch.zeros_like(source.row_status, dtype=torch.bool),
+    )
+    sink = native_burst.NativeBurstProfileSink(max_tokens=200)
+    commit = _CommitRecorder()
+    _call(
+        core,
+        pools,
+        torch.tensor([PLACEHOLDER_ID], device=native_device),
+        _envelope(torch.zeros(1000), final=True, seq=0, geometry=geometry, hidden=CARRIER_HIDDEN)
+        .unsqueeze(0)
+        .to(native_device),
+        _plan(prefills=[1], geometries=[geometry]),
+        native_burst_handoff=sink,
+        commit_sink=commit,
+    )
+    if overflow:
+        assert int(commit.staged[0][0]) & advance.ROW_STATUS_DECODE_INVARIANT
+        assert sink.payload.num_sampled.tolist() == [1]
+        assert sink.payload.sampled_token_ids[0, 0] == PARK_ID
+        _assert_pools_equal(pools, prior)
+    else:
+        assert int(commit.staged[0][0]) == 0
+        assert sink.payload.num_sampled.tolist() == [bound]
+        # Successful fresh-row stores happened, so a no-op cannot pass.
+        assert not torch.equal(pools["book_pool"][1], prior["book_pool"][1])
+
+
+@pytest.mark.parametrize("geometry", [-1, 5, 1000000])
+def test_native_invalid_geometry_fails_without_resident_writes(geometry, native_device):
+    # @spec PORT-STATE-008, PORT-INT-002
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+
+    core = _tiny_core()
+    pools = _native_pool_device(core, _sentinel_pools(value=77), native_device)
+    before = _clone_pools(pools)
+    sink = NativeBurstProfileSink(max_tokens=142)
+    try:
+        _call(
+            core,
+            pools,
+            torch.tensor([PLACEHOLDER_ID], device=native_device),
+            _envelope(torch.zeros(100), final=True, seq=0, geometry=geometry, hidden=CARRIER_HIDDEN)
+            .unsqueeze(0)
+            .to(native_device),
+            _plan(prefills=[1], geometries=[geometry]),
+            native_burst_handoff=sink,
+        )
+    except ValueError:
+        pass
+    else:
+        assert sink.payload.row_status.item() != 0
+        assert sink.payload.num_sampled.tolist() == [1]
+        assert sink.payload.sampled_token_ids[0, 0] == PARK_ID
+    _assert_pools_equal(pools, before)
+
+
+@pytest.mark.parametrize("forced_eou", [False, True])
+def test_native_forced_eou_and_final_flush_match_all_compatibility_pools(forced_eou, native_device):
+    # @spec PORT-DEC-010, PORT-DEC-011, PORT-DEC-012
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+
+    core = _tiny_core()
+    baseline = _native_pool_device(core, _fresh_pools(), native_device)
+    _call(
+        core,
+        baseline,
+        torch.tensor([PLACEHOLDER_ID], device=native_device),
+        _envelope(torch.zeros(REG_SAMPLES - int(not forced_eou)), final=not forced_eou, seq=0, hidden=CARRIER_HIDDEN)
+        .unsqueeze(0)
+        .to(native_device),
+        _plan(prefills=[1]),
+    )
+    _set_drained_book(baseline, 1, blank=core.blank_id)
+    baseline["endpoint_history_pool"] = torch.zeros(3, 8, dtype=torch.int32, device=native_device)
+    baseline["endpoint_book_pool"] = torch.zeros(3, 6, dtype=torch.int32, device=native_device)
+    baseline["endpoint_book_pool"][1, 4] = int(forced_eou)
+    baseline = _native_pool_device(core, baseline, native_device)
+    candidate = _native_pool_device(core, _clone_pools(baseline), native_device)
+    eou = VOCAB + 3
+    token = eou if forced_eou else PARK_ID
+    adapter = advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id)
+
+    def call(pools, current, handoff=None):
+        return advance.advance_model_rows(
+            core,
+            torch.tensor([current], device=native_device),
+            torch.zeros(1, CARRIER_HIDDEN, device=native_device),
+            _plan(decodes=[1]),
+            adapter=adapter,
+            decode_resolver=_fixed_resolver(),
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            eou_token_id=eou,
+            native_burst_handoff=handoff,
+            **pools,
+        )
+
+    expected = [_decision(call(baseline, token))[0]]
+    while expected[-1] != PARK_ID:
+        expected.append(_decision(call(baseline, expected[-1]))[0])
+    sink = NativeBurstProfileSink(max_tokens=142)
+    call(candidate, token, sink)
+    assert sink.payload.sampled_token_ids[0, : sink.payload.num_sampled[0]].tolist() == expected
+    assert sink.payload.row_status.tolist() == [0]
+    assert expected == ([eou, PARK_ID] if forced_eou else [PARK_ID])
+    _assert_pools_equal(candidate, baseline)
+
+
+def test_native_mixed_geometry_chunk_and_flush_rows_preserve_order_and_inactive_pools(monkeypatch, native_device):
+    # @spec PORT-DEC-010, PORT-DEC-011, PORT-DEC-012, PORT-STATE-008
+    import sys
+
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+
+    monkeypatch.setattr(sys.modules[__name__], "CAP", 141)
+    monkeypatch.setattr(sys.modules[__name__], "CARRIER_HIDDEN", 17927)
+    core = _tiny_core(seed=1)
+    baseline = _native_pool_device(core, _fresh_pools(num_blocks=5), native_device)
+    _set_drained_book(baseline, 3, blank=core.blank_id)
+    baseline["frontend_counter_pool"][3, _CTR["finalized"]] = 1
+    baseline["frontend_counter_pool"][3, _CTR["expected_chunk_sequence"]] = 1
+    # Unallocated block is poisoned; neither transaction may gather/store it.
+    for value in baseline.values():
+        for tensor in value if isinstance(value, list) else [value]:
+            tensor[4].fill_(987654)
+    candidate = _native_pool_device(core, _clone_pools(baseline), native_device)
+    geometries = [0, 0, 4]
+    inputs = torch.tensor([PARK_ID, PLACEHOLDER_ID, PLACEHOLDER_ID], device=native_device)
+    embeds = torch.stack(
+        [
+            torch.zeros(CARRIER_HIDDEN),
+            _envelope(torch.zeros(1280), final=False, seq=0, geometry=0, hidden=CARRIER_HIDDEN),
+            _envelope(torch.zeros(17919), final=True, seq=0, geometry=4, hidden=CARRIER_HIDDEN),
+        ]
+    )
+    embeds = embeds.to(native_device)
+    plan = _plan(decodes=[3], prefills=[1, 2], num_pool_blocks=5, geometries=geometries)
+    first = _decision(_call(core, baseline, inputs, embeds, plan))
+    expected = [[token] for token in first]
+    current = first
+    # Keep a fixed batch to compare exact row order and pool updates. Rows
+    # already at PARK receive idempotent PARK echoes while other rows drain;
+    # this does not claim that the serving scheduler keeps completed rows.
+    while any(token != PARK_ID for token in current):
+        next_tokens = _decision(
+            _call(
+                core,
+                baseline,
+                torch.tensor(current, device=native_device),
+                torch.zeros(3, CARRIER_HIDDEN, device=native_device),
+                _plan(decodes=[3, 1, 2], num_pool_blocks=5, geometries=geometries),
+            )
+        )
+        for row, token in enumerate(next_tokens):
+            if expected[row][-1] != PARK_ID:
+                expected[row].append(token)
+        current = next_tokens
+    sink = NativeBurstProfileSink(max_tokens=142)
+    _call(core, candidate, inputs, embeds, plan, native_burst_handoff=sink)
+    assert sink.payload.row_status.tolist() == [0, 0, 0]
+    assert len(expected[1]) > 1 and len(expected[2]) > 1
+    for row, tokens in enumerate(expected):
+        assert sink.payload.sampled_token_ids[row, : sink.payload.num_sampled[row]].tolist() == tokens
+    _assert_pools_equal(candidate, baseline)
+    for value in candidate.values():
+        for tensor in value if isinstance(value, list) else [value]:
+            assert torch.all(tensor[4] == 987654)
+
+
+def test_native_profile_executes_real_finalizer_with_ephemeral_reservation(monkeypatch: Any) -> None:
+    # @spec PORT-MIG-005 / PORT-DEC-010
+    from vllm_omni.model_executor.models.nemotron_asr import native_burst, profile_execution
+
+    core = _tiny_core(seed=1)
+    pools = _fresh_pools()
+    samples = torch.randn(FINAL_SAMPLES) * 0.01
+    invocation = SimpleNamespace(
+        input_ids=torch.tensor([PLACEHOLDER_ID]),
+        inputs_embeds=_envelope(samples, final=True, seq=0, geometry=GEOM_FINAL).unsqueeze(0),
+        plan=_plan(prefills=[1], geometries=[GEOM_FINAL]),
+        pools=SimpleNamespace(
+            channel=pools["channel_pools"],
+            convolution=pools["time_pools"],
+            valid_length=pools["len_pools"],
+            predictor_h=pools["h_pool"],
+            predictor_c=pools["c_pool"],
+            replay_queue=pools["queue_pool"],
+            replay_book=pools["book_pool"],
+            frontend_raw=pools["frontend_raw_pool"],
+            frontend_mel=pools["frontend_mel_pool"],
+            frontend_counters=pools["frontend_counter_pool"],
+            endpoint_history=torch.zeros(pools["queue_pool"].shape[0], 12, dtype=torch.int32),
+            endpoint_book=torch.zeros(pools["queue_pool"].shape[0], 6, dtype=torch.int32),
+        ),
+    )
+    calls = []
+    finalize = native_burst.finalize_native_burst
+
+    def observe(*args: Any, **kwargs: Any) -> Any:
+        result = finalize(*args, **kwargs)
+        calls.append(result.sampled_token_ids.shape)
+        return result
+
+    monkeypatch.setattr(native_burst, "finalize_native_burst", observe)
+    monkeypatch.setattr(profile_execution, "build_profile_invocation", lambda *a, **kw: invocation)
+    live_handoff = native_burst.NativeBurstHandoff(max_tokens=42)
+    model = SimpleNamespace(
+        core=core,
+        config=SimpleNamespace(
+            eos_token_id=PARK_ID,
+            audio_chunk_token_id=PLACEHOLDER_ID,
+            eou_token_id=VOCAB + 1,
+            supported_num_lookahead_tokens=[3],
+        ),
+        _encoder_execution=SimpleNamespace(arm="eager", transition=None),
+        _emission_adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=VOCAB),
+        _decode_resolver=_fixed_resolver(rnnt.decode_dense_masked_frames),
+        _native_burst_handoff=live_handoff,
+    )
+    profile_execution.run_persistent_state_profile(model, num_rows=1, device=torch.device("cpu"))
+    assert calls == [(1, CAP + 1)]
+    with pytest.raises(RuntimeError, match="absent"):
+        live_handoff.consume(object())
+
+
+@pytest.mark.parametrize("geometry,samples_count", [(0, 1280), (1, 2560), (2, 5120), (3, 8960), (4, 17920)])
+def test_native_repeated_park_chunk_final_flush_cycles_match_all_pools(
+    monkeypatch, geometry, samples_count, native_device
+):
+    # @spec PORT-DEC-011, PORT-DEC-012: fresh, continuing, final and FLUSH transactions.
+    import sys
+
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+
+    monkeypatch.setattr(sys.modules[__name__], "CAP", 141)
+    monkeypatch.setattr(sys.modules[__name__], "CARRIER_HIDDEN", 17927)
+    core = _tiny_core(seed=1)
+    baseline = _native_pool_device(core, _fresh_pools(), native_device)
+    candidate = _native_pool_device(core, _clone_pools(baseline), native_device)
+    for sequence in range(2):
+        carrier = (
+            _envelope(
+                torch.zeros(samples_count - int(sequence == 1)),
+                final=sequence == 1,
+                seq=sequence,
+                geometry=geometry,
+                hidden=CARRIER_HIDDEN,
+            )
+            .unsqueeze(0)
+            .to(native_device)
+        )
+        plan = (
+            _plan(prefills=[1], geometries=[geometry])
+            if sequence == 0
+            else _plan(decodes=[1], chunk=[True], geometries=[geometry])
+        )
+        expected = [
+            _decision(_call(core, baseline, torch.tensor([PLACEHOLDER_ID], device=native_device), carrier, plan))[0]
+        ]
+        while expected[-1] != PARK_ID:
+            output = _call(
+                core,
+                baseline,
+                torch.tensor([expected[-1]], device=native_device),
+                torch.zeros(1, CARRIER_HIDDEN, device=native_device),
+                _plan(decodes=[1], geometries=[geometry]),
+            )
+            expected.append(_decision(output)[0])
+        assert len(expected) > 1, "each CHUNK must emit labels before PARK"
+        sink = NativeBurstProfileSink(max_tokens=142)
+        _call(
+            core,
+            candidate,
+            torch.tensor([PLACEHOLDER_ID], device=native_device),
+            carrier,
+            plan,
+            native_burst_handoff=sink,
+        )
+        assert sink.payload.sampled_token_ids[0, : sink.payload.num_sampled[0]].tolist() == expected
+        assert sink.payload.row_status.tolist() == [0]
+        _assert_pools_equal(candidate, baseline)
+    flush = _plan(decodes=[1], geometries=[geometry])
+    assert _decision(
+        _call(
+            core,
+            baseline,
+            torch.tensor([PARK_ID], device=native_device),
+            torch.zeros(1, CARRIER_HIDDEN, device=native_device),
+            flush,
+        )
+    ) == [PARK_ID]
+    sink = NativeBurstProfileSink(max_tokens=142)
+    _call(
+        core,
+        candidate,
+        torch.tensor([PARK_ID], device=native_device),
+        torch.zeros(1, CARRIER_HIDDEN, device=native_device),
+        flush,
+        native_burst_handoff=sink,
+    )
+    assert sink.payload.num_sampled.tolist() == [1]
+    assert sink.payload.sampled_token_ids[0, 0] == PARK_ID
+    _assert_pools_equal(candidate, baseline)
+
+
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", id="cpu"),
+        pytest.param(
+            "cuda",
+            id="cuda",
+            marks=[pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA")],
+        ),
+    ]
+)
+def native_device(request, monkeypatch):
+    """Explicit execution device; CUDA comparisons use verified IEEE FP32."""
+    import sys
+
+    monkeypatch.setattr(sys.modules[__name__], "CAP", 141)
+    monkeypatch.setattr(sys.modules[__name__], "CARRIER_HIDDEN", 17927)
+    assert torch.get_default_dtype() == torch.float32
+    device = torch.device(request.param)
+    if device.type == "cpu":
+        with torch.inference_mode():
+            yield device
+        return
+    from vllm_omni.model_executor.models.nemotron_asr.precision import reduced_precision_state
+
+    backends = (torch.backends.cuda.matmul, torch.backends.cudnn.conv, torch.backends.cudnn.rnn)
+    previous = [backend.fp32_precision for backend in backends]
+    try:
+        for backend in backends:
+            backend.fp32_precision = "ieee"
+        state = reduced_precision_state()
+        assert state["tf32_matmul_enabled"] is False
+        assert state["tf32_cudnn_conv_enabled"] is False
+        assert state["tf32_cudnn_rnn_enabled"] is False
+        assert state["matmul_fp32_precision"] == "ieee"
+        assert state["cudnn_conv_fp32_precision"] == "ieee"
+        assert state["cudnn_rnn_fp32_precision"] == "ieee"
+        with torch.inference_mode():
+            yield device
+    finally:
+        for backend, value in zip(backends, previous, strict=True):
+            backend.fp32_precision = value
+
+
+def _native_pool_device(core, pools, device):
+    """Reuse the canonical CUDA scatter warmup for actual resident layouts."""
+    for module in vars(core).values():
+        if isinstance(module, torch.nn.Module):
+            module.to(device)
+    pools = {
+        name: [tensor.to(device) for tensor in value] if isinstance(value, list) else value.to(device)
+        for name, value in pools.items()
+    }
+    if device.type == "cuda":
+        advance.warmup_advance_model_rows_scatter(**pools)
+    return pools

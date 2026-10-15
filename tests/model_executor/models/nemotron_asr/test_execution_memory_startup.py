@@ -72,6 +72,7 @@ def _model(monkeypatch, *, graphs=True, fail=None, policy=FP32_BRINGUP):
         "_max_num_seqs": 2,
         "_encoder_execution": execution,
         "_decode_graph_binding": binding,
+        "_emission_selection": ("compatibility_replay", None),
         "_execution_memory_prepared": False,
         "_execution_memory_failed": False,
         "_state_pools": no_resident,

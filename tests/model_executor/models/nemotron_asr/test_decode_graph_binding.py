@@ -352,6 +352,7 @@ def test_execution_profile_receipt_reports_resolved_arms_and_ready_keys() -> Non
     )
 
     model = object.__new__(NemotronASRForRNNT)
+    object.__setattr__(model, "_emission_selection", ("compatibility_replay", None))
     object.__setattr__(
         model,
         "config",
@@ -378,6 +379,7 @@ def test_execution_profile_receipt_reports_resolved_arms_and_ready_keys() -> Non
 
     assert model.execution_profile_receipt() == {
         "schema": "nemotron-execution-profile/1",
+        "emission": {"lane": "compatibility_replay", "profile": None},
         "decode": {
             "arm": "dense-graphed",
             "captured_keys": [[0, 1], [0, 2]],

@@ -441,3 +441,15 @@ def test_preemption_is_named_nonterminal_failure_and_never_prunes() -> None:
         )
 
     assert metadata.pruned == []
+
+
+def test_native_sampler_is_selected_only_for_explicit_handoff() -> None:
+    # @spec PORT-DEC-010 / PORT-MIG-004
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff, NativeBurstSampler
+
+    state = object.__new__(_module().NemotronASRModelState)
+    state.model = SimpleNamespace(_native_burst_handoff=NativeBurstHandoff())
+    selected = state.custom_sampler(object())
+    assert selected is not None and isinstance(selected[0], NativeBurstSampler)
+    assert selected[1] is None
+    assert state.num_new_sampled_tokens_per_step == 1
