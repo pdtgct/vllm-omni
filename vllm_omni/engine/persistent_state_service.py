@@ -89,7 +89,8 @@ class PersistentStateUnsupportedServiceInterval(  # noqa: N818
         self.requested_interval_ms = requested_interval_ms
         self.resolved_envelope = resolved_envelope
         super().__init__(
-            f"persistent-state service interval {requested_interval_ms}ms is unsupported by {resolved_envelope}"
+            f"persistent-state service interval {requested_interval_ms}ms is unsupported "
+            f"by deployment profile {resolved_envelope!r}"
         )
 
 
@@ -903,7 +904,7 @@ class PersistentStateService:
         if service_interval_ms not in self._submitted_interval_counts:
             raise PersistentStateUnsupportedServiceInterval(
                 requested_interval_ms=service_interval_ms,
-                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "unknown")),
             )
         self._pending_service_intervals[operation_id] = service_interval_ms
         self._submitted_interval_counts[service_interval_ms] += 1
@@ -1568,7 +1569,7 @@ class PersistentStateService:
             self._observe_admission_rejection("unsupported")
             raise PersistentStateUnsupportedServiceInterval(
                 requested_interval_ms=service_interval_ms,
-                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "unknown")),
             )
         from vllm_omni.engine.persistent_state_admission import (
             AdmissionAttempt,
@@ -1914,7 +1915,7 @@ class PersistentStateService:
         if "persistent_state_unsupported_service_interval" in message:
             return PersistentStateUnsupportedServiceInterval(
                 requested_interval_ms=(0 if service_interval_ms is None else service_interval_ms),
-                resolved_envelope=str((self._inventory or {}).get("profile_id", "installed profile")),
+                resolved_envelope=str((self._inventory or {}).get("profile_id", "unknown")),
             )
         if "persistent_state_horizon_exhausted" in message:
             return PersistentStateBackpressure(
