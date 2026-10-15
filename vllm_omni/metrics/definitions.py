@@ -479,6 +479,7 @@ STREAMING_SESSION_OPEN_REJECTIONS = METRIC_PREFIX + "streaming_session_open_reje
 STREAMING_ADMISSION_REJECTIONS = METRIC_PREFIX + "streaming_admission_rejections"
 PERSISTENT_STATE_SLOTS = METRIC_PREFIX + "persistent_state_slots"
 PERSISTENT_STATE_PROFILE_ADVISORY = METRIC_PREFIX + "persistent_state_profile_advisory"
+PERSISTENT_STATE_CONTROL_CHARGE = METRIC_PREFIX + "persistent_state_control_charge"
 PERSISTENT_STATE_SERVICE_DEMAND_RATIO = METRIC_PREFIX + "persistent_state_service_demand_ratio"
 PERSISTENT_STATE_EXECUTION_CLAIMS = METRIC_PREFIX + "persistent_state_execution_claims"
 PERSISTENT_STATE_ADMISSION_HEADROOM = METRIC_PREFIX + "persistent_state_admission_headroom"
@@ -558,6 +559,7 @@ PERSISTENT_STATE_SLOT_KINDS = (
     "configured_limit",
     "effective_capacity",
 )
+PERSISTENT_STATE_CONTROL_CHARGE_STATUSES = ("proven_zero", "unproven", "explicit_table")
 PERSISTENT_STATE_SERVICE_DEMAND_KINDS = ("budget", "charged_demand")
 PERSISTENT_STATE_SERVICE_DEMAND_SOURCES = (
     "qualified_profile",

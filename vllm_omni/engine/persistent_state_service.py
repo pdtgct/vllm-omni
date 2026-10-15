@@ -745,12 +745,30 @@ class PersistentStateService:
 
         future.add_done_callback(completed)
 
+    # @spec PORT-OBS-013
     def install_metrics(self, metrics_sink: Any) -> None:
         """Attach the app-owned non-authoritative metric sink exactly once."""
         if self._metrics_sink is not None:
             raise RuntimeError("persistent-state metrics already installed")
         self._metrics_sink = metrics_sink
         self._sync_service_projection()
+        self._publish_sealed_receipt()
+
+    def _publish_sealed_receipt(self) -> None:
+        """Publish immutable receipt state only at installation or recovery."""
+        profile = self._compiled_service_profile
+        inventory = self._inventory
+        if not self._startup_profile_sealed or profile is None or inventory is None:
+            return
+        receipt = getattr(profile, "receipt", None)
+        if receipt is None:
+            return
+        self._observe_metrics(
+            "observe_persistent_state_control_charge",
+            str(inventory["stage"]),
+            str(inventory["replica"]),
+            receipt.control_charge_status,
+        )
 
     def _observe_metrics(
         self,
@@ -783,6 +801,7 @@ class PersistentStateService:
             },
         )
 
+    # @spec PORT-OBS-014
     def _sync_service_projection(self) -> None:
         inventory = self._inventory
         if inventory is None:
@@ -869,7 +888,7 @@ class PersistentStateService:
                             "measured_fallback",
                         )
                     )
-                    if profile is not None
+                    if profile is not None and self._startup_profile_sealed
                     else None
                 ),
                 service_budget=(float(profile.derating_factor) if profile is not None else None),
@@ -1116,6 +1135,7 @@ class PersistentStateService:
         if self._dispatcher_task is None or self._dispatcher_task.done():
             self._dispatcher_task = asyncio.create_task(self._dispatch(), name="persistent-state-dispatch")
 
+    # @spec PORT-OBS-013
     async def _perform_handshake(self, *, open_admission: bool) -> None:
         """Reconcile one authoritative snapshot and optionally open serving."""
 
@@ -1255,6 +1275,7 @@ class PersistentStateService:
         if controller is not None:
             controller.authority_recovered(engine_epoch=engine_epoch)
             self._sync_service_projection()
+        self._publish_sealed_receipt()
         self._refresh_tombstone_admission()
         self._project_inventory()
         self._schedule_admission_drain()
@@ -1309,7 +1330,7 @@ class PersistentStateService:
         self._submitted_interval_counts = dict.fromkeys(intervals_ms, 0)
         self._failed_release_interval_counts = dict.fromkeys(intervals_ms, 0)
 
-    # @spec PORT-STATE-026
+    # @spec PORT-STATE-026, PORT-OBS-013
     def seal_startup_profile(
         self,
         *,
@@ -1368,11 +1389,12 @@ class PersistentStateService:
         assert self._engine_epoch is not None
         self._admission_controller.authority_recovered(engine_epoch=self._engine_epoch)
         self._sync_service_projection()
+        self._publish_sealed_receipt()
         self._refresh_tombstone_admission()
         self._project_inventory()
         self._schedule_admission_drain()
 
-    # @spec PORT-STATE-027, PORT-PERF-006
+    # @spec PORT-STATE-027, PORT-PERF-006, PORT-OBS-013
     def seal_startup_authority(
         self,
         *,
@@ -1398,28 +1420,27 @@ class PersistentStateService:
             raise ValueError("hard-cap authority and admission controller intervals disagree")
         if tuple(self._resident_interval_counts) != intervals:
             raise ValueError("bootstrap and hard-cap intervals disagree")
-        if compiled_service_profile is not None:
-            receipt = compiled_service_profile.receipt
-            if (
-                tuple(compiled_service_profile.compiled_demand.intervals_ms) != intervals
-                or receipt.admission_policy != "hard_cap"
-                or not receipt.advisory
-                or receipt.control_charge_status not in {"proven_zero", "unproven", "explicit_table"}
-                or (receipt.control_charge_status == "explicit_table")
-                != (compiled_service_profile.control_upper_ns_by_window_and_population is not None)
-                or (
-                    receipt.control_dominance_evidence is not None
-                    and (
-                        receipt.control_dominance_evidence.get("control_charge_status") != receipt.control_charge_status
-                        or (receipt.control_charge_status == "unproven")
-                        != any(
-                            not cell["dominance_passed"] for cell in receipt.control_dominance_evidence.get("cells", ())
-                        )
-                    )
+        if compiled_service_profile is None:
+            raise ValueError("hard-cap startup requires a service-profile receipt")
+        receipt = compiled_service_profile.receipt
+        if (
+            tuple(compiled_service_profile.compiled_demand.intervals_ms) != intervals
+            or receipt.admission_policy != "hard_cap"
+            or not receipt.advisory
+            or receipt.control_charge_status not in {"proven_zero", "unproven", "explicit_table"}
+            or (receipt.control_charge_status == "explicit_table")
+            != (compiled_service_profile.control_upper_ns_by_window_and_population is not None)
+            or (
+                receipt.control_dominance_evidence is not None
+                and (
+                    receipt.control_dominance_evidence.get("control_charge_status") != receipt.control_charge_status
+                    or (receipt.control_charge_status == "unproven")
+                    != any(not cell["dominance_passed"] for cell in receipt.control_dominance_evidence.get("cells", ()))
                 )
-                or receipt.receipt_sha256 != authority.service_profile_identity
-            ):
-                raise ValueError("hard-cap advisory profile and authority disagree")
+            )
+            or receipt.receipt_sha256 != authority.service_profile_identity
+        ):
+            raise ValueError("hard-cap advisory profile and authority disagree")
         inventory_static = {
             "model_profile_id": str(self._inventory["profile_id"]),
             "execution_environment_key": str(self._inventory["execution_environment_key"]),
@@ -1468,6 +1489,7 @@ class PersistentStateService:
         assert self._engine_epoch is not None
         self._admission_controller.authority_recovered(engine_epoch=self._engine_epoch)
         self._sync_service_projection()
+        self._publish_sealed_receipt()
         self._refresh_tombstone_admission()
         self._project_inventory()
         self._schedule_admission_drain()

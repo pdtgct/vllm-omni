@@ -408,8 +408,8 @@ def test_service_projection_exports_the_exact_installed_derating() -> None:
     asyncio.run(scenario())
 
 
-def test_hard_cap_service_seals_static_authority_without_profile() -> None:
-    """@spec PORT-STATE-026/027 / PORT-OBS-012: no profile or bypass."""
+def test_hard_cap_service_seals_static_authority_with_advisory_profile() -> None:
+    """@spec PORT-STATE-026/027 / PORT-OBS-012: advisory profile does not gate hard dispatch."""
 
     async def scenario() -> None:
         from vllm_omni.engine import persistent_state_startup as startup
@@ -445,6 +445,7 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
         )
         inventory = await service.bootstrap_handshake()
         service.configure_bootstrap_intervals((80, 320, 560, 1120))
+        profile = _compiled_admission_profile(admitted_geometry_ids=(0, 2, 3, 4), admission_policy="hard_cap")
         authority = derive(
             served_intervals_ms=(80, 320, 560, 1120),
             model_profile_id=inventory["profile_id"],
@@ -460,10 +461,12 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
             max_num_seqs=2,
             safety_reserve=0,
             controller_identity="controller-a",
+            service_profile_identity=profile.receipt.receipt_sha256,
         )
         service.seal_startup_authority(
             admission_config=admission_config,
             authority=authority,
+            compiled_service_profile=profile,
         )
 
         with pytest.raises(PersistentStateUnsupportedServiceInterval):
@@ -501,7 +504,7 @@ def test_hard_cap_service_seals_static_authority_without_profile() -> None:
         assert service.admission_snapshot.submitted_count == 0
         assert service.inventory is not None
         assert service.inventory["admission_policy"] == "hard_cap"
-        assert service.inventory["service_profile_identity"] is None
+        assert service.inventory["service_profile_identity"] == profile.receipt.receipt_sha256
         await service.release(
             operation_id="release-hard-cap",
             lease=lease,
@@ -652,6 +655,7 @@ def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
             supported_intervals_ms=intervals,
             admission_policy="hard_cap",
         )
+        profile = _compiled_admission_profile(admitted_geometry_ids=(0, 2, 3, 4), admission_policy="hard_cap")
         authority = derive(
             served_intervals_ms=intervals,
             model_profile_id=inventory["profile_id"],
@@ -667,10 +671,12 @@ def test_hard_cap_recovery_reopens_on_dynamic_change_and_escalates_static_drift(
             max_num_seqs=2,
             safety_reserve=0,
             controller_identity="controller-a",
+            service_profile_identity=profile.receipt.receipt_sha256,
         )
         service.seal_startup_authority(
             admission_config=config,
             authority=authority,
+            compiled_service_profile=profile,
         )
 
         lease = await service.reserve(
