@@ -111,3 +111,32 @@ def phase(name: str) -> _NullPhase | _NvtxPhase:
     the digest, which is where a profiling mistake belongs.
     """
     return _RANGES.get(name, _NULL)
+
+
+# Separate from the comparable worker phases: only these startup probe windows
+# are correlated, and IDs keep their lifetime independent of thread-stack order.
+STARTUP_ROUND_NAMES: dict[str, str] = {
+    f"geometry-{geometry}-single-ordinary-repeat-{repeat}": (
+        f"port.startup.measurement.geometry-{geometry}-single-ordinary-repeat-{repeat}"
+    )
+    for geometry in (0, 1)
+    for repeat in range(4)
+}
+
+
+# @spec PORT-PERF-007
+def start_startup_round(round_id: str) -> int | None:
+    """Start one declared probe range; disabled calls avoid even name lookup."""
+    if not _ENABLED:
+        return None
+    name = STARTUP_ROUND_NAMES.get(round_id)
+    if name is None:
+        return None
+    return torch.cuda.nvtx.range_start(name)
+
+
+# @spec PORT-PERF-007
+def end_startup_round(range_id: int | None) -> None:
+    """End the exact probe handle, including zero, without a thread-stack pop."""
+    if range_id is not None:
+        torch.cuda.nvtx.range_end(range_id)

@@ -11,6 +11,8 @@ from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
 
+from vllm.logger import init_logger
+
 from vllm_omni.engine.persistent_state_capacity import (
     CanaryChunkTiming,
     ServiceExecutionTier,
@@ -26,6 +28,8 @@ from vllm_omni.model_executor.models.nemotron_asr.manifests import (
     CADENCES,
     RAW_SAMPLES_PER_CHUNK,
 )
+
+logger = init_logger(__name__)
 
 _PRIMING_SCENARIOS = (
     "ordinary",
@@ -224,7 +228,7 @@ class NemotronPersistentStateStartupProvider:
             served_intervals_ms=tuple(int(cadence.removesuffix("ms")) for _, cadence in admitted_geometries),
         )
 
-    # @spec PORT-STATE-026, PORT-PERF-005, PORT-PERF-006
+    # @spec PORT-STATE-026, PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
     async def execute_priming_round(
         self,
         *,
@@ -238,6 +242,10 @@ class NemotronPersistentStateStartupProvider:
 
         from vllm_omni.entrypoints.nemotron_session import (
             NemotronSessionLease,
+        )
+        from vllm_omni.model_executor.models.nemotron_asr.profiling import (
+            end_startup_round,
+            start_startup_round,
         )
         from vllm_omni.model_executor.models.nemotron_asr.session import (
             NemotronRealtimeSession,
@@ -278,12 +286,14 @@ class NemotronPersistentStateStartupProvider:
             RAW_SAMPLES_PER_CHUNK[cadence],
             dtype=np.float32,
         )
-        started_ns = time.monotonic_ns()
-        canary_wait_ns = 0
-        canary_wait_start_ns = None
-        canary_timer_start_ns = None
-        following_chunk_timings: tuple[CanaryChunkTiming, ...] = ()
+        range_id: int | None = None
         try:
+            range_id = start_startup_round(round_spec.round_id)
+            started_ns = time.monotonic_ns()
+            canary_wait_ns = 0
+            canary_wait_start_ns = None
+            canary_timer_start_ns = None
+            following_chunk_timings: tuple[CanaryChunkTiming, ...] = ()
             if round_spec.scenario_id == "ordinary":
                 await asyncio.gather(*(lease.feed(samples) for lease in bound))
                 completed_legal_parks = len(bound)
@@ -312,6 +322,9 @@ class NemotronPersistentStateStartupProvider:
             else:
                 raise ValueError(f"unknown persistent-state priming scenario {round_spec.scenario_id}")
             elapsed_ns = time.monotonic_ns() - started_ns
+            ending_range_id = range_id
+            range_id = None
+            end_startup_round(ending_range_id)
             if round_spec.scenario_id == "forced_eou_then_chunk":
                 timings = []
                 for lease, timing in zip(bound, release_timings):
@@ -329,10 +342,20 @@ class NemotronPersistentStateStartupProvider:
                     )
                 following_chunk_timings = tuple(timings)
         finally:
-            await asyncio.gather(
-                *(lease.abort() for lease in bound),
-                return_exceptions=True,
-            )
+            try:
+                if range_id is not None:
+                    ending_range_id = range_id
+                    range_id = None
+                    try:
+                        end_startup_round(ending_range_id)
+                    except BaseException:
+                        # A body error is already propagating; retain its cause.
+                        logger.warning("NVTX startup range cleanup failed", exc_info=True)
+            finally:
+                await asyncio.gather(
+                    *(lease.abort() for lease in bound),
+                    return_exceptions=True,
+                )
         return SimpleNamespace(
             completed_legal_parks=completed_legal_parks,
             elapsed_ns=elapsed_ns,
