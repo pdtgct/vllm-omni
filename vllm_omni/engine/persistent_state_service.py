@@ -877,7 +877,11 @@ class PersistentStateService:
                 max_num_seqs=projection.max_num_seqs,
                 headroom_by_cadence={
                     str(interval): {
-                        "hard": projection.hard_headroom,
+                        "hard": (
+                            projection.hard_headroom
+                            if projection.candidate_supported_by_interval.get(interval, False)
+                            else 0
+                        ),
                         **({"nominal": nominal_headroom[interval]} if nominal_headroom is not None else {}),
                     }
                     for interval in self._resident_interval_counts
@@ -1304,6 +1308,7 @@ class PersistentStateService:
         self._submitted_interval_counts = dict.fromkeys(intervals_ms, 0)
         self._failed_release_interval_counts = dict.fromkeys(intervals_ms, 0)
 
+    # @spec PORT-STATE-026
     def seal_startup_profile(
         self,
         *,

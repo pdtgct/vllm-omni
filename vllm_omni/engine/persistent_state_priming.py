@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_omni.engine.persistent_state_capacity import CanaryChunkTiming
+
 
 @dataclass(frozen=True)
 class ServicePrimingBudgetCell:
@@ -168,6 +170,11 @@ class ServicePrimingObservation:
     dummy_run: bool = False
     is_profile: bool = False
     scenario_id: str = "ordinary"
+    censored: bool = False
+    canary_wait_ns: int = 0
+    canary_wait_start_ns: int | None = None
+    canary_timer_start_ns: int | None = None
+    following_chunk_timings: tuple[CanaryChunkTiming, ...] = ()
 
 
 PrimingExecutor = Callable[
@@ -309,6 +316,11 @@ async def run_service_priming_round(
             post_jit=round_spec.post_jit,
             continuously_loaded=round_spec.continuously_loaded,
             scenario_id=round_spec.scenario_id,
+            censored=bool(getattr(result, "censored", False)),
+            canary_wait_ns=int(getattr(result, "canary_wait_ns", 0)),
+            canary_wait_start_ns=getattr(result, "canary_wait_start_ns", None),
+            canary_timer_start_ns=getattr(result, "canary_timer_start_ns", None),
+            following_chunk_timings=tuple(getattr(result, "following_chunk_timings", ())),
         )
     except BaseException as error:
         primary = error

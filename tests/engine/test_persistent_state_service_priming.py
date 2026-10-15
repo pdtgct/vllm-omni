@@ -463,3 +463,35 @@ def test_service_priming_rejects_memory_profile_markers(marker: str) -> None:
         assert service.resident == 0
 
     asyncio.run(scenario())
+
+
+def test_canary_witnesses_survive_observation_conversion():
+    """@spec PORT-PERF-006: priming and compiler observations preserve every untimed-wait operand."""
+    from dataclasses import replace
+
+    from tests.engine.persistent_state_helpers import canary_timing_kwargs
+    from vllm_omni.engine.persistent_state_startup import _service_executions
+
+    async def scenario():
+        service = _PrimingService([])
+        spec = replace(
+            _round(active_population=1), scenario_id="forced_eou_then_chunk", expected_legal_parks_per_lease=2
+        )
+        timing = canary_timing_kwargs(spec.scenario_id, interval_ms=1120)
+
+        async def execute(spec, leases):
+            return SimpleNamespace(
+                completed_legal_parks=2,
+                elapsed_ns=10,
+                completed_model_rows=None,
+                dummy_run=False,
+                is_profile=False,
+                **timing,
+            )
+
+        observation = await _symbol("run_service_priming_round")(service=service, round_spec=spec, execute=execute)
+        converted = _service_executions([observation])[0]
+        for key, value in timing.items():
+            assert getattr(observation, key) == getattr(converted, key) == value
+
+    asyncio.run(scenario())

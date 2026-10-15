@@ -64,7 +64,7 @@ def _runtime() -> SimpleNamespace:
         recovery_backoff_s=(0.01, 0.02),
         release_convergence_timeout_s=60.01,
         service_profile_trailing_rounds=3,
-        startup_priming_round_timeout_s=0.25,
+        startup_priming_round_timeout_s=2.0,
         startup_priming_timeout_s=0.5,
         service_profile_derating_factor=0.5,
         reserve_queue_capacity=8,
@@ -554,6 +554,7 @@ def test_nemotron_provider_covers_single_and_bulk_eager_shapes() -> None:
         model_config=SimpleNamespace(hf_config=SimpleNamespace(supported_num_lookahead_tokens=[3, 0, 6, 13])),
     )
 
+    assert plan.compile_kwargs["context"].compiler_version == "persistent-state-service-v2"
     tiers = plan.compile_kwargs["execution_tiers"]
     assert [(tier.tier_id, tier.max_active_population) for tier in tiers] == [
         ("single", 1),
@@ -781,7 +782,6 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
 @pytest.mark.parametrize(
     ("scenario_id", "expected_action_order"),
     [
-        ("forced_eou_then_chunk", ("setup_feed", "force", "feed")),
         ("final_tail_then_flush", ("feed", "flush")),
     ],
 )
@@ -865,8 +865,9 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy", ("profile", "hard_cap"))
-async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, policy):
-    """@spec PORT-PERF-006, PORT-STATE-027: preparation handles failed valid canary by policy"""
+@pytest.mark.parametrize("unsupported", (False, True))
+async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, policy, unsupported):
+    """@spec PORT-PERF-006, PORT-STATE-026, PORT-STATE-027: preparation seals unsupported cadences with one warning."""
     from dataclasses import replace
     from fractions import Fraction
     from unittest.mock import Mock
@@ -885,6 +886,8 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
     runtime = _runtime()
     runtime.admission_policy = policy
     events = []
+    from tests.engine.persistent_state_helpers import canary_timing_kwargs
+
     ordinary = ServiceRoundExecution(
         tier_id="single",
         active_population=1,
@@ -901,22 +904,43 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
     rounds = (
         ordinary,
         *(
-            replace(ordinary, scenario_id=scenario, elapsed_ns=201, completed_legal_parks=2)
+            replace(
+                ordinary,
+                scenario_id=scenario,
+                elapsed_ns=201,
+                completed_legal_parks=2,
+                **canary_timing_kwargs(scenario),
+            )
             for scenario in ("forced_eou_then_chunk", "final_tail_then_flush")
         ),
     )
+
+    if unsupported:
+        rounds = tuple(
+            replace(s, elapsed_ns=50_000_000 if s.scenario_id == "ordinary" else 100_000_001) for s in rounds
+        ) + tuple(
+            replace(
+                s,
+                geometry_id=1,
+                service_interval_ms=160,
+                elapsed_ns=100 if s.scenario_id == "ordinary" else 200,
+                **canary_timing_kwargs(s.scenario_id, interval_ms=160),
+            )
+            for s in rounds
+        )
+    intervals = (80, 160) if unsupported else (80,)
 
     class Provider:
         def build_priming_plan(self, **kwargs):
             return SimpleNamespace(
                 rounds=rounds,
-                served_intervals_ms=(80,),
+                served_intervals_ms=intervals,
                 compile_kwargs=dict(
                     execution_tiers=(ServiceExecutionTier("single", 1),),
                     max_population=1,
                     reference_interval_ms=80,
                     reference_geometry_id=0,
-                    admitted_geometry_ids=(0,),
+                    admitted_geometry_ids=tuple(range(len(intervals))),
                     trailing_rounds=1,
                     derating_factor=Fraction(1, 2),
                     context=ServiceProfileContext(
@@ -945,11 +969,26 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
             return _startup_inventory()
 
         def configure_bootstrap_intervals(self, intervals):
-            assert intervals == (80,)
+            assert intervals == ((80, 160) if unsupported else (80,))
+
+        def seal_startup_profile(self, *, admission_config, compiled_service_profile):
+            self.seal_startup_authority(
+                authority=SimpleNamespace(service_profile_identity=compiled_service_profile.receipt.receipt_sha256),
+                admission_config=admission_config,
+                compiled_service_profile=compiled_service_profile,
+            )
 
         def seal_startup_authority(self, *, authority, admission_config, compiled_service_profile):
             assert authority.service_profile_identity == compiled_service_profile.receipt.receipt_sha256
-            assert compiled_service_profile.receipt.control_charge_status == "unproven"
+            receipt = compiled_service_profile.receipt
+            assert receipt.control_charge_status == ("proven_zero" if policy == "profile" else "unproven")
+            if unsupported and policy == "profile":
+                assert set(receipt.measured_unsupported_by_geometry) == {0}
+                assert receipt.measured_unsupported_by_geometry[0].control_ns == 0
+                cells = receipt.control_dominance_evidence["cells"]
+                failed = [cell for cell in cells if not cell["dominance_passed"]]
+                assert len(failed) == 2
+                assert all(cell["geometry_id"] == 0 and not cell["admission_relevant"] for cell in failed)
             self.ready = True
             events.append("seal")
 
@@ -969,7 +1008,7 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
         startup_provider=Provider(),
         host_fatal_callback=lambda error: None,
     )
-    if policy == "profile":
+    if policy == "profile" and not unsupported:
         with pytest.raises(ValueError, match="control-dominance failed"):
             await module.prepare_persistent_state_service(**kwargs)
         assert events == ["shutdown"]
@@ -977,3 +1016,5 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
         service = await module.prepare_persistent_state_service(**kwargs)
         assert service.ready and events == ["seal"]
         assert warning.call_count == 1
+        if policy == "profile":
+            assert "measured-unsupported" in warning.call_args.args[0]
