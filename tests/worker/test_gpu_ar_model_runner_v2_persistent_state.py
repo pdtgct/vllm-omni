@@ -900,3 +900,50 @@ def test_persistent_worker_rejects_multiple_microbatches(monkeypatch, enable_dbo
     monkeypatch.setattr(model_loader, "get_model_cls", lambda _: SimpleNamespace(supports_persistent_state=True))
     with pytest.raises(RuntimeError, match="more than one microbatch"):
         worker._select_model_runner_cls()
+
+
+def test_native_dummy_sampler_uses_only_explicit_runner_scope() -> None:
+    # @spec PORT-MIG-005 / PORT-DEC-010
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff, NativeBurstSampler
+
+    runner = object.__new__(_runner_cls())
+    handoff = NativeBurstHandoff()
+    runner.model = SimpleNamespace(
+        _native_burst_handoff=handoff,
+        config=SimpleNamespace(eos_token_id=9000),
+        compute_logits=lambda hidden: torch.zeros(hidden.shape[0], 9001),
+    )
+    runner.input_buffers = InputBuffers(2, 2, torch.device("cpu"))
+    runner.sampler = NativeBurstSampler(object(), handoff)
+    runner._dummy_sampler_run(torch.zeros(2, 1))
+    batch = InputBatch.make_dummy(2, 2, runner.input_buffers)
+    with pytest.raises(RuntimeError, match="absent"):
+        runner.sampler(torch.zeros(2, 9001), batch)
+
+
+def test_native_history_preflight_precedes_core_request_mutation(monkeypatch: Any) -> None:
+    # @spec PORT-STATE-007 / PORT-DEC-010
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.nemotron_asr.model_state_v2 import NemotronASRModelState
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff
+
+    state = object.__new__(NemotronASRModelState)
+    state.model = SimpleNamespace(
+        _native_burst_handoff=NativeBurstHandoff(max_tokens=142), config=SimpleNamespace(eos_token_id=9000)
+    )
+    state.model_config = SimpleNamespace(max_model_len=142)
+    runner = _runner(state)
+    request = SimpleNamespace(
+        prefill_token_ids=[9001],
+        prompt_token_ids=[9001],
+        num_computed_tokens=0,
+        sampling_params=SamplingParams(max_tokens=142),
+    )
+    called = []
+    monkeypatch.setattr(GPUModelRunner, "add_requests", lambda *args: called.append(True))
+    with pytest.raises(ValueError, match="history"):
+        runner.add_requests(SimpleNamespace(scheduled_new_reqs=[request]))
+    assert called == []

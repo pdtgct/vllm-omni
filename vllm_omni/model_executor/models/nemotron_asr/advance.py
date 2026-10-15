@@ -2827,27 +2827,28 @@ def advance_model_rows(
         | ((len_all > 0) & (~queue_tail_is_eou) & (last != queue_last))
         | ((remaining > 0) & (~pending))
     )
+    # Build the per-geometry cadence table on the HOST and index it
+    # by the CPU RowPlan geometry authority, THEN stage the per-row
+    # result to the device — never ``torch.tensor(list,
+    # device=cuda)``, which is a synchronizing host→device
+    # construction on the per-turn hot path (the full-turn probe's
+    # sync tripwire named exactly this call). Mirrors how
+    # ``prior_prompt`` etc. are staged: CPU build, pooled
+    # non-blocking H2D.
+    cadence_frames = _stage(
+        "cadence_frames",
+        torch.tensor(
+            [8 * (lookahead + 1) for lookahead in lookaheads],
+            dtype=torch.int64,
+        ).index_select(0, plan.geometry_id),
+    )
     counter_bad = _counter_invariant_rows(
         counters_small,
         raw_tail_capacity=int(frontend_raw_pool.shape[1]),
         mel_tail_capacity=int(frontend_mel_pool.shape[2]),
         hop_length=hop,
         n_fft=int(core.featurizer.n_fft),
-        # Build the per-geometry cadence table on the HOST and index it
-        # by the CPU RowPlan geometry authority, THEN stage the per-row
-        # result to the device — never ``torch.tensor(list,
-        # device=cuda)``, which is a synchronizing host→device
-        # construction on the per-turn hot path (the full-turn probe's
-        # sync tripwire named exactly this call). Mirrors how
-        # ``prior_prompt`` etc. are staged: CPU build, pooled
-        # non-blocking H2D.
-        cadence_frames=_stage(
-            "cadence_frames",
-            torch.tensor(
-                [8 * (lookahead + 1) for lookahead in lookaheads],
-                dtype=torch.int64,
-            ).index_select(0, plan.geometry_id),
-        ),
+        cadence_frames=cadence_frames,
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
     status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
@@ -3301,6 +3302,11 @@ def advance_model_rows(
             eou_token_id=eou_token_id if endpoint_enabled else None,
         )
         native_bad |= native_projection.num_sampled > native_burst_handoff.max_tokens
+        # @spec PORT-DEC-010, PORT-INT-002: each row uses its own manifest
+        # frame/symbol bound plus optional EOU and PARK. CPU RowPlan geometry
+        # was validated before any resident reads; reuse its staged cadence.
+        row_emission_bound = (cadence_frames // 8) * MAX_SYMBOLS_PER_STEP + 2
+        native_bad |= native_projection.num_sampled > row_emission_bound
         status |= native_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
         native_projection.sampled_token_ids.masked_fill_(native_bad.unsqueeze(1), -1)
         native_projection.sampled_token_ids[:, 0] = torch.where(

@@ -334,6 +334,22 @@ class NemotronASRForRNNT(nn.Module):
         # Resolve the effective (stage-overridden) selector once, before any
         # state reservation, execution construction or checkpoint loading.
         policy = resolve_precision_policy(hf_config)
+        # @spec PORT-DEC-011, PORT-DEC-014: bind the selected lane once,
+        # before constructing the model or reserving persistent state.
+        native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
+        if not isinstance(native_burst_enabled, bool):
+            raise ValueError("experimental_native_burst must be a boolean")
+        native_profile = getattr(hf_config, "experimental_native_burst_profile", None)
+        if native_profile is not None and not native_burst_enabled:
+            raise ValueError("experimental_native_burst_profile requires experimental_native_burst=true")
+        self._emission_selection: tuple[str, str | None] = ("compatibility_replay", None)
+        if native_burst_enabled:
+            from vllm_omni.model_executor.models.nemotron_asr.native_burst import validate_native_burst_config
+
+            if policy is not FP32_BRINGUP:
+                raise ValueError("native burst requires the actual FP32_BRINGUP precision policy")
+            native_profile = validate_native_burst_config(vllm_config, hf_config=hf_config, profile=native_profile)
+            self._emission_selection = ("native_burst", native_profile)
         from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
             ensure_prompt_dictionary,
             validate_prompt_dictionary,
@@ -418,18 +434,13 @@ class NemotronASRForRNNT(nn.Module):
             park_id=hf_config.eos_token_id,
             blank_id=self.core.blank_id,
         )
-        native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
-        if not isinstance(native_burst_enabled, bool):
-            raise ValueError("experimental_native_burst must be a boolean")
         self._native_burst_handoff = None
         if native_burst_enabled:
             from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
                 NativeBurstHandoff,
                 native_burst_token_budget,
-                validate_native_burst_config,
             )
 
-            validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._native_burst_handoff = NativeBurstHandoff(max_tokens=native_burst_token_budget(hf_config))
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         served_geometry_ids = _served_geometry_ids(hf_config)
@@ -846,12 +857,14 @@ class NemotronASRForRNNT(nn.Module):
         )
 
     def execution_profile_receipt(self) -> dict[str, Any]:
-        """Report the resolved execution arms and startup coverage."""
+        """@spec PORT-DEC-011: report bound emission selection and startup coverage."""
         binding = self._decode_graph_binding
         keys = () if binding is None else binding.captured_keys
         decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        emission_lane, emission_profile = self._emission_selection
         receipt = {
             "schema": "nemotron-execution-profile/1",
+            "emission": {"lane": emission_lane, "profile": emission_profile},
             "decode": {
                 "arm": decode_arm,
                 "captured_keys": [list(key) for key in keys],

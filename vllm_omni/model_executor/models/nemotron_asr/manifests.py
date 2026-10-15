@@ -431,14 +431,14 @@ def author_transition_manifest(config: Any) -> dict[str, Any]:
 
 
 def author_emission_manifest(config: Any) -> dict[str, Any]:
-    """Author the emission manifest (PORT-WGT-004).
+    """Author the emission manifest (@spec PORT-WGT-004, PORT-INT-002).
 
     Schema: ``{"schema": "emission-manifest-v1", "limits":
     SESSION_LIMITS, "per_geometry": {label:
     {"max_valid_encoder_frames": int, "max_symbols_per_step":
     SESSION_LIMITS["max_symbols_per_step"], "max_emission_tokens":
-    frames * symbols + 1}, ...}}`` — the PORT-INT-002 budget formula,
-    ``+ 1`` for the park token, one entry per :data:`CADENCES` label
+    frames * symbols + 2}, ...}}`` — the PORT-INT-002 budget formula,
+    ``+ 1`` for optional EOU and ``+ 1`` for park, per :data:`CADENCES` label
     with ``max_valid_encoder_frames = frames_per_chunk`` for that
     cadence. ``config`` is accepted for signature uniformity.
     """
