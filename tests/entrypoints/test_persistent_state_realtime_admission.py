@@ -529,6 +529,7 @@ async def test_unsupported_interval_is_nonretryable_and_keeps_socket_open() -> N
     error = websocket.sent[-1]
     assert error["code"] == "unsupported_service_interval"
     assert "80" in error["error"]
+    assert "deployment profile 'profile-a'" in error["error"]
     assert "retry_after_ms" not in error
     assert websocket.closed == []
     assert connection._is_model_validated is False
