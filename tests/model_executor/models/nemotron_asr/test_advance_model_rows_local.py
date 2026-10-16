@@ -3772,6 +3772,9 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         replay_pools["endpoint_history_pool"] = torch.zeros(3, 8, dtype=torch.int32, device=device)
         replay_pools["endpoint_book_pool"] = torch.zeros(3, 6, dtype=torch.int32, device=device)
     native_pools = _clone_pools(replay_pools)
+    # Endpoint observation needs the frame symbols that the tuple-only wrapper
+    # discards. Bind the same frame-aware decode to oracle and candidate.
+    resolver = _fixed_resolver(rnnt.decode_dense_masked_frames) if endpoint_enabled else None
     if torch.device(device).type == "cuda":
         advance.warmup_advance_model_rows_scatter(**replay_pools)
         advance.warmup_advance_model_rows_scatter(**native_pools)
@@ -3781,6 +3784,7 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         torch.tensor([PLACEHOLDER_ID], device=device),
         carrier,
         _plan(prefills=[1], geometries=[geometry]),
+        resolver=resolver,
         eou_token_id=9002 if endpoint_enabled else None,
     )
     expected = [_decision(output)[0]]
@@ -3791,6 +3795,7 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
             torch.tensor([expected[-1]], device=device),
             torch.zeros(1, CARRIER_HIDDEN, device=device),
             _plan(decodes=[1], geometries=[geometry]),
+            resolver=resolver,
             eou_token_id=9002 if endpoint_enabled else None,
         )
         expected.append(_decision(output)[0])
@@ -3813,6 +3818,7 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         _plan(prefills=[1], geometries=[geometry]),
         native_burst_handoff=handoff,
         outer_tensor_execution=outer_tensor_execution,
+        resolver=resolver,
         eou_token_id=9002 if endpoint_enabled else None,
     )
     payload = handoff.consume(batch)

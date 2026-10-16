@@ -534,12 +534,12 @@ def test_cuda_compiler_frame_budget_failure_restores_settings_and_never_retries(
     monkeypatch.setattr(torch, "compile", controlled_compile)
     with torch.inference_mode():
         if defect != "runtime-error":
-            with pytest.raises(RuntimeError, match="frame|compil|prepar|budget"):
+            with pytest.raises(RuntimeError, match="one accepted frame|second frame exceeds family budget"):
                 binding.warmup(torch.device("cuda"))
             assert not binding.receipt()["ready"]
             attempts, entries = len(invocations), len(compile_entries)
             assert entries > 0
-            with pytest.raises(RuntimeError, match="failed|prepar|fresh"):
+            with pytest.raises(RuntimeError, match="preparation failed; fresh worker required"):
                 binding.warmup(torch.device("cuda"))
             assert len(invocations) == attempts
             assert len(compile_entries) == entries  # Also detects zero-frame retries returning plain fn.
@@ -578,3 +578,57 @@ def test_cuda_receipt_is_detached_immutable_identity_with_live_monotone_counters
             assert current[field] == initial[field]
         assert current["frames"] == initial["frames"]
         assert current["dispatch"]["pre"]["fused_calls"] == initial["dispatch"]["pre"]["fused_calls"] + 1
+
+
+def test_real_dynamo_two_bindings_have_independent_helper_cache_budgets(monkeypatch):
+    """@spec PORT-PERF-016, PORT-PERF-020: CPU tracing pins actual binding lifetime.
+
+    Only canonical example allocation is routed to CPU and backend codegen is
+    replaced by graph.forward. The real warmup, counted backend, clone use and
+    seal run unchanged. This does not establish CUDA correctness or readiness.
+    """
+    from inspect import signature
+
+    import torch._inductor.compile_fx as compile_fx_module
+
+    module = _fusion_module()
+    examples = module.OuterTensorExecution._examples
+
+    def host_examples(self, requested_device):
+        assert requested_device.type == "cuda"
+        return examples(self, torch.device("cpu"))
+
+    generated = []
+    compile_fx_signature = signature(compile_fx_module.compile_fx)
+
+    def host_codegen(*args, **kwargs):
+        bound = compile_fx_signature.bind(*args, **kwargs)
+        assert bound.arguments["config_patches"] == {"triton.cudagraphs": False}
+        graph = bound.arguments["model_"]
+        generated.append(graph)
+        return graph.forward
+
+    monkeypatch.setattr(module.OuterTensorExecution, "_examples", host_examples)
+    monkeypatch.setattr(compile_fx_module, "compile_fx", host_codegen)
+    names = (
+        "cache_size_limit",
+        "accumulated_cache_size_limit",
+        "suppress_errors",
+        "error_on_recompile",
+        "fail_on_recompile_limit_hit",
+    )
+    original = {name: getattr(torch._dynamo.config, name) for name in names}
+    bindings = [_binding(), _binding()]
+    with torch.inference_mode():
+        for binding in bindings:
+            binding.warmup(torch.device("cuda"))
+            receipt = binding.receipt()
+            assert receipt["prepared"] == list(FAMILIES)
+            assert receipt["frames"]["accepted"] == dict.fromkeys(FAMILIES, 1)
+            assert receipt["frames"]["backend_attempts"] == 7
+            assert receipt["declared"][0]["inputs"][0]["device"] == "cpu"
+            assert receipt["sealed"] and not receipt["ready"]
+            binding.warmup(torch.device("cuda"))
+            assert binding.receipt() == receipt
+    assert len(generated) == 14
+    assert {name: getattr(torch._dynamo.config, name) for name in names} == original
