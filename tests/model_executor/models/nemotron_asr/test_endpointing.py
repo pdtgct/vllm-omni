@@ -7,10 +7,12 @@ from __future__ import annotations
 import copy
 import importlib
 import inspect
+from dataclasses import replace
 from typing import Any, NoReturn
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -269,17 +271,24 @@ def test_eou_disarms_and_continuing_silence_cannot_emit_empty_segments() -> None
     assert repeated.is_eou is False
     assert repeated.next_book.segment_generation == 1
 
-    rearmed = _observe(repeated.next_book, [[20]], policy=policy)
-    assert rearmed.next_book.endpoint_armed is True
-    assert rearmed.next_book.segment_has_output is True
+    # NEW silence after the reset belongs to the next segment. Its first
+    # nonblank can rearm and close in the same regular CHUNK.
+    closed = _observe(repeated.next_book, [[20]], policy=policy)
+    assert closed.is_eou is True
+    assert closed.emitted_labels == (20,)
+    assert closed.next_book.endpoint_armed is False
+    assert closed.next_book.segment_has_output is False
+    assert closed.next_book.segment_generation == 2
 
-    detected_again = _observe(
-        rearmed.next_book,
-        [[], [], [], [], []],
-        policy=policy,
-    )
-    assert detected_again.is_eou is True
-    assert detected_again.next_book.segment_generation == 2
+    # An immediate new label must not reuse silence from the closed segment.
+    immediate = _observe(detected.next_book, [[20]], policy=policy)
+    assert immediate.is_eou is False
+    assert immediate.next_book.endpoint_armed is True
+    assert immediate.next_book.segment_has_output is True
+    assert immediate.next_book.segment_generation == 1
+    later = _observe(immediate.next_book, [[], [], [], [], []], policy=policy)
+    assert later.is_eou is True
+    assert later.next_book.segment_generation == 2
 
 
 def test_one_chunk_produces_at_most_one_boolean_eou_decision() -> None:
@@ -531,3 +540,553 @@ def test_stale_forced_generation_is_ignored_and_preserves_book() -> None:
 
     assert ignored is None
     assert book == before
+
+
+# Public NeMo PIN: de242add77945a110568c7c44bdae4891451851e.
+# Goldens below execute that PIN's actual detect_eou_near_pivot function,
+# not a local reconstruction. Runtime tests require neither NeMo nor Git.
+# Reproduce with Python >=3.10 from the repository root
+# (NEMO_CHECKOUT is a public NeMo checkout):
+# python - "$NEMO_CHECKOUT" <<'PY'
+# import ast, pathlib, subprocess, sys, types
+# pin = 'de242add77945a110568c7c44bdae4891451851e'
+# base = 'nemo/collections/asr/inference/'
+# def source(path):
+#     return ast.parse(subprocess.check_output(
+#         ['git', '-C', sys.argv[1], 'show', pin + ':' + base + path], text=True))
+# utilities = source('utils/endpointing_utils.py')
+# detector = source('streaming/endpointing/greedy/greedy_endpointing.py')
+# cls = next(n for n in detector.body if isinstance(n, ast.ClassDef) and n.name == 'GreedyEndpointing')
+# method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'detect_eou_near_pivot')
+# nodes = [n for n in utilities.body if isinstance(n, ast.FunctionDef)] + [method]
+# namespace = {}
+# exec(compile(ast.Module(body=nodes, type_ignores=[]), '<public-NeMo-PIN>', 'exec'), namespace)
+# test = ast.parse(pathlib.Path('tests/model_executor/models/nemotron_asr/test_endpointing.py').read_text())
+# cases = next(n.value for n in test.body if isinstance(n, ast.Assign)
+#              and any(isinstance(t, ast.Name) and t.id == '_PUBLIC_ENDPOINT_CASES' for t in n.targets))
+# for threshold, residue, symbols, _ in ast.literal_eval(cases):
+#     oracle = types.SimpleNamespace(residue_tokens_at_end=residue,
+#         stop_history_eou=threshold, ms_per_timestep=80,
+#         is_token_silent=lambda token: token == 0,
+#         is_token_start_of_word=lambda token: token == 1)
+#     window = (1, *symbols)[-(threshold + residue):]
+#     result = namespace['detect_eou_near_pivot'](oracle, list(window), len(window)-1)
+#     print((threshold, residue, symbols, result[0]))
+# PY
+# Columns: threshold, residue, frame symbols (0 blank, 1 word, 2 nonword), EOU.
+# A preceding nonblank seeds arming/output; it is included in the public window.
+_PUBLIC_ENDPOINT_CASES = [
+    (3, 2, (0, 0, 0, 0, 1), True),
+    (3, 2, (0, 0, 0, 0, 2), True),
+    (3, 2, (0, 0, 0, 0, 0), True),
+    (10, 2, (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1), True),
+    (10, 2, (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), True),
+    (3, 2, (0, 0, 0, 1), False),
+    (3, 2, (0, 0, 0, 0), False),
+    (3, 0, (0, 0, 0, 0, 1), False),
+    (3, 0, (0, 0, 0, 0, 0), False),
+    (3, 1, (0, 0, 0, 0, 1), False),
+    (3, 1, (0, 0, 0, 0, 0), False),
+    (1, 0, (0,), False),
+    (1, 1, (0, 1), False),
+    (1, 2, (0, 0, 1), True),
+    (1, 3, (2,), False),
+    (1, 3, (0, 0, 2), True),
+    (3, 2, (0, 2, 0, 0, 1), False),
+    (3, 2, (0, 1, 0, 0, 2), False),
+]
+
+
+_ENDPOINT_EXECUTIONS = [
+    pytest.param("scalar", id="scalar"),
+    pytest.param("cpu", id="tensor-cpu"),
+    pytest.param(
+        "cuda",
+        id="tensor-cuda",
+        marks=[pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA")],
+    ),
+]
+
+
+def _endpoint_tensors(book: Any, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    history = torch.tensor([[int(value) for value in book.history]], dtype=torch.int32, device=device)
+    fields = [
+        book.history_length,
+        book.history_head,
+        int(book.endpoint_armed),
+        book.segment_generation,
+        int(book.segment_has_output),
+        book.pending_forced_generation,
+    ]
+    return history, torch.tensor([fields], dtype=torch.int32, device=device)
+
+
+def _tensor_book(history: torch.Tensor, book: torch.Tensor) -> Any:
+    module = _module()
+    values = book[0].tolist()
+    return module.EndpointBook(
+        history=tuple(module.FrameSymbol(value) for value in history[0].tolist()),
+        history_length=values[0],
+        history_head=values[1],
+        endpoint_armed=bool(values[2]),
+        segment_generation=values[3],
+        segment_has_output=bool(values[4]),
+        pending_forced_generation=values[5],
+    )
+
+
+def _endpoint_step(
+    execution: str, book: Any, frames: list[list[int]], policy: Any
+) -> tuple[Any, bool, tuple[int, ...]]:
+    module = _module()
+    if execution == "scalar":
+        result = _observe(book, frames, policy=policy)
+        labels = module.compose_chunk_output(
+            labels=result.emitted_labels, is_eou=result.is_eou, eou_token_id=101, park_token_id=103
+        )
+        return result.next_book, result.is_eou, tuple(labels)
+    history, fields = _endpoint_tensors(book, execution)
+    labels = [label for frame in frames for label in frame]
+    result = module.observe_chunk_tensors(
+        history=history,
+        book=fields,
+        frame_emission_counts=torch.tensor([[len(frame) for frame in frames]], dtype=torch.int32, device=execution),
+        valid_frame_lengths=torch.tensor([len(frames)], dtype=torch.int64, device=execution),
+        token_ids=torch.tensor([labels], dtype=torch.int32, device=execution),
+        token_lengths=torch.tensor([len(labels)], dtype=torch.int32, device=execution),
+        final_tail=torch.tensor([False], device=execution),
+        mode=torch.tensor([1], dtype=torch.int64, device=execution),
+        threshold_frames=torch.tensor([policy.threshold_frames], dtype=torch.int64, device=execution),
+        residue_frames=torch.tensor([policy.residue_frames], dtype=torch.int64, device=execution),
+        eou_token_id=101,
+        row_clean=torch.tensor([True], device=execution),
+    )
+    assert not result.overflow.item()
+    assert torch.equal(history, _endpoint_tensors(book, execution)[0]), "observer mutated input history"
+    assert torch.equal(fields, _endpoint_tensors(book, execution)[1]), "observer mutated input book"
+    output = tuple(result.token_ids[0, : result.token_lengths.item()].tolist()) + (103,)
+    return _tensor_book(result.history, result.book), bool(result.is_eou.item()), output
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+@pytest.mark.parametrize("threshold,residue,symbols,expected", _PUBLIC_ENDPOINT_CASES)
+def test_endpoint_matches_pinned_public_boolean(execution, threshold, residue, symbols, expected):
+    # @spec PORT-SEG-002, PORT-SEG-003
+    capacity = max(8, threshold + residue)
+    policy = _policy(stop_history_ms=80 * threshold, residue_frames=residue, capacity=capacity)
+    frames = [[10]] + [([] if value == 0 else [20 if value == 1 else 11]) for value in symbols]
+    book, detected, output = _endpoint_step(execution, _book(capacity), frames, policy)
+    assert detected is expected, "Boolean differs from actual pinned public NeMo golden"
+    labels = tuple(label for frame in frames for label in frame)
+    assert output == labels + ((101,) if expected else ()) + (103,)
+    assert book.segment_generation == int(expected)
+    if expected:
+        assert not book.endpoint_armed and not book.segment_has_output
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+def test_model_eou_physically_resets_history(execution):
+    # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
+    policy = _policy(capacity=8)
+    book, detected, output = _endpoint_step(execution, _book(8), [[10], [], [], [], [], []], policy)
+    assert detected and output == (10, 101, 103)
+    assert (book.history_length, book.history_head) == (0, 0), "EOU retained valid old history"
+    assert all(int(symbol) == 0 for symbol in book.history), "model EOU did not clear backing history"
+    assert (book.segment_generation, book.endpoint_armed, book.segment_has_output) == (1, False, False)
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+def test_model_reset_separates_old_silence_from_new_silence(execution):
+    # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
+    policy = _policy(capacity=8)
+    reset, detected, _ = _endpoint_step(execution, _book(8), [[10], [], [], [], [], []], policy)
+    assert detected
+    immediate, detected, output = _endpoint_step(execution, reset, [[20]], policy)
+    assert not detected and output == (20, 103), "new label reused pre-EOU silence"
+    assert immediate.segment_generation == 1 and immediate.endpoint_armed and immediate.segment_has_output
+    quiet, detected, _ = _endpoint_step(execution, reset, [[], [], [], [], []], policy)
+    assert not detected and quiet.segment_generation == 1
+    closed, detected, output = _endpoint_step(execution, quiet, [[20]], policy)
+    assert detected and output == (20, 101, 103), "new silence plus nonblank pivot must close"
+    assert closed.segment_generation == 2 and not closed.endpoint_armed
+
+
+def _force_step(execution: str, book: Any) -> tuple[Any, bool]:
+    module = _module()
+    if execution == "scalar":
+        result = module.apply_forced_eou(
+            book, request_generation=7, expected_request_generation=7, eou_token_id=101, park_token_id=103
+        )
+        assert result is not None and result.output_ids == (101, 103)
+        assert not result.empty_segment and not result.coalesced
+        return result.next_book, True
+    history, fields = _endpoint_tensors(book, execution)
+    result = module.apply_forced_eou_tensors(book=fields, selected_rows=torch.tensor([True], device=execution))
+    assert torch.equal(fields, _endpoint_tensors(book, execution)[1]), "force mutated input book"
+    return _tensor_book(history, result.book), bool(result.is_eou.item())
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+def test_successful_force_logically_resets_history(execution):
+    # @spec PORT-SEG-004, PORT-SEG-007
+    policy = _policy(capacity=8)
+    old, detected, _ = _endpoint_step(execution, _book(8), [[10], [], [], []], policy)
+    assert not detected
+    reset, emitted = _force_step(execution, old)
+    assert emitted
+    assert (reset.history_length, reset.history_head) == (0, 0), "force retained valid old history"
+    assert reset.history == old.history, "forced logical reset must retain backing slots"
+    assert (reset.segment_generation, reset.endpoint_armed, reset.segment_has_output) == (1, False, False)
+    assert reset.pending_forced_generation == 0
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+def test_successful_force_blocks_old_silence_but_allows_new_silence(execution):
+    # @spec PORT-SEG-002, PORT-SEG-004, PORT-SEG-007
+    policy = _policy(capacity=8)
+    old, detected, _ = _endpoint_step(execution, _book(8), [[10], [], [], []], policy)
+    assert not detected
+    reset, emitted = _force_step(execution, old)
+    assert emitted
+    resumed, detected, output = _endpoint_step(execution, reset, [[], [20]], policy)
+    assert not detected and output == (20, 103), "force boundary leaked old silence"
+    assert resumed.history_length == 2 and resumed.segment_generation == 1
+    quiet, detected, _ = _endpoint_step(execution, reset, [[], [], [], [], []], policy)
+    assert not detected
+    closed, detected, output = _endpoint_step(execution, quiet, [[20]], policy)
+    assert detected and output == (20, 101, 103)
+    assert closed.segment_generation == 2
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+def test_model_wins_queued_force_preserves_new_history(execution):
+    # @spec PORT-SEG-002, PORT-SEG-004, PORT-SEG-007
+    module = _module()
+    policy = _policy(capacity=8)
+    queued = module.queue_forced_eou(_book(8), request_generation=7)
+    reset, detected, _ = _endpoint_step(execution, queued, [[10], [], [], [], [], []], policy)
+    assert detected
+    quiet, detected, _ = _endpoint_step(execution, reset, [[], []], policy)
+    assert not detected and quiet.history_length == 2
+    if execution == "scalar":
+        result = module.apply_forced_eou(
+            quiet, request_generation=7, expected_request_generation=7, eou_token_id=101, park_token_id=103
+        )
+        assert result is not None and result.coalesced and result.output_ids == (103,)
+        after = result.next_book
+    else:
+        history, fields = _endpoint_tensors(quiet, execution)
+        result = module.apply_forced_eou_tensors(book=fields, selected_rows=torch.tensor([True], device=execution))
+        assert result.is_eou.tolist() == [False]
+        after = _tensor_book(history, result.book)
+    assert after == replace(quiet, pending_forced_generation=0), "coalesced force erased new history"
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+@pytest.mark.parametrize("last_frame,expected", [([20], False), ([], True)])
+def test_zero_threshold_legacy_probe_is_preserved(execution, last_frame, expected):
+    # @spec PORT-SEG-002
+    # Deliberately outside enabled admission; pin the existing helper behavior.
+    policy = replace(_policy(capacity=8), threshold_frames=0, residue_frames=2, active_window_frames=2)
+    book = replace(_book(8), history_length=2, history_head=2, endpoint_armed=True, segment_has_output=True)
+    _, detected, _ = _endpoint_step(execution, book, [last_frame], policy)
+    assert detected is expected
+
+
+@pytest.mark.parametrize("execution", _ENDPOINT_EXECUTIONS)
+@pytest.mark.parametrize("capacity,threshold,residue", [(1, 1, 0), (2, 1, 1), (8, 3, 2), (12, 10, 2)])
+def test_empty_observation_preserves_admitted_book(execution, capacity, threshold, residue):
+    # @spec PORT-SEG-001, PORT-SEG-002
+    policy = _policy(capacity=capacity, stop_history_ms=threshold * 80, residue_frames=residue)
+    original = _book(capacity)
+    after, detected, output = _endpoint_step(execution, original, [], policy)
+    assert after == original and not detected and output == (103,)
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+def test_tensor_force_mixed_rows_preserves_noop_metadata(device):
+    # @spec PORT-SEG-004, PORT-SEG-007, PORT-STATE-008
+    book = torch.tensor(
+        [[4, 4, 1, 2, 1, 9], [5, 5, 1, 3, 0, 9], [6, 6, 1, 4, 0, 9], [7, 7, 1, 5, 1, 9]],
+        dtype=torch.int32,
+        device=device,
+    )
+    before = book.clone()
+    selected = torch.tensor([True, True, False, False], device=device)
+    result = _module().apply_forced_eou_tensors(book=book, selected_rows=selected)
+    assert result.is_eou.tolist() == [True, False, False, False]
+    expected = before.clone()
+    expected[0] = torch.tensor([0, 0, 0, 3, 0, 0], device=device)
+    # Existing selected-empty behavior clears armed/pending, but NOT history.
+    expected[1] = torch.tensor([5, 5, 0, 3, 0, 0], device=device)
+    assert torch.equal(result.book, expected)
+    assert torch.equal(book, before)
+    result.book.zero_()
+    assert torch.equal(book, before), "force output aliases its input"
+
+
+def test_scalar_malformed_empty_force_retains_existing_armed_bit():
+    # @spec PORT-SEG-004, PORT-SEG-007
+    # Scalar and tensor legacy behavior differs outside armed/has_output invariant.
+    book = replace(
+        _book(8),
+        history_length=5,
+        history_head=5,
+        endpoint_armed=True,
+        segment_has_output=False,
+        pending_forced_generation=9,
+    )
+    result = _module().apply_forced_eou(
+        book, request_generation=7, expected_request_generation=7, eou_token_id=101, park_token_id=103
+    )
+    assert result is not None and result.empty_segment and not result.coalesced
+    assert result.next_book == replace(book, pending_forced_generation=0)
+
+
+def _mixed_tensor_observation(device):
+    history = torch.zeros(5, 8, dtype=torch.int32, device=device)
+    history[:, 0] = 2
+    book = torch.tensor([[4, 4, 1, 3, 1, 7]] * 5, dtype=torch.int32, device=device)
+    book[3, 2] = book[3, 4] = 0
+    inputs = dict(
+        history=history,
+        book=book,
+        frame_emission_counts=torch.tensor([[0, 1]] * 5, dtype=torch.int32, device=device),
+        valid_frame_lengths=torch.tensor([2] * 5, dtype=torch.int64, device=device),
+        token_ids=torch.tensor([[20]] * 5, dtype=torch.int32, device=device),
+        token_lengths=torch.ones(5, dtype=torch.int32, device=device),
+        final_tail=torch.tensor([False, False, True, False, False], device=device),
+        mode=torch.tensor([1, 1, 1, 0, 1], dtype=torch.int64, device=device),
+        threshold_frames=torch.tensor([3, 3, 3, 0, -1], dtype=torch.int64, device=device),
+        residue_frames=torch.tensor([2, 2, 2, 0, 2], dtype=torch.int64, device=device),
+        eou_token_id=101,
+        row_clean=torch.tensor([True, False, True, True, True], device=device),
+    )
+    return inputs
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+def test_tensor_endpoint_mixed_eligibility_and_all_outputs(device):
+    # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007, PORT-STATE-008
+    inputs = _mixed_tensor_observation(device)
+    history_before, book_before = inputs["history"].clone(), inputs["book"].clone()
+    result = _module().observe_chunk_tensors(**inputs)
+    assert result.is_eou.tolist() == [True, False, False, False, False]
+    assert result.overflow.tolist() == [False, False, False, False, True]
+    assert result.token_ids.tolist() == [[20, 101], [20, 0], [20, 0], [20, 0], [20, 0]]
+    assert result.token_lengths.tolist() == [2, 1, 1, 1, 1]
+    expected_history = history_before.clone()
+    expected_history[0].zero_()
+    assert torch.equal(result.history, expected_history)
+    expected_book = book_before.clone()
+    expected_book[0] = torch.tensor([0, 0, 0, 4, 0, 7], device=device)
+    expected_book[3] = torch.tensor([4, 4, 1, 3, 1, 7], device=device)
+    assert torch.equal(result.book, expected_book)
+    assert torch.equal(inputs["history"], history_before) and torch.equal(inputs["book"], book_before)
+    # Dirty-row candidate labels are scratch; the existing transaction owns
+    # zero publication and no resident scatter, not this standalone helper.
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+def test_tensor_endpoint_retained_outputs_have_independent_storage(device):
+    # @spec PORT-SEG-007, PORT-STATE-008
+    inputs = _mixed_tensor_observation(device)
+    before = {name: value.clone() for name, value in inputs.items() if isinstance(value, torch.Tensor)}
+    first = _module().observe_chunk_tensors(**inputs)
+    fields = ("history", "book", "token_ids", "token_lengths", "is_eou", "overflow")
+    retained = {name: getattr(first, name).clone() for name in fields}
+    second = _module().observe_chunk_tensors(**inputs)
+    for name in fields:
+        getattr(second, name).fill_(1)
+    for name in fields:
+        assert torch.equal(getattr(first, name), retained[name]), f"later result aliases retained {name}"
+        getattr(first, name).fill_(1)
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value), f"output mutation changed input {name}"
+
+
+def _sequential_count_oracle(*, history, length, head, enabled, active_window):
+    """Independent scalar walk; Python integers explicitly emulate int64 wrap."""
+    counts = []
+    capacity = history.shape[1]
+    rows = zip(history.tolist(), length.tolist(), head.tolist(), enabled.tolist(), active_window.tolist())
+    for symbols, valid_length, cursor, active, window in rows:
+        count = 0
+        if active:
+            limit = max(0, min(valid_length, window, capacity))
+            for offset in range(2, limit + 1):
+                wrapped = ((cursor - offset + 2**63) % 2**64) - 2**63
+                if symbols[wrapped % capacity] != 0:
+                    break
+                count += 1
+        counts.append(count)
+    return torch.tensor(counts, dtype=torch.int64, device=history.device)
+
+
+def _count_inputs(cases, capacity, device, window_dtype=torch.int64):
+    # Each row is (history, valid length, head, enabled, active window).
+    return dict(
+        history=torch.tensor([row[0] for row in cases], dtype=torch.int32, device=device).reshape(-1, capacity),
+        length=torch.tensor([row[1] for row in cases], dtype=torch.int64, device=device),
+        head=torch.tensor([row[2] for row in cases], dtype=torch.int64, device=device),
+        enabled=torch.tensor([row[3] for row in cases], dtype=torch.bool, device=device),
+        active_window=torch.tensor([row[4] for row in cases], dtype=window_dtype, device=device),
+    )
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity", [1, 2, 12, 16, 64])
+def test_reverse_history_exact_count_all_heads_stops_and_symbols(device, capacity):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    cases = []
+    for head in range(capacity):
+        cases.append(([0] * capacity, capacity, head, True, capacity))
+        pivot = [0] * capacity
+        pivot[(head - 1) % capacity] = 1
+        cases.append((pivot, capacity, head, True, capacity))
+        for length in (0, 1, capacity):
+            for window in (0, 1, capacity):
+                cases.append((pivot, length, head, True, window))
+        cases.append(([0] * capacity, capacity, head, False, capacity))
+    for stop in range(2, capacity + 1):
+        head = (stop * 7) % capacity
+        for symbol in (1, 2):
+            history = [0] * capacity
+            history[(head - stop) % capacity] = symbol
+            # A second farther nonblank must not displace the first stop.
+            if stop < capacity:
+                history[(head - stop - 1) % capacity] = 3 - symbol
+            for window in (stop - 1, stop, capacity):
+                cases.append((history, capacity, head, True, window))
+    inputs = _count_inputs(cases, capacity, device)
+    before = {name: value.clone() for name, value in inputs.items()}
+    expected = _sequential_count_oracle(**inputs)
+    actual = _module()._count_silent_before_pivot(**inputs)
+    assert torch.equal(actual, expected)
+    assert actual.dtype == torch.int64 and actual.device == inputs["history"].device
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value), f"count mutated {name}"
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity", [1, 2, 12, 16, 64])
+@pytest.mark.parametrize("window_dtype", [torch.int32, torch.int64])
+def test_reverse_history_integral_malformed_count_parity(device, capacity, window_dtype):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    cases = []
+    low, high = torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max
+    windows = (torch.iinfo(window_dtype).min, -1, 0, 1, capacity, capacity + 9, torch.iinfo(window_dtype).max)
+    for head in (low, high, -(2**31), 2**31 - 1, -1, capacity, capacity + 1):
+        for length in (low, -1, 0, 1, capacity, capacity + 7, high):
+            for window in windows:
+                history = [0] * capacity
+                history[0] = 1
+                if capacity > 1:
+                    history[-1] = 2
+                cases.append((history, length, head, True, window))
+    inputs = _count_inputs(cases, capacity, device, window_dtype)
+    assert torch.equal(_module()._count_silent_before_pivot(**inputs), _sequential_count_oracle(**inputs))
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("policy_dtype", [torch.int32, torch.int64])
+def test_reverse_history_wrapped_policy_addition_preserves_zero_count(device, policy_dtype):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    threshold = torch.tensor([torch.iinfo(policy_dtype).max], dtype=policy_dtype, device=device)
+    residue = torch.ones(1, dtype=policy_dtype, device=device)
+    window = threshold + residue  # Preserve the observer's existing dtype/evaluation order.
+    assert window.item() == torch.iinfo(policy_dtype).min
+    inputs = _count_inputs([([0] * 12, 12, 0, True, 0)], 12, device, policy_dtype)
+    inputs["active_window"] = window
+    actual = _module()._count_silent_before_pivot(**inputs)
+    assert actual.tolist() == [0]
+    assert torch.equal(actual, _sequential_count_oracle(**inputs))
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("rows,capacity", [(0, 1), (0, 12), (1, 1), (4, 1), (4, 2)])
+def test_reverse_history_empty_and_one_slot_counts_are_owned(device, rows, capacity):
+    # @spec PORT-PERF-026, PORT-STATE-008
+    inputs = _count_inputs([([0] * capacity, capacity, 0, True, capacity)] * rows, capacity, device)
+    before = {name: value.clone() for name, value in inputs.items()}
+    first = _module()._count_silent_before_pivot(**inputs)
+    second = _module()._count_silent_before_pivot(**inputs)
+    assert first.shape == (rows,) and first.dtype == torch.int64 and first.device == inputs["history"].device
+    assert torch.equal(first, _sequential_count_oracle(**inputs))
+    if capacity == 1:
+        assert first.tolist() == [0] * rows
+    # Empty tensors all have data_ptr()==0; compare storage identities instead.
+    storage = first.untyped_storage()._cdata
+    assert storage != second.untyped_storage()._cdata
+    assert all(storage != value.untyped_storage()._cdata for value in inputs.values())
+    saved = first.clone()
+    second.fill_(9)
+    assert torch.equal(first, saved)
+    first.fill_(7)
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value)
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity,frame_width", [(1, 0), (2, 1), (12, 1), (12, 14), (16, 4), (64, 7)])
+def test_reverse_history_observer_matches_corrected_sequential_control(device, capacity, frame_width, monkeypatch):
+    # @spec PORT-PERF-026, PORT-SEG-002, PORT-SEG-003, PORT-SEG-007, PORT-STATE-008
+    module = _module()
+    inputs = _mixed_tensor_observation(device)
+    inputs["history"] = torch.zeros(5, capacity, dtype=torch.int32, device=device)
+    inputs["history"][:, 0] = 2
+    inputs["book"][:, 0] = min(4, capacity)
+    inputs["book"][:, 1] = min(4, capacity) % capacity
+    inputs["frame_emission_counts"] = torch.zeros(5, frame_width, dtype=torch.int32, device=device)
+    if frame_width:
+        inputs["frame_emission_counts"][:, -1] = 1
+    inputs["valid_frame_lengths"] = torch.full((5,), frame_width, dtype=torch.int64, device=device)
+    threshold = min(3, capacity)
+    residue = min(2, capacity - threshold)
+    inputs["threshold_frames"][:] = torch.tensor([threshold, threshold, threshold, 0, -1], device=device)
+    inputs["residue_frames"][:] = torch.tensor([residue, residue, residue, 0, residue], device=device)
+    before = {name: value.clone() for name, value in inputs.items() if isinstance(value, torch.Tensor)}
+    actual = module.observe_chunk_tensors(**inputs)
+    # Frozen A=221a684c has the same surrounding observer. Its independent
+    # scalar sequential count supplies the control, not the candidate helper.
+    with monkeypatch.context() as context:
+        context.setattr(module, "_count_silent_before_pivot", _sequential_count_oracle)
+        expected = module.observe_chunk_tensors(**inputs)
+    for name in ("history", "book", "token_ids", "token_lengths", "is_eou", "overflow"):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), f"A/B mismatch in {name}"
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value)
+
+
+class _EndpointDispatchCounter(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.calls += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("pattern", ["blank", "mixed"])
+def test_reverse_history_dispatch_is_independent_of_rows_capacity_window(pattern):
+    # @spec PORT-PERF-026
+    # Host-dispatched ATen calls include views; these are NOT CUDA launches or timings.
+    helper = _module()._count_silent_before_pivot
+    counts = {}
+    for rows in (1, 4, 16):
+        for capacity in (2, 12, 64, 256):
+            for window in sorted({1, min(5, capacity), capacity}):
+                history = [0] * capacity
+                if pattern == "mixed":
+                    history[capacity // 2] = 2
+                inputs = _count_inputs([(history, capacity, 0, True, window)] * rows, capacity, "cpu")
+                counter = _EndpointDispatchCounter()
+                with counter:
+                    result = helper(**inputs)
+                assert result.shape == (rows,)
+                counts[rows, capacity, window] = counter.calls
+    spread = max(counts.values()) - min(counts.values())
+    # Permit small fixed shape-edge overhead; reject per-row, per-slot or
+    # per-window dispatch growth without pinning any exact ATen count/name.
+    assert spread <= 8, f"reverse host-dispatch spread {spread} exceeds fixed budget: {counts}"

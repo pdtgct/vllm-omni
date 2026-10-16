@@ -207,6 +207,11 @@ def apply_forced_eou_tensors(
     next_book = book.clone()
     has_output = next_book[:, 4] != 0
     emit = selected_rows & has_output
+    next_book[:, :2] = torch.where(
+        emit.unsqueeze(1),
+        torch.zeros_like(next_book[:, :2]),
+        next_book[:, :2],
+    )
     next_book[:, 2] = torch.where(
         selected_rows,
         torch.zeros_like(next_book[:, 2]),
@@ -228,6 +233,35 @@ def apply_forced_eou_tensors(
         next_book[:, 5],
     )
     return ForcedTensorEndpointTransition(book=next_book, is_eou=emit)
+
+
+# @spec PORT-PERF-026
+def _count_silent_before_pivot(
+    *,
+    history: torch.Tensor,
+    length: torch.Tensor,
+    head: torch.Tensor,
+    enabled: torch.Tensor,
+    active_window: torch.Tensor,
+) -> torch.Tensor:
+    """Count consecutive blanks before the newest pivot without host readback."""
+    rows, capacity = history.shape
+    if capacity == 1:
+        return torch.zeros(rows, dtype=torch.long, device=history.device)
+    # Offset one is the pivot itself. Signed subtraction precedes floor-mod.
+    offsets = torch.arange(2, capacity + 1, dtype=torch.long, device=history.device)
+    indices = (head.unsqueeze(1) - offsets) % capacity
+    symbols = history.gather(1, indices)
+    limit = torch.minimum(length, active_window)
+    within = offsets <= limit.unsqueeze(1)
+    first_nonblank = torch.where(
+        within & (symbols != int(FrameSymbol.BLANK)),
+        offsets,
+        capacity + 1,
+    ).amin(dim=1)
+    # Clamp before subtracting: a malformed int64-min window must stay empty.
+    silent = (torch.minimum(limit.clamp(min=0, max=capacity), first_nonblank - 1) - 1).clamp(min=0)
+    return torch.where(enabled, silent, torch.zeros_like(silent))
 
 
 # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
@@ -311,18 +345,13 @@ def observe_chunk_tensors(
         saw_frame |= valid
 
     active_window = threshold_frames + residue_frames
-    silent = torch.zeros(rows, dtype=torch.long, device=history.device)
-    still_silent = torch.ones(rows, dtype=torch.bool, device=history.device)
-    # Offset one is the pivot itself.  The reference detector starts at
-    # pivot-1, hence this loop starts at two.
-    for offset in range(2, capacity + 1):
-        within = offset <= torch.minimum(length, active_window)
-        index = (head - offset) % capacity
-        symbol = next_history.gather(1, index.unsqueeze(1)).squeeze(1)
-        blank = symbol == int(FrameSymbol.BLANK)
-        count = enabled & within & still_silent & blank
-        silent += count.long()
-        still_silent &= ~within | blank
+    silent = _count_silent_before_pivot(
+        history=next_history,
+        length=length,
+        head=head,
+        enabled=enabled,
+        active_window=active_window,
+    )
 
     is_eou = (
         active_row
@@ -330,7 +359,7 @@ def observe_chunk_tensors(
         & armed
         & has_output
         & saw_frame
-        & (last_symbol == int(FrameSymbol.BLANK))
+        & ((last_symbol == int(FrameSymbol.BLANK)) | (threshold_frames > 0))
         & (silent > threshold_frames)
     )
     label_width = int(token_ids.shape[1])
@@ -364,6 +393,9 @@ def observe_chunk_tensors(
     generation += is_eou.long()
     armed &= ~is_eou
     has_output &= ~is_eou
+    next_history.masked_fill_(is_eou.unsqueeze(1), int(FrameSymbol.BLANK))
+    length = torch.where(is_eou, torch.zeros_like(length), length)
+    head = torch.where(is_eou, torch.zeros_like(head), head)
     next_book[:, 0] = length.to(next_book.dtype)
     next_book[:, 1] = head.to(next_book.dtype)
     next_book[:, 2] = armed.to(next_book.dtype)
@@ -440,12 +472,15 @@ def observe_chunk(
         and candidate.endpoint_armed
         and candidate.segment_has_output
         and bool(symbols)
-        and symbols[-1] == FrameSymbol.BLANK
+        and (symbols[-1] == FrameSymbol.BLANK or policy.threshold_frames > 0)
         and trace.silent_frames > policy.threshold_frames
     )
     if is_eou:
         candidate = replace(
             candidate,
+            history=(FrameSymbol.BLANK,) * len(candidate.history),
+            history_length=0,
+            history_head=0,
             endpoint_armed=False,
             segment_generation=candidate.segment_generation + 1,
             segment_has_output=False,
@@ -546,6 +581,8 @@ def apply_forced_eou(
     generation = book.segment_generation + 1
     next_book = replace(
         book,
+        history_length=0,
+        history_head=0,
         endpoint_armed=False,
         segment_generation=generation,
         segment_has_output=False,
