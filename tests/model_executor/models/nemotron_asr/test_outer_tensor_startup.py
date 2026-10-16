@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -117,6 +119,7 @@ class _Engine:
         self.events = events
         self.receipt = _ready_receipt()
         self.pid = pid
+        self.warmup_complete = True
         self.fail_read = False
         self.after_abort = False
 
@@ -125,12 +128,15 @@ class _Engine:
         self.events.append("rpc")
         if self.fail_read:
             raise RuntimeError("receipt read failed")
+        # AsyncOmni preserves the stage/replica list and each worker-result list.
         return [
-            {
-                "worker_pid": self.pid,
-                "persistent_state_warmup_complete": True,
-                "execution_profile": deepcopy(self.receipt),
-            }
+            [
+                {
+                    "worker_pid": self.pid,
+                    "persistent_state_warmup_complete": self.warmup_complete,
+                    "execution_profile": deepcopy(self.receipt),
+                }
+            ]
         ]
 
     def execute(self):
@@ -225,6 +231,136 @@ async def _boundary(provider, engine, plan, phase, context=None):
 
 def _leases():
     return (SimpleNamespace(session_key="session-1", engine_epoch="epoch-a", generation=1),)
+
+
+@pytest.mark.asyncio
+async def test_actual_orchestrator_worker_result_shape_reaches_provider(monkeypatch):
+    """@spec PORT-PERF-025: consume the actual stage/replica aggregation shape."""
+    from vllm_omni.engine.messages import CollectiveRPCRequestMessage
+    from vllm_omni.engine.orchestrator import Orchestrator
+    from vllm_omni.engine.stage_pool import StagePool
+
+    provider = startup.NemotronPersistentStateStartupProvider()
+    engine = _Engine(True, [])
+    plan = _plan(provider, engine)
+    worker = {
+        "worker_pid": engine.pid,
+        "persistent_state_warmup_complete": True,
+        "execution_profile": deepcopy(engine.receipt),
+    }
+    # The core executor returns one list item per worker. Exercise the real pool
+    # forwarding and orchestrator aggregation rather than duplicating that logic.
+    client_rpc = AsyncMock(return_value=[worker])
+    pool = object.__new__(StagePool)
+    pool.stage_id = 0
+    pool.clients = [SimpleNamespace(stage_type="llm", collective_rpc_async=client_rpc)]
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [pool]
+    orchestrator.num_stages = 1
+    orchestrator.rpc_async_queue = asyncio.Queue()
+
+    async def collective_rpc(method, **kwargs):
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(rpc_id="receipt", method=method, args=(), kwargs={}, stage_ids=None)
+        )
+        result = orchestrator.rpc_async_queue.get_nowait()
+        assert result.stage_ids == [0]
+        assert result.results == [[worker]]
+        return result.results
+
+    monkeypatch.setattr(engine, "collective_rpc", collective_rpc)
+    context = await _boundary(provider, engine, plan, "before")
+    assert context.worker_pid == engine.pid
+    client_rpc.assert_awaited_once_with(method="nemotron_execution_profile_receipt", timeout=None, args=(), kwargs={})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ("non-sequence", "exactly one stage/replica"),
+        ("empty-outer", "exactly one stage/replica"),
+        ("multiple-replicas", "exactly one stage/replica"),
+        ("flat", "exactly one expected worker"),
+        ("empty-inner", "exactly one expected worker"),
+        ("multiple-workers", "exactly one expected worker"),
+        ("over-nested", "worker receipt envelope is malformed"),
+        ("scalar-worker", "worker receipt envelope is malformed"),
+        ("stage-error", "exactly one expected worker"),
+        ("worker-error", "worker receipt envelope is malformed"),
+    ],
+)
+async def test_receipt_rpc_shape_rejects_malformed_membership(monkeypatch, shape, message):
+    """@spec PORT-PERF-025: exactly one stage/replica and one worker are required."""
+    provider = startup.NemotronPersistentStateStartupProvider()
+    engine = _Engine(True, [])
+    plan = _plan(provider, engine)
+    worker = (await engine.collective_rpc("nemotron_execution_profile_receipt"))[0][0]
+    responses: object = {
+        "non-sequence": None,
+        "empty-outer": [],
+        "multiple-replicas": [[worker], [worker]],
+        "flat": [worker],
+        "empty-inner": [[]],
+        "multiple-workers": [[worker, worker]],
+        "over-nested": [[[worker]]],
+        "scalar-worker": [[None]],
+        "stage-error": [{"supported": False, "error": "unavailable"}],
+        "worker-error": [[{"error": "receipt read failed"}]],
+    }[shape]
+    monkeypatch.setattr(engine, "collective_rpc", AsyncMock(return_value=responses))
+    with pytest.raises(RuntimeError, match=message):
+        await _boundary(provider, engine, plan, "before")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warmup", [False, None, 1, "true"])
+@pytest.mark.parametrize("snapshot", ["pre-plan", "before-round", "after-round", "final-boundary"])
+async def test_worker_warmup_requires_true_at_every_snapshot(monkeypatch, warmup, snapshot):
+    """@spec PORT-PERF-025: unwrapping never bypasses the worker readiness flag."""
+    provider = startup.NemotronPersistentStateStartupProvider()
+    engine = _Engine(True, [])
+    plan = _plan(provider, engine)
+    if snapshot == "pre-plan":
+        engine.warmup_complete = warmup
+        with pytest.raises(RuntimeError, match="worker warmup is incomplete"):
+            await _boundary(provider, engine, plan, "before")
+        return
+    context = await _boundary(provider, engine, plan, "before")
+    if snapshot == "final-boundary":
+        engine.execute()
+        engine.warmup_complete = warmup
+        with pytest.raises(RuntimeError, match="worker warmup is incomplete"):
+            await _boundary(provider, engine, plan, "after", context)
+        return
+
+    def poison(current):
+        current.warmup_complete = warmup
+
+    _bound_fakes(monkeypatch, engine, poison=poison if snapshot == "after-round" else None)
+    if snapshot == "before-round":
+        engine.warmup_complete = warmup
+    with pytest.raises(RuntimeError, match="worker warmup is incomplete"):
+        await provider.execute_priming_round(
+            engine_client=engine, round_spec=plan.rounds[0], leases=_leases(), boundary_context=context
+        )
+    if snapshot == "before-round":
+        assert "feed" not in engine.events
+    else:
+        assert engine.events[-2:] == ["abort", "rpc"]
+
+
+@pytest.mark.asyncio
+async def test_final_boundary_rejects_worker_pid_change():
+    """@spec PORT-PERF-025: final cleanup cannot replace the expected worker."""
+    provider = startup.NemotronPersistentStateStartupProvider()
+    engine = _Engine(True, [])
+    plan = _plan(provider, engine)
+    context = await _boundary(provider, engine, plan, "before")
+    engine.execute()
+    engine.pid += 1
+    with pytest.raises(RuntimeError, match="worker identity/counters changed"):
+        await _boundary(provider, engine, plan, "after", context)
 
 
 @pytest.mark.asyncio
@@ -374,7 +510,7 @@ async def test_between_round_gap_and_worker_identity_corruption_fail_before_work
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["read-before", "read-after", "eager-after", "compile-after"])
+@pytest.mark.parametrize("failure", ["read-before", "read-after", "eager-after", "compile-after", "pid-after"])
 async def test_receipt_failures_preserve_abort_and_reject_round(monkeypatch, failure):
     """@spec PORT-PERF-021, PORT-PERF-025, PORT-STATE-008: no retry after selected-call failure."""
     provider = startup.NemotronPersistentStateStartupProvider()
@@ -390,6 +526,8 @@ async def test_receipt_failures_preserve_abort_and_reject_round(monkeypatch, fai
             block["dispatch"]["post"]["eager_calls"] += 1
         elif failure == "compile-after":
             block["frames"]["backend_attempts"] += 1
+        elif failure == "pid-after":
+            current.pid += 1
 
     _bound_fakes(monkeypatch, engine, poison=poison)
     if failure == "read-before":

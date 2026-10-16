@@ -461,9 +461,14 @@ async def _outer_snapshot(
 
     responses = await engine.collective_rpc("nemotron_execution_profile_receipt")
     if not isinstance(responses, (list, tuple)) or len(responses) != 1:
+        raise RuntimeError("outer tensor fusion requires exactly one stage/replica receipt")
+    worker_responses = responses[0]
+    if not isinstance(worker_responses, (list, tuple)) or len(worker_responses) != 1:
         raise RuntimeError("outer tensor fusion requires exactly one expected worker receipt")
-    envelope = responses[0]
-    if not isinstance(envelope, dict) or envelope.get("persistent_state_warmup_complete") is not True:
+    envelope = worker_responses[0]
+    if not isinstance(envelope, dict) or "persistent_state_warmup_complete" not in envelope:
+        raise RuntimeError("outer tensor fusion worker receipt envelope is malformed")
+    if envelope.get("persistent_state_warmup_complete") is not True:
         raise RuntimeError("outer tensor fusion worker warmup is incomplete")
     pid = envelope.get("worker_pid")
     if type(pid) is not int or pid <= 0:
