@@ -191,6 +191,27 @@ def test_off_never_constructs_compiler_and_omits_receipt(monkeypatch):
     assert "outer_tensor_fusion" not in model.execution_profile_receipt()
 
 
+def test_receipt_runtime_version_roundtrips_through_strict_worker_transport(monkeypatch):
+    """@spec PORT-PERF-022: detached runtime identity crosses the worker transport."""
+    from torch.torch_version import TorchVersion
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    runtime_version = TorchVersion(str(torch.__version__))
+    monkeypatch.setattr(torch, "__version__", runtime_version)
+    encoder = MsgpackEncoder()
+    with pytest.raises(TypeError, match="TorchVersion.*not serializable"):
+        encoder.encode_into({"torch": runtime_version}, bytearray())
+
+    receipt = _binding().receipt()
+    buffers = encoder.encode_into(receipt, bytearray())
+    restored = MsgpackDecoder().decode(buffers)
+    assert type(receipt["compiler"]["torch"]) is str
+    assert receipt["compiler"]["torch"] == str(runtime_version)
+    assert restored == receipt
+    assert type(restored["compiler"]["torch"]) is str
+
+
 @pytest.mark.parametrize("kind", ["parameter", "buffer", "model-parameter", "model-buffer", "integer-buffer"])
 def test_load_exit_attests_all_floating_storage(monkeypatch, kind):
     """@spec PORT-PERF-013: copied checkpoint dtype cannot excuse wrong destination."""

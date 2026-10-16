@@ -209,7 +209,7 @@ class OuterTensorExecution:
             triton_version = "unavailable"
         self._compiler = dict(
             backend="inductor",
-            torch=torch.__version__,
+            torch=str(torch.__version__),
             triton=triton_version,
             fullgraph=True,
             dynamic=False,
