@@ -12,6 +12,7 @@ from typing import Any, NoReturn
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -902,3 +903,190 @@ def test_tensor_endpoint_retained_outputs_have_independent_storage(device):
         getattr(first, name).fill_(1)
     for name, value in before.items():
         assert torch.equal(inputs[name], value), f"output mutation changed input {name}"
+
+
+def _sequential_count_oracle(*, history, length, head, enabled, active_window):
+    """Independent scalar walk; Python integers explicitly emulate int64 wrap."""
+    counts = []
+    capacity = history.shape[1]
+    rows = zip(history.tolist(), length.tolist(), head.tolist(), enabled.tolist(), active_window.tolist())
+    for symbols, valid_length, cursor, active, window in rows:
+        count = 0
+        if active:
+            limit = max(0, min(valid_length, window, capacity))
+            for offset in range(2, limit + 1):
+                wrapped = ((cursor - offset + 2**63) % 2**64) - 2**63
+                if symbols[wrapped % capacity] != 0:
+                    break
+                count += 1
+        counts.append(count)
+    return torch.tensor(counts, dtype=torch.int64, device=history.device)
+
+
+def _count_inputs(cases, capacity, device, window_dtype=torch.int64):
+    # Each row is (history, valid length, head, enabled, active window).
+    return dict(
+        history=torch.tensor([row[0] for row in cases], dtype=torch.int32, device=device).reshape(-1, capacity),
+        length=torch.tensor([row[1] for row in cases], dtype=torch.int64, device=device),
+        head=torch.tensor([row[2] for row in cases], dtype=torch.int64, device=device),
+        enabled=torch.tensor([row[3] for row in cases], dtype=torch.bool, device=device),
+        active_window=torch.tensor([row[4] for row in cases], dtype=window_dtype, device=device),
+    )
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity", [1, 2, 12, 16, 64])
+def test_reverse_history_exact_count_all_heads_stops_and_symbols(device, capacity):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    cases = []
+    for head in range(capacity):
+        cases.append(([0] * capacity, capacity, head, True, capacity))
+        pivot = [0] * capacity
+        pivot[(head - 1) % capacity] = 1
+        cases.append((pivot, capacity, head, True, capacity))
+        for length in (0, 1, capacity):
+            for window in (0, 1, capacity):
+                cases.append((pivot, length, head, True, window))
+        cases.append(([0] * capacity, capacity, head, False, capacity))
+    for stop in range(2, capacity + 1):
+        head = (stop * 7) % capacity
+        for symbol in (1, 2):
+            history = [0] * capacity
+            history[(head - stop) % capacity] = symbol
+            # A second farther nonblank must not displace the first stop.
+            if stop < capacity:
+                history[(head - stop - 1) % capacity] = 3 - symbol
+            for window in (stop - 1, stop, capacity):
+                cases.append((history, capacity, head, True, window))
+    inputs = _count_inputs(cases, capacity, device)
+    before = {name: value.clone() for name, value in inputs.items()}
+    expected = _sequential_count_oracle(**inputs)
+    actual = _module()._count_silent_before_pivot(**inputs)
+    assert torch.equal(actual, expected)
+    assert actual.dtype == torch.int64 and actual.device == inputs["history"].device
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value), f"count mutated {name}"
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity", [1, 2, 12, 16, 64])
+@pytest.mark.parametrize("window_dtype", [torch.int32, torch.int64])
+def test_reverse_history_integral_malformed_count_parity(device, capacity, window_dtype):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    cases = []
+    low, high = torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max
+    windows = (torch.iinfo(window_dtype).min, -1, 0, 1, capacity, capacity + 9, torch.iinfo(window_dtype).max)
+    for head in (low, high, -(2**31), 2**31 - 1, -1, capacity, capacity + 1):
+        for length in (low, -1, 0, 1, capacity, capacity + 7, high):
+            for window in windows:
+                history = [0] * capacity
+                history[0] = 1
+                if capacity > 1:
+                    history[-1] = 2
+                cases.append((history, length, head, True, window))
+    inputs = _count_inputs(cases, capacity, device, window_dtype)
+    assert torch.equal(_module()._count_silent_before_pivot(**inputs), _sequential_count_oracle(**inputs))
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("policy_dtype", [torch.int32, torch.int64])
+def test_reverse_history_wrapped_policy_addition_preserves_zero_count(device, policy_dtype):
+    # @spec PORT-PERF-026, PORT-SEG-002
+    threshold = torch.tensor([torch.iinfo(policy_dtype).max], dtype=policy_dtype, device=device)
+    residue = torch.ones(1, dtype=policy_dtype, device=device)
+    window = threshold + residue  # Preserve the observer's existing dtype/evaluation order.
+    assert window.item() == torch.iinfo(policy_dtype).min
+    inputs = _count_inputs([([0] * 12, 12, 0, True, 0)], 12, device, policy_dtype)
+    inputs["active_window"] = window
+    actual = _module()._count_silent_before_pivot(**inputs)
+    assert actual.tolist() == [0]
+    assert torch.equal(actual, _sequential_count_oracle(**inputs))
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("rows,capacity", [(0, 1), (0, 12), (1, 1), (4, 1), (4, 2)])
+def test_reverse_history_empty_and_one_slot_counts_are_owned(device, rows, capacity):
+    # @spec PORT-PERF-026, PORT-STATE-008
+    inputs = _count_inputs([([0] * capacity, capacity, 0, True, capacity)] * rows, capacity, device)
+    before = {name: value.clone() for name, value in inputs.items()}
+    first = _module()._count_silent_before_pivot(**inputs)
+    second = _module()._count_silent_before_pivot(**inputs)
+    assert first.shape == (rows,) and first.dtype == torch.int64 and first.device == inputs["history"].device
+    assert torch.equal(first, _sequential_count_oracle(**inputs))
+    if capacity == 1:
+        assert first.tolist() == [0] * rows
+    # Empty tensors all have data_ptr()==0; compare storage identities instead.
+    storage = first.untyped_storage()._cdata
+    assert storage != second.untyped_storage()._cdata
+    assert all(storage != value.untyped_storage()._cdata for value in inputs.values())
+    saved = first.clone()
+    second.fill_(9)
+    assert torch.equal(first, saved)
+    first.fill_(7)
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value)
+
+
+@pytest.mark.parametrize("device", _ENDPOINT_EXECUTIONS[1:])
+@pytest.mark.parametrize("capacity,frame_width", [(1, 0), (2, 1), (12, 1), (12, 14), (16, 4), (64, 7)])
+def test_reverse_history_observer_matches_corrected_sequential_control(device, capacity, frame_width, monkeypatch):
+    # @spec PORT-PERF-026, PORT-SEG-002, PORT-SEG-003, PORT-SEG-007, PORT-STATE-008
+    module = _module()
+    inputs = _mixed_tensor_observation(device)
+    inputs["history"] = torch.zeros(5, capacity, dtype=torch.int32, device=device)
+    inputs["history"][:, 0] = 2
+    inputs["book"][:, 0] = min(4, capacity)
+    inputs["book"][:, 1] = min(4, capacity) % capacity
+    inputs["frame_emission_counts"] = torch.zeros(5, frame_width, dtype=torch.int32, device=device)
+    if frame_width:
+        inputs["frame_emission_counts"][:, -1] = 1
+    inputs["valid_frame_lengths"] = torch.full((5,), frame_width, dtype=torch.int64, device=device)
+    threshold = min(3, capacity)
+    residue = min(2, capacity - threshold)
+    inputs["threshold_frames"][:] = torch.tensor([threshold, threshold, threshold, 0, -1], device=device)
+    inputs["residue_frames"][:] = torch.tensor([residue, residue, residue, 0, residue], device=device)
+    before = {name: value.clone() for name, value in inputs.items() if isinstance(value, torch.Tensor)}
+    actual = module.observe_chunk_tensors(**inputs)
+    # Frozen A=221a684c has the same surrounding observer. Its independent
+    # scalar sequential count supplies the control, not the candidate helper.
+    with monkeypatch.context() as context:
+        context.setattr(module, "_count_silent_before_pivot", _sequential_count_oracle)
+        expected = module.observe_chunk_tensors(**inputs)
+    for name in ("history", "book", "token_ids", "token_lengths", "is_eou", "overflow"):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), f"A/B mismatch in {name}"
+    for name, value in before.items():
+        assert torch.equal(inputs[name], value)
+
+
+class _EndpointDispatchCounter(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.calls += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("pattern", ["blank", "mixed"])
+def test_reverse_history_dispatch_is_independent_of_rows_capacity_window(pattern):
+    # @spec PORT-PERF-026
+    # Host-dispatched ATen calls include views; these are NOT CUDA launches or timings.
+    helper = _module()._count_silent_before_pivot
+    counts = {}
+    for rows in (1, 4, 16):
+        for capacity in (2, 12, 64, 256):
+            for window in sorted({1, min(5, capacity), capacity}):
+                history = [0] * capacity
+                if pattern == "mixed":
+                    history[capacity // 2] = 2
+                inputs = _count_inputs([(history, capacity, 0, True, window)] * rows, capacity, "cpu")
+                counter = _EndpointDispatchCounter()
+                with counter:
+                    result = helper(**inputs)
+                assert result.shape == (rows,)
+                counts[rows, capacity, window] = counter.calls
+    spread = max(counts.values()) - min(counts.values())
+    # Permit small fixed shape-edge overhead; reject per-row, per-slot or
+    # per-window dispatch growth without pinning any exact ATen count/name.
+    assert spread <= 8, f"reverse host-dispatch spread {spread} exceeds fixed budget: {counts}"
