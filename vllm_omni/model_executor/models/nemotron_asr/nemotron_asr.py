@@ -334,6 +334,16 @@ class NemotronASRForRNNT(nn.Module):
         # Resolve the effective (stage-overridden) selector once, before any
         # state reservation, execution construction or checkpoint loading.
         policy = resolve_precision_policy(hf_config)
+        from vllm_omni.model_executor.models.nemotron_asr.outer_tensor_fusion import (
+            OuterTensorExecution,
+            model_constants,
+            validate_selection,
+        )
+
+        fusion_enabled = validate_selection(vllm_config, hf_config, policy)
+        self._outer_tensor_execution = (
+            OuterTensorExecution(constants=model_constants(hf_config)) if fusion_enabled else None
+        )
         # @spec PORT-DEC-011, PORT-DEC-014: bind the selected lane once,
         # before constructing the model or reserving persistent state.
         native_burst_enabled = getattr(hf_config, "experimental_native_burst", False)
@@ -451,6 +461,7 @@ class NemotronASRForRNNT(nn.Module):
             warmup_geometries=served_geometry_ids,
             vllm_config=vllm_config,
         )
+        self._decode_selection = getattr(hf_config, "decode_dispatch_arm", None)
         self._decode_graph_binding = None
         if getattr(hf_config, "decode_dispatch_arm", None) == "dense-graphed":
             from vllm_omni.model_executor.models.nemotron_asr.decode_graph import (
@@ -578,6 +589,12 @@ class NemotronASRForRNNT(nn.Module):
             raise ValueError(f"LID weights absent ({lid_missing}); conditioned transcription never degrades silently")
         if missing:
             raise ValueError(f"{len(missing)} expected weights not provided, e.g. {sorted(missing)[:3]}")
+        # @spec PORT-PERF-013: attest actual loaded destinations, including
+        # floating model buffers outside the checkpoint's core subtree.
+        if getattr(self, "_outer_tensor_execution", None) is not None:
+            for name, tensor in (*self.named_parameters(), *self.named_buffers()):
+                if tensor.is_floating_point() and tensor.dtype != torch.float32:
+                    raise ValueError(f"outer tensor fusion requires FP32 loaded storage: {name}/{tensor.dtype}")
         return {f"core.{name}" for name in consumed}
 
     @staticmethod
@@ -758,6 +775,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None and not chunk_binding.ready:
             raise RuntimeError("CHUNK execution inventory is incomplete")
+        outer = getattr(self, "_outer_tensor_execution", None)
+        if outer is not None and not outer.ready:
+            raise RuntimeError("outer tensor fusion execution inventory is incomplete")
         binding = self._decode_graph_binding
         if binding is None:
             if getattr(self.config, "decode_dispatch_arm", None) == "dense-graphed":
@@ -780,6 +800,7 @@ class NemotronASRForRNNT(nn.Module):
         """Retain execution inventory and profile its transient headroom before state allocation."""
         from vllm_omni.model_executor.models.nemotron_asr.profile_execution import (
             run_persistent_state_profile,
+            warmup_outer_tensor_execution,
             warmup_static_encoder_execution,
         )
 
@@ -797,6 +818,8 @@ class NemotronASRForRNNT(nn.Module):
             chunk_binding = getattr(self, "_chunk_bucket_binding", None)
             if chunk_binding is not None:
                 chunk_binding.warmup(device)
+            if getattr(self, "_outer_tensor_execution", None) is not None:
+                warmup_outer_tensor_execution(self, device=device)
             self._require_execution_inventory_ready()
             # All retained graph buffers must coexist with this temporary
             # transaction so the profiler sees their combined high-water mark.
@@ -860,7 +883,9 @@ class NemotronASRForRNNT(nn.Module):
         """@spec PORT-DEC-011: report bound emission selection and startup coverage."""
         binding = self._decode_graph_binding
         keys = () if binding is None else binding.captured_keys
-        decode_arm = getattr(self.config, "decode_dispatch_arm", None) or "compact-eager"
+        decode_arm = (
+            getattr(self, "_decode_selection", getattr(self.config, "decode_dispatch_arm", None)) or "compact-eager"
+        )
         emission_lane, emission_profile = self._emission_selection
         receipt = {
             "schema": "nemotron-execution-profile/1",
@@ -875,6 +900,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
+        outer = getattr(self, "_outer_tensor_execution", None)
+        if outer is not None:
+            receipt["outer_tensor_fusion"] = outer.receipt()
         return execution_mode(getattr(self, "core", None)).readiness_receipt(receipt)
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
@@ -1058,6 +1086,7 @@ class NemotronASRForRNNT(nn.Module):
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
+                outer_tensor_execution=getattr(self, "_outer_tensor_execution", None),
             )
         except BaseException:
             if native_handoff is not None:

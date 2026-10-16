@@ -940,6 +940,41 @@ def _mrv1_projection_invariant_rows(
     receives its own typed projection validator with PORT-DEC-010; it must not
     silently pass through this one-token decision-carrier contract.
     """
+    return _mrv1_tensor_invariant_rows(
+        result.token_ids,
+        result.token_lengths,
+        context.roles,
+        context.chunk_rows,
+        context.queue,
+        context.book,
+        context.prompt_index,
+        projection.rows,
+        projection.queue,
+        projection.book,
+        effective_status,
+        park_id=park_id,
+        blank_id=blank_id,
+        eou_token_id=eou_token_id,
+    )
+
+
+def _mrv1_tensor_invariant_rows(
+    token_ids: torch.Tensor,
+    token_lengths: torch.Tensor,
+    roles: torch.Tensor,
+    chunk_rows: torch.Tensor,
+    baseline_queue: torch.Tensor,
+    baseline_book: torch.Tensor,
+    prompt_index: torch.Tensor,
+    proposed_rows: torch.Tensor,
+    proposed_queue: torch.Tensor,
+    proposed_book: torch.Tensor,
+    effective_status: torch.Tensor,
+    *,
+    park_id: int,
+    blank_id: int,
+    eou_token_id: int | None = None,
+) -> torch.Tensor:
     from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
         BOOK_EXPECTED_LABEL,
         BOOK_GEOMETRY,
@@ -950,7 +985,7 @@ def _mrv1_projection_invariant_rows(
         QUEUE_PROMPT,
     )
 
-    rows = projection.rows
+    rows = proposed_rows
     decision = rows[:, 0]
     finite = torch.isfinite(decision)
     integral = finite & (decision == decision.trunc())
@@ -961,29 +996,29 @@ def _mrv1_projection_invariant_rows(
     if rows.shape[1] > 1:
         bad |= (rows[:, 1:] != 0).any(dim=1)
 
-    queue_changed = (projection.queue != context.queue).any(dim=1)
-    book_changed = (projection.book != context.book).any(dim=1)
+    queue_changed = (proposed_queue != baseline_queue).any(dim=1)
+    book_changed = (proposed_book != baseline_book).any(dim=1)
     clean = effective_status == 0
     failed = ~clean
     bad |= failed & ((decision != park_id) | queue_changed | book_changed)
 
-    is_flush = clean & (context.roles == ROLE_FLUSH)
+    is_flush = clean & (roles == ROLE_FLUSH)
     bad |= is_flush & ((decision != park_id) | queue_changed | book_changed)
 
     # REPLAY consumes exactly the prior queue item at old head, updates only
     # head/pending/expected, and never rewrites queue payload or identity.
-    head = context.book[:, QUEUE_HEAD].long()
-    length = context.book[:, QUEUE_LEN].long()
-    cap = int(context.queue.shape[1])
+    head = baseline_book[:, QUEUE_HEAD].long()
+    length = baseline_book[:, QUEUE_LEN].long()
+    cap = int(baseline_queue.shape[1])
     next_label = (
-        context.queue.gather(
+        baseline_queue.gather(
             1,
             head.clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
         )
         .squeeze(1)
         .long()
     )
-    replay = clean & (context.roles == ROLE_REPLAY)
+    replay = clean & (roles == ROLE_REPLAY)
     replay_emits = replay & (head < length)
     replay_drained = replay & ~replay_emits
     expected_replay_decision = torch.where(
@@ -1000,42 +1035,41 @@ def _mrv1_projection_invariant_rows(
     expected_replay_label = torch.where(
         replay_emits,
         next_label,
-        context.book[:, BOOK_EXPECTED_LABEL].long(),
+        baseline_book[:, BOOK_EXPECTED_LABEL].long(),
     )
     replay_bad = (
         (decision.long() != expected_replay_decision)
         | queue_changed
-        | (projection.book[:, QUEUE_HEAD].long() != expected_replay_head)
-        | (projection.book[:, QUEUE_LEN] != context.book[:, QUEUE_LEN])
-        | (projection.book[:, QUEUE_LAST_LABEL] != context.book[:, QUEUE_LAST_LABEL])
-        | (projection.book[:, QUEUE_PROMPT] != context.book[:, QUEUE_PROMPT])
-        | (projection.book[:, BOOK_PENDING_ECHO].long() != expected_replay_pending)
-        | (projection.book[:, BOOK_EXPECTED_LABEL].long() != expected_replay_label)
-        | (projection.book[:, BOOK_GEOMETRY] != context.book[:, BOOK_GEOMETRY])
+        | (proposed_book[:, QUEUE_HEAD].long() != expected_replay_head)
+        | (proposed_book[:, QUEUE_LEN] != baseline_book[:, QUEUE_LEN])
+        | (proposed_book[:, QUEUE_LAST_LABEL] != baseline_book[:, QUEUE_LAST_LABEL])
+        | (proposed_book[:, QUEUE_PROMPT] != baseline_book[:, QUEUE_PROMPT])
+        | (proposed_book[:, BOOK_PENDING_ECHO].long() != expected_replay_pending)
+        | (proposed_book[:, BOOK_EXPECTED_LABEL].long() != expected_replay_label)
+        | (proposed_book[:, BOOK_GEOMETRY] != baseline_book[:, BOOK_GEOMETRY])
     )
     bad |= (replay | replay_drained) & replay_bad
 
     # CHUNK replaces the queue with exactly its active burst, emits the first
     # label, and arms an echo iff the burst is nonempty.
-    chunk_rows = context.chunk_rows
     if int(chunk_rows.shape[0]):
         chunk_clean = clean.index_select(0, chunk_rows)
-        chunk_queue = projection.queue.index_select(0, chunk_rows)
-        chunk_book = projection.book.index_select(0, chunk_rows)
+        chunk_queue = proposed_queue.index_select(0, chunk_rows)
+        chunk_book = proposed_book.index_select(0, chunk_rows)
         chunk_decision = decision.index_select(0, chunk_rows)
-        lengths = result.token_lengths.long()
+        lengths = token_lengths.long()
         has = lengths > 0
-        width = int(result.token_ids.shape[1])
+        width = int(token_ids.shape[1])
         expected_queue = torch.zeros_like(chunk_queue)
         copied = min(width, cap)
         if copied:
             cols = torch.arange(copied, device=chunk_queue.device).unsqueeze(0)
             expected_queue[:, :copied] = torch.where(
                 cols < lengths.unsqueeze(1),
-                result.token_ids[:, :copied].to(expected_queue.dtype),
+                token_ids[:, :copied].to(expected_queue.dtype),
                 torch.zeros_like(expected_queue[:, :copied]),
             )
-            first = result.token_ids[:, 0].long()
+            first = token_ids[:, 0].long()
         else:
             first = torch.zeros_like(lengths)
         expected_decision = torch.where(
@@ -1043,14 +1077,14 @@ def _mrv1_projection_invariant_rows(
             first,
             torch.full_like(first, park_id),
         )
-        old_book = context.book.index_select(0, chunk_rows)
+        old_book = baseline_book.index_select(0, chunk_rows)
         chunk_bad = (
             (chunk_decision.long() != expected_decision)
             | (chunk_queue != expected_queue).any(dim=1)
             | (chunk_book[:, QUEUE_HEAD].long() != has.long())
             | (chunk_book[:, QUEUE_LEN].long() != lengths)
             | (chunk_book[:, QUEUE_LAST_LABEL] != old_book[:, QUEUE_LAST_LABEL])
-            | (chunk_book[:, QUEUE_PROMPT].long() != context.prompt_index.index_select(0, chunk_rows))
+            | (chunk_book[:, QUEUE_PROMPT].long() != prompt_index.index_select(0, chunk_rows))
             | (chunk_book[:, BOOK_PENDING_ECHO].long() != has.long())
             | (chunk_book[:, BOOK_EXPECTED_LABEL].long() != torch.where(has, first, torch.zeros_like(first)))
             | (chunk_book[:, BOOK_GEOMETRY] != old_book[:, BOOK_GEOMETRY])
@@ -2412,6 +2446,260 @@ def consume_batch_stats() -> list[tuple[str, int]] | None:
     return stats
 
 
+# @spec PORT-PERF-014, PORT-ADV-004
+def _outer_pre_tensor_predicates(
+    *,
+    input_ids: torch.Tensor,
+    is_chunk: torch.Tensor,
+    plan_geometry: torch.Tensor,
+    prior_prompt: torch.Tensor,
+    queue: torch.Tensor,
+    book: torch.Tensor,
+    frontend_counters: torch.Tensor,
+    cadence_frames: torch.Tensor,
+    queue_capacity: int,
+    blank_id: int,
+    placeholder_id: int,
+    park_id: int,
+    eou_token_id: int | None,
+    raw_tail_capacity: int,
+    mel_tail_capacity: int,
+    hop_length: int,
+    n_fft: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm_omni.model_executor.models.nemotron_asr.frontend import CTR_FINALIZED
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    cap, blank = queue_capacity, blank_id
+    device, n_real = input_ids.device, input_ids.shape[0]
+    endpoint_enabled = eou_token_id is not None
+    ids_dev = input_ids.long()
+    head_all = book[:, QUEUE_HEAD].long()
+    len_all = book[:, QUEUE_LEN].long()
+    pend_col = book[:, BOOK_PENDING_ECHO]
+    pending = pend_col == 1
+    remaining = len_all - head_all
+    last = book[:, QUEUE_LAST_LABEL].long()
+    expected = book[:, BOOK_EXPECTED_LABEL].long()
+    finalized_col = frontend_counters[:, CTR_FINALIZED]
+    finalized = finalized_col == 1
+    slot = torch.arange(cap, device=device).unsqueeze(0)
+    queued_value_valid = (queue >= 0) & (queue < blank)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        queued_value_valid |= queue == int(eou_token_id)
+    queued_bad = ((~queued_value_valid) & (slot < len_all.unsqueeze(1))).any(dim=1)
+    prior_emitted = (
+        queue.gather(
+            1,
+            (head_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    queue_last = (
+        queue.gather(
+            1,
+            (len_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    queue_tail_is_eou = torch.zeros_like(pending)
+    expected_is_eou = torch.zeros_like(pending)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        queue_tail_is_eou = (len_all > 0) & (queue_last == int(eou_token_id))
+        expected_is_eou = expected == int(eou_token_id)
+    book_bad = (
+        (head_all < 0)
+        | (head_all > len_all)
+        | (len_all > cap)
+        | ((pend_col != 0) & (pend_col != 1))
+        | (last < 0)
+        | (last > blank)
+        | (expected < 0)
+        | ((expected > blank) & (~expected_is_eou))
+        | (pending & (expected >= blank) & (~expected_is_eou))
+        | queued_bad
+        | (pending & (head_all < 1))
+        | (pending & (expected != prior_emitted))
+        | ((len_all > 0) & (~queue_tail_is_eou) & (last != queue_last))
+        | ((remaining > 0) & (~pending))
+    )
+    counter_bad = _counter_invariant_rows(
+        frontend_counters,
+        raw_tail_capacity=raw_tail_capacity,
+        mel_tail_capacity=mel_tail_capacity,
+        hop_length=hop_length,
+        n_fft=n_fft,
+        cadence_frames=cadence_frames,
+    )
+    status = torch.zeros(n_real, dtype=torch.int32, device=device)
+    status |= (is_chunk != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
+    status |= ((~is_chunk) & pending & (ids_dev != expected)).to(torch.int32) * ROW_STATUS_ECHO_MISMATCH
+    status |= (is_chunk & (pending | (remaining > 0))).to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
+    # The AR park echo: under async scheduling the engine's in-flight
+    # frame legally feeds an emitted park token back as the next input
+    # (the label twin of this row is ROLE_REPLAY, armed at commit). A
+    # non-chunk park-token row on a drained, unarmed, live session is
+    # therefore a distinct asynchronous park echo — validated downstream
+    # as emit-park-change-nothing — not FLUSH or a protocol violation.
+    park_echo = (~is_chunk) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == park_id)
+    forced_eou = torch.zeros_like(park_echo)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        forced_eou = (~is_chunk) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == int(eou_token_id))
+    status |= ((~is_chunk) & (~pending) & ((remaining > 0) | (~finalized)) & (~park_echo) & (~forced_eou)).to(
+        torch.int32
+    ) * ROW_STATUS_SESSION_PROTOCOL
+    status |= (book[:, BOOK_GEOMETRY].long() != plan_geometry).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
+    status |= (book[:, QUEUE_PROMPT].long() != prior_prompt).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
+    status |= (book_bad | counter_bad).to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+    # Safe substitution (PORT-ADV-004 as amended): a corrupt book's
+    # last label must never reach the predictor embedding.
+    safe_last = torch.where(
+        book_bad | counter_bad,
+        torch.full_like(last, blank),
+        last.clamp(0, blank),
+    )
+    roles = torch.full((n_real,), ROLE_FLUSH, dtype=torch.long, device=device)
+    roles = torch.where(
+        (~is_chunk) & pending,
+        torch.full_like(roles, ROLE_REPLAY),
+        roles,
+    )
+    roles = torch.where(
+        forced_eou,
+        torch.full_like(roles, ROLE_EOU),
+        roles,
+    )
+    roles = torch.where(is_chunk, torch.full_like(roles, ROLE_CHUNK), roles)
+
+    return status, safe_last, roles, park_echo
+
+
+# @spec PORT-PERF-014, PORT-ADV-003, PORT-STATE-008
+def _outer_post_tensor_predicates(
+    *,
+    token_ids: torch.Tensor,
+    token_lengths: torch.Tensor,
+    roles: torch.Tensor,
+    chunk_rows: torch.Tensor,
+    baseline_queue: torch.Tensor,
+    baseline_book: torch.Tensor,
+    prompt_index: torch.Tensor,
+    incoming_status: torch.Tensor,
+    proposed_rows: torch.Tensor,
+    proposed_queue: torch.Tensor,
+    proposed_book: torch.Tensor,
+    proposed_status: torch.Tensor,
+    plan_geometry: torch.Tensor,
+    park_id: int,
+    blank_id: int,
+    eou_token_id: int | None,
+) -> torch.Tensor:
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    cap, blank = int(baseline_queue.shape[1]), blank_id
+    endpoint_enabled = eou_token_id is not None
+    slot = torch.arange(cap, device=baseline_queue.device).unsqueeze(0)
+    # Validate the adapter's proposed persistent book before it can
+    # become resident. Any defect is a row-tier masked park/no-store.
+    pbook = proposed_book
+    phead = pbook[:, QUEUE_HEAD].long()
+    plen = pbook[:, QUEUE_LEN].long()
+    ppend_col = pbook[:, BOOK_PENDING_ECHO]
+    ppend = ppend_col == 1
+    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
+    plast = pbook[:, QUEUE_LAST_LABEL].long()
+    premaining = plen - phead
+    proposed_queue_value_valid = (proposed_queue >= 0) & (proposed_queue < blank)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        proposed_queue_value_valid |= proposed_queue == int(eou_token_id)
+    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
+    proposed_prior_emitted = (
+        proposed_queue.gather(
+            1,
+            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_queue_last = (
+        proposed_queue.gather(
+            1,
+            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+        )
+        .squeeze(1)
+        .long()
+    )
+    proposed_tail_is_eou = torch.zeros_like(ppend)
+    proposed_expected_is_eou = torch.zeros_like(ppend)
+    if endpoint_enabled:
+        assert eou_token_id is not None
+        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
+        proposed_expected_is_eou = pexpected == int(eou_token_id)
+    proposed_bad = (
+        (phead < 0)
+        | (phead > plen)
+        | (plen > cap)
+        | ((ppend_col != 0) & (ppend_col != 1))
+        | (plast < 0)
+        | (plast > blank)
+        | (pexpected < 0)
+        | ((pexpected > blank) & (~proposed_expected_is_eou))
+        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
+        | proposed_queued_bad
+        | (ppend & (phead < 1))
+        | (ppend & (pexpected != proposed_prior_emitted))
+        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
+        | ((premaining > 0) & (~ppend))
+        | (pbook[:, BOOK_GEOMETRY].long() != plan_geometry)
+        | (pbook[:, QUEUE_PROMPT].long() != prompt_index)
+    )
+    incoming_adapter_status = incoming_status
+    lost_status = (proposed_status & incoming_adapter_status) != incoming_adapter_status
+    status = incoming_adapter_status | proposed_status
+    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= ((proposed_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
+    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
+    projection_bad = _mrv1_tensor_invariant_rows(
+        token_ids,
+        token_lengths,
+        roles,
+        chunk_rows,
+        baseline_queue,
+        baseline_book,
+        prompt_index,
+        proposed_rows,
+        proposed_queue,
+        proposed_book,
+        status,
+        park_id=park_id,
+        blank_id=blank_id,
+        eou_token_id=eou_token_id,
+    )
+    return status | (projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT)
+
+
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
 # @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(
@@ -2445,6 +2733,7 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    outer_tensor_execution: Any | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -2521,7 +2810,6 @@ def advance_model_rows(
     )
     from vllm_omni.model_executor.models.nemotron_asr.frontend import (
         CTR_EXPECTED_CHUNK_SEQUENCE,
-        CTR_FINALIZED,
     )
     from vllm_omni.model_executor.models.nemotron_asr.manifests import (
         CADENCES,
@@ -2773,60 +3061,6 @@ def advance_model_rows(
             dtype=torch.int64,
         ),
     )
-    ids_dev = input_ids.long()
-    head_all = book[:, QUEUE_HEAD].long()
-    len_all = book[:, QUEUE_LEN].long()
-    pend_col = book[:, BOOK_PENDING_ECHO]
-    pending = pend_col == 1
-    remaining = len_all - head_all
-    last = book[:, QUEUE_LAST_LABEL].long()
-    expected = book[:, BOOK_EXPECTED_LABEL].long()
-    finalized_col = counters_small[:, CTR_FINALIZED]
-    finalized = finalized_col == 1
-    slot = torch.arange(cap, device=device).unsqueeze(0)
-    queued_value_valid = (queue >= 0) & (queue < blank)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        queued_value_valid |= queue == int(eou_token_id)
-    queued_bad = ((~queued_value_valid) & (slot < len_all.unsqueeze(1))).any(dim=1)
-    prior_emitted = (
-        queue.gather(
-            1,
-            (head_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    queue_last = (
-        queue.gather(
-            1,
-            (len_all - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    queue_tail_is_eou = torch.zeros_like(pending)
-    expected_is_eou = torch.zeros_like(pending)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        queue_tail_is_eou = (len_all > 0) & (queue_last == int(eou_token_id))
-        expected_is_eou = expected == int(eou_token_id)
-    book_bad = (
-        (head_all < 0)
-        | (head_all > len_all)
-        | (len_all > cap)
-        | ((pend_col != 0) & (pend_col != 1))
-        | (last < 0)
-        | (last > blank)
-        | (expected < 0)
-        | ((expected > blank) & (~expected_is_eou))
-        | (pending & (expected >= blank) & (~expected_is_eou))
-        | queued_bad
-        | (pending & (head_all < 1))
-        | (pending & (expected != prior_emitted))
-        | ((len_all > 0) & (~queue_tail_is_eou) & (last != queue_last))
-        | ((remaining > 0) & (~pending))
-    )
     # Build the per-geometry cadence table on the HOST and index it
     # by the CPU RowPlan geometry authority, THEN stage the per-row
     # result to the device — never ``torch.tensor(list,
@@ -2842,54 +3076,37 @@ def advance_model_rows(
             dtype=torch.int64,
         ).index_select(0, plan.geometry_id),
     )
-    counter_bad = _counter_invariant_rows(
-        counters_small,
+    ids_dev = input_ids.long()
+    pre_inputs = dict(
+        input_ids=input_ids,
+        is_chunk=is_chunk_dev,
+        plan_geometry=plan_geom_dev,
+        prior_prompt=prior_prompt_dev,
+        queue=queue,
+        book=book,
+        frontend_counters=counters_small,
+        cadence_frames=cadence_frames,
+    )
+    pre_constants = dict(
+        queue_capacity=cap,
+        blank_id=blank,
+        placeholder_id=placeholder_id,
+        park_id=park_id,
+        eou_token_id=eou_token_id if endpoint_enabled else None,
         raw_tail_capacity=int(frontend_raw_pool.shape[1]),
         mel_tail_capacity=int(frontend_mel_pool.shape[2]),
         hop_length=hop,
         n_fft=int(core.featurizer.n_fft),
-        cadence_frames=cadence_frames,
     )
-    status = torch.zeros(n_real, dtype=torch.int32, device=device)
-    status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(torch.int32) * ROW_STATUS_ROLE_MISMATCH
-    status |= ((~is_chunk_dev) & pending & (ids_dev != expected)).to(torch.int32) * ROW_STATUS_ECHO_MISMATCH
-    status |= (is_chunk_dev & (pending | (remaining > 0))).to(torch.int32) * ROW_STATUS_QUEUE_NOT_DRAINED
-    # The AR park echo: under async scheduling the engine's in-flight
-    # frame legally feeds an emitted park token back as the next input
-    # (the label twin of this row is ROLE_REPLAY, armed at commit). A
-    # non-chunk park-token row on a drained, unarmed, live session is
-    # therefore a distinct asynchronous park echo — validated downstream
-    # as emit-park-change-nothing — not FLUSH or a protocol violation.
-    park_echo = (~is_chunk_dev) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == park_id)
-    forced_eou = torch.zeros_like(park_echo)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        forced_eou = (~is_chunk_dev) & (~pending) & (remaining == 0) & (~finalized) & (ids_dev == int(eou_token_id))
-    status |= ((~is_chunk_dev) & (~pending) & ((remaining > 0) | (~finalized)) & (~park_echo) & (~forced_eou)).to(
-        torch.int32
-    ) * ROW_STATUS_SESSION_PROTOCOL
-    status |= (book[:, BOOK_GEOMETRY].long() != plan_geom_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
-    status |= (book[:, QUEUE_PROMPT].long() != prior_prompt_dev).to(torch.int32) * ROW_STATUS_BOOK_IDENTITY
-    status |= (book_bad | counter_bad).to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
-    # Safe substitution (PORT-ADV-004 as amended): a corrupt book's
-    # last label must never reach the predictor embedding.
-    safe_last = torch.where(
-        book_bad | counter_bad,
-        torch.full_like(last, blank),
-        last.clamp(0, blank),
-    )
-    roles = torch.full((n_real,), ROLE_FLUSH, dtype=torch.long, device=device)
-    roles = torch.where(
-        (~is_chunk_dev) & pending,
-        torch.full_like(roles, ROLE_REPLAY),
-        roles,
-    )
-    roles = torch.where(
-        forced_eou,
-        torch.full_like(roles, ROLE_EOU),
-        roles,
-    )
-    roles = torch.where(is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles)
+    if outer_tensor_execution is None:
+        status, safe_last, roles, park_echo = _outer_pre_tensor_predicates(**pre_inputs, **pre_constants)
+    else:
+        status, safe_last, roles, park_echo = outer_tensor_execution.run_pre(
+            **pre_inputs,
+            **pre_constants,
+            capture=capture,
+            endpoint_enabled=endpoint_enabled,
+        )
 
     # ---- deadline-ordered buckets → fresh-aware gather → transition ----
     capture_on = capture
@@ -3203,77 +3420,31 @@ def advance_model_rows(
     ):
         raise ValueError("adapter row_status must be device-local int32 shaped (N,)")
 
-    # Validate the adapter's proposed persistent book before it can
-    # become resident. Any defect is a row-tier masked park/no-store.
-    pbook = projection.book
-    phead = pbook[:, QUEUE_HEAD].long()
-    plen = pbook[:, QUEUE_LEN].long()
-    ppend_col = pbook[:, BOOK_PENDING_ECHO]
-    ppend = ppend_col == 1
-    pexpected = pbook[:, BOOK_EXPECTED_LABEL].long()
-    plast = pbook[:, QUEUE_LAST_LABEL].long()
-    premaining = plen - phead
-    proposed_queue_value_valid = (projection.queue >= 0) & (projection.queue < blank)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_queue_value_valid |= projection.queue == int(eou_token_id)
-    proposed_queued_bad = ((~proposed_queue_value_valid) & (slot < plen.unsqueeze(1))).any(dim=1)
-    proposed_prior_emitted = (
-        projection.queue.gather(
-            1,
-            (phead - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
+    post_inputs = dict(
+        token_ids=merged.token_ids,
+        token_lengths=merged.token_lengths,
+        roles=context.roles,
+        chunk_rows=context.chunk_rows,
+        baseline_queue=context.queue,
+        baseline_book=context.book,
+        prompt_index=context.prompt_index,
+        incoming_status=status,
+        proposed_rows=projection.rows,
+        proposed_queue=projection.queue,
+        proposed_book=projection.book,
+        proposed_status=projection.row_status,
+        plan_geometry=plan_geom_dev,
+    )
+    post_constants = dict(park_id=park_id, blank_id=blank, eou_token_id=eou_token_id if endpoint_enabled else None)
+    if outer_tensor_execution is None:
+        status = _outer_post_tensor_predicates(**post_inputs, **post_constants)
+    else:
+        status = outer_tensor_execution.run_post(
+            **post_inputs,
+            **post_constants,
+            capture=capture,
+            endpoint_enabled=endpoint_enabled,
         )
-        .squeeze(1)
-        .long()
-    )
-    proposed_queue_last = (
-        projection.queue.gather(
-            1,
-            (plen - 1).clamp(min=0, max=max(cap - 1, 0)).unsqueeze(1),
-        )
-        .squeeze(1)
-        .long()
-    )
-    proposed_tail_is_eou = torch.zeros_like(ppend)
-    proposed_expected_is_eou = torch.zeros_like(ppend)
-    if endpoint_enabled:
-        assert eou_token_id is not None
-        proposed_tail_is_eou = (plen > 0) & (proposed_queue_last == int(eou_token_id))
-        proposed_expected_is_eou = pexpected == int(eou_token_id)
-    proposed_bad = (
-        (phead < 0)
-        | (phead > plen)
-        | (plen > cap)
-        | ((ppend_col != 0) & (ppend_col != 1))
-        | (plast < 0)
-        | (plast > blank)
-        | (pexpected < 0)
-        | ((pexpected > blank) & (~proposed_expected_is_eou))
-        | (ppend & (pexpected >= blank) & (~proposed_expected_is_eou))
-        | proposed_queued_bad
-        | (ppend & (phead < 1))
-        | (ppend & (pexpected != proposed_prior_emitted))
-        | ((plen > 0) & (~proposed_tail_is_eou) & (plast != proposed_queue_last))
-        | ((premaining > 0) & (~ppend))
-        | (pbook[:, BOOK_GEOMETRY].long() != plan_geom_dev)
-        | (pbook[:, QUEUE_PROMPT].long() != admitted_prompt_dev)
-    )
-    incoming_adapter_status = status
-    lost_status = (projection.row_status & incoming_adapter_status) != incoming_adapter_status
-    status = incoming_adapter_status | projection.row_status
-    status |= lost_status.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= ((projection.row_status & ~((1 << 19) - 1)) != 0).to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
-    status |= proposed_bad.to(torch.int32) * ROW_STATUS_BOOK_INVARIANT
-    projection_bad = _mrv1_projection_invariant_rows(
-        merged,
-        context,
-        projection,
-        status,
-        park_id=park_id,
-        blank_id=blank,
-        eou_token_id=eou_token_id if endpoint_enabled else None,
-    )
-    status |= projection_bad.to(torch.int32) * ROW_STATUS_DECODE_INVARIANT
     native_stage: Callable[[], None] | None = None
     if native_burst_handoff is not None:
         from vllm_omni.model_executor.models.nemotron_asr.native_burst import (

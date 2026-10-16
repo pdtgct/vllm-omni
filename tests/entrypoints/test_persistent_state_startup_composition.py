@@ -8,12 +8,144 @@ import asyncio
 import importlib
 from types import ModuleType, SimpleNamespace
 from typing import Any, NoReturn
+from unittest.mock import Mock
 
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _STARTUP_MODULE = "vllm_omni.engine.persistent_state_startup"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["absent", "pass", "before-error", "after-error", "before-timeout", "after-timeout", "body-error"]
+)
+async def test_optional_provider_boundaries_cover_actual_release_and_whole_plan_timeout(monkeypatch, mode):
+    """@spec PORT-PERF-025, PORT-PERF-005, PORT-STATE-008: opaque optional hook only.
+
+    Uses the real reserve/execute/release primitive. No fusion semantics enter
+    this generic lifecycle test, and absent-hook providers preserve their route.
+    """
+    module = _startup_module()
+    events = []
+    runtime = _runtime()
+    runtime.startup_priming_timeout_s = 0.02 if "timeout" in mode else 1.0
+    body_error = RuntimeError("primary model execution failed")
+    snapshot_error = RuntimeError("boundary receipt failed")
+    spec = SimpleNamespace(
+        round_id="round-0",
+        service_interval_ms=80,
+        geometry_id=0,
+        active_population=1,
+        schema_id="schema-a",
+        profile_id="profile-a",
+        tier_id="single",
+        post_jit=False,
+        continuously_loaded=True,
+        scenario_id="ordinary",
+        expected_legal_parks_per_lease=1,
+    )
+    plan = SimpleNamespace(rounds=(spec,), compile_kwargs={}, served_intervals_ms=(80,))
+    profile = SimpleNamespace(compiled_demand=SimpleNamespace(intervals_ms=(80,)))
+
+    class Provider:
+        def build_priming_plan(self, **kwargs):
+            return plan
+
+        async def execute_priming_round(self, **kwargs):
+            events.append("execute")
+            if mode == "absent":
+                assert "boundary_context" not in kwargs
+            else:
+                assert kwargs.get("boundary_context") is opaque_context
+            if mode == "body-error":
+                raise body_error
+            return SimpleNamespace(
+                completed_legal_parks=1,
+                elapsed_ns=100,
+                completed_model_rows=1,
+                dummy_run=False,
+                is_profile=False,
+            )
+
+    provider = Provider()
+    boundary_calls = 0
+    opaque_context = ("epoch-a", ("worker-42", "sealed-profile"))
+
+    async def boundary(**kwargs):
+        nonlocal boundary_calls
+        boundary_calls += 1
+        side = "before" if boundary_calls == 1 else "after"
+        assert kwargs["plan"] is plan
+        if side == "after":
+            assert kwargs.get("boundary_context") is opaque_context
+        events.append(side)
+        if mode == f"{side}-timeout":
+            await asyncio.Event().wait()
+        if mode == f"{side}-error" or (mode == "body-error" and side == "after"):
+            raise snapshot_error
+        return opaque_context
+
+    if mode != "absent":
+        setattr(provider, "validate_priming_boundary", boundary)
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            self.ready = False
+
+        async def bootstrap_handshake(self):
+            return _startup_inventory()
+
+        def configure_bootstrap_intervals(self, intervals):
+            assert intervals == (80,)
+
+        async def reserve_for_priming(self, **kwargs):
+            events.append("reserve")
+            return object()
+
+        async def release(self, **kwargs):
+            await asyncio.sleep(0)
+            events.append("released")
+
+        def seal_startup_profile(self, **kwargs):
+            events.append("seal")
+            self.ready = True
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    monkeypatch.setattr(module, "PersistentStateService", Service)
+    monkeypatch.setattr(module, "compile_provisional_service_profile", lambda *a, **kw: profile)
+    monkeypatch.setattr(module, "derive_admission_controller_config", lambda *a, **kw: object())
+    kwargs = dict(
+        engine_client=SimpleNamespace(model_config=object()),
+        stage_client=None,
+        runtime_config=runtime,
+        startup_provider=provider,
+        host_fatal_callback=lambda _: None,
+    )
+    if mode in {"absent", "pass"}:
+        result = await module.prepare_persistent_state_service(**kwargs)
+        assert result.ready
+        expected = ["reserve", "execute", "released", "seal"]
+        if mode == "pass":
+            expected = ["before", *expected[:-1], "after", "seal"]
+        assert events == expected
+    else:
+        with pytest.raises((RuntimeError, asyncio.TimeoutError)) as caught:
+            await module.prepare_persistent_state_service(**kwargs)
+        if mode == "body-error":
+            assert caught.value is body_error
+        elif "error" in mode:
+            assert caught.value is snapshot_error
+        assert events[-1] == "shutdown" and "seal" not in events
+        if mode.startswith("before-"):
+            assert "reserve" not in events
+        else:
+            assert events.index("released") > events.index("execute")
+            if "after" in events:
+                assert events.index("after") > events.index("released")
 
 
 def _startup_inventory() -> dict[str, Any]:
@@ -757,8 +889,13 @@ async def test_nemotron_provider_executes_bound_requests_to_legal_park(
         for index in range(2)
     )
     round_spec = SimpleNamespace(
+        round_id="geometry-0-bulk-ordinary-repeat-1",
+        geometry_id=0,
         service_interval_ms=80,
         scenario_id="ordinary",
+        active_population=2,
+        tier_id="bulk",
+        post_jit=True,
     )
 
     result = await NEMOTRON_PERSISTENT_STATE_STARTUP.execute_priming_round(
@@ -843,8 +980,13 @@ async def test_nemotron_provider_executes_exceptional_control_chain(
         ),
     )
     round_spec = SimpleNamespace(
+        round_id=f"geometry-0-single-{scenario_id}-repeat-1",
+        geometry_id=0,
         service_interval_ms=80,
         scenario_id=scenario_id,
+        active_population=1,
+        tier_id="single",
+        post_jit=True,
     )
     if scenario_id == "forced_eou_then_chunk":
         clock = iter((100, 200, 230))
@@ -1018,3 +1160,239 @@ async def test_preparation_handles_failed_valid_canary_by_policy(monkeypatch, po
         assert warning.call_count == 1
         if policy == "profile":
             assert "measured-unsupported" in warning.call_args.args[0]
+
+
+@pytest.fixture
+def startup_correlation_probe(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Exercise the provider with existing lease APIs and fake NVTX, without CUDA."""
+    from vllm.logger import init_logger
+
+    from vllm_omni.entrypoints import nemotron_session as binding_module
+    from vllm_omni.model_executor.models.nemotron_asr import profiling, session, startup
+
+    logger = init_logger(startup.__name__)
+    warning = Mock(wraps=logger.warning)
+    monkeypatch.setattr(logger, "warning", warning)
+    events: list[tuple[str, Any]] = []
+    failures: dict[str, BaseException] = {}
+    body_errors: list[BaseException] = []
+    real_gather = asyncio.gather
+    clock_calls = 0
+
+    async def observe_gather(*awaitables: Any, **kwargs: Any) -> Any:
+        try:
+            return await real_gather(*awaitables, **kwargs)
+        except BaseException as error:
+            if not kwargs.get("return_exceptions", False):
+                body_errors.append(error)
+            raise
+
+    def range_start(name: str) -> int:
+        events.append(("start", name))
+        if "start" in failures:
+            raise failures["start"]
+        return 0
+
+    def range_end(handle: int) -> None:
+        events.append(("end", handle))
+        if "end" in failures:
+            raise failures["end"]
+
+    def clock() -> int:
+        nonlocal clock_calls
+        clock_calls += 1
+        events.append(("clock", clock_calls))
+        if f"clock-{clock_calls}" in failures:
+            raise failures[f"clock-{clock_calls}"]
+        return (100, 200, 230, 270)[clock_calls - 1]
+
+    class Bound:
+        def __init__(self, **kwargs: Any) -> None:
+            self.request_id = kwargs["request_id"]
+            events.append(("construct", self.request_id))
+            self.session = SimpleNamespace(accepted_audio=SimpleNamespace(prior_actual_submission_ns=220))
+
+        async def feed(self, samples: Any) -> list[str]:
+            events.append(("feed", (self.request_id, len(samples))))
+            if "feed" in failures:
+                raise failures["feed"]
+            return [""]
+
+        async def wait_for_legal_park(self) -> None:
+            events.append(("park", self.request_id))
+
+        def stage_forced_eou_then_chunk(self, samples: Any) -> SimpleNamespace:
+            events.append(("stage", self.request_id))
+            return SimpleNamespace(true_ready_ns=100, prior_actual_submission_ns=100, cadence_ns=10, eligible_ns=190)
+
+        async def dispatch_staged_priming_chain(self) -> None:
+            events.append(("dispatch", self.request_id))
+
+        async def flush(self) -> SimpleNamespace:
+            events.append(("flush", self.request_id))
+            return SimpleNamespace(text="")
+
+        async def abort(self) -> None:
+            events.append(("abort", self.request_id))
+
+    monkeypatch.setattr(binding_module, "NemotronSessionLease", Bound)
+    monkeypatch.setattr(session.NemotronRealtimeSession, "from_model_config", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(profiling, "_ENABLED", True)
+    monkeypatch.setattr(profiling.torch.cuda.nvtx, "range_start", range_start)
+    monkeypatch.setattr(profiling.torch.cuda.nvtx, "range_end", range_end)
+    monkeypatch.setattr(startup.time, "monotonic_ns", clock)
+    monkeypatch.setattr(startup.asyncio, "gather", observe_gather)
+
+    async def run(
+        geometry: int = 0, repeat: int = 1, scenario: str = "ordinary", tier: str = "single", enabled: bool = True
+    ) -> Any:
+        monkeypatch.setattr(profiling, "_ENABLED", enabled)
+        population = 2 if tier == "bulk" else 1
+        return await startup.NEMOTRON_PERSISTENT_STATE_STARTUP.execute_priming_round(
+            engine_client=SimpleNamespace(
+                model_config=SimpleNamespace(hf_config=SimpleNamespace(prompt_dictionary={"en-US": 0}))
+            ),
+            round_spec=SimpleNamespace(
+                round_id=f"geometry-{geometry}-{tier}-{scenario}-repeat-{repeat}",
+                geometry_id=geometry,
+                service_interval_ms=80 if geometry == 0 else 160,
+                scenario_id=scenario,
+                active_population=population,
+                tier_id=tier,
+                post_jit=repeat > 0,
+            ),
+            leases=tuple(
+                SimpleNamespace(session_key=f"session-{index}", engine_epoch="epoch-a", generation=index + 1)
+                for index in range(population)
+            ),
+        )
+
+    return SimpleNamespace(run=run, events=events, failures=failures, warning=warning, body_errors=body_errors)
+
+
+# @spec PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
+@pytest.mark.asyncio
+@pytest.mark.parametrize("geometry", (0, 1))
+@pytest.mark.parametrize("repeat", range(4))
+async def test_startup_correlation_actual_provider_preserves_ordinary_timer(
+    startup_correlation_probe: Any, geometry: int, repeat: int
+) -> None:
+    probe = startup_correlation_probe
+    result = await probe.run(geometry=geometry, repeat=repeat)
+    assert probe.events == [
+        ("construct", "session-0"),
+        ("start", f"port.startup.measurement.geometry-{geometry}-single-ordinary-repeat-{repeat}"),
+        ("clock", 1),
+        ("feed", ("session-0", 1_280 if geometry == 0 else 2_560)),
+        ("clock", 2),
+        ("end", 0),
+        ("abort", "session-0"),
+    ]
+    assert result.elapsed_ns == 100
+    assert result.completed_legal_parks == 1
+    assert (result.canary_wait_ns, result.canary_wait_start_ns, result.canary_timer_start_ns) == (0, None, None)
+    assert result.following_chunk_timings == ()
+    assert probe.warning.call_count == 0
+    assert (result.completed_model_rows, result.dummy_run, result.is_profile) == (None, False, False)
+
+
+# @spec PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "tier", "actions", "elapsed", "parks"),
+    [
+        ("final_tail_then_flush", "single", ("clock", "feed", "flush", "clock", "abort"), 100, 2),
+        (
+            "forced_eou_then_chunk",
+            "single",
+            ("clock", "feed", "park", "stage", "clock", "clock", "dispatch", "clock", "abort"),
+            40,
+            2,
+        ),
+        ("ordinary", "bulk", ("clock", "feed", "feed", "clock", "abort", "abort"), 100, 2),
+    ],
+)
+async def test_startup_correlation_excludes_canaries_and_bulk(
+    startup_correlation_probe: Any, scenario: str, tier: str, actions: tuple[str, ...], elapsed: int, parks: int
+) -> None:
+    probe = startup_correlation_probe
+    result = await probe.run(scenario=scenario, tier=tier)
+    construction = ("construct",) * (2 if tier == "bulk" else 1)
+    assert tuple(action for action, _ in probe.events) == construction + actions
+    assert probe.warning.call_count == 0
+    assert (result.elapsed_ns, result.completed_legal_parks) == (elapsed, parks)
+    if scenario == "forced_eou_then_chunk":
+        assert (result.canary_wait_start_ns, result.canary_timer_start_ns, result.canary_wait_ns) == (200, 230, 30)
+        assert len(result.following_chunk_timings) == 1
+        assert result.following_chunk_timings[0].submitted_ns == 220
+
+
+# @spec PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_point", "cleanup_end_fails"),
+    [(point, cleanup) for point in ("start", "clock-1", "clock-2", "feed", "cancel") for cleanup in (False, True)]
+    + [("normal-end", False)],
+)
+async def test_startup_correlation_failures_close_once_and_always_abort(
+    startup_correlation_probe: Any,
+    failure_point: str,
+    cleanup_end_fails: bool,
+) -> None:
+    probe = startup_correlation_probe
+    primary: BaseException = (
+        asyncio.CancelledError("feed cancellation")
+        if failure_point == "cancel"
+        else ValueError(f"primary {failure_point}")
+    )
+    point = "feed" if failure_point == "cancel" else "end" if failure_point == "normal-end" else failure_point
+    probe.failures[point] = primary
+    if cleanup_end_fails and failure_point != "normal-end":
+        probe.failures["end"] = RuntimeError("secondary NVTX end")
+    with pytest.raises(type(primary)) as caught:
+        await probe.run()
+    if failure_point in ("feed", "cancel"):
+        # gather may normalize a child's cancellation differently by Python
+        # version; preserve the exact error delivered to the provider body.
+        assert len(probe.body_errors) == 1
+        assert caught.value is probe.body_errors[0]
+    else:
+        assert probe.body_errors == []
+        assert caught.value is primary
+    actions = [action for action, _ in probe.events]
+    assert probe.events[:2] == [
+        ("construct", "session-0"),
+        ("start", "port.startup.measurement.geometry-0-single-ordinary-repeat-1"),
+    ]
+    assert probe.events[-1] == ("abort", "session-0")
+    assert actions.count("abort") == 1
+    assert actions.count("end") == (0 if failure_point == "start" else 1)
+    if "end" in actions:
+        assert actions.index("end") < actions.index("abort")
+    if failure_point in ("start", "clock-1"):
+        assert "feed" not in actions
+    if failure_point == "start":
+        assert "clock" not in actions
+    expected_warning_count = int(cleanup_end_fails and failure_point not in ("start", "normal-end"))
+    assert probe.warning.call_count == expected_warning_count
+    if expected_warning_count:
+        assert "nvtx" in str(probe.warning.call_args).lower()
+
+
+# @spec PORT-PERF-005, PORT-PERF-006, PORT-PERF-007
+@pytest.mark.asyncio
+async def test_startup_correlation_actual_provider_disabled_preserves_ordinary_timer(
+    startup_correlation_probe: Any,
+) -> None:
+    probe = startup_correlation_probe
+    result = await probe.run(enabled=False)
+    assert probe.events == [
+        ("construct", "session-0"),
+        ("clock", 1),
+        ("feed", ("session-0", 1_280)),
+        ("clock", 2),
+        ("abort", "session-0"),
+    ]
+    assert result.elapsed_ns == 100
+    assert result.completed_legal_parks == 1
+    assert probe.warning.call_count == 0

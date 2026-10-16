@@ -364,6 +364,8 @@ def _call(
     memory_profile: bool = False,
     staging: Any = None,
     native_burst_handoff: Any = None,
+    outer_tensor_execution: Any = None,
+    eou_token_id: int | None = None,
 ) -> torch.Tensor:
     if adapter is None:
         adapter = advance.make_mrv1_adapter(
@@ -386,6 +388,8 @@ def _call(
         memory_profile=memory_profile,
         staging=staging,
         native_burst_handoff=native_burst_handoff,
+        eou_token_id=eou_token_id,
+        **({"outer_tensor_execution": outer_tensor_execution} if outer_tensor_execution is not None else {}),
         **pools,
     )
     return out
@@ -3747,6 +3751,8 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
     samples_count: int = FINAL_SAMPLES,
     max_tokens: int = 142,
     return_receipt: bool = False,
+    outer_tensor_execution: Any = None,
+    endpoint_enabled: bool = False,
 ) -> dict[str, Any] | None:
     # @spec PORT-DEC-010 / PORT-DEC-012 / PORT-STATE-008
     from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstHandoff
@@ -3762,7 +3768,13 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         name: [t.to(device) for t in value] if isinstance(value, list) else value.to(device)
         for name, value in _fresh_pools().items()
     }
+    if endpoint_enabled:
+        replay_pools["endpoint_history_pool"] = torch.zeros(3, 8, dtype=torch.int32, device=device)
+        replay_pools["endpoint_book_pool"] = torch.zeros(3, 6, dtype=torch.int32, device=device)
     native_pools = _clone_pools(replay_pools)
+    # Endpoint observation needs the frame symbols that the tuple-only wrapper
+    # discards. Bind the same frame-aware decode to oracle and candidate.
+    resolver = _fixed_resolver(rnnt.decode_dense_masked_frames) if endpoint_enabled else None
     if torch.device(device).type == "cuda":
         advance.warmup_advance_model_rows_scatter(**replay_pools)
         advance.warmup_advance_model_rows_scatter(**native_pools)
@@ -3772,6 +3784,8 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         torch.tensor([PLACEHOLDER_ID], device=device),
         carrier,
         _plan(prefills=[1], geometries=[geometry]),
+        resolver=resolver,
+        eou_token_id=9002 if endpoint_enabled else None,
     )
     expected = [_decision(output)[0]]
     while expected[-1] != PARK_ID:
@@ -3781,6 +3795,8 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
             torch.tensor([expected[-1]], device=device),
             torch.zeros(1, CARRIER_HIDDEN, device=device),
             _plan(decodes=[1], geometries=[geometry]),
+            resolver=resolver,
+            eou_token_id=9002 if endpoint_enabled else None,
         )
         expected.append(_decision(output)[0])
     batch = SimpleNamespace(req_ids=["a"], idx_mapping_np=[0])
@@ -3801,12 +3817,23 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
         carrier,
         _plan(prefills=[1], geometries=[geometry]),
         native_burst_handoff=handoff,
+        outer_tensor_execution=outer_tensor_execution,
+        resolver=resolver,
+        eou_token_id=9002 if endpoint_enabled else None,
     )
     payload = handoff.consume(batch)
     assert payload.row_status.tolist() == [0]
     assert len(expected) > 1, "transaction discriminator must emit labels before PARK"
     assert payload.sampled_token_ids[0, : payload.num_sampled[0]].tolist() == expected
     _assert_pools_equal(native_pools, replay_pools)
+    if outer_tensor_execution is not None:
+        # @spec PORT-PERF-024: also distinguish signed zero and all stored bytes.
+        for name, value in native_pools.items():
+            actual = value if isinstance(value, list) else [value]
+            expected_pools = replay_pools[name]
+            expected_values = expected_pools if isinstance(expected_pools, list) else [expected_pools]
+            for got, want in zip(actual, expected_values, strict=True):
+                assert torch.equal(got.contiguous().view(torch.uint8), want.contiguous().view(torch.uint8))
     if return_receipt:
         assert len(expected) > 1, "CUDA discriminator must emit labels before PARK"
         return {
@@ -3819,6 +3846,118 @@ def test_experimental_native_burst_transaction_matches_all_replayed_pools(
             "cuda_scatter_layouts_warmed": torch.device(device).type == "cuda",
         }
     return None
+
+
+@pytest.mark.parametrize("geometry,samples_count", [(0, 1280), (1, 2560), (2, 5120), (3, 8960), (4, 17920)])
+def test_outer_fusion_native_transaction_matches_independent_replay_all_pools(
+    monkeypatch, geometry, samples_count, native_device
+):
+    """@spec PORT-PERF-014, PORT-PERF-018, PORT-PERF-024, PORT-ADV-003, PORT-STATE-008, PORT-DEC-010, PORT-DEC-012.
+
+    The complete compatibility-drain oracle explicitly has no fusion binding.
+    CUDA fixture proves real fused calls; CPU fixture proves eager probe preservation.
+    """
+    from tests.model_executor.models.nemotron_asr.test_outer_tensor_fusion import (
+        CONSTANTS,
+        _fusion_module,
+        _symbol,
+    )
+
+    constants = dict(CONSTANTS, mel_tail_capacity=9)
+    binding = _symbol(_fusion_module(), "OuterTensorExecution")(constants=constants)
+    if native_device.type == "cuda":
+        binding.warmup(native_device)
+    before = binding.receipt()
+    test_experimental_native_burst_transaction_matches_all_replayed_pools(
+        device=str(native_device),
+        geometry=geometry,
+        samples_count=samples_count - 1,
+        outer_tensor_execution=binding,
+        endpoint_enabled=True,
+    )
+    after = binding.receipt()
+    for region in ("pre", "post"):
+        selected = "fused_calls" if native_device.type == "cuda" else "eager_calls"
+        assert after["dispatch"][region][selected] == before["dispatch"][region][selected] + 1
+        if native_device.type == "cuda":
+            assert after["dispatch"][region]["eager_calls"] == before["dispatch"][region]["eager_calls"]
+    assert after["frames"] == before["frames"]
+
+
+# Expected route is derived from each original f931 assertion body and transaction
+# ordering, never from whether this replay happened to observe a patched call.
+# Fields: case, args, uses_monkeypatch, expects_transaction, expected_pre, expected_post.
+_FUSION_BASELINE_CASES = [
+    *(
+        (test_corrupt_book_masks_safely, (value,), False, True, True, True)
+        for value in ("negative_head", "oversized_length", "bad_last_label")
+    ),
+    (test_nonnegative_corrupt_replay_counters_mask_without_store, (), False, True, True, True),
+    (test_replay_counter_sequence_must_match_geometry_cadence, (), False, True, True, True),
+    (test_transition_validation_preserves_incoming_status_bits, (), False, False, False, False),
+    (test_adapter_validation_preserves_incoming_status_bits, (), False, True, True, True),
+    *(
+        (test_malformed_adapter_decision_masks_without_store, (value,), False, True, True, True)
+        for value in ("nan", "fractional", "out_of_range", "tail_garbage", "echo_disagreement", "coherent_substitution")
+    ),
+    *(
+        (test_adapter_cannot_mutate_transaction_authority_in_place, (value,), False, True, True, True)
+        for value in ("clear_status", "flush_book", "replay_queue")
+    ),
+    *(
+        (test_adapter_proposed_book_defect_masks_without_store, (value,), False, True, True, True)
+        for value in ("negative_head", "armed_blank")
+    ),
+    *((test_gather_fresh_poison_is_never_read, (value,), True, False, False, False) for value in (False, True)),
+    (test_experimental_native_burst_failed_row_emits_only_park_without_state_change, (), False, False, False, False),
+    (test_adapter_chunk_burst_first_label_and_armed_echo, (), False, False, False, False),
+    (test_adapter_zero_burst_parks_without_echo, (), False, False, False, False),
+    # f931 pre predicates precede the bucket; malformed capture is rejected by
+    # _validated_result/_validate_result_structure before post-adapter predicates.
+    (test_capture_shape_mismatch_is_precommit_fatal, (), True, True, True, False),
+]
+
+
+@pytest.mark.parametrize(
+    "original_case,args,uses_monkeypatch,expects_transaction,expected_pre,expected_post",
+    [
+        pytest.param(fn, args, patch, transaction, pre, post, id=fn.__name__ + repr(args))
+        for fn, args, patch, transaction, pre, post in _FUSION_BASELINE_CASES
+    ],
+)
+def test_outer_fusion_replays_all_24_pre_extraction_oracles(
+    monkeypatch, original_case, args, uses_monkeypatch, expects_transaction, expected_pre, expected_post
+):
+    """@spec PORT-PERF-014, PORT-PERF-024, PORT-ADV-003, PORT-ADV-004, PORT-STATE-008.
+
+    Original known expectations are unchanged. Direct-helper cases have no
+    transaction dispatch; they do not acquire fabricated fusion coverage.
+    """
+    from tests.model_executor.models.nemotron_asr.test_outer_tensor_fusion import CONSTANTS, _fusion_module, _symbol
+
+    assert len(_FUSION_BASELINE_CASES) == 24
+    constants = dict(CONSTANTS, queue_capacity=CAP, carrier_width=CARRIER_HIDDEN, mel_tail_capacity=9)
+    binding = _symbol(_fusion_module(), "OuterTensorExecution")(constants=constants)
+    original = advance.advance_model_rows
+    transaction_calls = []
+
+    def selected(*values, **kwargs):
+        transaction_calls.append(True)
+        return original(*values, **dict(kwargs, outer_tensor_execution=binding))
+
+    monkeypatch.setattr(advance, "advance_model_rows", selected)
+    before = binding.receipt()
+    original_case(*args, **({"monkeypatch": monkeypatch} if uses_monkeypatch else {}))
+    after = binding.receipt()
+    assert bool(transaction_calls) == expects_transaction
+    assert after["frames"] == before["frames"]
+    for region, expected_hit in (("pre", expected_pre), ("post", expected_post)):
+        assert after["dispatch"][region]["fused_calls"] == before["dispatch"][region]["fused_calls"]
+        delta = after["dispatch"][region]["eager_calls"] - before["dispatch"][region]["eager_calls"]
+        if expected_hit:
+            assert delta > 0
+        else:
+            assert delta == 0
 
 
 @pytest.mark.parametrize("defect", ["blank", "declared-bound"])
@@ -4040,7 +4179,9 @@ def test_native_invalid_geometry_fails_without_resident_writes(geometry, native_
 
 
 @pytest.mark.parametrize("forced_eou", [False, True])
-def test_native_forced_eou_and_final_flush_match_all_compatibility_pools(forced_eou, native_device):
+def test_native_forced_eou_and_final_flush_match_all_compatibility_pools(
+    forced_eou, native_device, outer_tensor_execution=None
+):
     # @spec PORT-DEC-010, PORT-DEC-011, PORT-DEC-012
     from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
 
@@ -4077,6 +4218,11 @@ def test_native_forced_eou_and_final_flush_match_all_compatibility_pools(forced_
             park_id=PARK_ID,
             eou_token_id=eou,
             native_burst_handoff=handoff,
+            **(
+                {"outer_tensor_execution": outer_tensor_execution}
+                if handoff is not None and outer_tensor_execution is not None
+                else {}
+            ),
             **pools,
         )
 
@@ -4089,6 +4235,39 @@ def test_native_forced_eou_and_final_flush_match_all_compatibility_pools(forced_
     assert sink.payload.row_status.tolist() == [0]
     assert expected == ([eou, PARK_ID] if forced_eou else [PARK_ID])
     _assert_pools_equal(candidate, baseline)
+
+
+@pytest.mark.parametrize("forced_eou", [False, True])
+def test_outer_fusion_actual_native_controls_execute_zero_chunk_family(forced_eou, native_device):
+    """@spec PORT-PERF-018, PORT-PERF-024, PORT-PERF-025, PORT-DEC-010, PORT-DEC-012, PORT-STATE-008.
+
+    Execute real forced EOU/final FLUSH through the canonical transaction;
+    preparation counts and mocked provider calls cannot substitute for this.
+    """
+    from tests.model_executor.models.nemotron_asr.test_outer_tensor_fusion import (
+        CONSTANTS,
+        _fusion_module,
+        _symbol,
+    )
+
+    binding = _symbol(_fusion_module(), "OuterTensorExecution")(
+        constants=dict(CONSTANTS, mel_tail_capacity=9, eou_token_id=VOCAB + 3)
+    )
+    if native_device.type == "cuda":
+        binding.warmup(native_device)
+    before = binding.receipt()
+    test_native_forced_eou_and_final_flush_match_all_compatibility_pools(
+        forced_eou,
+        native_device,
+        outer_tensor_execution=binding,
+    )
+    after = binding.receipt()
+    for region in ("pre", "post"):
+        selected = "fused_calls" if native_device.type == "cuda" else "eager_calls"
+        assert after["dispatch"][region][selected] == before["dispatch"][region][selected] + 1
+        if native_device.type == "cuda":
+            assert after["dispatch"][region]["eager_calls"] == before["dispatch"][region]["eager_calls"]
+    assert after["frames"] == before["frames"]
 
 
 def test_native_mixed_geometry_chunk_and_flush_rows_preserve_order_and_inactive_pools(monkeypatch, native_device):
