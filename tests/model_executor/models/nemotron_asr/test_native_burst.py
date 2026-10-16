@@ -350,12 +350,17 @@ def _construct_model(monkeypatch, hf):
     from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as module
 
     core = torch.nn.Module()
+    from tests.model_executor.models.nemotron_asr.test_encoder_execution import _PreEncode
+
     core.encoder = torch.nn.Linear(2, 2)
+    core.encoder.pre_encode = _PreEncode()
     core.lid = torch.nn.Linear(2, 2)
+    core.lid.num_prompts = hf.num_prompts
     core.featurizer = torch.nn.Linear(2, 2)
     core.predictor = torch.nn.Linear(2, 2)
     core.joint = torch.nn.Linear(2, 2)
     core.blank_id = 13087
+    core.batch_invariant_mode = module.installed_batch_invariant_mode()
 
     def construct(*, policy, **kwargs):
         core.policy = policy
@@ -541,7 +546,7 @@ def test_native_constructor_rejects_non_fp32_actual_policy_even_with_fp32_hf(mon
 
 @pytest.mark.parametrize("profile", [None, FIVE_CADENCE_PROFILE])
 def test_chunk_graph_pilot_cannot_inherit_five_cadence_native_guard(monkeypatch, profile):
-    # @spec PORT-DEC-011, PORT-DEC-014, PORT-PERF-009
+    # @spec PORT-DEC-011, PORT-DEC-014, PORT-PERF-009, PORT-PERF-028
     from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph
 
     def unexpected_binding(*args, **kwargs):
@@ -556,12 +561,14 @@ def test_chunk_graph_pilot_cannot_inherit_five_cadence_native_guard(monkeypatch,
 
 @pytest.mark.parametrize("precision", [None, "float16"])
 def test_chunk_graph_pilot_keeps_160ms_compatibility_selection(monkeypatch, precision):
-    # @spec PORT-DEC-011, PORT-PERF-009: shared guard must not require native opt-in.
+    # @spec PORT-DEC-011, PORT-PERF-009, PORT-PERF-028: compatibility guard keeps native opt-out.
     from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph
 
     binding = object()
     monkeypatch.setattr(chunk_bucket_graph, "ExactChunkGraphBinding", lambda *args, **kwargs: binding)
     hf = _native_config(enabled=False, lookaheads=(1,), precision=precision)
+    hf.encoder_execution_arm = "eager-graphed"
+    hf.decode_dispatch_arm = "dense-graphed"
     hf.chunk_bucket_graph_populations = [1]
     model = _construct_model(monkeypatch, hf)
     assert model._native_burst_handoff is None
@@ -588,3 +595,85 @@ def test_five_cadence_model_accepts_real_stage_defaults_at_worker_admission(monk
     state.validate_omni_request(_request(effective))
     assert effective.max_tokens == model._native_burst_handoff.max_tokens == 142
     assert state.num_new_sampled_tokens_per_step == 1
+
+
+# Exact-cell CHUNK selection: exercise the existing model constructor, not a new API.
+def _exact_chunk_config():
+    hf = _native_config(profile=FIVE_CADENCE_PROFILE, lookaheads=LOOKAHEADS)
+    hf.encoder_execution_arm = "eager-graphed"
+    hf.decode_dispatch_arm = "dense-graphed"
+    return hf
+
+
+@pytest.mark.parametrize("cells", [[[0, 1]], ((0, 1),)])
+def test_exact_g0_chunk_selection_reserves_only_one_native_cell(monkeypatch, cells):
+    """@spec PORT-PERF-027, PORT-PERF-029, PORT-PERF-030."""
+    hf = _exact_chunk_config()
+    hf.experimental_chunk_bucket_graph_cells = cells
+    model = _construct_model(monkeypatch, hf)
+    assert model._chunk_bucket_binding is not None, "explicit g0 CHUNK selection was ignored"
+    assert model._encoder_execution._chunk_graph_cells == frozenset({(0, 1)})
+    assert model._decode_graph_binding._frame_widths == (1, 2, 4, 7, 14)
+    assert model._emission_selection == ("native_burst", FIVE_CADENCE_PROFILE)
+    hf.experimental_chunk_bucket_graph_cells = [[1, 1]]
+    assert model._chunk_bucket_binding._cells == frozenset({(0, 1)}), "selection was not frozen"
+
+
+@pytest.mark.parametrize("value", [0, False, "", {}, [[0]], [[False, 1]], [[0, 1], (0, 1)]])
+def test_exact_chunk_malformed_selection_rejected_before_core(monkeypatch, value):
+    """@spec PORT-PERF-027: falsey and canonical-value duplicates are not empty."""
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as module
+
+    hf = _exact_chunk_config()
+    hf.experimental_chunk_bucket_graph_cells = value
+    monkeypatch.setattr(module, "NemotronASRCore", lambda **kw: pytest.fail("invalid CHUNK selection reached core"))
+    with pytest.raises(ValueError):
+        module.NemotronASRForRNNT(vllm_config=_runtime_config(hf))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("experimental_chunk_bucket_graph_cells", [[1, 1]]),
+        ("chunk_bucket_graph_populations", [1]),
+        ("encoder_execution_arm", "eager"),
+        ("decode_dispatch_arm", "dense-eager"),
+        ("max_num_seqs", 2),
+    ],
+)
+def test_exact_chunk_incompatible_domain_rejected_before_core(monkeypatch, field, value):
+    """@spec PORT-PERF-027, PORT-PERF-029: no silent geometry/arm/population widening."""
+    from vllm_omni.model_executor.models.nemotron_asr import nemotron_asr as module
+
+    hf = _exact_chunk_config()
+    hf.experimental_chunk_bucket_graph_cells = [[0, 1]]
+    runtime = _runtime_config(hf)
+    setattr(runtime.scheduler_config if field == "max_num_seqs" else hf, field, value)
+    monkeypatch.setattr(module, "NemotronASRCore", lambda **kw: pytest.fail("unsupported CHUNK domain reached core"))
+    with pytest.raises(ValueError):
+        module.NemotronASRForRNNT(vllm_config=runtime)
+
+
+@pytest.mark.parametrize("empty", [[], (), None])
+def test_exact_chunk_empty_retains_native_split_inventory(monkeypatch, empty):
+    """@spec PORT-PERF-027, PORT-PERF-038: empty never materializes CHUNK authority."""
+    hf = _exact_chunk_config()
+    hf.experimental_chunk_bucket_graph_cells = empty
+    hf.chunk_bucket_graph_populations = empty
+    model = _construct_model(monkeypatch, hf)
+    assert model._chunk_bucket_binding is None
+    assert model._encoder_execution._chunk_graph_cells == frozenset()
+    assert model._encoder_execution._chunk_graph_entries == {}
+    baseline = _construct_model(monkeypatch, _exact_chunk_config())
+    assert model.execution_profile_receipt() == baseline.execution_profile_receipt()
+    assert "chunk" not in model.execution_profile_receipt()
+    assert model._decode_graph_binding._frame_widths == (1, 2, 4, 7, 14)
+    assert model._emission_selection == ("native_burst", FIVE_CADENCE_PROFILE)
+
+
+def test_exact_chunk_runtime_does_not_require_analysis_observer(monkeypatch):
+    """@spec PORT-PERF-029, PORT-PERF-033: scientific evidence is not engine admission."""
+    hf = _exact_chunk_config()
+    hf.experimental_chunk_bucket_graph_cells = [[0, 1]]
+    hf.experimental_chunk_graph_startup_attestation = False
+    assert _construct_model(monkeypatch, hf)._chunk_bucket_binding is not None

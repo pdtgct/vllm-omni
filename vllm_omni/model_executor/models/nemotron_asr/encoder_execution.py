@@ -715,12 +715,13 @@ class ResolvedEncoderExecution:
         return self._active_cell is not None
 
     def reserve_chunk_graph_cells(self, cells: frozenset[tuple[int, int]]) -> None:
-        """Partition the startup inventory before any model warmup or capture."""
+        """@spec PORT-PERF-030: partition before any model warmup or capture."""
         if self.arm != "eager-graphed" or self._sealed or self._warmup_signatures or self._chunk_graph_cells:
             raise ValueError("CHUNK ownership requires an untouched native encoder domain")
         expected = {(g, n) for g in self.warmup_geometries for n in self.warmup_populations}
-        if not cells or not cells <= expected or any(g != 1 or n not in (1, 31, 63) for g, n in cells):
-            raise ValueError("CHUNK pilot cells must be declared exact 160-ms populations 1/31/63")
+        admitted = cells == frozenset({(0, 1)}) or all(g == 1 and n in (1, 31, 63) for g, n in cells)
+        if not cells or not cells <= expected or not admitted:
+            raise ValueError("CHUNK cells must be declared 80-ms B1 or 160-ms populations 1/31/63")
         self._chunk_graph_cells = cells
 
     def publish_chunk_graphs(self, entries: dict[tuple[int, int], Any]) -> None:

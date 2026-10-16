@@ -145,13 +145,14 @@ class _Engine:
             block["dispatch"][region]["fused_calls"] += 1
 
 
-def _plan(provider, engine):
+def _plan(provider, engine, *, trailing_rounds=1, admission_policy="profile"):
     runtime = SimpleNamespace(
-        service_profile_trailing_rounds=1,
+        service_profile_trailing_rounds=trailing_rounds,
+        admission_policy=admission_policy,
         service_profile_derating_factor=0.5,
         priming_budget_descriptor=provider.build_priming_budget_descriptor(
             configured_population_ceiling=1,
-            trailing_rounds=1,
+            trailing_rounds=trailing_rounds,
         ),
     )
     inventory = {
@@ -209,7 +210,7 @@ def _bound_fakes(monkeypatch, engine, *, no_op=False, poison=None):
 
     monkeypatch.setattr(nemotron_session, "NemotronSessionLease", Bound)
     monkeypatch.setattr(session.NemotronRealtimeSession, "from_model_config", lambda *a, **kw: SimpleNamespace())
-    ticks = iter(range(100, 10000, 100))
+    ticks = iter(range(100, 100000, 100))
 
     def now():
         engine.events.append("clock")
@@ -364,11 +365,15 @@ async def test_final_boundary_rejects_worker_pid_change():
 
 
 @pytest.mark.asyncio
-async def test_default_off_round_preserves_exact_rpc_clock_and_cleanup_behavior(monkeypatch):
+@pytest.mark.parametrize("explicit_chunk_off", [False, True])
+async def test_default_off_round_preserves_exact_rpc_clock_and_cleanup_behavior(monkeypatch, explicit_chunk_off):
     """@spec PORT-PERF-012, PORT-PERF-025, PORT-PERF-005, PORT-PERF-007: no disabled-path evidence RPC."""
     events: list[str] = []
     provider = startup.NemotronPersistentStateStartupProvider()
     engine = _Engine(False, events)
+    if explicit_chunk_off:
+        engine.model_config.hf_config.experimental_chunk_bucket_graph_cells = []
+        engine.model_config.hf_config.experimental_chunk_graph_startup_attestation = False
     plan = _plan(provider, engine)
     context = await _boundary(provider, engine, plan, "before")
     assert context is None and events == []
@@ -566,3 +571,330 @@ async def test_shared_provider_contexts_are_engine_local_detached_and_worker_che
     assert repr(context_a) == frozen_a
     with pytest.raises((ValueError, RuntimeError)):
         await _boundary(provider, first, plan_a, "after", context_a)
+
+
+CHUNK_LOG_PREFIX = "Nemotron CHUNK startup attestation "
+
+
+def _chunk_engine(*, selected=True, observe=True):
+    engine = _Engine(False, [])
+    hf = engine.model_config.hf_config
+    hf.experimental_chunk_bucket_graph_cells = [[0, 1]] if selected else []
+    hf.experimental_chunk_graph_startup_attestation = observe
+    domain = [[g, 1] for g in range(5)]
+    engine.receipt.pop("outer_tensor_fusion")
+    engine.receipt["encoder"].update(
+        warmup_geometries=list(range(5)),
+        warmup_populations=[1],
+        warmup_cells=deepcopy(domain),
+        captured_keys=deepcopy(domain[1:] if selected else domain),
+    )
+    if selected:
+        engine.receipt["encoder"].update(chunk_graph_keys=[[0, 1]], reserved_chunk_graph_keys=[[0, 1]])
+        engine.receipt["chunk"] = {
+            "ready": True,
+            "worker_pid": engine.pid,
+            "instance_id": "42:12345",
+            "source_sha256": {
+                name: "a" * 64
+                for name in (
+                    "advance.py",
+                    "encoder.py",
+                    "encoder_execution.py",
+                    "decode_graph.py",
+                    "rnnt.py",
+                    "chunk_bucket_graph.py",
+                    "nemotron_asr.py",
+                    "profile_execution.py",
+                )
+            },
+            "cells": [{"geometry": 0, "encoder_population": 1, "decoder_tier": 1, "successful_replays": 7}],
+            "fallbacks": [],
+        }
+
+    def execute():
+        if selected:
+            engine.receipt["chunk"]["cells"][0]["successful_replays"] += 1
+
+    setattr(engine, "execute", execute)
+    return engine
+
+
+def _chunk_log_data(caplog):
+    import hashlib
+    import json
+
+    messages = [r.getMessage() for r in caplog.records if r.getMessage().startswith(CHUNK_LOG_PREFIX)]
+    assert len(messages) == 1, "requested three-sample CHUNK attestation log is missing or duplicated"
+    envelope = json.loads(messages[0][len(CHUNK_LOG_PREFIX) :])
+    data = envelope["data"]
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+    assert envelope["data_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert len(raw) <= 131072
+    return data
+
+
+@pytest.mark.parametrize("value", [None, 0, "", [], {}])
+def test_chunk_analysis_present_nonboolean_rejected_during_plan_build(value):
+    """@spec PORT-PERF-033: malformed falsey flags cannot quietly disable observation."""
+    engine = _chunk_engine(observe=value)
+    with pytest.raises(ValueError, match="(?i)boolean"):
+        _plan(startup.NemotronPersistentStateStartupProvider(), engine, trailing_rounds=3)
+
+
+@pytest.mark.parametrize("trailing_rounds", [1, 2, 4])
+def test_chunk_analysis_requires_exact_three_round_roster_at_plan_build(trailing_rounds):
+    """@spec PORT-PERF-033, PORT-PERF-034: no vacuous zero/short witness."""
+    with pytest.raises(ValueError, match="(?i)three|3|trailing|roster"):
+        _plan(startup.NemotronPersistentStateStartupProvider(), _chunk_engine(), trailing_rounds=trailing_rounds)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("supported_num_lookahead_tokens", [1]),
+        ("experimental_chunk_bucket_graph_cells", [[1, 1]]),
+    ],
+)
+def test_chunk_analysis_rejects_wrong_domain_at_plan_build(field, value):
+    """@spec PORT-PERF-033: analysis checks happen at provider plan construction."""
+    engine = _chunk_engine()
+    setattr(engine.model_config.hf_config, field, value)
+    with pytest.raises(ValueError, match="(?i)chunk|attestation|geometry|lookahead|native"):
+        _plan(startup.NemotronPersistentStateStartupProvider(), engine, trailing_rounds=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("admission_policy", ["profile", "hard_cap"])
+async def test_chunk_analysis_brackets_only_final_three_and_emits_canonical_owned_log(
+    monkeypatch, caplog, selected, admission_policy
+):
+    """@spec PORT-PERF-033, PORT-PERF-034, PORT-PERF-035: exact sample witness, not setup credit."""
+    import hashlib
+    import json
+
+    caplog.set_level("INFO")
+    import os
+
+    from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import installed_batch_invariant_mode
+
+    provider, engine = startup.NemotronPersistentStateStartupProvider(), _chunk_engine(selected=selected)
+    plan = _plan(provider, engine, trailing_rounds=3, admission_policy=admission_policy)
+    # Derive expectations from independently supplied config/plan inputs before mutation,
+    # never from a worker receipt or the finalized witness. hard_cap is observable even
+    # though the separate experimental harness must reject it for the support gate.
+    hf = engine.model_config.hf_config
+    expected_config = {
+        "geometry_cells": [list(cell) for cell in sorted({(r.geometry_id, r.active_population) for r in plan.rounds})],
+        "chunk_cells": deepcopy(hf.experimental_chunk_bucket_graph_cells),
+        "encoder_arm": hf.encoder_execution_arm,
+        "decode_arm": hf.decode_dispatch_arm,
+        "dtype": str(engine.model_config.dtype).removeprefix("torch."),
+        "batch_invariant_mode": "on" if installed_batch_invariant_mode().enabled else "off",
+        "emission_lane": "native_burst" if hf.experimental_native_burst else "compatibility_replay",
+        "emission_profile": hf.experimental_native_burst_profile,
+        "max_num_seqs": plan.compile_kwargs["max_population"],
+        "admission_policy": admission_policy,
+        "derating_numerator": plan.compile_kwargs["derating_factor"].numerator,
+        "derating_denominator": plan.compile_kwargs["derating_factor"].denominator,
+        "trailing_rounds": plan.compile_kwargs["trailing_rounds"],
+    }
+    expected_api_pid, expected_worker_pid = os.getpid(), engine.pid
+    before_identity = (plan.actual_plan_sha256, plan.actual_operation_count, deepcopy(plan.compile_kwargs))
+    context = await _boundary(provider, engine, plan, "before")
+    _bound_fakes(monkeypatch, engine)
+    from vllm_omni.model_executor.models.nemotron_asr import profiling
+
+    monkeypatch.setattr(profiling, "start_startup_round", lambda _: engine.events.append("range-start"))
+    monkeypatch.setattr(profiling, "end_startup_round", lambda _: engine.events.append("range-end"))
+    expected = []
+    # Frozen plan controls observation even if the HF config is changed afterward.
+    engine.model_config.hf_config.experimental_chunk_graph_startup_attestation = False
+    for ordinal, spec in enumerate(plan.rounds):
+        start = len(engine.events)
+        result = await provider.execute_priming_round(
+            engine_client=engine,
+            round_spec=spec,
+            leases=_leases(),
+            boundary_context=context,
+        )
+        events = engine.events[start:]
+        measured = spec.geometry_id == 0 and spec.scenario_id == "ordinary" and spec.post_jit
+        if measured:
+            assert events.count("rpc") == 2, "timed g0 sample lacks its own BEFORE/AFTER pair"
+            assert events.index("rpc") < events.index("range-start")
+            assert (
+                events.index("range-end")
+                < max(i for i, event in enumerate(events) if event == "rpc")
+                < events.index("abort")
+            )
+            assert "rpc" not in events[events.index("range-start") : events.index("range-end")]
+            assert result.elapsed_ns == 100, "observer time leaked into U"
+            expected.append((ordinal, spec.round_id, result.elapsed_ns))
+        else:
+            assert events.count("rpc") == 0, "leading/canary/other geometry was needlessly observed"
+    await _boundary(provider, engine, plan, "after", context)
+    assert (plan.actual_plan_sha256, plan.actual_operation_count, plan.compile_kwargs) == before_identity
+    assert "chunk_graph_attestation" not in plan.compile_kwargs["startup_priming_receipt"]
+    data = _chunk_log_data(caplog)
+    assert data["schema"] == "nemotron-chunk-startup-attestation/1"
+    assert data["expected"] == expected_config
+    assert data["api_pid"] == expected_api_pid
+    assert data["worker_pid"] == expected_worker_pid == engine.pid
+    assert data["verdict"] == "PASS"
+    assert data["plan_sha256"] == plan.actual_plan_sha256
+    assert [(r["plan_ordinal"], r["round_id"], r["elapsed_ns"]) for r in data["samples"]] == expected
+    assert len(expected) == 3
+    identity_keys = (
+        "plan_ordinal",
+        "round_id",
+        "geometry_id",
+        "tier_id",
+        "active_population",
+        "scenario_id",
+        "post_jit",
+        "repeat",
+    )
+    roster = [{key: record[key] for key in identity_keys} for record in data["samples"]]
+    assert (
+        data["roster_sha256"]
+        == hashlib.sha256(
+            json.dumps(
+                roster,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    for record in data["samples"]:
+        assert record["completed_legal_parks"] == 1
+        assert (
+            record["before_response_ns"]
+            <= record["timer_start_ns"]
+            <= record["timer_end_ns"]
+            <= record["after_request_ns"]
+        )
+        assert record["elapsed_ns"] == record["timer_end_ns"] - record["timer_start_ns"]
+        before = record["before"][0][0]["execution_profile"]
+        after = record["after"][0][0]["execution_profile"]
+        if selected:
+            assert after["chunk"]["cells"][0]["successful_replays"] > before["chunk"]["cells"][0]["successful_replays"]
+        else:
+            assert "chunk" not in before and "chunk" not in after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect", ["no-replay", "fallback", "changed-instance", "nonfinite", "oversized", "inventory", "source"]
+)
+async def test_chunk_analysis_invalid_interval_fails_startup_with_cleanup(monkeypatch, caplog, defect):
+    """@spec PORT-PERF-034, PORT-PERF-035: provider enforces, not merely reports invalid evidence."""
+    provider, engine = startup.NemotronPersistentStateStartupProvider(), _chunk_engine()
+    plan = _plan(provider, engine, trailing_rounds=3)
+    context = await _boundary(provider, engine, plan, "before")
+    original = engine.execute
+
+    def execute():
+        if defect != "no-replay":
+            original()
+        block = engine.receipt["chunk"]
+        if defect == "fallback":
+            block["fallbacks"] = [{"geometry": 0, "encoder_population": 1, "successful_calls": 1}]
+        elif defect == "changed-instance":
+            block["instance_id"] = "foreign-instance"
+        elif defect == "inventory":
+            engine.receipt["encoder"]["captured_keys"].append([0, 1])
+        elif defect == "source":
+            block["source_sha256"]["chunk_bucket_graph.py"] = "b" * 64
+        elif defect in {"nonfinite", "oversized"}:
+            engine.receipt["encoder"]["memory_diagnostics"] = [
+                {
+                    "stage": "x" * 17000 if defect == "oversized" else "after-capture",
+                    "allocated_bytes": 0 if defect == "oversized" else float("nan"),
+                }
+            ]
+
+    engine.execute = execute
+    _bound_fakes(monkeypatch, engine)
+    spec = next(s for s in plan.rounds if s.geometry_id == 0 and s.scenario_id == "ordinary" and s.post_jit)
+    with pytest.raises((ValueError, RuntimeError)):
+        await provider.execute_priming_round(
+            engine_client=engine, round_spec=spec, leases=_leases(), boundary_context=context
+        )
+    assert "abort" in engine.events
+    assert not any(r.getMessage().startswith(CHUNK_LOG_PREFIX) for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_chunk_analysis_execution_error_keeps_primary_and_skips_after(monkeypatch):
+    """@spec PORT-PERF-034: the failed operation cannot mint replay or be masked by readback."""
+    provider, engine = startup.NemotronPersistentStateStartupProvider(), _chunk_engine()
+    plan = _plan(provider, engine, trailing_rounds=3)
+    context = await _boundary(provider, engine, plan, "before")
+    primary = RuntimeError("primary model failure")
+
+    def execute():
+        engine.fail_read = True  # an accidental AFTER would obscure the primary error
+        raise primary
+
+    engine.execute = execute
+    _bound_fakes(monkeypatch, engine)
+    spec = next(s for s in plan.rounds if s.geometry_id == 0 and s.scenario_id == "ordinary" and s.post_jit)
+    start = len(engine.events)
+    with pytest.raises(RuntimeError, match="primary model failure") as caught:
+        await provider.execute_priming_round(
+            engine_client=engine, round_spec=spec, leases=_leases(), boundary_context=context
+        )
+    assert caught.value is primary
+    events = engine.events[start:]
+    assert events.count("rpc") == 1 and events[-1] == "abort"
+
+
+def test_chunk_analysis_plan_samples_compile_to_exact_maximum_without_receipt_join():
+    """@spec PORT-PERF-037: actual provider plan -> converter -> real compiler, source/test linkage only."""
+    from tests.engine.persistent_state_helpers import canary_timing_kwargs
+    from vllm_omni.engine.persistent_state_capacity import compile_provisional_service_profile
+    from vllm_omni.engine.persistent_state_priming import ServicePrimingObservation
+    from vllm_omni.engine.persistent_state_startup import _service_executions
+
+    provider = startup.NemotronPersistentStateStartupProvider()
+    plan = _plan(provider, _chunk_engine(observe=False), trailing_rounds=3)
+    independent_plan = _plan(provider, _chunk_engine(observe=False), trailing_rounds=3)
+    assert independent_plan.actual_plan_sha256 == plan.actual_plan_sha256
+    assert independent_plan.rounds == plan.rounds
+    observations = []
+    selected = []
+    for ordinal, spec in enumerate(plan.rounds):
+        repeat = int(spec.round_id.rsplit("-", 1)[1])
+        elapsed = (9999, 17, 31, 23)[repeat] if spec.scenario_id == "ordinary" else 10
+        observations.append(
+            ServicePrimingObservation(
+                round_id=spec.round_id,
+                service_interval_ms=spec.service_interval_ms,
+                geometry_id=spec.geometry_id,
+                active_population=spec.active_population,
+                elapsed_ns=elapsed,
+                completed_legal_parks=spec.expected_legal_parks_per_lease,
+                completed_model_rows=None,
+                tier_id=spec.tier_id,
+                post_jit=spec.post_jit,
+                scenario_id=spec.scenario_id,
+                **canary_timing_kwargs(spec.scenario_id, interval_ms=spec.service_interval_ms),
+            )
+        )
+        if spec.geometry_id == 0 and spec.scenario_id == "ordinary" and spec.post_jit:
+            selected.append((ordinal, repeat, elapsed))
+    assert selected == [(1, 1, 17), (2, 2, 31), (3, 3, 23)]
+    converted = _service_executions(observations)
+    assert [sample.elapsed_ns for sample in converted] == [sample.elapsed_ns for sample in observations]
+    result = compile_provisional_service_profile(converted, admission_policy="profile", **plan.compile_kwargs)
+    assert result.upper_duration_ns_by_geometry_and_population[0] == (max(x[2] for x in selected),)
+    assert result.receipt.fragmentation_duration_ns_by_geometry_and_population[0] == (31,)
+    assert result.receipt.control_charge_status == "proven_zero"
+    assert result.receipt.derating_factor.numerator == 1
+    assert result.receipt.derating_factor.denominator == 2
+    assert result.receipt.count_cap == 1
+    assert result.service_interval_ms_by_geometry[0] == 80

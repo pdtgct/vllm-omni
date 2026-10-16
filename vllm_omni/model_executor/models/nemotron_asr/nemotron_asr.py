@@ -360,6 +360,39 @@ class NemotronASRForRNNT(nn.Module):
                 raise ValueError("native burst requires the actual FP32_BRINGUP precision policy")
             native_profile = validate_native_burst_config(vllm_config, hf_config=hf_config, profile=native_profile)
             self._emission_selection = ("native_burst", native_profile)
+        # @spec PORT-PERF-027, PORT-PERF-028, PORT-PERF-029
+        from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import chunk_graph_selection
+
+        chunk_populations, chunk_cells = chunk_graph_selection(hf_config)
+        if chunk_populations or chunk_cells:
+            from vllm_omni.model_executor.models.nemotron_asr.batch_invariance import installed_batch_invariant_mode
+            from vllm_omni.model_executor.models.nemotron_asr.native_burst import (
+                NATIVE_BURST_FIVE_CADENCE_PROFILE,
+                validate_native_burst_config,
+            )
+
+            if (
+                getattr(hf_config, "encoder_execution_arm", None) != "eager-graphed"
+                or getattr(hf_config, "decode_dispatch_arm", None) != "dense-graphed"
+            ):
+                raise ValueError("CHUNK selection requires eager-graphed encoder and dense-graphed decoder")
+            if chunk_cells:
+                if (
+                    chunk_cells != frozenset({(0, 1)})
+                    or policy is not FP32_BRINGUP
+                    or vllm_config.model_config.dtype != torch.float32
+                    or vllm_config.scheduler_config.max_num_seqs != 1
+                    or installed_batch_invariant_mode().enabled
+                    or fusion_enabled
+                    or not native_burst_enabled
+                    or native_profile != NATIVE_BURST_FIVE_CADENCE_PROFILE
+                ):
+                    raise ValueError("exact CHUNK selection requires native-five FP32 BI-off cap1 geometry0")
+                validate_native_burst_config(vllm_config, hf_config=hf_config, profile=native_profile)
+            else:
+                if native_burst_enabled or any(n not in (1, 31, 63) for n in chunk_populations):
+                    raise ValueError("legacy CHUNK selection requires compatibility emission and populations 1/31/63")
+                validate_native_burst_config(vllm_config, hf_config=hf_config)
         from vllm_omni.model_executor.models.nemotron_asr.configuration_nemotron_asr import (
             ensure_prompt_dictionary,
             validate_prompt_dictionary,
@@ -491,21 +524,16 @@ class NemotronASRForRNNT(nn.Module):
             graph_binding=self._decode_graph_binding,
         )
         self._chunk_bucket_binding = None
-        chunk_populations = getattr(hf_config, "chunk_bucket_graph_populations", ())
-        if not isinstance(chunk_populations, (tuple, list)):
-            raise ValueError("chunk_bucket_graph_populations must be a sequence")
-        if chunk_populations:
+        if chunk_populations or chunk_cells:
             from vllm_omni.model_executor.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
-            from vllm_omni.model_executor.models.nemotron_asr.native_burst import validate_native_burst_config
 
-            # Reuse the existing initial-profile configuration guard only.
-            # This does not enable native burst; shared decoder scratch requires
-            # synchronous, non-speculative single-device worker execution.
-            if native_burst_enabled:
-                raise ValueError("CHUNK serving pilot requires native burst disabled")
-            validate_native_burst_config(vllm_config, hf_config=hf_config)
             self._chunk_bucket_binding = ExactChunkGraphBinding(
-                self.core, hf_config, self._encoder_execution, self._decode_graph_binding, chunk_populations
+                self.core,
+                hf_config,
+                self._encoder_execution,
+                self._decode_graph_binding,
+                chunk_populations,
+                cells=chunk_cells,
             )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
@@ -589,12 +617,15 @@ class NemotronASRForRNNT(nn.Module):
             raise ValueError(f"LID weights absent ({lid_missing}); conditioned transcription never degrades silently")
         if missing:
             raise ValueError(f"{len(missing)} expected weights not provided, e.g. {sorted(missing)[:3]}")
-        # @spec PORT-PERF-013: attest actual loaded destinations, including
+        # @spec PORT-PERF-013, PORT-PERF-029: attest actual loaded destinations, including
         # floating model buffers outside the checkpoint's core subtree.
-        if getattr(self, "_outer_tensor_execution", None) is not None:
+        chunk = getattr(self, "_chunk_bucket_binding", None)
+        if getattr(self, "_outer_tensor_execution", None) is not None or (
+            chunk is not None and chunk._cells == frozenset({(0, 1)})
+        ):
             for name, tensor in (*self.named_parameters(), *self.named_buffers()):
                 if tensor.is_floating_point() and tensor.dtype != torch.float32:
-                    raise ValueError(f"outer tensor fusion requires FP32 loaded storage: {name}/{tensor.dtype}")
+                    raise ValueError(f"native graph composition requires FP32 loaded storage: {name}/{tensor.dtype}")
         return {f"core.{name}" for name in consumed}
 
     @staticmethod
