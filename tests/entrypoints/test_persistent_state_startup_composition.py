@@ -133,7 +133,7 @@ async def test_optional_provider_boundaries_cover_actual_release_and_whole_plan_
             expected = ["before", *expected[:-1], "after", "seal"]
         assert events == expected
     else:
-        with pytest.raises((RuntimeError, TimeoutError)) as caught:
+        with pytest.raises((RuntimeError, asyncio.TimeoutError)) as caught:
             await module.prepare_persistent_state_service(**kwargs)
         if mode == "body-error":
             assert caught.value is body_error
