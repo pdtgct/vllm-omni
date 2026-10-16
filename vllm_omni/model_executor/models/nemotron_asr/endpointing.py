@@ -235,6 +235,7 @@ def apply_forced_eou_tensors(
     return ForcedTensorEndpointTransition(book=next_book, is_eou=emit)
 
 
+# @spec PORT-PERF-026
 def _count_silent_before_pivot(
     *,
     history: torch.Tensor,
@@ -245,18 +246,22 @@ def _count_silent_before_pivot(
 ) -> torch.Tensor:
     """Count consecutive blanks before the newest pivot without host readback."""
     rows, capacity = history.shape
-    silent = torch.zeros(rows, dtype=torch.long, device=history.device)
-    still_silent = torch.ones(rows, dtype=torch.bool, device=history.device)
-    # Offset one is the pivot itself. The reference starts at pivot-1.
-    for offset in range(2, capacity + 1):
-        within = offset <= torch.minimum(length, active_window)
-        index = (head - offset) % capacity
-        symbol = history.gather(1, index.unsqueeze(1)).squeeze(1)
-        blank = symbol == int(FrameSymbol.BLANK)
-        count = enabled & within & still_silent & blank
-        silent += count.long()
-        still_silent &= ~within | blank
-    return silent
+    if capacity == 1:
+        return torch.zeros(rows, dtype=torch.long, device=history.device)
+    # Offset one is the pivot itself. Signed subtraction precedes floor-mod.
+    offsets = torch.arange(2, capacity + 1, dtype=torch.long, device=history.device)
+    indices = (head.unsqueeze(1) - offsets) % capacity
+    symbols = history.gather(1, indices)
+    limit = torch.minimum(length, active_window)
+    within = offsets <= limit.unsqueeze(1)
+    first_nonblank = torch.where(
+        within & (symbols != int(FrameSymbol.BLANK)),
+        offsets,
+        capacity + 1,
+    ).amin(dim=1)
+    # Clamp before subtracting: a malformed int64-min window must stay empty.
+    silent = (torch.minimum(limit.clamp(min=0, max=capacity), first_nonblank - 1) - 1).clamp(min=0)
+    return torch.where(enabled, silent, torch.zeros_like(silent))
 
 
 # @spec PORT-SEG-002, PORT-SEG-003, PORT-SEG-007
