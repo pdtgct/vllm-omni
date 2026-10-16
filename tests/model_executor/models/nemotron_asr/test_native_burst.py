@@ -546,7 +546,7 @@ def test_native_constructor_rejects_non_fp32_actual_policy_even_with_fp32_hf(mon
 
 @pytest.mark.parametrize("profile", [None, FIVE_CADENCE_PROFILE])
 def test_chunk_graph_pilot_cannot_inherit_five_cadence_native_guard(monkeypatch, profile):
-    # @spec PORT-DEC-011, PORT-DEC-014, PORT-PERF-009
+    # @spec PORT-DEC-011, PORT-DEC-014, PORT-PERF-009, PORT-PERF-028
     from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph
 
     def unexpected_binding(*args, **kwargs):
@@ -561,12 +561,14 @@ def test_chunk_graph_pilot_cannot_inherit_five_cadence_native_guard(monkeypatch,
 
 @pytest.mark.parametrize("precision", [None, "float16"])
 def test_chunk_graph_pilot_keeps_160ms_compatibility_selection(monkeypatch, precision):
-    # @spec PORT-DEC-011, PORT-PERF-009: shared guard must not require native opt-in.
+    # @spec PORT-DEC-011, PORT-PERF-009, PORT-PERF-028: compatibility guard keeps native opt-out.
     from vllm_omni.model_executor.models.nemotron_asr import chunk_bucket_graph
 
     binding = object()
     monkeypatch.setattr(chunk_bucket_graph, "ExactChunkGraphBinding", lambda *args, **kwargs: binding)
     hf = _native_config(enabled=False, lookaheads=(1,), precision=precision)
+    hf.encoder_execution_arm = "eager-graphed"
+    hf.decode_dispatch_arm = "dense-graphed"
     hf.chunk_bucket_graph_populations = [1]
     model = _construct_model(monkeypatch, hf)
     assert model._native_burst_handoff is None
