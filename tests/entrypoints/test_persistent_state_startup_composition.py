@@ -17,6 +17,137 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _STARTUP_MODULE = "vllm_omni.engine.persistent_state_startup"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["absent", "pass", "before-error", "after-error", "before-timeout", "after-timeout", "body-error"]
+)
+async def test_optional_provider_boundaries_cover_actual_release_and_whole_plan_timeout(monkeypatch, mode):
+    """@spec PORT-PERF-025, PORT-PERF-005, PORT-STATE-008: opaque optional hook only.
+
+    Uses the real reserve/execute/release primitive. No fusion semantics enter
+    this generic lifecycle test, and absent-hook providers preserve their route.
+    """
+    module = _startup_module()
+    events = []
+    runtime = _runtime()
+    runtime.startup_priming_timeout_s = 0.02 if "timeout" in mode else 1.0
+    body_error = RuntimeError("primary model execution failed")
+    snapshot_error = RuntimeError("boundary receipt failed")
+    spec = SimpleNamespace(
+        round_id="round-0",
+        service_interval_ms=80,
+        geometry_id=0,
+        active_population=1,
+        schema_id="schema-a",
+        profile_id="profile-a",
+        tier_id="single",
+        post_jit=False,
+        continuously_loaded=True,
+        scenario_id="ordinary",
+        expected_legal_parks_per_lease=1,
+    )
+    plan = SimpleNamespace(rounds=(spec,), compile_kwargs={}, served_intervals_ms=(80,))
+    profile = SimpleNamespace(compiled_demand=SimpleNamespace(intervals_ms=(80,)))
+
+    class Provider:
+        def build_priming_plan(self, **kwargs):
+            return plan
+
+        async def execute_priming_round(self, **kwargs):
+            events.append("execute")
+            if mode == "absent":
+                assert "boundary_context" not in kwargs
+            else:
+                assert kwargs.get("boundary_context") is opaque_context
+            if mode == "body-error":
+                raise body_error
+            return SimpleNamespace(
+                completed_legal_parks=1,
+                elapsed_ns=100,
+                completed_model_rows=1,
+                dummy_run=False,
+                is_profile=False,
+            )
+
+    provider = Provider()
+    boundary_calls = 0
+    opaque_context = ("epoch-a", ("worker-42", "sealed-profile"))
+
+    async def boundary(**kwargs):
+        nonlocal boundary_calls
+        boundary_calls += 1
+        side = "before" if boundary_calls == 1 else "after"
+        assert kwargs["plan"] is plan
+        if side == "after":
+            assert kwargs.get("boundary_context") is opaque_context
+        events.append(side)
+        if mode == f"{side}-timeout":
+            await asyncio.Event().wait()
+        if mode == f"{side}-error" or (mode == "body-error" and side == "after"):
+            raise snapshot_error
+        return opaque_context
+
+    if mode != "absent":
+        setattr(provider, "validate_priming_boundary", boundary)
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            self.ready = False
+
+        async def bootstrap_handshake(self):
+            return _startup_inventory()
+
+        def configure_bootstrap_intervals(self, intervals):
+            assert intervals == (80,)
+
+        async def reserve_for_priming(self, **kwargs):
+            events.append("reserve")
+            return object()
+
+        async def release(self, **kwargs):
+            await asyncio.sleep(0)
+            events.append("released")
+
+        def seal_startup_profile(self, **kwargs):
+            events.append("seal")
+            self.ready = True
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    monkeypatch.setattr(module, "PersistentStateService", Service)
+    monkeypatch.setattr(module, "compile_provisional_service_profile", lambda *a, **kw: profile)
+    monkeypatch.setattr(module, "derive_admission_controller_config", lambda *a, **kw: object())
+    kwargs = dict(
+        engine_client=SimpleNamespace(model_config=object()),
+        stage_client=None,
+        runtime_config=runtime,
+        startup_provider=provider,
+        host_fatal_callback=lambda _: None,
+    )
+    if mode in {"absent", "pass"}:
+        result = await module.prepare_persistent_state_service(**kwargs)
+        assert result.ready
+        expected = ["reserve", "execute", "released", "seal"]
+        if mode == "pass":
+            expected = ["before", *expected[:-1], "after", "seal"]
+        assert events == expected
+    else:
+        with pytest.raises((RuntimeError, TimeoutError)) as caught:
+            await module.prepare_persistent_state_service(**kwargs)
+        if mode == "body-error":
+            assert caught.value is body_error
+        elif "error" in mode:
+            assert caught.value is snapshot_error
+        assert events[-1] == "shutdown" and "seal" not in events
+        if mode.startswith("before-"):
+            assert "reserve" not in events
+        else:
+            assert events.index("released") > events.index("execute")
+            if "after" in events:
+                assert events.index("after") > events.index("released")
+
+
 def _startup_inventory() -> dict[str, Any]:
     return {
         "configured_limit": 4,

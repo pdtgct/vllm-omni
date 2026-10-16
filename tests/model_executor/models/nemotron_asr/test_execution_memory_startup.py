@@ -201,3 +201,66 @@ def test_runner_propagates_inventory_failure(monkeypatch):
     runner.model = SimpleNamespace(prepare_execution_memory=fail)
     with pytest.raises(RuntimeError, match="inventory failed"):
         runner.profile_run()
+
+
+def _fusion_inventory_model(monkeypatch, *, failure=None):
+    model, events, execution, decoder = _model(monkeypatch)
+    fusion = SimpleNamespace(ready=False, sealed=False, warmup_calls=0)
+    fusion.receipt = lambda: {"ready": fusion.ready, "sealed": fusion.sealed}
+    object.__setattr__(model, "_outer_tensor_execution", fusion)
+
+    def warm_outer(value, *, device):
+        assert value is model and device.type == "cpu"
+        assert events == ["encoder", "decoder"]
+        assert torch.is_inference_mode_enabled()
+        fusion.warmup_calls += 1
+        events.append("outer-preparation-and-real-profile-coverage")
+        if failure == "warmup":
+            raise RuntimeError("outer compilation failed")
+        if failure == "coverage":
+            raise RuntimeError("outer canonical coverage incomplete")
+        fusion.ready = True
+        fusion.sealed = True
+
+    monkeypatch.setattr(profile, "warmup_outer_tensor_execution", warm_outer, raising=False)
+    original_profile = profile.run_persistent_state_profile
+
+    def final_profile(*args, **kwargs):
+        assert fusion.ready and fusion.sealed, "final memory profile preceded fusion inventory"
+        return original_profile(*args, **kwargs)
+
+    monkeypatch.setattr(profile, "run_persistent_state_profile", final_profile)
+    return model, events, fusion
+
+
+def test_outer_inventory_precedes_final_coexistence_profile_and_does_not_reprepare(monkeypatch):
+    """@spec PORT-PERF-018, PORT-PERF-020, PORT-STATE-003: model lifecycle, not CPU compiler proof."""
+    model, events, fusion = _fusion_inventory_model(monkeypatch)
+    model.prepare_execution_memory()
+    assert events == ["encoder", "decoder", "outer-preparation-and-real-profile-coverage", "final-profile"]
+    model.config.experimental_outer_tensor_fusion = False
+    model.prepare_execution_memory()
+    assert fusion.warmup_calls == 1
+    assert model._outer_tensor_execution is fusion
+
+
+@pytest.mark.parametrize("failure", ["warmup", "coverage"])
+def test_outer_preparation_failure_latches_no_retry_or_resident_access(monkeypatch, failure):
+    """@spec PORT-PERF-019, PORT-PERF-020, PORT-STATE-003: failed preparation requires fresh worker."""
+    model, events, fusion = _fusion_inventory_model(monkeypatch, failure=failure)
+    with pytest.raises(RuntimeError, match="outer"):
+        model.prepare_execution_memory()
+    assert model._execution_memory_failed and not model._execution_memory_prepared
+    before = list(events)
+    for attempt in (model.prepare_execution_memory, model.warmup_resident_state):
+        with pytest.raises(RuntimeError, match="failed|prepared"):
+            attempt()
+    assert events == before and fusion.warmup_calls == 1
+
+
+def test_outer_inventory_cannot_hide_behind_decoder_early_return(monkeypatch):
+    """@spec PORT-PERF-018: every execution inventory gates readiness."""
+    model, _, _, _ = _model(monkeypatch, graphs=False)
+    object.__setattr__(model, "_outer_tensor_execution", SimpleNamespace(ready=False))
+    with pytest.raises(RuntimeError, match="outer|fusion|inventory"):
+        model._require_execution_inventory_ready()

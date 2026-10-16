@@ -139,10 +139,12 @@ def test_profile_invocation_accepts_one_exact_geometry() -> None:
     assert invocation.inputs_embeds[:, valid_index].tolist() == [2_560.0, 2_560.0]
 
 
+@pytest.mark.parametrize("ready_domain", [False, True])
 def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     monkeypatch: pytest.MonkeyPatch,
+    ready_domain: bool,
 ) -> None:
-    # @spec PORT-ADV-001 / PORT-MIG-003 / PORT-MIG-005
+    # @spec PORT-ADV-001 / PORT-MIG-003 / PORT-MIG-005 / PORT-PERF-018
     profile = _profile_module()
     invocation = SimpleNamespace(
         input_ids=torch.zeros(2, dtype=torch.long),
@@ -191,11 +193,14 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
         lambda: events.append(("drain", None)),
     )
     model = _no_state_model()
+    fusion = SimpleNamespace(ready=True, sealed=True)
+    object.__setattr__(model, "_outer_tensor_execution", fusion)
 
     profile.run_persistent_state_profile(
         model,
         num_rows=2,
         device=torch.device("cuda"),
+        ready_domain=ready_domain,
     )
 
     assert [name for name, _ in events] == ["log", "build", "warmup", "advance", "drain"]
@@ -217,6 +222,103 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     assert advance_kwargs["commit_sink"] is None
     assert advance_kwargs["decode_resolver"] is model._decode_resolver
     assert advance_kwargs["encoder_transition"] is model._encoder_execution.transition
+    assert advance_kwargs.get("outer_tensor_execution") is (fusion if ready_domain else None)
+
+
+@pytest.mark.parametrize("defect", [None, "incomplete-coverage", "eager-profile"])
+def test_real_outer_warmup_helper_attests_canonical_geometry_and_control_calls(monkeypatch, defect):
+    """@spec PORT-PERF-018, PORT-PERF-019: exercise the real helper, not a warmup mock.
+
+    Compilation and canonical transactions are CPU stubs here. The product
+    helper must route/verify them and cannot manufacture coverage from keys.
+    """
+    from tests.model_executor.models.nemotron_asr import test_advance_model_rows_local as transaction
+    from tests.model_executor.models.nemotron_asr.test_outer_tensor_fusion import CONSTANTS, FAMILIES, _symbol
+    from tests.model_executor.models.nemotron_asr.test_outer_tensor_startup import _Engine, _ready_receipt
+
+    profile = _profile_module()
+    warmup = _symbol(profile, "warmup_outer_tensor_execution")
+    events = []
+    geometry_calls = []
+    control_ids = set()
+    block = _ready_receipt()["outer_tensor_fusion"]
+    block["real_profile_covered"] = []
+    block["warmup_complete"] = block["sealed"] = block["ready"] = False
+
+    def cover(*families):
+        covered = set(block["real_profile_covered"]) | set(families)
+        block["real_profile_covered"] = [family for family in FAMILIES if family in covered]
+
+    class Binding:
+        constants = dict(CONSTANTS)
+        sealed = False
+
+        @property
+        def ready(self):
+            return self.sealed and block["real_profile_covered"] == list(FAMILIES)
+
+        def warmup(self, device):
+            assert device == torch.device("cpu")
+            events.append("compile-inventory")
+            self.sealed = True
+            block["warmup_complete"] = block["sealed"] = True
+
+        def receipt(self):
+            from copy import deepcopy
+
+            return deepcopy(dict(block, ready=self.ready))
+
+    binding = Binding()
+    core = transaction._tiny_core()
+    core.policy = FP32_BRINGUP
+    model = SimpleNamespace(
+        config=_Engine(True, []).model_config.hf_config,
+        core=core,
+        _outer_tensor_execution=binding,
+        _max_num_seqs=1,
+        _encoder_execution=SimpleNamespace(arm="eager", transition=None, ready=True),
+        _decode_graph_binding=None,
+        _chunk_bucket_binding=None,
+        _decode_resolver=transaction._fixed_resolver(),
+        _emission_adapter=transaction.advance.make_mrv1_adapter(hidden_size=17927, park_id=9000, blank_id=12),
+        _state_pools=lambda: pytest.fail("compiler preparation requested resident pools"),
+        _registry=SimpleNamespace(reserve=lambda *a, **kw: pytest.fail("compiler preparation reserved a lease")),
+    )
+
+    def canonical_profile(value, *, num_rows, device, geometry_id, ready_domain):
+        assert value is model and num_rows == 1 and device.type == "cpu"
+        assert ready_domain is True and events[0] == "compile-inventory"
+        geometry_calls.append(geometry_id)
+        events.append(f"geometry-{geometry_id}")
+        if not (defect == "incomplete-coverage" and geometry_id == 4):
+            cover("pre", f"post-g{geometry_id}")
+        if defect == "eager-profile" and geometry_id == 2:
+            block["dispatch"]["post"]["eager_calls"] += 1
+        return torch.zeros(1, 17927)
+
+    def canonical_control(*args, **kwargs):
+        # Five CHUNK calls go through the existing profile operator above.
+        # Zero-CHUNK role witnesses must still reach the canonical transaction.
+        row_plan = args[3]
+        assert not bool(row_plan.is_chunk.any())
+        assert kwargs.get("outer_tensor_execution") is binding
+        assert kwargs.get("capture", False) is False
+        control_ids.update(args[1].tolist())
+        cover("pre", "post-control")
+        events.append("canonical-control")
+        return torch.zeros(1, 17927)
+
+    monkeypatch.setattr(profile, "run_persistent_state_profile", canonical_profile)
+    monkeypatch.setattr(profile, "advance_model_rows", canonical_control)
+    if defect is None:
+        warmup(model, device=torch.device("cpu"))
+        assert sorted(geometry_calls) == [0, 1, 2, 3, 4]
+        assert {9000, 9002} <= control_ids
+        assert block["real_profile_covered"] == list(FAMILIES)
+        assert binding.ready
+    else:
+        with pytest.raises(RuntimeError, match="coverage|eager|fusion|inventory"):
+            warmup(model, device=torch.device("cpu"))
 
 
 def test_profile_execution_bypasses_strict_served_graph_resolver_before_capture(
