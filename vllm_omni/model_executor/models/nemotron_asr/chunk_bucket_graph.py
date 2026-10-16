@@ -4,13 +4,15 @@
 
 The caller constructs this binding before measured execution and keeps its model
 immutable. Exact encoder populations are independent of the padded decoder
-tier. The optional serving pilot replaces only declared 160-ms B1/B31/B63 cells.
+tier. Serving selection replaces declared 160-ms B1/B31/B63 or native 80-ms B1.
 """
 
 import hashlib
 import os
 import time
+from bisect import bisect_left
 from collections.abc import Callable
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,34 @@ from vllm_omni.model_executor.models.nemotron_asr.decode_graph import GraphRunti
 from vllm_omni.model_executor.models.nemotron_asr.encoder_execution import _tensor_signature
 from vllm_omni.model_executor.models.nemotron_asr.manifests import CADENCES
 from vllm_omni.model_executor.models.nemotron_asr.rnnt import decode_dense_masked_frames
+
+
+# @spec PORT-PERF-027
+def chunk_graph_selection(config: Any) -> tuple[tuple[int, ...], frozenset[tuple[int, int]]]:
+    """Normalize both selectors without accepting coerced or falsey values."""
+    legacy = getattr(config, "chunk_bucket_graph_populations", None)
+    exact = getattr(config, "experimental_chunk_bucket_graph_cells", None)
+    legacy = () if legacy is None else legacy
+    exact = () if exact is None else exact
+    if not isinstance(legacy, (list, tuple)) or any(type(n) is not int for n in legacy):
+        raise ValueError("CHUNK populations must be a list/tuple of exact integers")
+    if len(set(legacy)) != len(legacy):
+        raise ValueError("CHUNK populations must be distinct")
+    if not isinstance(exact, (list, tuple)) or any(
+        not isinstance(cell, (list, tuple)) or len(cell) != 2 or any(type(n) is not int for n in cell) or cell[1] <= 0
+        for cell in exact
+    ):
+        raise ValueError("CHUNK cells must be integer pairs with positive populations")
+    cells = frozenset(tuple(cell) for cell in exact)
+    if len(cells) != len(exact) or (legacy and cells):
+        raise ValueError("CHUNK selectors must be distinct and mutually exclusive")
+    return tuple(legacy), cells
+
+
+def _storage_span(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr()
+    return tensor.device, start, start + storage.nbytes()
 
 
 def _state_tensors(state: SessionStateBatch) -> tuple[torch.Tensor, ...]:
@@ -103,9 +133,11 @@ def capture_chunk_bucket(
     decoder's B1/B32/B64 staging and arithmetic. Unsupported shapes fail before staging.
     Fresh-aware resident gathers and every transaction commit remain outside.
     """
+    # @spec PORT-PERF-031, PORT-PERF-032
     population = int(env.shape[0])
-    if geometry != 1 or population not in (1, 31, 32, 63, 64):
-        raise ValueError("experimental bucket graph supports only 160-ms B1/B31/B32/B63/B64")
+    frozen_geometry = geometry
+    if (geometry, population) != (0, 1) and (geometry != 1 or population not in (1, 31, 32, 63, 64)):
+        raise ValueError("experimental bucket graph supports 80-ms B1 or 160-ms B1/B31/B32/B63/B64")
     expected_tier = 1 if population == 1 else (32 if population <= 32 else 64)
     if decoder_tier is not None and decoder_tier != expected_tier:
         raise ValueError("CHUNK decoder tier differs from the existing split decoder")
@@ -122,6 +154,20 @@ def capture_chunk_bucket(
     static_state = _clone_state(state)
     sources = (env, admitted_prompt, incoming_status, *_state_tensors(state))
     scratch = (static_env, static_prompt, static_status, *_state_tensors(static_state))
+    # Prefix maxima retain enclosing spans even when a later storage starts
+    # inside them. Per-call queries need no scan of the frozen owned inventory.
+    by_device: dict[torch.device, list[tuple[int, int]]] = {}
+    for tensor in scratch:
+        device, start, end = _storage_span(tensor)
+        by_device.setdefault(device, []).append((start, end))
+    scratch_spans = {}
+    for device, spans in by_device.items():
+        bases = frozenset(start for start, _ in spans)
+        nonempty = sorted((start, end) for start, end in spans if start < end)
+        starts = tuple(start for start, _ in nonempty)
+        max_ends = tuple(accumulate((end for _, end in nonempty), max))
+        scratch_spans[device] = (starts, max_ends, bases)
+    frozen_mode = execution_mode(core)
     signature = tuple(_tensor_signature(tensor) for tensor in sources)
     descriptor = runtime.descriptor_factory(population)
     result_type: Any = None
@@ -208,7 +254,8 @@ def capture_chunk_bucket(
         values = (actual_env, admitted_prompt, incoming_status, *_state_tensors(actual_state))
         if (
             actual_core is not core
-            or geometry != 1
+            or geometry != frozen_geometry
+            or execution_mode(actual_core) != frozen_mode
             or queue_capacity != frozen_capacity
             or decode_fn is not admitted_decode_fn
             or encoder_transition is not admitted_encoder_transition
@@ -217,9 +264,12 @@ def capture_chunk_bucket(
             or tuple(_tensor_signature(tensor) for tensor in values) != signature
         ):
             raise ValueError("bucket graph invocation differs from its captured cell")
-        scratch_storages = {tensor.untyped_storage().data_ptr() for tensor in scratch}
-        if any(tensor.untyped_storage().data_ptr() in scratch_storages for tensor in values):
-            raise ValueError("bucket caller aliases graph-owned scratch")
+        for tensor in values:
+            device, start, end = _storage_span(tensor)
+            starts, max_ends, bases = scratch_spans.get(device, ((), (), frozenset()))
+            index = bisect_left(starts, end)
+            if start in bases or (start < end and index > 0 and max_ends[index - 1] > start):
+                raise ValueError("bucket caller aliases or overlaps graph-owned scratch")
         stage(values)
         output = call(runtime.graph_mode)
         for destination, source in zip(_state_tensors(actual_state), _state_tensors(static_state), strict=True):
@@ -259,22 +309,34 @@ class ExactChunkGraphBinding:
     execution stream. Fresh gathers and resident commits stay with advance.py.
     """
 
-    def __init__(self, core: Any, config: Any, encoder_execution: Any, decoder_binding: Any, populations: Any):
+    def __init__(
+        self,
+        core: Any,
+        config: Any,
+        encoder_execution: Any,
+        decoder_binding: Any,
+        populations: Any = (),
+        *,
+        cells: frozenset[tuple[int, int]] = frozenset(),
+    ):
+        # @spec PORT-PERF-030: only metadata is reserved before disposable profiling.
+        selected = cells or frozenset((1, n) for n in populations)
         if (
             not isinstance(populations, (tuple, list))
-            or not populations
+            or not selected
+            or (cells and (cells != frozenset({(0, 1)}) or populations))
             or any(type(n) is not int or n not in (1, 31, 63) for n in populations)
             or len(set(populations)) != len(populations)
             or decoder_binding is None
         ):
             raise ValueError("CHUNK serving pilot requires distinct populations 1/31/63 and a dense graph decoder")
-        if any(decoder_binding.execution_tier(n) != (1 if n == 1 else (32 if n == 31 else 64)) for n in populations):
+        if any(decoder_binding.execution_tier(n) != (1 if n == 1 else (32 if n == 31 else 64)) for _, n in selected):
             raise ValueError("CHUNK pilot requires unchanged physical decoder tiers 1/32/64")
         self._core = core
         self._config = config
         self._encoder = encoder_execution
         self._decoder = decoder_binding
-        self._cells = frozenset((1, n) for n in populations)
+        self._cells = selected
         self._fallback_counts: dict[tuple[int, int], int] = {}
         self._instance_id = f"{os.getpid()}:{time.monotonic_ns()}"
         self._source_sha256 = {

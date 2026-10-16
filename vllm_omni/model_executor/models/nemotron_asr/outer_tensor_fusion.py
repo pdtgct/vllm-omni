@@ -73,7 +73,7 @@ def model_constants(config: Any) -> dict[str, int]:
     )
 
 
-# @spec PORT-PERF-012, PORT-PERF-013
+# @spec PORT-PERF-012, PORT-PERF-013, PORT-PERF-029
 def validate_selection(runtime: Any, config: Any, policy: Any) -> bool:
     enabled = getattr(config, "experimental_outer_tensor_fusion", False)
     if type(enabled) is not bool:
@@ -95,6 +95,7 @@ def validate_selection(runtime: Any, config: Any, policy: Any) -> bool:
         or getattr(config, "experimental_native_burst", False) is not True
         or getattr(config, "experimental_native_burst_profile", None) != PROFILE
         or bool(getattr(config, "chunk_bucket_graph_populations", ()))
+        or bool(getattr(config, "experimental_chunk_bucket_graph_cells", ()))
     ):
         raise ValueError("outer tensor fusion requires the FP32 singleton native five-cadence graph profile")
     validate_native_burst_config(runtime, hf_config=config, profile=PROFILE)
