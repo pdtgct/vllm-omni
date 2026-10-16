@@ -2566,3 +2566,36 @@ def test_graphed_arms_stage_valid_mel_widths_as_a_replayed_input(
 
     with pytest.raises(ValueError, match="signature"):
         execution.transition(*_graph_transition_args(population=live, base=7.0))
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_g0_chunk_reservation_keeps_complete_complementary_encoder_inventory(monkeypatch):
+    """@spec PORT-PERF-030, PORT-PERF-032: one replacement; no missing or duplicate cell."""
+    monkeypatch.setattr(encoder_execution_module, "execute_encoder_transition", _functional_graph_transition)
+    execution = build_encoder_execution(
+        _compiled_core(),
+        _dense_graphed_config("eager-graphed"),
+        maximum_population=1,
+        warmup_geometries=(0, 1, 2, 3, 4),
+        vllm_config=object(),
+        graph_runtime=_graph_runtime(),
+    )
+    execution.reserve_chunk_graph_cells(frozenset({(0, 1)}))
+
+    def invoke(geometry, population):
+        shape = execution._geometry_shapes[geometry]
+        args = _graph_transition_args(population=population, mel_width=shape.mel_width, out_width=shape.out_width)
+        return execution.transition(*args)
+
+    domain = {(g, 1) for g in range(5)}
+    execution.warmup_domain(expected_cells=tuple(sorted(domain)), invoke=invoke)
+    assert set(execution._graph_entries) == domain - {(0, 1)}
+    assert not execution.ready
+    with pytest.raises(ValueError, match="inventory"):
+        execution.publish_chunk_graphs({(1, 1): lambda: None})
+    assert not execution.ready and not execution._chunk_graph_entries
+    execution.publish_chunk_graphs({(0, 1): lambda: None})
+    assert execution.ready
+    assert set(execution._graph_entries).isdisjoint(execution._chunk_graph_entries)
+    assert set(execution._graph_entries) | set(execution._chunk_graph_entries) == domain

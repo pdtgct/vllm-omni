@@ -406,3 +406,245 @@ def test_endpoint_overflow_masks_only_delta_predicate(monkeypatch):
     assert int(status[1]) == advance.ROW_STATUS_DECODE_INVARIANT | advance.ROW_STATUS_BOOK_INVARIANT
     assert torch.all(status[2:] == advance.ROW_STATUS_BOOK_INVARIANT)
     _assert_pools_equal(pools, before)
+
+
+def _g0_graph_fixture(device="cpu"):
+    from vllm_omni.model_executor.models.nemotron_asr.decode_graph import DenseGraphBinding
+
+    core = _tiny_core()
+    if device == "cuda":
+        for name in ("encoder", "lid", "predictor", "joint", "featurizer"):
+            getattr(core, name).to(device).eval()
+    state = _fresh_state(1)
+    for name in ("raw_tail", "mel_tail", "frontend_counters", "h", "c", "last_label"):
+        setattr(state, name, getattr(state, name).to(device))
+    for name in ("channel", "window_valid", "time"):
+        setattr(state, name, [t.to(device) for t in getattr(state, name)])
+    env = _envelope(torch.randn(1280), final=False, seq=0, geometry=0).unsqueeze(0).to(device)
+    config = None
+    runtime = _graph_runtime()
+    if device == "cuda":
+        from contextlib import contextmanager
+        from dataclasses import replace
+
+        from vllm.config import VllmConfig
+
+        from vllm_omni.model_executor.models.nemotron_asr.decode_graph import platform_graph_runtime
+
+        @contextmanager
+        def stream_capture(dev):
+            current = torch.cuda.current_stream(dev)
+            stream = torch.cuda.Stream(device=dev)
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                yield
+            current.wait_stream(stream)
+
+        config = VllmConfig()
+        runtime = replace(platform_graph_runtime(), capture_context=stream_capture)
+
+    def decoder():
+        binding = DenseGraphBinding(
+            decode_fn=rnnt.decode_dense_masked_frames,
+            predictor=core.predictor,
+            joint=core.joint,
+            vllm_config=config,
+            frame_widths=(1,),
+            tiers=(1,),
+            encoder_hidden=32,
+            predictor_layers=2,
+            predictor_hidden=16,
+            blank_id=core.blank_id,
+            runtime=runtime,
+        )
+        binding.warmup(torch.device(device), torch.float32)
+        return binding
+
+    candidate_decoder, reference_decoder = decoder(), decoder()
+    args = dict(
+        geometry=0,
+        admitted_prompt=torch.zeros(1, dtype=torch.long, device=device),
+        incoming_status=torch.zeros(1, dtype=torch.int32, device=device),
+        queue_capacity=48,
+    )
+    return core, env, state, args, runtime, config, candidate_decoder, reference_decoder
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.mark.parametrize("tail_samples", [None, 0, 639])
+def test_g0_chunk_values_state_and_owned_outputs_across_continuing_final_tail(device, tail_samples):
+    """@spec PORT-PERF-031, PORT-PERF-032: CPU dispatch is not real CUDA coverage."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires real CUDA capture; CPU fake cannot prove value independence")
+    core, env, state, args, runtime, config, candidate, reference = _g0_graph_fixture(device)
+    graph_decode = candidate.decode_fn(geometry=0, tier=1)
+    transition = capture_chunk_bucket(
+        core,
+        env,
+        state,
+        **args,
+        vllm_config=config,
+        runtime=runtime,
+        capture_decode_fn=candidate.uncaptured_decode_fn(geometry=0, tier=1),
+        admitted_decode_fn=graph_decode,
+        decoder_tier=1,
+    )
+    held = []
+    sizes = (0,) if tail_samples is None else (1280, 1280, tail_samples)
+    for step, size in enumerate(sizes):
+        env = _envelope(torch.randn(size), final=step == len(sizes) - 1, seq=step, geometry=0).unsqueeze(0).to(device)
+        oracle_state = _clone_state(state)
+        oracle = advance.advance_chunk_bucket(
+            core, env, oracle_state, **args, decode_fn=reference.decode_fn(geometry=0, tier=1)
+        )
+        actual = transition(core, env, state, **args, decode_fn=graph_decode)
+        if tail_samples is None:
+            assert actual.result.frame_valid_lengths.tolist() == [0]
+        for left, right in zip(
+            (*_outputs(actual), *_state_tensors(state)), (*_outputs(oracle), *_state_tensors(oracle_state)), strict=True
+        ):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+        outputs = _outputs(actual)
+        assert len(outputs) == 13
+        nonempty = [t for t in outputs if t.numel()]
+        assert len({t.untyped_storage().data_ptr() for t in nonempty}) == len(nonempty)
+        assert actual.batch.samples.untyped_storage().data_ptr() == env.untyped_storage().data_ptr()
+        assert actual.batch.valid_samples.untyped_storage().data_ptr() != env.untyped_storage().data_ptr()
+        held.append((actual, tuple(t.clone() for t in outputs)))
+        # Overwrite the shared decoder workspace without a second CHUNK replay.
+        candidate.decode_fn(geometry=0, tier=1)(
+            torch.zeros(1, 1, 32, device=device),
+            torch.zeros(1, dtype=torch.long, device=device),
+            core.predictor,
+            core.joint,
+            rnnt.DecodeState(
+                torch.zeros(2, 1, 16, device=device),
+                torch.zeros(2, 1, 16, device=device),
+                torch.full((1,), core.blank_id, dtype=torch.long, device=device),
+            ),
+        )
+        for retained, snapshot in held:
+            for left, right in zip(_outputs(retained), snapshot, strict=True):
+                torch.testing.assert_close(left, right, atol=0, rtol=0)
+    assert transition.replay_count == len(sizes)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("invocation_kind", ["overlap", "introspection"])
+def test_chunk_rejects_distinct_storage_overlap_before_any_staging(monkeypatch, invocation_kind):
+    """@spec PORT-PERF-031: equal element/base pointers are not an overlap proof."""
+    core, env, state, args = _fixture(32)  # existing admitted cell isolates the alias defect
+    backing = bytearray(33 * 8)
+    owned_prompt = torch.frombuffer(backing, dtype=torch.int64, count=32, offset=8)
+    caller_prompt = torch.frombuffer(backing, dtype=torch.int64, count=32, offset=0)
+    assert owned_prompt.untyped_storage().data_ptr() != caller_prompt.untyped_storage().data_ptr()
+    original_clone, original_copy = torch.Tensor.clone, torch.Tensor.copy_
+    original_prompt = args["admitted_prompt"]
+    checking = False
+
+    def clone(tensor, *a, **kw):
+        return owned_prompt if tensor is original_prompt else original_clone(tensor, *a, **kw)
+
+    def copy(destination, source, *a, **kw):
+        if checking:
+            pytest.fail("overlapping caller reached graph staging before rejection")
+        return original_copy(destination, source, *a, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy)
+    transition = capture_chunk_bucket(core, env, state, **args, vllm_config=None, runtime=_graph_runtime())
+    checking = True
+    invocation = args | ({"admitted_prompt": caller_prompt} if invocation_kind == "overlap" else {"capture": True})
+    with pytest.raises(ValueError, match="alias|overlap|captured cell"):
+        transition(core, env, state, **invocation, decode_fn=rnnt.decode_dense_masked_frames)
+    assert transition.replay_count == 0
+
+
+@torch.inference_mode()
+def test_chunk_healthy_context_recovers_next_call_without_failed_replay_credit():
+    """@spec PORT-PERF-031, PORT-PERF-032: preserve existing no-latch recovery and prior state."""
+    core, env, state, args = _fixture(32)
+    before = _clone_state(state)
+    runtime = _graph_runtime(fail_graph_call=3, graph_error=RuntimeError("recoverable host replay fault"))
+    transition = capture_chunk_bucket(core, env, state, **args, vllm_config=None, runtime=runtime)
+    with pytest.raises(RuntimeError, match="recoverable host replay fault"):
+        transition(core, env, state, **args, decode_fn=rnnt.decode_dense_masked_frames)
+    assert transition.replay_count == 0
+    for left, right in zip(_state_tensors(state), _state_tensors(before), strict=True):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+    # A separately admitted call supplies freshly gathered authoritative state.
+    next_state = _clone_state(before)
+    oracle_state = _clone_state(before)
+    env[:, advance.ENVELOPE_HEADER_SLOTS :] *= 0.33
+    expected = advance.advance_chunk_bucket(core, env, oracle_state, **args, decode_fn=rnnt.decode_dense_masked_frames)
+    actual = transition(core, env, next_state, **args, decode_fn=rnnt.decode_dense_masked_frames)
+    assert transition.replay_count == 1
+    for left, right in zip(
+        (*_outputs(actual), *_state_tensors(next_state)),
+        (*_outputs(expected), *_state_tensors(oracle_state)),
+        strict=True,
+    ):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_g0_native_chunk_whole_transaction_matches_split_state_status_and_payload():
+    """@spec PORT-PERF-031, PORT-PERF-038, PORT-STATE-008: complete native transaction, not bucket alone."""
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+
+    core, env, state, args, runtime, config, candidate, reference = _g0_graph_fixture()
+    decode = candidate.decode_fn(geometry=0, tier=1)
+    transition = capture_chunk_bucket(
+        core,
+        env,
+        state,
+        **args,
+        vllm_config=config,
+        runtime=runtime,
+        capture_decode_fn=candidate.uncaptured_decode_fn(geometry=0, tier=1),
+        admitted_decode_fn=decode,
+        decoder_tier=1,
+    )
+    pools = _fresh_pools(2)
+    expected_pools = _clone_pools(pools)
+    actual_native, expected_native = NativeBurstProfileSink(max_tokens=142), NativeBurstProfileSink(max_tokens=142)
+    actual_commit, expected_commit = _CommitRecorder(), _CommitRecorder()
+    plan = _plan(prefills=[1], num_pool_blocks=2, geometries=[0])
+    common = dict(
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        adapter=advance.make_mrv1_adapter(hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id),
+    )
+    ids = torch.full((1,), PLACEHOLDER_ID, dtype=torch.long)
+    expected = advance.advance_model_rows(
+        core,
+        ids,
+        env,
+        plan,
+        **expected_pools,
+        **common,
+        decode_resolver=_fixed_resolver(reference.decode_fn(geometry=0, tier=1)),
+        commit_sink=expected_commit,
+        native_burst_handoff=expected_native,
+    )
+    actual = advance.advance_model_rows(
+        core,
+        ids,
+        env,
+        plan,
+        **pools,
+        **common,
+        decode_resolver=_fixed_resolver(decode),
+        bucket_transition=transition,
+        commit_sink=actual_commit,
+        native_burst_handoff=actual_native,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    _assert_pools_equal(pools, expected_pools)
+    torch.testing.assert_close(actual_commit.staged[0], expected_commit.staged[0], atol=0, rtol=0)
+    assert actual_native.payload is not None and expected_native.payload is not None
+    for field in ("sampled_token_ids", "num_sampled", "row_status", "queue", "book"):
+        torch.testing.assert_close(
+            getattr(actual_native.payload, field), getattr(expected_native.payload, field), atol=0, rtol=0
+        )

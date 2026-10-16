@@ -653,3 +653,14 @@ def test_real_dynamo_two_bindings_have_independent_helper_cache_budgets(monkeypa
             assert binding.receipt() == receipt
     assert len(generated) == 14
     assert {name: getattr(torch._dynamo.config, name) for name in names} == original
+
+
+def test_outer_fusion_rejects_exact_chunk_selector_before_core(monkeypatch):
+    """@spec PORT-PERF-013, PORT-PERF-014: new selector cannot bypass legacy exclusion."""
+    hf = native._native_config(profile=native.FIVE_CADENCE_PROFILE, lookaheads=native.LOOKAHEADS)
+    hf.experimental_outer_tensor_fusion = True
+    hf.experimental_chunk_bucket_graph_cells = [[0, 1]]
+    hf.encoder_execution_arm, hf.decode_dispatch_arm = "eager-graphed", "dense-graphed"
+    monkeypatch.setattr(model_module, "NemotronASRCore", lambda **kw: pytest.fail("fusion plus CHUNK reached core"))
+    with pytest.raises(ValueError):
+        model_module.NemotronASRForRNNT(vllm_config=native._runtime_config(hf))
