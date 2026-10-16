@@ -229,8 +229,9 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
 def test_real_outer_warmup_helper_attests_canonical_geometry_and_control_calls(monkeypatch, defect):
     """@spec PORT-PERF-018, PORT-PERF-019: exercise the real helper, not a warmup mock.
 
-    Compilation and canonical transactions are CPU stubs here. The product
-    helper must route/verify them and cannot manufacture coverage from keys.
+    Compilation and tensor execution are CPU stubs here; structural preflight
+    is real. The helper must produce valid control plans and cannot manufacture
+    coverage from keys.
     """
     from tests.model_executor.models.nemotron_asr import test_advance_model_rows_local as transaction
     from tests.model_executor.models.nemotron_asr.test_outer_tensor_fusion import CONSTANTS, FAMILIES, _symbol
@@ -300,6 +301,9 @@ def test_real_outer_warmup_helper_attests_canonical_geometry_and_control_calls(m
         # Five CHUNK calls go through the existing profile operator above.
         # Zero-CHUNK role witnesses must still reach the canonical transaction.
         row_plan = args[3]
+        transaction.advance._structural_preflight(row_plan, args[1].shape[0], args[2].shape[0])
+        assert row_plan.ready_deadline_ns.tolist() == [0]
+        assert all(item.ready_deadline_ns == 0 for item in row_plan.bindings)
         assert not bool(row_plan.is_chunk.any())
         assert kwargs.get("outer_tensor_execution") is binding
         assert kwargs.get("capture", False) is False

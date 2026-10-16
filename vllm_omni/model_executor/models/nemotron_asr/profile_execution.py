@@ -410,7 +410,8 @@ def warmup_outer_tensor_execution(model: NemotronASRForRNNT, *, device: torch.de
             num_prefills=0,
             has_initial_states_p=torch.empty(0, dtype=torch.bool),
             is_chunk=torch.zeros(1, dtype=torch.bool),
-            bindings=tuple(replace(item, is_chunk=False) for item in invocation.plan.bindings),
+            ready_deadline_ns=torch.zeros_like(invocation.plan.ready_deadline_ns),
+            bindings=tuple(replace(item, is_chunk=False, ready_deadline_ns=0) for item in invocation.plan.bindings),
         )
         advance_model_rows(
             model.core,
