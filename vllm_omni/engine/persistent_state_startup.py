@@ -177,7 +177,7 @@ def _service_executions(observations: list[Any]) -> list[Any]:
     return converted
 
 
-# @spec ENV-MIG-012 / PORT-PERF-005 / PORT-PERF-006 / PORT-INT-013
+# @spec ENV-MIG-012 / PORT-PERF-005 / PORT-PERF-006 / PORT-PERF-025 / PORT-INT-013
 async def prepare_persistent_state_service(
     *,
     engine_client: Any,
@@ -222,6 +222,11 @@ async def prepare_persistent_state_service(
 
         async def run_plan() -> list[Any]:
             observations: list[Any] = []
+            boundary = getattr(startup_provider, "validate_priming_boundary", None)
+            boundary_kwargs: dict[str, Any] = {}
+            if boundary is not None:
+                boundary_context = await boundary(engine_client=engine_client, plan=plan, phase="before")
+                boundary_kwargs["boundary_context"] = boundary_context
             for round_spec in plan.rounds:
 
                 async def execute(spec: Any, leases: tuple[Any, ...]) -> Any:
@@ -229,6 +234,7 @@ async def prepare_persistent_state_service(
                         engine_client=engine_client,
                         round_spec=spec,
                         leases=leases,
+                        **boundary_kwargs,
                     )
 
                 observations.append(
@@ -242,6 +248,11 @@ async def prepare_persistent_state_service(
                         timeout=float(runtime_config.startup_priming_round_timeout_s),
                     )
                 )
+            # run_service_priming_round has completed its generic lease release.
+            # A failing body already propagates through the existing shutdown;
+            # do not replace it with a secondary completion snapshot failure.
+            if boundary is not None:
+                await boundary(engine_client=engine_client, plan=plan, phase="after", **boundary_kwargs)
             return observations
 
         observations = await asyncio.wait_for(

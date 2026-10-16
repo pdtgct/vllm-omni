@@ -269,8 +269,12 @@ def run_persistent_state_profile(
 
                 native_profile_sink = NativeBurstProfileSink(max_tokens=native_handoff.max_tokens)
             chunk_binding = getattr(model, "_chunk_bucket_binding", None) if ready_domain else None
+            outer = getattr(model, "_outer_tensor_execution", None) if ready_domain else None
+            ready_decode = chunk_binding is not None or (
+                outer is not None and getattr(model, "_decode_graph_binding", None) is not None
+            )
             profile_plan = invocation.plan
-            if chunk_binding is not None:
+            if ready_decode:
                 profile_plan = replace(
                     profile_plan, execution_tier=model._decode_graph_binding.execution_tier(num_rows)
                 )
@@ -293,9 +297,7 @@ def run_persistent_state_profile(
                 endpoint_book_pool=pools.endpoint_book,
                 eou_token_id=_required_control(model.config, "eou_token_id"),
                 adapter=model._emission_adapter,
-                decode_resolver=model._decode_resolver
-                if chunk_binding is not None
-                else _profile_decode_resolver(model),
+                decode_resolver=model._decode_resolver if ready_decode else _profile_decode_resolver(model),
                 encoder_transition=model._encoder_execution.transition,
                 bucket_transition=chunk_binding,
                 placeholder_id=_required_control(
@@ -308,9 +310,10 @@ def run_persistent_state_profile(
                 # The final coexisting CHUNK inventory must execute its real
                 # decoder bindings. The pre-capture profile retains its original
                 # dense-eager admission flag and never claims graph coverage.
-                memory_profile=chunk_binding is None,
-                graph_covers_decode=chunk_binding is not None,
+                memory_profile=not ready_decode,
+                graph_covers_decode=ready_decode,
                 native_burst_handoff=native_profile_sink,
+                outer_tensor_execution=getattr(model, "_outer_tensor_execution", None) if ready_domain else None,
                 staging=None,
             )
 
@@ -370,3 +373,80 @@ __all__ = [
     "run_persistent_state_profile",
     "warmup_static_encoder_execution",
 ]
+
+
+# @spec PORT-PERF-018, PORT-PERF-019
+def warmup_outer_tensor_execution(model: NemotronASRForRNNT, *, device: torch.device) -> None:
+    """Attest compiler keys with real ephemeral CHUNK and control transactions."""
+    from vllm_omni.model_executor.models.nemotron_asr.frontend import CTR_EXPECTED_CHUNK_SEQUENCE, CTR_FINALIZED
+    from vllm_omni.model_executor.models.nemotron_asr.native_burst import NativeBurstProfileSink
+    from vllm_omni.model_executor.models.nemotron_asr.outer_tensor_fusion import FAMILIES
+    from vllm_omni.model_executor.models.nemotron_asr.rnnt import QUEUE_LAST_LABEL
+
+    binding = model._outer_tensor_execution
+    binding.warmup(device)
+    before = binding.receipt()
+    for geometry in range(len(CADENCES)):
+        run_persistent_state_profile(model, num_rows=1, device=device, geometry_id=geometry, ready_domain=True)
+    # Native serving reaches zero-CHUNK PARK echoes and forced EOU controls.
+    # Each witness has owned ephemeral state and never reserves a service lease.
+    for token in (binding.constants["park_id"], binding.constants["eou_token_id"]):
+        invocation = build_profile_invocation(model.config, num_rows=1, device=device, geometry_id=0)
+        pools = invocation.pools
+        pools.replay_book.zero_()
+        pools.replay_book[:, QUEUE_LAST_LABEL] = binding.constants["blank_id"]
+        pools.replay_queue.zero_()
+        pools.frontend_counters.zero_()
+        if token == binding.constants["park_id"]:
+            pools.frontend_counters[:, CTR_FINALIZED] = 1
+            pools.frontend_counters[:, CTR_EXPECTED_CHUNK_SEQUENCE] = 1
+        pools.endpoint_book.zero_()
+        pools.endpoint_history.zero_()
+        plan = replace(
+            invocation.plan,
+            state_indices_d=invocation.plan.state_indices_p.reshape(1, 1),
+            num_decodes=1,
+            state_indices_p=torch.empty(0, dtype=torch.int64),
+            num_prefills=0,
+            has_initial_states_p=torch.empty(0, dtype=torch.bool),
+            is_chunk=torch.zeros(1, dtype=torch.bool),
+            bindings=tuple(replace(item, is_chunk=False) for item in invocation.plan.bindings),
+        )
+        advance_model_rows(
+            model.core,
+            torch.full_like(invocation.input_ids, token),
+            invocation.inputs_embeds,
+            plan,
+            channel_pools=list(pools.channel),
+            time_pools=list(pools.convolution),
+            len_pools=list(pools.valid_length),
+            h_pool=pools.predictor_h,
+            c_pool=pools.predictor_c,
+            queue_pool=pools.replay_queue,
+            book_pool=pools.replay_book,
+            frontend_raw_pool=pools.frontend_raw,
+            frontend_mel_pool=pools.frontend_mel,
+            frontend_counter_pool=pools.frontend_counters,
+            endpoint_history_pool=pools.endpoint_history,
+            endpoint_book_pool=pools.endpoint_book,
+            eou_token_id=binding.constants["eou_token_id"],
+            adapter=model._emission_adapter,
+            decode_resolver=model._decode_resolver,
+            encoder_transition=model._encoder_execution.transition,
+            placeholder_id=binding.constants["placeholder_id"],
+            park_id=binding.constants["park_id"],
+            outer_tensor_execution=binding,
+            capture=False,
+            native_burst_handoff=NativeBurstProfileSink(max_tokens=model._native_burst_handoff.max_tokens)
+            if getattr(model, "_native_burst_handoff", None) is not None
+            else None,
+        )
+        consume_batch_stats()
+    after = binding.receipt()
+    if (
+        not binding.ready
+        or after["real_profile_covered"] != list(FAMILIES)
+        or after["frames"] != before["frames"]
+        or any(after["dispatch"][r]["eager_calls"] != before["dispatch"][r]["eager_calls"] for r in ("pre", "post"))
+    ):
+        raise RuntimeError("outer tensor fusion canonical coverage incomplete or selected eager")
