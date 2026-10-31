@@ -391,6 +391,31 @@ _PERSISTENT_STATE_PROFILE_KEYS = frozenset(
     }
 )
 
+# Engine-side admission keys a deploy block may set. The runtime resolver
+# (PersistentStateRuntimeConfig) owns the cross-field rules; here each value is
+# only type-checked so a typo fails at deploy load rather than at engine boot.
+_PERSISTENT_STATE_POSITIVE_INT_KEYS = frozenset(
+    {
+        "max_resident_sessions",
+        "persistent_state_admission_waiter_capacity",
+        "persistent_state_admission_max_inflight_reserves",
+        "persistent_state_admission_dispatch_budget",
+    }
+)
+_PERSISTENT_STATE_DURATION_KEYS = frozenset(
+    {
+        "persistent_state_admission_aging_threshold_s",
+        "persistent_state_admission_wait_timeout_s",
+        "persistent_state_release_convergence_timeout_s",
+        "streaming_unadmitted_connection_timeout_s",
+    }
+)
+_PERSISTENT_STATE_ENGINE_KEYS = (
+    _PERSISTENT_STATE_POSITIVE_INT_KEYS
+    | _PERSISTENT_STATE_DURATION_KEYS
+    | {"persistent_state_admission_retry_jitter_ms", "persistent_state_recovery_backoff_s"}
+)
+
 
 @dataclass(frozen=True)
 class PersistentStateDeployConfig:
@@ -408,6 +433,16 @@ class PersistentStateDeployConfig:
     persistent_state_startup_priming_round_timeout_s: float | None = None
     persistent_state_startup_priming_timeout_s: float | None = None
     persistent_state_service_profile_derating_factor: float | None = None
+    max_resident_sessions: int | None = None
+    persistent_state_admission_waiter_capacity: int | None = None
+    persistent_state_admission_max_inflight_reserves: int | None = None
+    persistent_state_admission_dispatch_budget: int | None = None
+    persistent_state_admission_aging_threshold_s: float | None = None
+    persistent_state_admission_wait_timeout_s: float | None = None
+    persistent_state_admission_retry_jitter_ms: int | None = None
+    persistent_state_recovery_backoff_s: list[float] | None = None
+    persistent_state_release_convergence_timeout_s: float | None = None
+    streaming_unadmitted_connection_timeout_s: float | None = None
 
     @classmethod
     def from_mapping(cls, values: Any) -> PersistentStateDeployConfig:
@@ -439,6 +474,23 @@ class PersistentStateDeployConfig:
             not isinstance(self.persistent_state_max_tombstones, int) or self.persistent_state_max_tombstones <= 0
         ):
             raise ValueError("persistent_state_max_tombstones must be a positive integer")
+
+        for key in _PERSISTENT_STATE_POSITIVE_INT_KEYS:
+            value = getattr(self, key)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+                raise ValueError(f"{key} must be a positive integer")
+        for key in _PERSISTENT_STATE_DURATION_KEYS:
+            value = getattr(self, key)
+            if value is not None and not _is_positive_finite_number(value):
+                raise ValueError(f"{key} must be positive and finite")
+        jitter = self.persistent_state_admission_retry_jitter_ms
+        if jitter is not None and (not isinstance(jitter, int) or isinstance(jitter, bool) or jitter < 0):
+            raise ValueError("persistent_state_admission_retry_jitter_ms must be a nonnegative integer")
+        backoff = self.persistent_state_recovery_backoff_s
+        if backoff is not None and (
+            not isinstance(backoff, list) or not backoff or not all(_is_positive_finite_number(v) for v in backoff)
+        ):
+            raise ValueError("persistent_state_recovery_backoff_s must be a non-empty list of positive durations")
 
         profile_values = {key: getattr(self, key) for key in _PERSISTENT_STATE_PROFILE_KEYS}
         missing = sorted(key for key, value in profile_values.items() if value is None)
@@ -490,6 +542,7 @@ def merge_persistent_state_additional_config(
         if key == "persistent_state_admission_policy"
         or key == "persistent_state_admission_retry_floor_ms"
         or key in _PERSISTENT_STATE_PROFILE_KEYS
+        or key in _PERSISTENT_STATE_ENGINE_KEYS
     }
     if persistent_values:
         PersistentStateDeployConfig.from_mapping(persistent_values)
