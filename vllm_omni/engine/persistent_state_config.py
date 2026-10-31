@@ -127,6 +127,14 @@ def _validated_admission_policy(
     raise ValueError(f"{name} must be exactly 'profile' or 'hard_cap', got {value!r}")
 
 
+def _number_or_default(values: Mapping[str, Any], name: str, default: float) -> float:
+    """Return a numeric input for a derived default; invalid inputs fail in their own validator."""
+    value = values.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return default
+    return float(value)
+
+
 def _resolve_a36_envelope(
     values: Mapping[str, Any],
     *,
@@ -179,9 +187,25 @@ def _resolve_a36_envelope(
             "persistent_state_admission_retry_jitter_ms": _DEFAULT_ADMISSION_RETRY_JITTER_MS,
             "persistent_state_recovery_backoff_s": _DEFAULT_RECOVERY_BACKOFF_S,
             "persistent_state_release_convergence_timeout_s": _DEFAULT_RELEASE_CONVERGENCE_S,
+            # ENV-MIG-011: derived from the resolved inputs, so a partial
+            # override (e.g. a longer admission wait) stays self-consistent.
             "streaming_unadmitted_connection_timeout_s": (
-                2 * (_DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S + _DEFAULT_ADMISSION_WAIT_S)
-                + (_DEFAULT_ADMISSION_RETRY_FLOOR_MS + _DEFAULT_ADMISSION_RETRY_JITTER_MS) / 1000
+                2
+                * (
+                    _number_or_default(
+                        values, "streaming_session_configuration_timeout_s", _DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S
+                    )
+                    + _number_or_default(values, "persistent_state_admission_wait_timeout_s", _DEFAULT_ADMISSION_WAIT_S)
+                )
+                + (
+                    _number_or_default(
+                        values, "persistent_state_admission_retry_floor_ms", _DEFAULT_ADMISSION_RETRY_FLOOR_MS
+                    )
+                    + _number_or_default(
+                        values, "persistent_state_admission_retry_jitter_ms", _DEFAULT_ADMISSION_RETRY_JITTER_MS
+                    )
+                )
+                / 1000
             ),
         }
     required = tuple(

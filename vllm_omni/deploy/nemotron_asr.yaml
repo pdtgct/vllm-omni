@@ -1,15 +1,37 @@
-# Qualified single-stage bring-up profile for cache-aware streaming ASR.
+# Single-stage profile for cache-aware streaming ASR.
+#
+# Admission uses the measured real-time profile: startup priming measures each
+# cadence and admits only what that profile supports, up to the 57-session
+# ceiling. The envelope below is the recorded lab recipe (derating 0.5,
+# 3 trailing rounds, 15 s priming round, 6300 s priming plan). It is NOT a
+# qualified envelope: no exact GPU profile has qualified these values yet, and
+# a host may admit fewer sessions, or no sessions at some cadences, under it.
+# The engine-side keys are the runtime's own hard_cap defaults at this ceiling.
 pipeline: nemotron_asr
+model_runner: v2
 async_chunk: false
 dtype: float32
 enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
+    max_num_seqs: 57
     enforce_eager: true
     async_scheduling: false
     persistent_state:
-      persistent_state_admission_policy: hard_cap
+      persistent_state_admission_policy: profile
+      max_resident_sessions: 57
+      persistent_state_service_profile_trailing_rounds: 3
+      persistent_state_startup_priming_round_timeout_s: 15.0
+      persistent_state_startup_priming_timeout_s: 6300.0
+      persistent_state_service_profile_derating_factor: 0.5
+      persistent_state_admission_waiter_capacity: 114
+      persistent_state_admission_max_inflight_reserves: 4
+      persistent_state_admission_dispatch_budget: 1
+      persistent_state_admission_aging_threshold_s: 1.0
+      persistent_state_admission_wait_timeout_s: 5.0
       persistent_state_admission_retry_floor_ms: 100
-      persistent_state_max_tombstones: 256
+      persistent_state_admission_retry_jitter_ms: 25
+      persistent_state_recovery_backoff_s: [0.1, 0.5, 1.0]
+      persistent_state_release_convergence_timeout_s: 61.0
+      streaming_unadmitted_connection_timeout_s: 30.125

@@ -80,6 +80,24 @@ def _resolved_default_stage() -> Any:
     return stages[0]
 
 
+def _runtime_config_for(stage: Any) -> Any:
+    """Resolve a lowered stage through the engine's runtime envelope resolver."""
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.persistent_state_config import PersistentStateRuntimeConfig
+    from vllm_omni.entrypoints.stage_utils import _to_dict
+    from vllm_omni.model_executor.models.nemotron_asr.identity import ARCHITECTURE
+
+    # Same conversion the engine applies to stage engine_args before boot.
+    engine_args = _to_dict(stage.to_omegaconf().engine_args)
+    vllm_config = SimpleNamespace(
+        additional_config=engine_args["additional_config"],
+        scheduler_config=SimpleNamespace(max_num_seqs=int(engine_args["max_num_seqs"])),
+        model_config=SimpleNamespace(architectures=(ARCHITECTURE,)),
+    )
+    return PersistentStateRuntimeConfig.from_vllm_config(vllm_config)
+
+
 def _write_deploy(
     tmp_path: Path,
     persistent_state: str = _HARD_CAP_PERSISTENT_STATE,
@@ -189,8 +207,7 @@ class TestNemotronPersistentStateDeploy:
         (
             "      null",
             "      persistent_state_unknown_key: 1",
-            "      persistent_state_admission_policy: hard_cap\n"
-            "      persistent_state_max_tombstones: 0",
+            "      persistent_state_admission_policy: hard_cap\n      persistent_state_max_tombstones: 0",
             "      persistent_state_admission_policy: profile\n"
             "      persistent_state_service_profile_trailing_rounds: 3",
         ),
@@ -215,17 +232,66 @@ class TestNemotronPersistentStateDeploy:
                 {"additional_config": {"persistent_state_admission_policy": "profile"}},
             )
 
-    def test_packaged_nemotron_deploy_selects_hard_cap_at_eight_sessions(self) -> None:
-        """@spec ENV-MIG-011/012: zero-argument registry boot is deterministic."""
+    def test_packaged_nemotron_deploy_selects_profile_at_57_sessions(self) -> None:
+        """@spec ENV-MIG-011/012: zero-argument registry boot selects profile admission."""
         stage = _resolved_default_stage()
         additional = stage.yaml_engine_args.get("additional_config")
         if not isinstance(additional, dict):
             _fail("ENV-MIG-011 packaged deploy was not lowered to additional_config")
 
-        assert stage.yaml_engine_args["max_num_seqs"] == 8
-        assert additional["persistent_state_admission_policy"] == "hard_cap"
-        assert additional["persistent_state_max_tombstones"] == 256
-        assert not _PROFILE_ONLY_KEYS & additional.keys()
+        assert stage.yaml_engine_args["max_num_seqs"] == 57
+        assert additional["persistent_state_admission_policy"] == "profile"
+        assert additional["max_resident_sessions"] == 57
+        assert _PROFILE_ONLY_KEYS <= additional.keys()
+        # The tombstone budget must be derived from the priming plan, never pinned.
+        assert "persistent_state_max_tombstones" not in additional
+
+    def test_packaged_nemotron_deploy_resolves_through_runtime_config(self) -> None:
+        """@spec ENV-MIG-011/012: the packaged deploy resolves a complete runtime envelope.
+
+        Lowering alone is not enough: the engine resolves the envelope again
+        through ``PersistentStateRuntimeConfig.from_vllm_config`` with the
+        model's priming plan, and a packaged default that fails there fails
+        every zero-argument boot.
+        """
+        from vllm_omni.engine.persistent_state_config import PersistentStateRuntimeConfig
+
+        stage = _resolved_default_stage()
+        runtime = _runtime_config_for(stage)
+
+        assert isinstance(runtime, PersistentStateRuntimeConfig)
+        assert runtime.admission_policy == "profile"
+        assert runtime.max_resident_sessions == 57
+        assert runtime.priming_configured_population_ceiling == 57
+        assert runtime.bootstrap_operation_budget > 0
+        assert runtime.max_tombstones >= runtime.bootstrap_operation_budget + runtime.runtime_tombstone_allowance
+
+    def test_minimal_hard_cap_deploy_resolves_through_runtime_config(self, tmp_path: Path) -> None:
+        """@spec ENV-MIG-011: a policy-only hard_cap deploy boots on runtime defaults.
+
+        On this lane hard_cap startup is profile-free: it runs no priming, so
+        it needs no service-profile inputs and no priming tombstone budget.
+        """
+        stage = _resolved_stage(_write_deploy(tmp_path, _HARD_CAP_PERSISTENT_STATE))
+        runtime = _runtime_config_for(stage)
+
+        assert runtime.admission_policy == "hard_cap"
+        assert runtime.max_resident_sessions == 8
+        assert runtime.bootstrap_operation_budget == 0
+        assert runtime.max_tombstones >= runtime.runtime_tombstone_allowance
+
+    def test_hard_cap_unadmitted_lifetime_default_follows_resolved_wait(self, tmp_path: Path) -> None:
+        """@spec ENV-MIG-011: the omitted lifetime is derived from the resolved inputs."""
+        stage = _resolved_stage(
+            _write_deploy(
+                tmp_path,
+                _HARD_CAP_PERSISTENT_STATE + "\n      persistent_state_admission_wait_timeout_s: 10.0",
+            )
+        )
+        runtime = _runtime_config_for(stage)
+
+        # 2 * (10 s configuration + 10 s wait) + (100 ms floor + 25 ms jitter)
+        assert runtime.unadmitted_connection_timeout_s == pytest.approx(40.125)
 
     def test_missing_packaged_nemotron_deploy_has_no_generic_fallback(
         self,
