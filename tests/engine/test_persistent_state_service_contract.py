@@ -781,8 +781,13 @@ def test_hard_cap_accepts_advisory_profile_runtime_fields() -> None:
     assert runtime.service_profile_derating_factor == 0.5
 
 
-def test_hard_cap_requires_explicit_profile_fields_and_funds_priming() -> None:
-    """@spec ENV-MIG-012 / PORT-PERF-006: both processes fund the same plan."""
+def test_hard_cap_defaults_profile_fields_and_funds_priming() -> None:
+    """@spec ENV-MIG-011 / ENV-MIG-012 / PORT-PERF-006: both processes fund the same plan.
+
+    hard_cap still primes, so a policy-only hard_cap envelope resolves the
+    service-profile inputs to defaults and derives the tombstone budget from
+    the priming plan instead of failing the boot.
+    """
     from vllm_omni.engine.persistent_state_config import PersistentStateRuntimeConfig
     from vllm_omni.model_executor.models.nemotron_asr.startup import NEMOTRON_PERSISTENT_STATE_STARTUP
 
@@ -790,9 +795,25 @@ def test_hard_cap_requires_explicit_profile_fields_and_funds_priming() -> None:
         model_config=SimpleNamespace(architectures=("Nemotron3_5AsrForRNNT",)),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
-    with pytest.raises(ValueError, match="service_profile_trailing_rounds"):
+    minimal = PersistentStateRuntimeConfig.from_vllm_config(
+        SimpleNamespace(additional_config={"persistent_state_admission_policy": "hard_cap"}, **common),
+        startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP,
+    )
+    assert minimal.service_profile_trailing_rounds == 3
+    assert minimal.startup_priming_round_timeout_s == 15.0
+    assert minimal.startup_priming_timeout_s == 6300.0
+    assert minimal.service_profile_derating_factor == 0.5
+    assert minimal.bootstrap_operation_budget == 3840
+    assert minimal.max_tombstones == 3872
+    with pytest.raises(ValueError, match="persistent_state_max_tombstones"):
         PersistentStateRuntimeConfig.from_vllm_config(
-            SimpleNamespace(additional_config={"persistent_state_admission_policy": "hard_cap"}, **common),
+            SimpleNamespace(
+                additional_config={
+                    "persistent_state_admission_policy": "hard_cap",
+                    "persistent_state_max_tombstones": 256,
+                },
+                **common,
+            ),
             startup_provider=NEMOTRON_PERSISTENT_STATE_STARTUP,
         )
     values = {key: value for key, value in _EXPLICIT_A36_ENVELOPE.items() if key != "persistent_state_max_tombstones"}
