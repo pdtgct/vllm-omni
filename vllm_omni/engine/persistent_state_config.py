@@ -49,6 +49,13 @@ _DEFAULT_ADMISSION_RETRY_FLOOR_MS = 100
 _DEFAULT_ADMISSION_RETRY_JITTER_MS = 25
 _DEFAULT_RECOVERY_BACKOFF_S = (0.1, 0.5, 1.0)
 _DEFAULT_RELEASE_CONVERGENCE_S = 61.0
+# hard_cap still primes at startup to derive its served cadences and the
+# advisory profile, so it needs the four service-profile inputs too. These
+# defaults apply only under hard_cap; profile must supply them explicitly.
+_DEFAULT_HARD_CAP_TRAILING_ROUNDS = 3
+_DEFAULT_HARD_CAP_PRIMING_ROUND_TIMEOUT_S = 15.0
+_DEFAULT_HARD_CAP_PRIMING_TIMEOUT_S = 6300.0
+_DEFAULT_HARD_CAP_DERATING_FACTOR = 0.5
 
 _A36_REQUIRED_KEYS = (
     "persistent_state_admission_waiter_capacity",
@@ -129,6 +136,14 @@ def _validated_admission_policy(
     raise ValueError(f"{name} must be exactly 'profile' or 'hard_cap', got {value!r}")
 
 
+def _number_or_default(values: Mapping[str, Any], name: str, default: float) -> float:
+    """Return a numeric input for a derived default; invalid inputs fail in their own validator."""
+    value = values.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return default
+    return float(value)
+
+
 def _resolve_a36_envelope(
     values: Mapping[str, Any],
     *,
@@ -170,10 +185,30 @@ def _resolve_a36_envelope(
             "persistent_state_admission_retry_jitter_ms": _DEFAULT_ADMISSION_RETRY_JITTER_MS,
             "persistent_state_recovery_backoff_s": _DEFAULT_RECOVERY_BACKOFF_S,
             "persistent_state_release_convergence_timeout_s": _DEFAULT_RELEASE_CONVERGENCE_S,
+            # ENV-MIG-011: derived from the resolved inputs, so a partial
+            # override (e.g. a longer admission wait) stays self-consistent.
             "streaming_unadmitted_connection_timeout_s": (
-                2 * (_DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S + _DEFAULT_ADMISSION_WAIT_S)
-                + (_DEFAULT_ADMISSION_RETRY_FLOOR_MS + _DEFAULT_ADMISSION_RETRY_JITTER_MS) / 1000
+                2
+                * (
+                    _number_or_default(
+                        values, "streaming_session_configuration_timeout_s", _DEFAULT_SESSION_CONFIGURATION_TIMEOUT_S
+                    )
+                    + _number_or_default(values, "persistent_state_admission_wait_timeout_s", _DEFAULT_ADMISSION_WAIT_S)
+                )
+                + (
+                    _number_or_default(
+                        values, "persistent_state_admission_retry_floor_ms", _DEFAULT_ADMISSION_RETRY_FLOOR_MS
+                    )
+                    + _number_or_default(
+                        values, "persistent_state_admission_retry_jitter_ms", _DEFAULT_ADMISSION_RETRY_JITTER_MS
+                    )
+                )
+                / 1000
             ),
+            "persistent_state_service_profile_trailing_rounds": _DEFAULT_HARD_CAP_TRAILING_ROUNDS,
+            "persistent_state_startup_priming_round_timeout_s": _DEFAULT_HARD_CAP_PRIMING_ROUND_TIMEOUT_S,
+            "persistent_state_startup_priming_timeout_s": _DEFAULT_HARD_CAP_PRIMING_TIMEOUT_S,
+            "persistent_state_service_profile_derating_factor": _DEFAULT_HARD_CAP_DERATING_FACTOR,
         }
     required = tuple(name for name in _A36_REQUIRED_KEYS if name != "persistent_state_admission_policy")
     missing = [name for name in required if name not in values and name not in defaults]
