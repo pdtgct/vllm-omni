@@ -1,0 +1,31 @@
+# Opt-in CUDA Model Runner V2 profile for Nemotron VoiceChat full-duplex serving.
+# Stage 0 (thinker) runs on MRv2; stages 1 (talker) and 2 (code2wav) stay on
+# Model Runner V1 until they are validated on MRv2. All duplex session, admission
+# (max_sessions, max_num_seqs, active_stream_window) and fast-profile settings
+# are inherited unchanged from nemotron_labs_voicechat_duplex.yaml.
+# Status: GPU validation is pending; only CPU config-resolution tests cover this
+# profile so far.
+base_config: nemotron_labs_voicechat_duplex.yaml
+
+session_mode: duplex
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    model_runner: v2
+
+  - stage_id: 1
+    model_runner: v1
+
+  - stage_id: 2
+    model_runner: v1
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

@@ -77,7 +77,10 @@ does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
 over this endpoint today. CUDA Qwen3-Omni deployments can use
 `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` to run the same duplex session
-on Model Runner V2; non-CUDA platforms in that profile stay on V1. PersonaPlex
+on Model Runner V2; non-CUDA platforms in that profile stay on V1. Nemotron
+VoiceChat has an opt-in `vllm_omni/deploy/nemotron_labs_voicechat_duplex_mrv2.yaml`
+profile that runs only stage 0 on Model Runner V2 (stages 1 and 2 stay on V1;
+GPU validation is pending). PersonaPlex
 carries its pre-framework duplex code: its pipeline declares no `duplex_plugin`,
 so it runs turn-based until the
 follow-up PR ports it to the plugin contract
